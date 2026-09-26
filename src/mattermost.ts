@@ -3,6 +3,27 @@ import { InventoryError, type Seat, type SeatReader, type Team, type TeamReader 
 const PAGE_SIZE = 100;
 type RecordValue = Record<string, unknown>;
 
+const CERTIFICATE_ERROR_CODES = new Set([
+  "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+  "UNABLE_TO_GET_ISSUER_CERT",
+  "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+  "DEPTH_ZERO_SELF_SIGNED_CERT",
+  "SELF_SIGNED_CERT_IN_CHAIN",
+  "CERT_HAS_EXPIRED",
+  "ERR_TLS_CERT_ALTNAME_INVALID",
+]);
+
+function certificateError(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  let current = error;
+  while (object(current) && !seen.has(current)) {
+    seen.add(current);
+    if (typeof current.code === "string" && CERTIFICATE_ERROR_CODES.has(current.code)) return true;
+    current = current.cause;
+  }
+  return false;
+}
+
 function object(value: unknown): value is RecordValue {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -119,7 +140,10 @@ export class MattermostClient {
         redirect: "manual",
         signal: AbortSignal.timeout(20_000),
       });
-    } catch {
+    } catch (error) {
+      if (certificateError(error)) {
+        throw new InventoryError("Mattermost TLS certificate verification failed. Check system trust and launch with npm start or npm run dev.");
+      }
       throw new InventoryError("Mattermost read failed; check connectivity and server response.");
     }
     if (response.status === 401 || response.status === 403) {
@@ -140,7 +164,7 @@ export class MattermostClient {
     let previousIds: string | undefined;
     for (let page = 0; page < 1000; page++) {
       const payload = await this.get(path, { page, per_page: PAGE_SIZE });
-      const items = records(objectKey ? (object(payload) ? payload[objectKey] : undefined) : payload);
+      const items = records(objectKey && object(payload) ? payload[objectKey] : payload);
       const ids = JSON.stringify(items.map((item) => item.id ?? item.user_id ?? ""));
       if (items.length === PAGE_SIZE && ids === previousIds) {
         throw new InventoryError("Mattermost inventory pagination did not advance.");

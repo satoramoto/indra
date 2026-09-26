@@ -61,6 +61,21 @@ describe("Mattermost read adapter", () => {
     expect(() => new MattermostClient("http://example.org", "secret")).toThrow("HTTPS origin");
   });
 
+  it("classifies certificate verification failures without exposing transport details", async () => {
+    const request = vi.fn(async () => {
+      throw new TypeError("fetch failed for https://example.org?token=secret", {
+        cause: Object.assign(new Error("certificate secret"), { code: "UNABLE_TO_VERIFY_LEAF_SIGNATURE" }),
+      });
+    });
+    const error = await new MattermostClient("https://example.org", "secret", request as typeof fetch).get("/bots").catch((value: unknown) => value);
+    expect(error).toBeInstanceOf(InventoryError);
+    expect(String(error)).toContain("TLS certificate verification failed");
+    expect(String(error)).not.toContain("secret");
+    expect(String(error)).not.toContain("example.org");
+    const other = new MattermostClient("https://example.org", "secret", vi.fn(async () => { throw new Error("private details"); }) as typeof fetch);
+    await expect(other.get("/bots")).rejects.toThrow("Mattermost read failed; check connectivity and server response.");
+  });
+
   it("resolves multiselect Role options from metadata and both value shapes", () => {
     const field = roleField([ROLE]);
     expect(roleValues({ "field-1": ["lead", "dev"] }, field)).toEqual(["Team Lead", "Developer"]);
@@ -72,11 +87,11 @@ describe("Mattermost read adapter", () => {
 
   it("includes only active member bots and preserves a bot across teams", async () => {
     const api = client({
-      "/bots?page=0&per_page=100": { bots: [
+      "/bots?page=0&per_page=100": [
         { user_id: "a", username: "alice", display_name: "Alice" },
         { user_id: "b", username: "bob", display_name: "Bob" },
         { user_id: "c", username: "charlie", delete_at: 1 },
-      ] },
+      ],
       "/teams/one/members?page=0&per_page=100": [{ user_id: "a" }, { user_id: "b" }, { user_id: "c" }],
       "/teams/two/members?page=0&per_page=100": [{ user_id: "a" }],
       "/custom_profile_attributes/fields": [ROLE],

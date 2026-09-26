@@ -4,12 +4,12 @@
   "private": true,
   "type": "module",
   "engines": {
-    "node": ">=22.12.0"
+    "node": ">=22.15.0"
   },
   "scripts": {
-    "dev": "tsx watch src/cli.ts",
+    "dev": "node --use-system-ca --import tsx --watch src/cli.ts",
     "build": "vite build",
-    "start": "node dist/cli.js",
+    "start": "node --use-system-ca dist/cli.js",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"
