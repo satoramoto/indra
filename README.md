@@ -4,7 +4,7 @@ Indra explores stable Mattermost team seats that can later be occupied by interc
 
 ## Run
 
-Requires Node.js 22 or newer, network access to `https://mattermost.newegypt.io`, and an existing signed-in 1Password CLI session with access to `op://Agent Rig/Mattermost/access_token`.
+Requires Node.js 22.12.0 or newer, network access to `https://mattermost.newegypt.io`, and an existing signed-in 1Password CLI session with access to `op://Agent Rig/Mattermost/access_token`.
 
 ```sh
 npm ci
