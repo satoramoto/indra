@@ -1,37 +1,47 @@
 # Indra
 
-Indra explores stable Mattermost team seats that can later be occupied by interchangeable coding-agent sessions. The current milestone is a **read-only terminal inventory**; it does not connect an agent to a seat.
+Indra opens a read-only view of stable team seats and a draft sprint from an `indra-state` Git checkout. A seat is a durable team identity; no agent session is connected or launched by this app.
 
 ## Run
 
-Requires Node.js 22.15.0 or newer, network access to `https://mattermost.newegypt.io`, and an existing signed-in 1Password CLI session with access to `op://Agent Rig/Mattermost/access_token`. The start and development commands use Node's system CA trust so certificates trusted by the operating system can be verified.
+Requires Node.js 22.15.0 or newer. Keep the separate `indra-state` checkout beside this project, or pass its directory explicitly:
 
 ```sh
 npm ci
 npm run build
 npm start
+npm start -- --state /path/to/indra-state
 ```
 
-The app lists teams visible to that credential. Enter a team number to inspect its active bot seats. Use `r` to refresh, `b` to return to teams, or `q` to quit. For a one-shot view:
+The default is the sibling `../indra-state` directory. `INDRA_STATE_REPO` also sets the checkout path; `--state` takes precedence. The terminal shows recorded teams, seats, roles, and draft sprint details. Enter `r` to reread `state.json` after a file edit or Git checkout change, or `q` to quit. `--once` prints one snapshot and exits, useful for scripts and a quick check:
 
 ```sh
-npm start -- --team yahaha
+npm start -- --state /path/to/indra-state --once
 ```
 
-For terminal development, `npm run dev` runs the TypeScript CLI with an automatic restart when files change. Use `npm run test:watch` for Vitest's watch mode. Vite builds the executable CLI; this project has no web server or HTTP preview.
+The app validates the version 1 structure and references before showing a snapshot. Validation errors name the invalid field or reference. A failed refresh never presents malformed data as an empty roster. The `indra-state` repository contains [the formal JSON Schema](https://github.com/satoramoto/indra-state/blob/main/schema/v1/state.schema.json); `state.json` carries `$schema` and `schemaVersion`. Edit and commit that file in the state repository to preserve business-record history. Indra does not write it or maintain a second database. The current sprint's work and allocations are **draft proposals**, not approved assignments or active execution.
 
-No token belongs in environment variables or command arguments. The app reads the existing 1Password reference into process memory, sends only `GET` requests, suppresses credential-bearing diagnostics, and refuses HTTP redirects. It does not create or change accounts, roles, messages, tokens, or sessions.
+## Existing live Mattermost inventory
 
-Seats are active bot accounts whose IDs appear in a team's membership list. A bot can appear on multiple teams. Role comes from the existing custom profile multiselect field named `Role`, with its option IDs resolved against field metadata. Mattermost permission roles and online presence are not used as agent occupancy. The UI labels agent occupancy **not connected yet**.
-
-The refresh time describes the last successful read for that view. A failed read is shown as an error, never as an empty team or seat list. Visibility depends on the credential's permissions; an absent team, bot, or Role value does not prove it does not exist elsewhere.
-
-## Verify
+The previous read-only live inventory remains available explicitly:
 
 ```sh
+npm start -- --mattermost
+npm start -- --mattermost --team yahaha
+```
+
+This mode requires network access to `https://mattermost.newegypt.io` and an existing signed-in 1Password CLI session with access to `op://Agent Rig/Mattermost/access_token`. The launch commands use Node's system CA trust. No token belongs in environment variables, arguments, or the state repository. The adapter sends only `GET` requests, suppresses credential-bearing diagnostics, and refuses HTTP redirects. Mattermost visibility is limited to that credential's permissions. Its refresh time is the last successful read, and agent occupancy is labeled **not connected yet**.
+
+## Develop and verify
+
+```sh
+npm run dev -- --state /path/to/indra-state
+npm run test:watch
 npm test
 npm run typecheck
 npm run build
 ```
 
-Tests use fake Mattermost responses and never read 1Password or contact production. `src/domain.ts` defines service-neutral teams, seats, and the two small read interfaces used by core inventory logic. `src/mattermost.ts` maps the current service onto those interfaces; `src/cli.ts` selects and connects that adapter. Future seat occupancy, agent orchestration, and a canonical business-record store are outside this milestone.
+`npm run dev` restarts the TypeScript CLI on source edits; enter `r` to reload state data without restarting. Vite builds the CLI and Vitest runs fixture tests. There is no web server or HTTP preview.
+
+`src/state-domain.ts` defines neutral state records and one read interface. `src/local-state.ts` validates and maps the local checkout; `src/cli.ts` selects it at the edge. `src/domain.ts` and `src/mattermost.ts` retain the independent live inventory path. This milestone does not synchronize providers, plan work, create messages, change roles, or run agents.
