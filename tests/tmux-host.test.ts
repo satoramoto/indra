@@ -9,12 +9,16 @@ import { PlanningStore } from "../src/planning.js";
 class FakeTmux implements TmuxRunner {
   calls: string[][] = [];
   pane?: string;
+  identity = "123:456";
+  dead = false;
+  onStart?: (nonce: string) => Promise<void>;
   async run(args: string[]): Promise<string> {
     this.calls.push(args);
-    if (args.includes("list-panes")) { if (!this.pane) throw new Error("gone"); return this.pane; }
+    if (args.includes("display-message")) { if (!this.pane) throw new Error("gone"); return this.identity; }
+    if (args.includes("list-panes")) { if (!this.pane) throw new Error("gone"); return `${this.pane}:${this.dead ? 1 : 0}`; }
     if (args.includes("list-sessions")) return this.pane ? args[args.indexOf("-s") + 1] ?? "" : "";
     if (args.includes("has-session")) throw new Error("absent");
-    if (args.includes("new-session")) { this.pane = "%1"; return `${args[args.indexOf("-s") + 1]}:%1`; }
+    if (args.includes("new-session")) { this.pane = "%1"; if (this.onStart) await this.onStart(args[args.indexOf("--ready-nonce") + 1]); return `${args[args.indexOf("-s") + 1]}:%1`; }
     throw new Error("unexpected tmux call");
   }
 }
@@ -32,6 +36,7 @@ async function fixture() {
 describe("tmux host", () => {
   it("uses exact owned names and argv, then reuses a verified session", async () => {
     const dir = await fixture(); const fake = new FakeTmux(); const host = new TmuxHost(dir, fake, dir);
+    fake.onStart = async (nonce) => { await writeFile(host.readyFile(nonce), JSON.stringify({ nonce })); };
     const record = await host.start();
     const launch = fake.calls.find((args) => args.includes("new-session"))!;
     expect(launch).toContain(process.execPath);
@@ -45,8 +50,9 @@ describe("tmux host", () => {
 
   it("withholds attach target when pane no longer matches", async () => {
     const dir = await fixture(); const fake = new FakeTmux(); const host = new TmuxHost(dir, fake, dir);
+    fake.onStart = async (nonce) => { await writeFile(host.readyFile(nonce), JSON.stringify({ nonce })); };
     await host.start();
-    fake.pane = "%2";
+    fake.identity = "987:654";
     expect(await host.verifiedRecord()).toBeUndefined();
     const snapshot = await new LocalSessionReader(dir, new PlanningStore(dir), host).readSessions();
     expect(snapshot.connection).toBe("disconnected");
@@ -55,11 +61,25 @@ describe("tmux host", () => {
 
   it("returns a neutral snapshot with a verified attach target", async () => {
     const dir = await fixture(); const fake = new FakeTmux(); const host = new TmuxHost(dir, fake, dir);
+    fake.onStart = async (nonce) => { await writeFile(host.readyFile(nonce), JSON.stringify({ nonce })); };
     await host.start();
     const store = new PlanningStore(dir);
     await store.update((state) => { state.planningGoals = [{ id: "goal-1", teamId: "team-001", seatId: "seat-001", participantSeatIds: [], goal: "Plan", projectRefs: [], stage: "clarifying", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), mattermost: { channelId: "channel", rootPostId: "root" }, brief: { summary: "Plan", decisions: [], openQuestions: [] } }]; });
     const snapshot = await new LocalSessionReader(dir, store, host).readSessions();
     expect(snapshot.connection).toBe("connected");
-    expect(snapshot.sessions[0]).toMatchObject({ id: "goal-1", status: "running", engine: "codex", attach: { kind: "tmux", target: host.attachTarget((await host.readRecord())!) } });
+    expect(snapshot.sessions[0]).toMatchObject({ id: "goal-1", status: "idle", engine: "codex", attach: { kind: "tmux", target: host.attachTarget((await host.readRecord())!) } });
+  });
+
+  it("does not claim readiness before the bridge signals its first successful poll", async () => {
+    const dir = await fixture(); const fake = new FakeTmux(); const host = new TmuxHost(dir, fake, dir, 100);
+    await expect(host.start()).rejects.toThrow("did not become ready");
+  });
+
+  it("rejects a dead pane even with matching identifiers", async () => {
+    const dir = await fixture(); const fake = new FakeTmux(); const host = new TmuxHost(dir, fake, dir);
+    fake.onStart = async (nonce) => { await writeFile(host.readyFile(nonce), JSON.stringify({ nonce })); };
+    await host.start();
+    fake.dead = true;
+    expect(await host.verifiedRecord()).toBeUndefined();
   });
 });
