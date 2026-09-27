@@ -3,7 +3,7 @@ import { render, useKeyboard, useTerminalDimensions } from "@opentui/solid";
 import { createMemo, createSignal, For, Show, type Accessor } from "solid-js";
 import type { StateInventory, StateSeat } from "./state-domain.js";
 import { attachTmux } from "./tmux-attach.js";
-import { currentSession, displayText, TerminalUiModel, type SessionReadPort, type TerminalSession } from "./terminal-ui.js";
+import { currentSession, displayText, newestPlanningRecord, TerminalUiModel, type SessionReadPort, type TerminalSession } from "./terminal-ui.js";
 
 const theme = {
   background: "#111827", panel: "#1F2937", selected: "#243B53",
@@ -12,9 +12,11 @@ const theme = {
 };
 
 function occupancy(model: TerminalUiModel, seat: StateSeat): { label: string; color: string; session?: TerminalSession } {
-  const session = currentSession(model.sessionsFor(seat.id));
-  if (model.sessionResult.connection !== "connected") return { label: "OCCUPANCY UNKNOWN", color: theme.idle, session };
-  if (session?.status === "error" && !session.sessionId) return { label: "RUNTIME RECORD ERROR", color: theme.error, session };
+  const records = model.sessionsFor(seat.id);
+  const session = currentSession(records);
+  const newest = newestPlanningRecord(records);
+  if (model.sessionResult.connection !== "connected") return { label: "OCCUPANCY UNKNOWN", color: theme.idle, session: newest };
+  if (newest?.status === "error" && !newest.sessionId) return { label: records.some((record) => !!record.sessionId) ? "RUNTIME ERROR · SAVED SESSION" : "RUNTIME RECORD ERROR", color: theme.error, session: newest };
   if (!session?.sessionId) return { label: "NO ACTIVE SESSION", color: theme.idle, session };
   return {
     label: session.status.toUpperCase() + " SESSION · " + session.engine,
@@ -24,7 +26,7 @@ function occupancy(model: TerminalUiModel, seat: StateSeat): { label: string; co
 }
 
 function activityLine(model: TerminalUiModel, seat: StateSeat, limit: number): string {
-  const session = currentSession(model.sessionsFor(seat.id));
+  const session = newestPlanningRecord(model.sessionsFor(seat.id));
   if (!session) return model.sessionResult.connection === "connected" ? "No recent runtime activity." : "Live activity unavailable.";
   const latest = session.recentActivity.at(-1);
   if (latest) return (model.sessionResult.connection === "connected" ? "Latest: " : "Recorded: ") + displayText(latest, limit);
