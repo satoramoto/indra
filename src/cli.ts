@@ -7,6 +7,10 @@ import { LocalStateRepository, StateDataError } from "./local-state.js";
 import { MattermostClient, MattermostInventory } from "./mattermost.js";
 import { interactiveState, printState } from "./state-cli.js";
 import { StateInventory } from "./state-domain.js";
+import { PlanningStore } from "./planning.js";
+import { PlanningBridge } from "./planning-bridge.js";
+import { MattermostPlanningChat, readChickToken } from "./planning-mattermost.js";
+import { CodexRuntime } from "./codex-runtime.js";
 
 export const SERVER = "https://mattermost.newegypt.io";
 export type Write = (line: string) => void;
@@ -70,12 +74,32 @@ export async function interactive(inventory: Inventory, read: Read, write: Write
   }
 }
 
-type Options = { mode: "help" } | { mode: "state"; checkout: string; once: boolean } | { mode: "mattermost"; slug?: string };
+type Options = { mode: "help" } | { mode: "state"; checkout: string; once: boolean } | { mode: "mattermost"; slug?: string } | { mode: "planning"; action: "start" | "serve"; checkout: string; channel?: string; goal?: string; projects: string[]; participants: string[] };
 
-const usage = "Usage: npm start -- [--state PATH] [--once] | --mattermost [--team SLUG]\nDefault: inspect the local indra-state checkout; use r to refresh.\n--mattermost: read the live Mattermost inventory using the existing 1Password credential.";
+const usage = "Usage: npm start -- [--state PATH] [--once] | --mattermost [--team SLUG] | planning start --goal TEXT --channel CHANNEL_ID [--project PATH] [--participant SEAT_ID] [--state PATH] | planning serve [--state PATH]\nPlanning serves only Chick's Yahaha thread. Reply in the thread to clarify; send /proposal there to request a draft.";
 
 export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_REPO): Options {
   if (args.length === 1 && (args[0] === "--help" || args[0] === "-h")) return { mode: "help" };
+  if (args[0] === "planning") {
+    const action = args[1];
+    if (action !== "start" && action !== "serve") throw new StateDataError(usage);
+    let checkout: string | undefined; let channel: string | undefined; let goal: string | undefined;
+    const projects: string[] = []; const participants: string[] = [];
+    for (let index = 2; index < args.length; index++) {
+      const key = args[index]; const value = args[++index];
+      if (!value || value.startsWith("--")) throw new StateDataError(usage);
+      if (key === "--state" && !checkout) checkout = value;
+      else if (key === "--channel" && !channel) channel = value;
+      else if (key === "--goal" && !goal) goal = value;
+      else if (key === "--project") projects.push(value);
+      else if (key === "--participant") participants.push(value);
+      else throw new StateDataError(usage);
+    }
+    if (action === "start" && (!goal || !channel)) throw new StateDataError(usage);
+    if (action === "serve" && (goal || channel || projects.length || participants.length)) throw new StateDataError(usage);
+    const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+    return { mode: "planning", action, checkout: resolve(checkout || stateEnv || resolve(projectRoot, "..", "indra-state")), goal, channel, projects, participants };
+  }
   let mattermost = false;
   let checkout: string | undefined;
   let slug: string | undefined;
@@ -119,6 +143,22 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         return await interactiveState(inventory, (prompt) => rl.question(prompt), console.log);
       } finally {
         rl.close();
+      }
+    }
+    if (options.mode === "planning") {
+      const store = new PlanningStore(options.checkout);
+      const chat = new MattermostPlanningChat(await readChickToken());
+      const runtime = new CodexRuntime(process.cwd());
+      const bridge = new PlanningBridge(store, chat, runtime);
+      if (options.action === "start") {
+        const goal = await bridge.start(options.goal!, options.channel!, options.projects, options.participants);
+        console.log(`Planning goal ${goal.id}: ${SERVER}/yahaha/pl/${goal.mattermost.rootPostId}`);
+        return 0;
+      }
+      console.log("Chick planning bridge running. Stop with Ctrl-C.");
+      while (true) {
+        await bridge.poll();
+        await new Promise((resolve) => setTimeout(resolve, 3000));
       }
     }
     const slug = options.slug;

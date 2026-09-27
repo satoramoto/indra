@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":false,"required":["reply","summary","decisions","openQuestions"],"properties":{"reply":{"type":"string"},"summary":{"type":"string"},"decisions":{"type":"array","items":{"type":"string"}},"openQuestions":{"type":"array","items":{"type":"string"}}}}
