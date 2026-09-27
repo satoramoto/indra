@@ -28,11 +28,15 @@ Use a writable, dedicated `indra-state` checkout with the compatible version 1 s
 ```sh
 npm start -- planning start --state /path/to/indra-state --channel CHANNEL_ID --goal "Familiarize yourself with this project and propose a roadmap" --project /path/to/project
 npm start -- planning serve --state /path/to/indra-state
+npm start -- planning host --state /path/to/indra-state
+npm start -- planning status --state /path/to/indra-state
 ```
 
 Optional `--participant SEAT_ID` records intended contributors. Only Chick runs in this MVP; listing George or another seat does not launch them. In the new thread, reply normally to clarify the brief. Send the exact message `/proposal` in that thread to request a draft. The bridge moves the goal through `clarifying`, `drafting`, and `awaiting-review`, writes the validated proposal into `state.json`, and posts its summary in the thread. It never approves or executes proposal work. Review and commit `state.json` in its own repository to preserve business history.
 
 The bridge uses Chick's 1Password bot item (`Mattermost bot - chickcorea`) and the existing authenticated Codex CLI. It does not accept an API key. Runtime session IDs, processed post IDs, run timestamps, and any reported usage live outside Git in `<state-checkout>.runtime`; preserve that directory to resume after a restart. Keep only one `planning serve` process for this checkout. The bridge polls every three seconds, serializes Chick's messages, caps a poll at 20 inputs, ignores its own posts, and scans the thread for delivery IDs before retrying pending replies. If a process dies in the narrow interval after a state update and before its pending delivery record is saved, inspect the thread and state before restarting. If `planning start` reports an orphan root post, inspect that post before trying again. 1Password may require desktop authorization.
+
+`planning host` launches the same bridge in a dedicated detached tmux session. It uses an Indra-owned socket and exact session name derived from the state checkout, and reuses an already verified pane on repeated calls. It records pane identity in `<state-checkout>.runtime/tmux-host.json`. `planning status` prints a neutral JSON session snapshot, including an attach target only while that exact pane remains live. The target is `socket:session`; split it and pass the pieces as argv to `tmux -L SOCKET attach-session -t =SESSION`. Attaching or detaching does not stop the bridge. A stale or missing ownership record is never grounds to kill or attach another session. The host command requires the built `dist/cli.js` (`npm run build` first).
 
 ## Existing live Mattermost inventory
 
