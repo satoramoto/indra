@@ -29,7 +29,7 @@ function startTyping(chat: PlanningChat, channelId: string, rootPostId: string):
   refresh();
   const timer = setInterval(refresh, TYPING_REFRESH_MS);
   timer.unref?.();
-  return () => { clearInterval(timer); controller.abort(); chat.stopTyping?.(); };
+  return () => { clearInterval(timer); controller.abort(); try { chat.stopTyping?.(); } catch { /* advisory cleanup */ } };
 }
 
 const briefSchema = resolve(dirname(fileURLToPath(import.meta.url)), "..", "schemas", "brief.json");

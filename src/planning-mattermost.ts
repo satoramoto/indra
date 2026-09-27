@@ -39,19 +39,29 @@ export class MattermostPlanningChat implements PlanningChat {
   private async connectTyping(): Promise<WebSocket> {
     if (this.typingSocket?.readyState === WebSocket.OPEN) return this.typingSocket;
     if (this.typingReady) return this.typingReady;
-    this.typingReady = (async () => {
-      const socket = this.socketFactory(TYPING_SOCKET);
-      this.typingSocket = socket;
+    let socket: WebSocket | undefined;
+    const connection = (async () => {
+      const opened = this.socketFactory(TYPING_SOCKET);
+      socket = opened;
+      this.typingSocket = opened;
       await new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error("Mattermost typing socket timed out.")), 2500);
         const open = () => { cleanup(); resolve(); };
         const error = () => { cleanup(); reject(new Error("Mattermost typing socket failed.")); };
-        const cleanup = () => { clearTimeout(timer); socket.removeEventListener("open", open); socket.removeEventListener("error", error); };
-        socket.addEventListener("open", open); socket.addEventListener("error", error);
+        const cleanup = () => { clearTimeout(timer); opened.removeEventListener("open", open); opened.removeEventListener("error", error); };
+        opened.addEventListener("open", open); opened.addEventListener("error", error);
       });
-      await this.typingFrame(socket, "authentication_challenge", { token: this.token }, 1);
-      return socket;
-    })().catch((error: unknown) => { this.stopTyping(); throw error; }).finally(() => { this.typingReady = undefined; });
+      await this.typingFrame(opened, "authentication_challenge", { token: this.token }, 1);
+      return opened;
+    })();
+    const guarded = connection.catch((error: unknown) => {
+      if (this.typingSocket === socket) {
+        socket?.close();
+        this.typingSocket = undefined;
+      }
+      throw error;
+    }).finally(() => { if (this.typingReady === guarded) this.typingReady = undefined; });
+    this.typingReady = guarded;
     return this.typingReady;
   }
 
