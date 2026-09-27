@@ -65,7 +65,7 @@ export class TmuxHost {
     }
     await mkdir(this.runtimeDir, { recursive: true, mode: 0o700 });
     const readyNonce = randomUUID();
-    const output = await this.runner.run(["-L", this.socket, "new-session", "-d", "-P", "-F", "#{session_name}:#{pane_id}", "-s", this.session, "-c", this.appDir, process.execPath, "--use-system-ca", this.cli, "planning", "serve", "--state", resolve(this.stateCheckout), "--ready-nonce", readyNonce]);
+    const output = await this.runner.run(["-L", this.socket, "new-session", "-d", "-P", "-F", "#{session_name}:#{pane_id}", "-s", this.session, "-c", this.appDir, process.execPath, "--experimental-ffi", "--use-system-ca", this.cli, "planning", "serve", "--state", resolve(this.stateCheckout), "--ready-nonce", readyNonce]);
     const [name, paneId] = output.split(":");
     if (name !== this.session || !/^%\d+$/.test(paneId ?? "")) throw new Error(`Tmux started but returned an unexpected pane identity; inspect socket ${this.socket} before retrying.`);
     const tmuxIdentity = await this.runner.run(["-L", this.socket, "display-message", "-p", "-t", `=${this.session}`, "-F", "#{pid}:#{session_created}"]);

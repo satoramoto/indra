@@ -11,6 +11,7 @@ npm ci
 npm run build
 npm start
 npm start -- --state /path/to/indra-state
+npm start -- --ui --state /path/to/indra-state
 ```
 
 The default is the sibling `../indra-state` directory. `INDRA_STATE_REPO` also sets the checkout path; `--state` takes precedence. The terminal shows recorded teams, seats, roles, and draft sprint details. Enter `r` to reread `state.json` after a file edit or Git checkout change, or `q` to quit. `--once` prints one snapshot and exits, useful for scripts and a quick check:
@@ -61,6 +62,6 @@ npm run build
 
 `npm run dev` watches source files and rebuilds the CLI and terminal UI; run `npm start` in a second terminal after the initial build. Vite compiles Solid TSX with the universal transform and Vitest runs fixture and native renderer tests. There is no web server or HTTP preview.
 
-`src/terminal-ui-solid.tsx` exports the read-only OpenTUI Solid screen for the coordinator to connect to `src/cli.ts` and the runtime's neutral `SessionReadPort`. It polls state and session snapshots every two seconds, keeps the selected stable seat during refresh, and labels disconnected occupancy as unknown while still showing recorded planning goals and activity. The team view shows each seat's role and newest recorded activity; Enter opens its detail. An attach action is available only for a verified Indra-owned tmux target and opens a read-only bridge event/log view. Detaching or quitting does not pause or stop the bridge. The 80-column view keeps all five Yahaha seats in the roster and moves the expanded detail to its own screen.
+`npm start -- --ui --state PATH` opens the read-only OpenTUI Solid screen with the local state and runtime session reader. It polls state and session snapshots every two seconds, keeps the selected stable seat during refresh, and labels disconnected occupancy as unknown while still showing recorded planning goals and activity. The team view shows each seat's role and newest recorded activity; Enter opens its detail. An attach action is available only for a verified Indra-owned tmux target and opens a read-only bridge event/log view. Detaching or quitting does not pause or stop the bridge. The 80-column view keeps all five Yahaha seats in the roster and moves the expanded detail to its own screen.
 
 `src/state-domain.ts` defines neutral inventory records. `src/planning.ts` owns state writes and local resume metadata. `src/planning-bridge.ts` routes Chick's thread and validates model output. `src/codex-runtime.ts` and `src/planning-mattermost.ts` are the provider adapters. There is no HTTP preview server.

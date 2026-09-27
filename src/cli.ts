@@ -77,9 +77,9 @@ export async function interactive(inventory: Inventory, read: Read, write: Write
   }
 }
 
-type Options = { mode: "help" } | { mode: "state"; checkout: string; once: boolean } | { mode: "mattermost"; slug?: string } | { mode: "planning"; action: "start" | "serve" | "host" | "status"; checkout: string; channel?: string; goal?: string; projects: string[]; participants: string[]; readyNonce?: string };
+type Options = { mode: "help" } | { mode: "state"; checkout: string; once: boolean } | { mode: "ui"; checkout: string } | { mode: "mattermost"; slug?: string } | { mode: "planning"; action: "start" | "serve" | "host" | "status"; checkout: string; channel?: string; goal?: string; projects: string[]; participants: string[]; readyNonce?: string };
 
-const usage = "Usage: npm start -- [--state PATH] [--once] | --mattermost [--team SLUG] | planning start --goal TEXT --channel CHANNEL_ID [--project PATH] [--participant SEAT_ID] [--state PATH] | planning serve|host|status [--state PATH]\nPlanning serves only Chick's Yahaha thread. Reply in the thread to clarify; send /proposal there to request a draft.";
+const usage = "Usage: npm start -- [--state PATH] [--once] | --ui [--state PATH] | --mattermost [--team SLUG] | planning start --goal TEXT --channel CHANNEL_ID [--project PATH] [--participant SEAT_ID] [--state PATH] | planning serve|host|status [--state PATH]\nPlanning serves only Chick's Yahaha thread. Reply in the thread to clarify; send /proposal there to request a draft.";
 
 export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_REPO): Options {
   if (args.length === 1 && (args[0] === "--help" || args[0] === "-h")) return { mode: "help" };
@@ -108,9 +108,11 @@ export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_
   let checkout: string | undefined;
   let slug: string | undefined;
   let once = false;
+  let ui = false;
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
     if (arg === "--mattermost" && !mattermost) mattermost = true;
+    else if (arg === "--ui" && !ui) ui = true;
     else if (arg === "--once" && !once) once = true;
     else if ((arg === "--state" || arg === "--team") && args[index + 1] && !args[index + 1].startsWith("--")) {
       const value = args[++index];
@@ -120,12 +122,14 @@ export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_
     } else throw new StateDataError(usage);
   }
   if (mattermost) {
-    if (checkout || once) throw new StateDataError(usage);
+    if (checkout || once || ui) throw new StateDataError(usage);
     return { mode: "mattermost", slug };
   }
   if (slug) throw new StateDataError("--team requires --mattermost.\n" + usage);
+  if (ui && once) throw new StateDataError(usage);
   const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-  return { mode: "state", checkout: resolve(checkout || stateEnv || resolve(projectRoot, "..", "indra-state")), once };
+  const stateCheckout = resolve(checkout || stateEnv || resolve(projectRoot, "..", "indra-state"));
+  return ui ? { mode: "ui", checkout: stateCheckout } : { mode: "state", checkout: stateCheckout, once };
 }
 
 export async function main(args: string[] = process.argv.slice(2)): Promise<number> {
@@ -134,6 +138,10 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
     if (options.mode === "help") {
       console.log(usage);
       return 0;
+    }
+    if (options.mode === "ui") {
+      const { runTerminalUi } = await import("./terminal-ui-solid.js");
+      return await runTerminalUi(new StateInventory(new LocalStateRepository(options.checkout)), new LocalSessionReader(options.checkout));
     }
     if (options.mode === "state") {
       const inventory = new StateInventory(new LocalStateRepository(options.checkout));
