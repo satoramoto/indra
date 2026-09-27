@@ -4,6 +4,16 @@ import { randomUUID } from "node:crypto";
 export interface AgentResult { sessionId: string; response: unknown; usage?: unknown; startedAt: string; finishedAt: string }
 export interface AgentRuntime { message(prompt: string, schemaPath: string, sessionId?: string, signal?: AbortSignal): Promise<AgentResult> }
 
+/** Codex uses its own login; planning and unrelated provider secrets are not inherited. */
+export function codexEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const clean: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (/^OP_|^INDRA_.*(?:TOKEN|SECRET|CREDENTIAL|PASSWORD|KEY)|(?:^|_)(?:TOKEN|SECRET|PASSWORD|API_KEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIALS?)(?:$|_)/i.test(key)) continue;
+    clean[key] = value;
+  }
+  return clean;
+}
+
 /** Uses the logged-in Codex CLI and an explicit session id; never uses --last. */
 export class CodexRuntime implements AgentRuntime {
   constructor(private readonly cwd: string, private readonly timeoutMs = 300_000) {}
@@ -14,7 +24,7 @@ export class CodexRuntime implements AgentRuntime {
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     signal?.addEventListener("abort", () => controller.abort(), { once: true });
     try {
-      const child = spawn("codex", args, { cwd: this.cwd, stdio: ["pipe", "pipe", "pipe"], signal: controller.signal });
+      const child = spawn("codex", args, { cwd: this.cwd, env: codexEnvironment(process.env), stdio: ["pipe", "pipe", "pipe"], signal: controller.signal });
       child.stdin.end(prompt);
       let output = ""; let stderr = "";
       child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
