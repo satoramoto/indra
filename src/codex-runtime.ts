@@ -1,16 +1,19 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { isAbsolute } from "node:path";
 
 export interface AgentResult { sessionId: string; response: unknown; usage?: unknown; startedAt: string; finishedAt: string }
 export interface AgentRuntime { message(prompt: string, schemaPath: string, sessionId?: string, signal?: AbortSignal): Promise<AgentResult> }
 
-/** Codex uses its own login; planning and unrelated provider secrets are not inherited. */
+const CODEX_ENV_KEYS = new Set(["PATH", "HOME", "TMPDIR", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "LC_COLLATE", "LC_NUMERIC", "LC_TIME", "TERM", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS"]);
+
+/** Codex uses its own local login; only runtime paths and locale settings are inherited. */
 export function codexEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const clean: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(source)) {
-    if (/^OP_|^INDRA_.*(?:TOKEN|SECRET|CREDENTIAL|PASSWORD|KEY)|(?:^|_)(?:TOKEN|SECRET|PASSWORD|API_KEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIALS?)(?:$|_)/i.test(key)) continue;
-    clean[key] = value;
+    if (CODEX_ENV_KEYS.has(key) && value !== undefined) clean[key] = value;
   }
+  if (source.CODEX_HOME && isAbsolute(source.CODEX_HOME)) clean.CODEX_HOME = source.CODEX_HOME;
   return clean;
 }
 
