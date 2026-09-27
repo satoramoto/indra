@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PlanningStore } from "../src/planning.js";
+import { PlanningStore, validatePlanningGoal } from "../src/planning.js";
 import { PlanningBridge, type PlanningChat, type Post } from "../src/planning-bridge.js";
 import type { AgentRuntime, AgentResult } from "../src/codex-runtime.js";
 
@@ -39,6 +39,7 @@ describe("planning bridge", () => {
     const bridge = new PlanningBridge(store, chat, runtime);
     const goal = await bridge.start("Explore project", "channel", ["/project"]);
     expect(goal.mattermost.rootPostId).toBe("post1");
+    expect((await store.runtime(goal.id)).lastSeenAt).toBeLessThanOrEqual(chat.posts[0].create_at);
     expect(runtime.sessions).toEqual([undefined]);
     chat.human("post1", "Start with the README");
     await bridge.poll();
@@ -73,5 +74,64 @@ describe("planning bridge", () => {
     const store = await fixture(); const chat = new FakeChat();
     await expect(new PlanningBridge(store, chat, new FakeRuntime()).start("Goal", "channel", [], ["missing"])).rejects.toThrow("participant");
     expect(chat.posts).toHaveLength(0);
+  });
+
+  it("processes a bounded queue across polls and ignores its own and replayed posts", async () => {
+    const store = await fixture(); const chat = new FakeChat(); const runtime = new FakeRuntime();
+    const bridge = new PlanningBridge(store, chat, runtime, 1);
+    const goal = await bridge.start("Explore project", "channel", []);
+    chat.human(goal.mattermost.rootPostId, "First");
+    chat.human(goal.mattermost.rootPostId, "Second");
+    await bridge.poll();
+    expect(runtime.sessions).toHaveLength(2);
+    await bridge.poll();
+    expect(runtime.sessions).toHaveLength(3);
+    await new PlanningBridge(store, chat, runtime).poll();
+    expect(runtime.sessions).toHaveLength(3);
+  });
+
+  it("retries a pending reply without rerunning Codex after a post failure", async () => {
+    const store = await fixture(); const chat = new FakeChat(); const runtime = new FakeRuntime();
+    const bridge = new PlanningBridge(store, chat, runtime);
+    const goal = await bridge.start("Explore project", "channel", []);
+    chat.human(goal.mattermost.rootPostId, "Question");
+    const original = chat.post.bind(chat);
+    let fail = true;
+    chat.post = async (...args) => { if (fail) { fail = false; throw new Error("network down"); } return original(...args); };
+    await expect(bridge.poll()).rejects.toThrow("network down");
+    expect((await store.runtime(goal.id)).pending?.inputPostId).toBe("post3");
+    await new PlanningBridge(store, chat, runtime).poll();
+    expect(runtime.sessions).toHaveLength(2);
+    expect((await store.runtime(goal.id)).pending).toBeUndefined();
+  });
+
+  it("reconstructs an unsent proposal announcement from durable state", async () => {
+    const store = await fixture(); const chat = new FakeChat(); const runtime = new FakeRuntime();
+    const bridge = new PlanningBridge(store, chat, runtime);
+    const goal = await bridge.start("Explore project", "channel", []);
+    chat.human(goal.mattermost.rootPostId, "/proposal");
+    const original = chat.post.bind(chat);
+    chat.post = async () => { throw new Error("network down"); };
+    await expect(bridge.poll()).rejects.toThrow("network down");
+    const record = await store.runtime(goal.id);
+    delete record.pending;
+    await store.saveRuntime(goal.id, record);
+    chat.post = original;
+    await new PlanningBridge(store, chat, runtime).poll();
+    expect(chat.posts.at(-1)?.message).toContain("awaiting review");
+    expect(runtime.sessions).toHaveLength(2);
+  });
+
+  it("rejects invalid planning references before writing state", async () => {
+    const store = await fixture();
+    await expect(store.update((state) => { state.planningGoals = [{ id: "goal-bad", teamId: "missing", seatId: "seat-001", participantSeatIds: [], goal: "Goal", projectRefs: [], stage: "clarifying", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), mattermost: { channelId: "channel", rootPostId: "root" }, brief: { summary: "Goal", decisions: [], openQuestions: [] } }]; })).rejects.toThrow("Unknown planning team");
+    expect((await store.read()).planningGoals).toEqual([]);
+  });
+
+  it("rejects empty proposal and brief entries before persistence", async () => {
+    const store = await fixture(); const chat = new FakeChat(); const runtime = new FakeRuntime();
+    const goal = await new PlanningBridge(store, chat, runtime).start("Goal", "channel", []);
+    expect(() => validatePlanningGoal({ ...goal, brief: { ...goal.brief, decisions: [""] } })).toThrow("Invalid planning brief");
+    expect(() => validatePlanningGoal({ ...goal, stage: "awaiting-review", proposal: { id: "proposal-1", createdAt: new Date().toISOString(), summary: "Roadmap", outcomes: [{ id: "outcome-1", title: "Do", description: "Describe" }], risks: [""], openQuestions: [] } })).toThrow("Invalid proposal");
   });
 });

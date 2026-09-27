@@ -15,7 +15,7 @@ export interface PlanningChat {
 const briefSchema = resolve(dirname(fileURLToPath(import.meta.url)), "..", "schemas", "brief.json");
 const proposalSchema = resolve(dirname(fileURLToPath(import.meta.url)), "..", "schemas", "proposal.json");
 const isObject = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
-const stringArray = (value: unknown): value is string[] => Array.isArray(value) && value.every((item) => typeof item === "string");
+const stringArray = (value: unknown): value is string[] => Array.isArray(value) && value.every((item) => typeof item === "string" && !!item.trim());
 
 function brief(value: unknown): { reply: string; summary: string; decisions: string[]; openQuestions: string[] } {
   if (!isObject(value) || typeof value.reply !== "string" || typeof value.summary !== "string" || !value.summary.trim() || !stringArray(value.decisions) || !stringArray(value.openQuestions)) throw new Error("Codex returned an invalid brief response.");
@@ -24,6 +24,10 @@ function brief(value: unknown): { reply: string; summary: string; decisions: str
 function proposal(value: unknown): NonNullable<PlanningGoal["proposal"]> {
   if (!isObject(value) || typeof value.summary !== "string" || !value.summary.trim() || !Array.isArray(value.outcomes) || !value.outcomes.length || !value.outcomes.every((item) => isObject(item) && typeof item.title === "string" && !!item.title.trim() && typeof item.description === "string" && !!item.description.trim()) || !stringArray(value.risks) || !stringArray(value.openQuestions)) throw new Error("Codex returned an invalid proposal.");
   return { id: `proposal-${randomUUID().slice(0, 8)}`, createdAt: new Date().toISOString(), summary: value.summary, outcomes: value.outcomes.map((item, index) => ({ id: `outcome-${index + 1}`, title: item.title, description: item.description })), risks: value.risks, openQuestions: value.openQuestions };
+}
+function proposalMessage(goal: PlanningGoal): string {
+  const draft = goal.proposal!;
+  return `**Draft proposal ${draft.id} — awaiting review**\n${draft.summary}\n${draft.outcomes.map((item) => `- **${item.title}:** ${item.description}`).join("\n")}\n\nRecorded in indra-state as ${goal.id}. No work has been approved or executed.`;
 }
 
 function prompt(goal: PlanningGoal, input: string, drafting: boolean): string {
@@ -48,7 +52,7 @@ export class PlanningBridge {
     const goal: PlanningGoal = { id, teamId: team.id, seatId: seat.id, participantSeatIds, goal: goalText, projectRefs, stage: "clarifying", createdAt: now, updatedAt: now, mattermost: { channelId, rootPostId: root.id }, brief: { summary: goalText, decisions: [], openQuestions: [] } };
     try { await this.store.update((state) => { state.planningGoals = [...(state.planningGoals ?? []), goal]; }); }
     catch (error) { throw new Error(`Planning root post ${root.id} was created, but state persistence failed; inspect that post and retry after repair.`, { cause: error }); }
-    const metadata: RuntimeRecord = { lastSeenAt: Date.now(), processedPostIds: [root.id], runs: [] };
+    const metadata: RuntimeRecord = { lastSeenAt: Math.max(0, root.create_at - 5000), processedPostIds: [root.id], runs: [] };
     await this.store.saveRuntime(id, metadata);
     const run = await this.runtime.message(prompt(goal, "Start this planning conversation. State what you understand and ask the most useful clarifying question.", false), briefSchema);
     metadata.sessionId = run.sessionId;
@@ -56,7 +60,9 @@ export class PlanningBridge {
     await this.store.saveRuntime(id, metadata);
     const update = brief(run.response);
     await this.store.update((state) => { const found = state.planningGoals!.find((item) => item.id === id)!; found.brief = { summary: update.summary, decisions: update.decisions, openQuestions: update.openQuestions }; found.updatedAt = new Date().toISOString(); });
-    await this.chat.post(channelId, update.reply, root.id);
+    metadata.pending = { inputPostId: root.id, since: root.create_at, message: update.reply };
+    await this.store.saveRuntime(id, metadata);
+    await this.deliver(goal, metadata);
     return goal;
   }
 
@@ -66,10 +72,17 @@ export class PlanningBridge {
     for (const goal of goals) {
       const metadata = await this.store.runtime(goal.id);
       if (metadata.pending) await this.deliver(goal, metadata);
-      if (goal.stage === "awaiting-review") continue;
+      if (goal.stage === "awaiting-review") {
+        const request = (await this.chat.since(goal.mattermost.channelId, metadata.lastSeenAt)).find((post) => post.root_id === goal.mattermost.rootPostId && post.user_id !== own && post.message.trim() === "/proposal" && !metadata.processedPostIds.includes(post.id));
+        if (request && goal.proposal) {
+          metadata.pending = { inputPostId: request.id, since: request.create_at, message: proposalMessage(goal) };
+          await this.store.saveRuntime(goal.id, metadata);
+          await this.deliver(goal, metadata);
+        }
+        continue;
+      }
       const posts = (await this.chat.since(goal.mattermost.channelId, metadata.lastSeenAt)).filter((post) => post.root_id === goal.mattermost.rootPostId && post.user_id !== own && !metadata.processedPostIds.includes(post.id)).sort((a, b) => a.create_at - b.create_at);
-      if (posts.length > this.maxQueue) throw new Error(`Planning queue exceeded ${this.maxQueue} messages for ${goal.id}.`);
-      for (const post of posts) await this.enqueue(goal.seatId, () => this.handle(goal.id, post));
+      for (const post of posts.slice(0, this.maxQueue)) await this.enqueue(goal.seatId, () => this.handle(goal.id, post));
       if (!posts.length) { metadata.lastSeenAt = Math.max(metadata.lastSeenAt, Date.now() - 5000); await this.store.saveRuntime(goal.id, metadata); }
     }
   }
@@ -98,7 +111,7 @@ export class PlanningBridge {
     if (drafting) {
       const draft = proposal(run.response);
       await this.store.update((state) => { const found = state.planningGoals!.find((item) => item.id === id)!; found.proposal = draft; found.stage = "awaiting-review"; found.updatedAt = new Date().toISOString(); });
-      metadata.pending = { inputPostId: post.id, since: post.create_at, message: `**Draft proposal ${draft.id} — awaiting review**\n${draft.summary}\n${draft.outcomes.map((item) => `- **${item.title}:** ${item.description}`).join("\n")}\n\nRecorded in indra-state as ${id}. No work has been approved or executed.` };
+      metadata.pending = { inputPostId: post.id, since: post.create_at, message: proposalMessage({ ...goal, proposal: draft }) };
     } else {
       const update = brief(run.response);
       await this.store.update((state) => { const found = state.planningGoals!.find((item) => item.id === id)!; found.brief = { summary: update.summary, decisions: update.decisions, openQuestions: update.openQuestions }; found.updatedAt = new Date().toISOString(); });
