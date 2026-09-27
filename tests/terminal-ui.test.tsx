@@ -1,0 +1,108 @@
+import { testRender } from "@opentui/solid";
+import { createSignal } from "solid-js";
+import { describe, expect, it } from "vitest";
+import { StateInventory, type StateSnapshot } from "../src/state-domain.js";
+import { TerminalUiModel, type SessionReadResult } from "../src/terminal-ui.js";
+import { TerminalApp } from "../src/terminal-ui-solid.js";
+import { parseOwnedTmuxTarget } from "../src/tmux-attach.js";
+
+const names = ["Chick Corea", "George Duke", "Aaron Magner", "Corey Henry", "Jordan Rudess"];
+const snapshot: StateSnapshot = {
+  teams: [{
+    id: "team-001", slug: "yahaha", displayName: "Yahaha",
+    seats: names.map((displayName, index) => ({ id: "seat-00" + (index + 1), displayName, handle: displayName.toLowerCase().replace(" ", ""), roles: [index === 0 ? "Team Lead" : index === 1 ? "Product" : "Developer"] })),
+  }],
+  sprints: [{ id: "sprint-001", teamId: "team-001", status: "draft", phase: "planning", goal: "Review the first cycle", proposedWork: [], proposedAllocations: [] }],
+};
+
+function harness() {
+  let state = snapshot;
+  let sessions: SessionReadResult = { connection: "disconnected", sessions: [] };
+  const model = new TerminalUiModel(new StateInventory({ read: async () => state }), { readSessions: async () => sessions });
+  return { model, state: (next: StateSnapshot) => { state = next; }, sessions: (next: SessionReadResult) => { sessions = next; } };
+}
+
+describe("terminal UI", () => {
+  it("shows five stable seats without inventing occupancy, then keeps selection during automatic updates", async () => {
+    const fixture = harness();
+    await fixture.model.refresh();
+    expect(fixture.model.page).toBe("team");
+    expect(fixture.model.team?.seats.map((seat) => seat.displayName)).toEqual([...names].sort());
+    expect(fixture.model.sessionResult.connection).toBe("disconnected");
+    fixture.model.key("down");
+    expect(fixture.model.seat?.displayName).toBe("Chick Corea");
+    fixture.sessions({ connection: "connected", sessions: [{
+      id: "goal-1", teamId: "team-001", seatId: "seat-001", status: "running", engine: "codex",
+      sessionId: "codex-123", goal: "Plan the next cycle", stage: "clarifying", recentActivity: ["Read the brief"],
+      attach: { kind: "tmux", target: "indra-bridge:indra-goal-1" },
+    }] });
+    expect(await fixture.model.refresh()).toBe(true);
+    expect(fixture.model.seat?.displayName).toBe("Chick Corea");
+    expect(fixture.model.sessionsFor("seat-003")).toEqual([]);
+    fixture.model.key("enter");
+    expect(fixture.model.attachTarget()).toBe("indra-bridge:indra-goal-1");
+    expect(fixture.model.key("a")).toBe("attach");
+  });
+
+  it("preserves the last good roster and labels read failures", async () => {
+    let reads = 0;
+    const model = new TerminalUiModel(new StateInventory({ read: async () => {
+      if (++reads > 1) throw new Error("state checkout unreadable");
+      return snapshot;
+    } }), { readSessions: async () => { throw new Error("bridge unavailable"); } });
+    await model.refresh();
+    await model.refresh();
+    expect(model.team?.seats).toHaveLength(5);
+    expect(model.stateError).toContain("unreadable");
+    expect(model.sessionResult.connection).toBe("error");
+    expect(model.key("a")).toBe("none");
+  });
+
+  it("renders a colored Solid frame and reacts to a new runtime snapshot", async () => {
+    const fixture = harness();
+    fixture.sessions({ connection: "connected", sessions: [] });
+    await fixture.model.refresh();
+    const [revision, setRevision] = createSignal(fixture.model.revision);
+    const setup = await testRender(() => <TerminalApp model={fixture.model} revision={revision} onKey={() => {}} />, { width: 120, height: 30 });
+    try {
+      await setup.renderOnce();
+      const initial = setup.captureCharFrame();
+      for (const name of names) expect(initial).toContain(name);
+      expect(initial).toContain("NO ACTIVE SESSION");
+      expect(initial).toContain("DRAFT SPRINT");
+      fixture.sessions({ connection: "connected", sessions: [{
+        id: "goal-1", teamId: "team-001", seatId: "seat-001", status: "running", engine: "codex",
+        sessionId: "codex-123", goal: "Plan the next cycle", stage: "clarifying", recentActivity: ["Read the brief"],
+        attach: { kind: "tmux", target: "indra-bridge:indra-goal-1" },
+      }] });
+      await fixture.model.refresh();
+      setRevision(fixture.model.revision);
+      await setup.renderOnce();
+      const updated = setup.captureCharFrame();
+      expect(updated).toContain("RUNNING SESSION");
+      expect(updated).toContain("Read the brief");
+      fixture.model.key("down");
+      fixture.model.key("enter");
+      setRevision(fixture.model.revision);
+      await setup.renderOnce();
+      expect(setup.captureCharFrame()).toContain("Stage: clarifying");
+      fixture.model.key("b");
+      setRevision(fixture.model.revision);
+      const narrow = await testRender(() => <TerminalApp model={fixture.model} revision={revision} onKey={() => {}} />, { width: 80, height: 24 });
+      try {
+        await narrow.renderOnce();
+        const frame = narrow.captureCharFrame();
+        for (const name of names) expect(frame).toContain(name);
+      } finally { narrow.renderer.destroy(); }
+    } finally {
+      setup.renderer.destroy();
+    }
+  });
+
+  it("only accepts exact socket:session tmux targets", () => {
+    expect(parseOwnedTmuxTarget("indra-bridge:indra-goal-1")).toEqual({ socket: "indra-bridge", session: "indra-goal-1" });
+    for (const invalid of ["indra-bridge", "one:two:three", "one:$(id)", "one:two;kill", "UPPER:case", "one:/tmp"]) {
+      expect(() => parseOwnedTmuxTarget(invalid)).toThrow("valid Indra tmux target");
+    }
+  });
+});

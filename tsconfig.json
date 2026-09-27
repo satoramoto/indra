@@ -4,11 +4,13 @@
     "lib": ["ES2022", "DOM"],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
+    "jsx": "preserve",
+    "jsxImportSource": "@opentui/solid",
     "types": ["node", "vitest/globals"],
     "strict": true,
     "noEmit": true,
     "skipLibCheck": true,
     "verbatimModuleSyntax": true
   },
-  "include": ["src/**/*.ts", "tests/**/*.ts", "vite.config.ts"]
+  "include": ["src/**/*.ts", "src/**/*.tsx", "tests/**/*.ts", "tests/**/*.tsx", "vite.config.ts"]
 }
