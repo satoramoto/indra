@@ -152,6 +152,31 @@ describe("terminal UI", () => {
     } finally { setup.renderer.destroy(); }
   });
 
+  it("surfaces a newer goal error while an older saved session still occupies the seat", async () => {
+    const fixture = harness();
+    fixture.sessions({ connection: "connected", sessions: [
+      { id: "goal-old", teamId: "team-001", seatId: "seat-001", status: "idle", engine: "codex", sessionId: "codex-old", goal: "Old goal", stage: "clarifying", updatedAt: "2026-01-01T00:00:00Z", recentActivity: ["Old activity"] },
+      { id: "goal-new", teamId: "team-001", seatId: "seat-001", status: "error", engine: "codex", goal: "New goal", stage: "drafting", updatedAt: "2026-01-02T00:00:00Z", recentActivity: ["Runtime metadata is unreadable."] },
+    ] });
+    await fixture.model.refresh();
+    const [revision, setRevision] = createSignal(fixture.model.revision);
+    const setup = await testRender(() => <TerminalApp model={fixture.model} revision={revision} onKey={() => {}} />, { width: 120, height: 30 });
+    try {
+      await setup.renderOnce();
+      const frame = setup.captureCharFrame();
+      expect(frame).toContain("RUNTIME ERROR · SAVED SESSION");
+      expect(frame).toContain("Latest: Runtime metadata is unreadable.");
+      expect(frame).not.toContain("Latest: Old activity");
+      fixture.model.key("down");
+      fixture.model.key("return");
+      setRevision(fixture.model.revision);
+      await setup.renderOnce();
+      const detail = setup.captureCharFrame();
+      expect(detail).toContain("Planning goal: New goal");
+      expect(detail).toContain("Stage: drafting");
+    } finally { setup.renderer.destroy(); }
+  });
+
   it("attaches to the verified tmux session in read-only mode", async () => {
     const calls: { args: string[]; stdio: string }[] = [];
     await attachTmux("indra-bridge:chick-123", async (args, stdio) => { calls.push({ args, stdio }); return 0; });

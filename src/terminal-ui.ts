@@ -41,6 +41,12 @@ export function currentSession(sessions: TerminalSession[]): TerminalSession | u
   )[0];
 }
 
+/** The newest planning record can differ from the session currently occupying a seat. */
+export function newestPlanningRecord(sessions: TerminalSession[]): TerminalSession | undefined {
+  return sessions.reduce<TerminalSession | undefined>((latest, session) =>
+    !latest || (session.updatedAt ?? "") >= (latest.updatedAt ?? "") ? session : latest, undefined);
+}
+
 export class TerminalUiModel {
   page: UiPage = "teams";
   teamId?: string;
