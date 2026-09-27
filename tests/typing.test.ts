@@ -78,6 +78,16 @@ describe("planning typing lifecycle", () => {
     expect(chat.posts.at(-1)?.message).toBe("Ready");
   });
 
+  it("ignores typing cleanup failure after posting the reply", async () => {
+    const store = await fixture(); const chat = new Chat(); const runtime: AgentRuntime = { message: async () => result() };
+    const bridge = new PlanningBridge(store, chat, runtime);
+    const goal = await bridge.start("Goal", "channel", []);
+    chat.stopTyping.mockImplementation(() => { throw new Error("socket close failed"); });
+    chat.human(goal.mattermost.rootPostId);
+    await expect(bridge.poll()).resolves.toBeUndefined();
+    expect(chat.posts.at(-1)?.message).toBe("Ready");
+  });
+
   it("does not signal a queued post until that post starts processing", async () => {
     const store = await fixture(); const chat = new Chat(); const runtime = new HoldingRuntime(); const bridge = new PlanningBridge(store, chat, runtime);
     const goal = await bridge.start("Goal", "channel", []);
@@ -98,7 +108,8 @@ describe("planning typing lifecycle", () => {
 class FakeSocket extends EventTarget {
   readyState = 0;
   frames: Record<string, unknown>[] = [];
-  constructor() { super(); queueMicrotask(() => { this.readyState = 1; this.dispatchEvent(new Event("open")); }); }
+  constructor(autoOpen = true) { super(); if (autoOpen) queueMicrotask(() => this.open()); }
+  open() { this.readyState = 1; this.dispatchEvent(new Event("open")); }
   send(data: string) {
     const frame = JSON.parse(data) as Record<string, unknown>;
     this.frames.push(frame);
@@ -115,5 +126,22 @@ describe("Mattermost typing protocol", () => {
     expect(socket.frames).toEqual([{ seq: 1, action: "authentication_challenge", data: { token: "fixture-token" } }, { seq: 2, action: "user_typing", data: { channel_id: "channel", parent_id: "root" } }]);
     chat.stopTyping();
     expect(socket.readyState).toBe(3);
+  });
+
+  it("does not let an old socket failure close a newer reply's socket", async () => {
+    const oldSocket = new FakeSocket(false);
+    const nextSocket = new FakeSocket();
+    const sockets = [oldSocket, nextSocket];
+    const chat = new MattermostPlanningChat("fixture-token", fetch, () => sockets.shift()! as unknown as WebSocket);
+    const first = chat.typing("channel", "root", new AbortController().signal);
+    chat.stopTyping();
+    await chat.typing("channel", "root", new AbortController().signal);
+    oldSocket.dispatchEvent(new Event("error"));
+    await expect(first).rejects.toThrow("socket failed");
+    await chat.typing("channel", "root", new AbortController().signal);
+    expect(nextSocket.readyState).toBe(1);
+    expect(nextSocket.frames.filter((frame) => frame.action === "user_typing")).toHaveLength(2);
+    expect(sockets).toHaveLength(0);
+    chat.stopTyping();
   });
 });
