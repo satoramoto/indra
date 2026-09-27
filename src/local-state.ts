@@ -133,7 +133,7 @@ function sprint(value: unknown, index: number): DraftSprint {
 /** Validates the version 1 record shape and references before exposing neutral records. */
 export function parseState(raw: unknown): StateSnapshot {
   const data = record(raw, "state.json");
-  fields(data, "state.json", ["$schema", "schemaVersion", "teams", "sprints"]);
+  fields(data, "state.json", ["$schema", "schemaVersion", "teams", "sprints", "planningGoals"]);
   if (data.$schema !== "./schema/v1/state.schema.json") {
     throw new StateDataError("$schema must reference ./schema/v1/state.schema.json.");
   }
