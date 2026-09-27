@@ -13,6 +13,7 @@ import { MattermostPlanningChat, readChickToken } from "./planning-mattermost.js
 import { CodexRuntime } from "./codex-runtime.js";
 import { TmuxHost } from "./tmux-host.js";
 import { LocalSessionReader } from "./session-snapshot.js";
+import { mkdir, writeFile } from "node:fs/promises";
 
 export const SERVER = "https://mattermost.newegypt.io";
 export type Write = (line: string) => void;
@@ -76,7 +77,7 @@ export async function interactive(inventory: Inventory, read: Read, write: Write
   }
 }
 
-type Options = { mode: "help" } | { mode: "state"; checkout: string; once: boolean } | { mode: "mattermost"; slug?: string } | { mode: "planning"; action: "start" | "serve" | "host" | "status"; checkout: string; channel?: string; goal?: string; projects: string[]; participants: string[] };
+type Options = { mode: "help" } | { mode: "state"; checkout: string; once: boolean } | { mode: "mattermost"; slug?: string } | { mode: "planning"; action: "start" | "serve" | "host" | "status"; checkout: string; channel?: string; goal?: string; projects: string[]; participants: string[]; readyNonce?: string };
 
 const usage = "Usage: npm start -- [--state PATH] [--once] | --mattermost [--team SLUG] | planning start --goal TEXT --channel CHANNEL_ID [--project PATH] [--participant SEAT_ID] [--state PATH] | planning serve|host|status [--state PATH]\nPlanning serves only Chick's Yahaha thread. Reply in the thread to clarify; send /proposal there to request a draft.";
 
@@ -85,7 +86,7 @@ export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_
   if (args[0] === "planning") {
     const action = args[1];
     if (action !== "start" && action !== "serve" && action !== "host" && action !== "status") throw new StateDataError(usage);
-    let checkout: string | undefined; let channel: string | undefined; let goal: string | undefined;
+    let checkout: string | undefined; let channel: string | undefined; let goal: string | undefined; let readyNonce: string | undefined;
     const projects: string[] = []; const participants: string[] = [];
     for (let index = 2; index < args.length; index++) {
       const key = args[index]; const value = args[++index];
@@ -95,12 +96,13 @@ export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_
       else if (key === "--goal" && !goal) goal = value;
       else if (key === "--project") projects.push(value);
       else if (key === "--participant") participants.push(value);
+      else if (key === "--ready-nonce" && !readyNonce && action === "serve" && /^[a-f0-9-]{36}$/.test(value)) readyNonce = value;
       else throw new StateDataError(usage);
     }
     if (action === "start" && (!goal || !channel)) throw new StateDataError(usage);
     if (action !== "start" && (goal || channel || projects.length || participants.length)) throw new StateDataError(usage);
     const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-    return { mode: "planning", action, checkout: resolve(checkout || stateEnv || resolve(projectRoot, "..", "indra-state")), goal, channel, projects, participants };
+    return { mode: "planning", action, checkout: resolve(checkout || stateEnv || resolve(projectRoot, "..", "indra-state")), goal, channel, projects, participants, readyNonce };
   }
   let mattermost = false;
   let checkout: string | undefined;
@@ -168,8 +170,15 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         return 0;
       }
       console.log("Chick planning bridge running. Stop with Ctrl-C.");
+      let ready = false;
       while (true) {
         await bridge.poll();
+        if (!ready && options.readyNonce) {
+          const host = new TmuxHost(options.checkout);
+          await mkdir(host.runtimeDir, { recursive: true, mode: 0o700 });
+          await writeFile(host.readyFile(options.readyNonce), JSON.stringify({ nonce: options.readyNonce, pid: process.pid, readyAt: new Date().toISOString() }), { flag: "wx", mode: 0o600 });
+          ready = true;
+        }
         await new Promise((resolve) => setTimeout(resolve, 3000));
       }
     }

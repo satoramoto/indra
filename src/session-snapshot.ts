@@ -18,7 +18,7 @@ export class LocalSessionReader implements SessionReadPort {
     let target: string | undefined;
     try {
       const record = await this.host.verifiedRecord();
-      if (record) { connection = "connected"; target = this.host.attachTarget(record); }
+      if (record && await this.host.isReady(record)) { connection = "connected"; target = this.host.attachTarget(record); }
     } catch { connection = "error"; }
     const state = await this.store.read();
     const sessions: SessionSnapshot["sessions"] = [];
@@ -26,7 +26,7 @@ export class LocalSessionReader implements SessionReadPort {
       let runtime: Awaited<ReturnType<PlanningStore["runtime"]>>;
       try { runtime = await this.store.runtime(goal.id); }
       catch { sessions.push({ id: goal.id, teamId: goal.teamId, seatId: goal.seatId, status: "error", engine: "codex", goal: goal.goal, stage: goal.stage, updatedAt: goal.updatedAt, recentActivity: ["Runtime metadata is unreadable."] }); continue; }
-      sessions.push({ id: goal.id, teamId: goal.teamId, seatId: goal.seatId, status: connection === "error" ? "error" : connection === "connected" && goal.stage !== "awaiting-review" ? "running" : "idle", engine: "codex", sessionId: runtime.sessionId, goal: goal.goal, stage: goal.stage, updatedAt: goal.updatedAt, recentActivity: runtime.runs.slice(-3).map((run) => `Codex run finished ${run.finishedAt}`), ...(target ? { attach: { kind: "tmux" as const, target } } : {}) });
+      sessions.push({ id: goal.id, teamId: goal.teamId, seatId: goal.seatId, status: connection === "error" ? "error" : "idle", engine: "codex", sessionId: runtime.sessionId, goal: goal.goal, stage: goal.stage, updatedAt: goal.updatedAt, recentActivity: runtime.runs.slice(-3).map((run) => `Codex run finished ${run.finishedAt}`), ...(target ? { attach: { kind: "tmux" as const, target } } : {}) });
     }
     return { connection, sessions };
   }
