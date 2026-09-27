@@ -4,7 +4,7 @@ Indra reads stable team seats and draft sprint records from an `indra-state` Git
 
 ## Run
 
-Requires Node.js 22.15.0 or newer. Keep the separate `indra-state` checkout beside this project, or pass its directory explicitly:
+Requires Node.js 26.4.0 or newer for the OpenTUI Solid terminal screen. The launcher passes Node's `--experimental-ffi` flag; it does not change the system Node installation. Keep the separate `indra-state` checkout beside this project, or pass its directory explicitly:
 
 ```sh
 npm ci
@@ -59,6 +59,8 @@ npm run typecheck
 npm run build
 ```
 
-`npm run dev` restarts the TypeScript CLI on source edits; enter `r` to reload state data without restarting. Vite builds the CLI and Vitest runs fixture tests. There is no web server or HTTP preview.
+`npm run dev` watches source files and rebuilds the CLI and terminal UI; run `npm start` in a second terminal after the initial build. Vite compiles Solid TSX with the universal transform and Vitest runs fixture and native renderer tests. There is no web server or HTTP preview.
+
+`src/terminal-ui-solid.tsx` exports the read-only OpenTUI Solid screen for the coordinator to connect to `src/cli.ts` and the runtime's neutral `SessionReadPort`. It polls state and session snapshots every two seconds, keeps the selected stable seat during refresh, and labels disconnected occupancy as unknown. The team view shows each seat's role and recent runtime activity; Enter opens its detail. An attach action is available only for a verified Indra-owned tmux target and opens the bridge event/log view. Detaching or quitting does not pause or stop the bridge. The 80-column view keeps all five Yahaha seats in the roster and moves the expanded detail to its own screen.
 
 `src/state-domain.ts` defines neutral inventory records. `src/planning.ts` owns state writes and local resume metadata. `src/planning-bridge.ts` routes Chick's thread and validates model output. `src/codex-runtime.ts` and `src/planning-mattermost.ts` are the provider adapters. There is no HTTP preview server.
