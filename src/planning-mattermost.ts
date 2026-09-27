@@ -4,7 +4,7 @@ import type { PlanningChat, Post } from "./planning-bridge.js";
 
 const execFileAsync = promisify(execFile);
 const SERVER = "https://mattermost.newegypt.io";
-const BOT_TOKEN_REF = "op://Agent Rig/Mattermost bot - chickcorea/access_token";
+const BOT_TOKEN_REF = "op://Agent Rig/Mattermost bot - chickcorea/token";
 
 export async function readChickToken(): Promise<string> {
   try {
