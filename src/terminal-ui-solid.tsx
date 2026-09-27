@@ -12,14 +12,23 @@ const theme = {
 };
 
 function occupancy(model: TerminalUiModel, seat: StateSeat): { label: string; color: string; session?: TerminalSession } {
-  if (model.sessionResult.connection !== "connected") return { label: "OCCUPANCY UNKNOWN", color: theme.idle };
   const session = currentSession(model.sessionsFor(seat.id));
-  if (!session?.sessionId) return { label: "NO ACTIVE SESSION", color: theme.idle };
+  if (model.sessionResult.connection !== "connected") return { label: "OCCUPANCY UNKNOWN", color: theme.idle, session };
+  if (session?.status === "error" && !session.sessionId) return { label: "RUNTIME RECORD ERROR", color: theme.error, session };
+  if (!session?.sessionId) return { label: "NO ACTIVE SESSION", color: theme.idle, session };
   return {
     label: session.status.toUpperCase() + " SESSION · " + session.engine,
     color: session.status === "error" ? theme.error : session.status === "running" ? theme.running : theme.idle,
     session,
   };
+}
+
+function activityLine(model: TerminalUiModel, seat: StateSeat, limit: number): string {
+  const session = currentSession(model.sessionsFor(seat.id));
+  if (!session) return model.sessionResult.connection === "connected" ? "No recent runtime activity." : "Live activity unavailable.";
+  const latest = session.recentActivity.at(-1);
+  if (latest) return (model.sessionResult.connection === "connected" ? "Latest: " : "Recorded: ") + displayText(latest, limit);
+  return "Planning goal: " + displayText(session.goal, limit) + " · stage: " + displayText(session.stage, 30);
 }
 
 export interface TerminalAppProps {
@@ -39,6 +48,13 @@ export function TerminalApp(props: TerminalAppProps) {
     const connection = props.model.sessionResult.connection;
     return connection === "connected" ? "RUNTIME CONNECTED" : connection === "error" ? "RUNTIME ERROR" : "RUNTIME DISCONNECTED";
   });
+  const stateSummary = createMemo(() => {
+    props.revision();
+    return props.model.stateError
+      ? "STATE ERROR · " + displayText(props.model.stateError)
+      : "State loaded " + (displayText(props.model.refreshedAt) || "pending");
+  });
+  const notice = createMemo(() => { props.revision(); return props.model.notice; });
 
   useKeyboard((key) => props.onKey(key.name, key.ctrl));
 
@@ -47,7 +63,7 @@ export function TerminalApp(props: TerminalAppProps) {
     const selected = seat();
     if (!selected) return <text fg={theme.muted}>Select a seat to inspect its runtime.</text>;
     const state = occupancy(props.model, selected);
-    const sessions = props.model.sessionsFor(selected.id).filter((session) => !!session.sessionId);
+    const sessions = props.model.sessionsFor(selected.id);
     return (
       <box flexDirection="column" gap={1} padding={1} backgroundColor={theme.panel} border borderColor="#42536B" title="SEAT DETAIL" titleColor={theme.accent}>
         <text fg={theme.heading}>{displayText(selected.displayName)}  @{displayText(selected.handle)}</text>
@@ -58,19 +74,19 @@ export function TerminalApp(props: TerminalAppProps) {
         </Show>
         <For each={sessions}>{(session) => (
           <box flexDirection="column" gap={0}>
-            <text fg={theme.accent}>Goal: {displayText(session.goal, 160)}</text>
-            <text fg={theme.regular}>Stage: {displayText(session.stage)}  ·  ID: {displayText(session.sessionId)}</text>
+            <text fg={theme.accent}>Planning goal: {displayText(session.goal, 160)}</text>
+            <text fg={theme.regular}>Stage: {displayText(session.stage)}  ·  {props.model.sessionResult.connection === "connected" ? "Codex session" : "Last Codex session"}: {displayText(session.sessionId) || "not started"}</text>
             <text fg={theme.muted}>Updated: {displayText(session.updatedAt) || "not reported"}</text>
-            <text fg={session.attach ? theme.running : theme.muted}>
-              Bridge view: {session.attach ? displayText(session.attach.target) : "no verified tmux target"}
+            <text fg={props.model.sessionResult.connection === "connected" && session.attach ? theme.running : theme.muted}>
+              Bridge view: {props.model.sessionResult.connection === "connected" && session.attach ? displayText(session.attach.target) : "no verified tmux target"}
             </text>
-            <text fg={theme.accent}>Recent activity</text>
-            <Show when={session.recentActivity.length} fallback={<text fg={theme.muted}>No runtime activity reported.</text>}>
+            <text fg={theme.accent}>Recorded activity</text>
+            <Show when={session.recentActivity.length} fallback={<text fg={theme.muted}>No runtime activity recorded.</text>}>
               <For each={session.recentActivity.slice(0, 5)}>{(activity) => <text fg={theme.regular}>• {displayText(activity, 160)}</text>}</For>
             </Show>
           </box>
         )}</For>
-        <Show when={props.model.sessionResult.connection === "connected" && sessions.length === 0}>
+        <Show when={props.model.sessionResult.connection === "connected" && !sessions.some((session) => !!session.sessionId)}>
           <text fg={theme.muted}>No active runtime session occupies this seat.</text>
         </Show>
       </box>
@@ -82,7 +98,7 @@ export function TerminalApp(props: TerminalAppProps) {
       <box height={2} flexDirection="column">
         <text fg={theme.heading}>INDRA  /  {page() === "teams" ? "Teams" : displayText(team()?.displayName)}  /  {runtime()}</text>
         <text fg={props.model.stateError ? theme.error : theme.muted}>
-          {props.model.stateError ? "STATE ERROR · " + displayText(props.model.stateError) : "State loaded " + (displayText(props.model.refreshedAt) || "pending")}  ·  {displayText(props.model.sessionResult.message) || "Auto-updating"}
+          {stateSummary()}  ·  {displayText(props.model.sessionResult.message) || "Auto-updating"}
         </text>
       </box>
 
@@ -112,6 +128,7 @@ export function TerminalApp(props: TerminalAppProps) {
               <For each={team()?.seats ?? []}>{(item) => {
                 const status = () => { props.revision(); return occupancy(props.model, item); };
                 const selected = () => { props.revision(); return props.model.seatId === item.id; };
+                const activity = () => { props.revision(); return activityLine(props.model, item, wide() ? 100 : 60); };
                 return (
                   <box height={wide() ? 3 : 2} flexDirection="column" paddingLeft={1} backgroundColor={selected() ? theme.selected : theme.panel}>
                     <text fg={selected() ? theme.accent : theme.regular}>
@@ -119,7 +136,7 @@ export function TerminalApp(props: TerminalAppProps) {
                     </text>
                     <Show when={wide()}><text fg={status().color}>  {status().label}</text></Show>
                     <text fg={theme.muted}>
-                      {"  "}{status().session?.recentActivity[0] ? displayText(status().session?.recentActivity[0], wide() ? 100 : 65) : status().session ? "Goal: " + displayText(status().session?.goal, wide() ? 80 : 50) + " · " + status().session?.stage : props.model.sessionResult.connection === "connected" ? "No recent runtime activity." : "Live activity unavailable."}
+                      {"  "}{activity()}
                     </text>
                   </box>
                 );
@@ -142,8 +159,8 @@ export function TerminalApp(props: TerminalAppProps) {
         <scrollbox flexGrow={1} scrollY>{seatDetail()}</scrollbox>
       </Show>
 
-      <box height={props.model.notice ? 3 : 2} flexDirection="column">
-        <Show when={props.model.notice}><text fg={theme.idle}>{displayText(props.model.notice)}</text></Show>
+      <box height={notice() ? 3 : 2} flexDirection="column">
+        <Show when={notice()}><text fg={theme.idle}>{displayText(notice())}</text></Show>
         <text fg={theme.accent}>
           {page() === "teams" ? "↑↓ choose team  ·  Enter open  ·  q quit" : page() === "team" ? "↑↓ choose seat  ·  Enter details  ·  b teams  ·  q quit" : "a attach bridge view  ·  b team  ·  q quit"}
         </text>
@@ -171,18 +188,26 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
   const refresh = async () => {
     if (!active || refreshing || attaching) return;
     refreshing = true;
-    try { if (await model.refresh()) setRevision(model.revision); }
+    try { if (await model.refresh() && active) setRevision(model.revision); }
+    catch (error) {
+      if (active) {
+        model.notice = error instanceof Error ? error.message : "Refresh failed.";
+        model.revision++;
+        setRevision(model.revision);
+      }
+    }
     finally { refreshing = false; }
   };
   return await new Promise<number>((resolve, reject) => {
-    const finish = () => {
-      if (!active) return;
+    const cleanup = (): boolean => {
+      if (!active) return false;
       active = false;
       if (timer) clearInterval(timer);
       options.signal?.removeEventListener("abort", finish);
       renderer.destroy();
-      resolve(0);
+      return true;
     };
+    const finish = () => { if (cleanup()) resolve(0); };
     const key = (name: string, ctrl?: boolean) => {
       if (!active || attaching) return;
       if (ctrl && name === "c") { finish(); return; }
@@ -215,6 +240,6 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
         options.signal?.addEventListener("abort", finish, { once: true });
         if (options.signal?.aborted) finish();
       })
-      .catch((error: unknown) => { finish(); reject(error); });
+      .catch((error: unknown) => { cleanup(); reject(error); });
   });
 }

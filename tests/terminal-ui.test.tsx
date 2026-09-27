@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { StateInventory, type StateSnapshot } from "../src/state-domain.js";
 import { TerminalUiModel, type SessionReadResult } from "../src/terminal-ui.js";
 import { TerminalApp } from "../src/terminal-ui-solid.js";
-import { parseOwnedTmuxTarget } from "../src/tmux-attach.js";
+import { attachTmux, parseOwnedTmuxTarget } from "../src/tmux-attach.js";
 
 const names = ["Chick Corea", "George Duke", "Aaron Magner", "Corey Henry", "Jordan Rudess"];
 const snapshot: StateSnapshot = {
@@ -39,9 +39,14 @@ describe("terminal UI", () => {
     expect(await fixture.model.refresh()).toBe(true);
     expect(fixture.model.seat?.displayName).toBe("Chick Corea");
     expect(fixture.model.sessionsFor("seat-003")).toEqual([]);
-    fixture.model.key("enter");
+    fixture.model.key("return");
     expect(fixture.model.attachTarget()).toBe("indra-bridge:indra-goal-1");
     expect(fixture.model.key("a")).toBe("attach");
+    fixture.model.key("b");
+    fixture.model.key("b");
+    expect(fixture.model.page).toBe("teams");
+    fixture.model.key("return");
+    expect(fixture.model.page).toBe("team");
   });
 
   it("preserves the last good roster and labels read failures", async () => {
@@ -72,7 +77,7 @@ describe("terminal UI", () => {
       expect(initial).toContain("DRAFT SPRINT");
       fixture.sessions({ connection: "connected", sessions: [{
         id: "goal-1", teamId: "team-001", seatId: "seat-001", status: "running", engine: "codex",
-        sessionId: "codex-123", goal: "Plan the next cycle", stage: "clarifying", recentActivity: ["Read the brief"],
+        sessionId: "codex-123", goal: "Plan the next cycle", stage: "clarifying", recentActivity: ["Old note", "Read the brief"],
         attach: { kind: "tmux", target: "indra-bridge:indra-goal-1" },
       }] });
       await fixture.model.refresh();
@@ -80,7 +85,8 @@ describe("terminal UI", () => {
       await setup.renderOnce();
       const updated = setup.captureCharFrame();
       expect(updated).toContain("RUNNING SESSION");
-      expect(updated).toContain("Read the brief");
+      expect(updated).toContain("Latest: Read the brief");
+      expect(updated).not.toContain("Latest: Old note");
       fixture.model.key("down");
       fixture.model.key("enter");
       setRevision(fixture.model.revision);
@@ -104,5 +110,54 @@ describe("terminal UI", () => {
     for (const invalid of ["indra-bridge", "one:two:three", "one:$(id)", "one:two;kill", "UPPER:case", "one:/tmp"]) {
       expect(() => parseOwnedTmuxTarget(invalid)).toThrow("valid Indra tmux target");
     }
+  });
+
+  it("keeps planning context visible with no Codex session and marks disconnected occupancy unknown", async () => {
+    const fixture = harness();
+    fixture.sessions({ connection: "disconnected", sessions: [{
+      id: "goal-1", teamId: "team-001", seatId: "seat-001", status: "idle", engine: "codex",
+      goal: "Plan the next cycle", stage: "clarifying", recentActivity: ["Earlier response"],
+      attach: { kind: "tmux", target: "indra-bridge:indra-goal-1" },
+    }] });
+    await fixture.model.refresh();
+    fixture.model.key("down");
+    expect(fixture.model.attachTarget()).toBeUndefined();
+    const [revision] = createSignal(fixture.model.revision);
+    const setup = await testRender(() => <TerminalApp model={fixture.model} revision={revision} onKey={() => {}} />, { width: 120, height: 30 });
+    try {
+      await setup.renderOnce();
+      const frame = setup.captureCharFrame();
+      expect(frame).toContain("OCCUPANCY UNKNOWN");
+      expect(frame).toContain("Recorded: Earlier response");
+      expect(frame).toContain("Planning goal: Plan the next cycle");
+      expect(frame).toContain("Stage: clarifying");
+      expect(frame).toContain("no verified tmux target");
+    } finally { setup.renderer.destroy(); }
+  });
+
+  it("shows runtime metadata errors without a session ID", async () => {
+    const fixture = harness();
+    fixture.sessions({ connection: "connected", sessions: [{
+      id: "goal-1", teamId: "team-001", seatId: "seat-001", status: "error", engine: "codex",
+      goal: "Plan the next cycle", stage: "clarifying", recentActivity: ["Runtime metadata is unreadable."],
+    }] });
+    await fixture.model.refresh();
+    const [revision] = createSignal(fixture.model.revision);
+    const setup = await testRender(() => <TerminalApp model={fixture.model} revision={revision} onKey={() => {}} />, { width: 120, height: 30 });
+    try {
+      await setup.renderOnce();
+      const frame = setup.captureCharFrame();
+      expect(frame).toContain("RUNTIME RECORD ERROR");
+      expect(frame).toContain("Runtime metadata is unreadable.");
+    } finally { setup.renderer.destroy(); }
+  });
+
+  it("attaches to the verified tmux session in read-only mode", async () => {
+    const calls: { args: string[]; stdio: string }[] = [];
+    await attachTmux("indra-bridge:chick-123", async (args, stdio) => { calls.push({ args, stdio }); return 0; });
+    expect(calls).toEqual([
+      { args: ["-L", "indra-bridge", "has-session", "-t", "=chick-123"], stdio: "ignore" },
+      { args: ["-L", "indra-bridge", "attach-session", "-r", "-t", "=chick-123"], stdio: "inherit" },
+    ]);
   });
 });

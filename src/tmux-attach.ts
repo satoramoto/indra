@@ -6,6 +6,8 @@ export function parseOwnedTmuxTarget(target: string): { socket: string; session:
   return { socket: match[1], session: match[2] };
 }
 
+export type TmuxCommand = (args: string[], stdio: "ignore" | "inherit") => Promise<number>;
+
 function tmux(args: string[], stdio: "ignore" | "inherit"): Promise<number> {
   return new Promise((resolve, reject) => {
     const child = spawn("tmux", args, { stdio, shell: false });
@@ -15,13 +17,13 @@ function tmux(args: string[], stdio: "ignore" | "inherit"): Promise<number> {
 }
 
 /** Inspect only the verified target supplied by the runtime reader. Detaching leaves the bridge running. */
-export async function attachTmux(target: string): Promise<void> {
+export async function attachTmux(target: string, run: TmuxCommand = tmux): Promise<void> {
   const { socket, session } = parseOwnedTmuxTarget(target);
   const exact = "=" + session;
   try {
-    const exists = await tmux(["-L", socket, "has-session", "-t", exact], "ignore");
+    const exists = await run(["-L", socket, "has-session", "-t", exact], "ignore");
     if (exists !== 0) throw new Error("The Indra tmux bridge is no longer available. Refresh to check its status.");
-    const result = await tmux(["-L", socket, "attach-session", "-t", exact], "inherit");
+    const result = await run(["-L", socket, "attach-session", "-r", "-t", exact], "inherit");
     if (result !== 0) throw new Error("tmux could not attach to the Indra bridge.");
   } catch (error) {
     if (error instanceof Error && "code" in error && error.code === "ENOENT") {
