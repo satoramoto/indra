@@ -11,6 +11,8 @@ import { PlanningStore } from "./planning.js";
 import { PlanningBridge } from "./planning-bridge.js";
 import { MattermostPlanningChat, readChickToken } from "./planning-mattermost.js";
 import { CodexRuntime } from "./codex-runtime.js";
+import { TmuxHost } from "./tmux-host.js";
+import { LocalSessionReader } from "./session-snapshot.js";
 
 export const SERVER = "https://mattermost.newegypt.io";
 export type Write = (line: string) => void;
@@ -74,15 +76,15 @@ export async function interactive(inventory: Inventory, read: Read, write: Write
   }
 }
 
-type Options = { mode: "help" } | { mode: "state"; checkout: string; once: boolean } | { mode: "mattermost"; slug?: string } | { mode: "planning"; action: "start" | "serve"; checkout: string; channel?: string; goal?: string; projects: string[]; participants: string[] };
+type Options = { mode: "help" } | { mode: "state"; checkout: string; once: boolean } | { mode: "mattermost"; slug?: string } | { mode: "planning"; action: "start" | "serve" | "host" | "status"; checkout: string; channel?: string; goal?: string; projects: string[]; participants: string[] };
 
-const usage = "Usage: npm start -- [--state PATH] [--once] | --mattermost [--team SLUG] | planning start --goal TEXT --channel CHANNEL_ID [--project PATH] [--participant SEAT_ID] [--state PATH] | planning serve [--state PATH]\nPlanning serves only Chick's Yahaha thread. Reply in the thread to clarify; send /proposal there to request a draft.";
+const usage = "Usage: npm start -- [--state PATH] [--once] | --mattermost [--team SLUG] | planning start --goal TEXT --channel CHANNEL_ID [--project PATH] [--participant SEAT_ID] [--state PATH] | planning serve|host|status [--state PATH]\nPlanning serves only Chick's Yahaha thread. Reply in the thread to clarify; send /proposal there to request a draft.";
 
 export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_REPO): Options {
   if (args.length === 1 && (args[0] === "--help" || args[0] === "-h")) return { mode: "help" };
   if (args[0] === "planning") {
     const action = args[1];
-    if (action !== "start" && action !== "serve") throw new StateDataError(usage);
+    if (action !== "start" && action !== "serve" && action !== "host" && action !== "status") throw new StateDataError(usage);
     let checkout: string | undefined; let channel: string | undefined; let goal: string | undefined;
     const projects: string[] = []; const participants: string[] = [];
     for (let index = 2; index < args.length; index++) {
@@ -96,7 +98,7 @@ export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_
       else throw new StateDataError(usage);
     }
     if (action === "start" && (!goal || !channel)) throw new StateDataError(usage);
-    if (action === "serve" && (goal || channel || projects.length || participants.length)) throw new StateDataError(usage);
+    if (action !== "start" && (goal || channel || projects.length || participants.length)) throw new StateDataError(usage);
     const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
     return { mode: "planning", action, checkout: resolve(checkout || stateEnv || resolve(projectRoot, "..", "indra-state")), goal, channel, projects, participants };
   }
@@ -146,6 +148,16 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       }
     }
     if (options.mode === "planning") {
+      if (options.action === "host") {
+        const host = new TmuxHost(options.checkout);
+        const record = await host.start();
+        console.log(`Chick bridge hosted in tmux. Attach target: ${host.attachTarget(record)}`);
+        return 0;
+      }
+      if (options.action === "status") {
+        console.log(JSON.stringify(await new LocalSessionReader(options.checkout).readSessions(), null, 2));
+        return 0;
+      }
       const store = new PlanningStore(options.checkout);
       const chat = new MattermostPlanningChat(await readChickToken());
       const runtime = new CodexRuntime(process.cwd());
