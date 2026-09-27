@@ -10,6 +10,26 @@ export interface PlanningChat {
   ownUserId(): Promise<string>;
   post(channelId: string, message: string, rootId?: string, deliveryId?: string): Promise<Post>;
   since(channelId: string, timestamp: number): Promise<Post[]>;
+  typing?(channelId: string, rootPostId: string, signal: AbortSignal): Promise<void>;
+  stopTyping?(): void;
+}
+
+const TYPING_REFRESH_MS = 3_000;
+
+/** Typing is advisory; failed or slow signaling never changes message delivery. */
+function startTyping(chat: PlanningChat, channelId: string, rootPostId: string): () => void {
+  if (!chat.typing) return () => {};
+  const controller = new AbortController();
+  let sending = false;
+  const refresh = () => {
+    if (controller.signal.aborted || sending) return;
+    sending = true;
+    void chat.typing!(channelId, rootPostId, controller.signal).catch(() => {}).finally(() => { sending = false; });
+  };
+  refresh();
+  const timer = setInterval(refresh, TYPING_REFRESH_MS);
+  timer.unref?.();
+  return () => { clearInterval(timer); controller.abort(); chat.stopTyping?.(); };
 }
 
 const briefSchema = resolve(dirname(fileURLToPath(import.meta.url)), "..", "schemas", "brief.json");
@@ -102,6 +122,8 @@ export class PlanningBridge {
     if (metadata.pending) await this.deliver(goal, metadata);
     if (goal.stage === "awaiting-review") return;
     if (metadata.processedPostIds.includes(post.id)) return;
+    const stopTyping = startTyping(this.chat, goal.mattermost.channelId, goal.mattermost.rootPostId);
+    try {
     const drafting = post.message.trim() === "/proposal";
     if (drafting) await this.store.update((state) => { const found = state.planningGoals!.find((item) => item.id === id)!; found.stage = "drafting"; found.updatedAt = new Date().toISOString(); });
     const run = await this.runtime.message(prompt(goal, post.message, drafting), drafting ? proposalSchema : briefSchema, metadata.sessionId);
@@ -119,6 +141,7 @@ export class PlanningBridge {
     }
     await this.store.saveRuntime(id, metadata);
     await this.deliver(goal, metadata);
+    } finally { stopTyping(); }
   }
 
   private async deliver(goal: PlanningGoal, metadata: RuntimeRecord): Promise<void> {
