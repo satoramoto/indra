@@ -59,13 +59,15 @@ export class TerminalUiModel {
   get seat(): StateSeat | undefined { return this.team?.seats.find((seat) => seat.id === this.seatId); }
 
   sessionsFor(seatId: string): TerminalSession[] {
-    return this.sessionResult.connection === "connected"
-      ? this.sessionResult.sessions.filter((session) => session.teamId === this.teamId && session.seatId === seatId)
-      : [];
+    return this.sessionResult.sessions.filter((session) => session.teamId === this.teamId && session.seatId === seatId);
   }
 
   selectedSession(): TerminalSession | undefined { return currentSession(this.seat ? this.sessionsFor(this.seat.id) : []); }
-  attachTarget(): string | undefined { return this.selectedSession()?.attach?.target; }
+  attachTarget(): string | undefined {
+    if (this.sessionResult.connection !== "connected") return undefined;
+    const attach = this.selectedSession()?.attach;
+    return attach?.kind === "tmux" ? attach.target : undefined;
+  }
 
   async refresh(): Promise<boolean> {
     const previous = JSON.stringify([this.snapshot, this.stateError, this.sessionResult]);
@@ -113,7 +115,7 @@ export class TerminalUiModel {
         const index = seats.findIndex((seat) => seat.id === this.seatId);
         this.seatId = seats[Math.max(0, Math.min(seats.length - 1, index + direction))]?.id;
       }
-    } else if (input === "enter" || input === "right") {
+    } else if (input === "enter" || input === "return" || input === "right") {
       if (this.page === "teams" && this.team) this.page = "team";
       else if (this.page === "team" && this.seat) this.page = "seat";
     } else if (input === "a") {
