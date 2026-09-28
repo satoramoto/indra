@@ -1,7 +1,6 @@
-import { fileURLToPath } from "node:url";
-import { dirname, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { AgentRuntime } from "./codex-runtime.js";
+import { schemaPathOf } from "./reload.js";
 import { planningId } from "./codex-runtime.js";
 import { PlanningStore, developerSeats, requireTeamHome, validateOutcomeSeats, type PlanningDocument, type PlanningGoal, type RuntimeRecord } from "./planning.js";
 
@@ -23,8 +22,8 @@ export const PROPOSE_EMOJI = "memo";
 /** ✅ on Chick's proposal post approves it. */
 export const APPROVE_EMOJI = "white_check_mark";
 
-const briefSchema = resolve(dirname(fileURLToPath(import.meta.url)), "..", "schemas", "brief.json");
-const proposalSchema = resolve(dirname(fileURLToPath(import.meta.url)), "..", "schemas", "proposal.json");
+const briefSchema = schemaPathOf(import.meta.url, "brief.json");
+const proposalSchema = schemaPathOf(import.meta.url, "proposal.json");
 const isObject = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
 const stringArray = (value: unknown): value is string[] => Array.isArray(value) && value.every((item) => typeof item === "string" && !!item.trim());
 
