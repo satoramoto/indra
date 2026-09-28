@@ -1,5 +1,5 @@
 import type { StateInventory, StateSeat, StateSnapshot, StateTeam } from "./state-domain.js";
-import type { GoalStarter, SeatLive, SeatProcessPort, SprintAction } from "./supervisor.js";
+import type { AssignmentRetry, GoalStarter, SeatLive, SeatProcessPort, SprintAction } from "./supervisor.js";
 import { missingTeamHome, missingTeamMessage } from "./planning.js";
 import type { StateSyncResult } from "./state-commit.js";
 import type { BuildStamp } from "./build-stamp.js";
@@ -60,7 +60,7 @@ export interface StateSyncPort {
 }
 
 export type UiPage = "teams" | "team" | "seat";
-export type UiAction = "none" | "refresh" | "quit" | "attach" | "stop" | "restart" | "submit" | "approve" | "propose" | "sprint" | "pause" | "ask-rollback" | "rollback";
+export type UiAction = "none" | "refresh" | "quit" | "attach" | "stop" | "restart" | "retry" | "submit" | "approve" | "propose" | "sprint" | "pause" | "ask-rollback" | "rollback";
 /** The one-line text input for a new planning goal. The channel and project come from the team in state. */
 export interface UiInput { value: string }
 /**
@@ -72,6 +72,7 @@ export interface UiApproval { action: "approve" | "propose" | "integrate" | "mer
 const sprintActions: Record<string, SprintAction> = { integrate: "integrate", merge: "merge", revert: "rollback" };
 /** A rollback (`R`) from the running build's short SHA to the previous build's. */
 export interface UiRollback { action: "rollback"; from: string; to: string }
+export interface UiRetry extends AssignmentRetry { action: "retry" }
 
 const shortSha = (sha?: string) => sha?.slice(0, 7) || "unknown build";
 
@@ -107,8 +108,10 @@ export class TerminalUiModel {
   /** Live process, assignment and thread activity per seat ID; empty without a process supervisor. */
   live: Record<string, SeatLive> = {};
   input?: UiInput;
-  /** Set while the y/n question for requesting or approving a proposal, or for a rollback, is open. */
-  confirm?: UiApproval | UiRollback;
+  /** Set while a y/n confirmation is open. */
+  confirm?: UiApproval | UiRollback | UiRetry;
+  private retrying?: UiRetry;
+  private retryPending = false;
   /** The approval the owner confirmed, until `approveConfirmed` runs it. */
   private approving?: UiApproval;
   /** The proposal request the owner confirmed, until `proposeConfirmed` runs it. */
@@ -358,6 +361,24 @@ export class TerminalUiModel {
     this.bump();
   }
 
+  /** Runs only the failed attempt named in the confirmation, even if selection or live state changed meanwhile. */
+  async retryConfirmed(): Promise<void> {
+    const target = this.retrying;
+    this.retrying = undefined;
+    const processes = this.processes;
+    if (!target || !processes?.retry || this.retryPending) return;
+    this.retryPending = true;
+    this.notice = `Re-queuing ${target.goalId}/${target.outcomeId} for ${target.seatId}…`;
+    this.bump();
+    try {
+      await this.tracked(async () => {
+        try { this.notice = await processes.retry!(target); }
+        catch (error) { this.notice = "Could not retry: " + (error instanceof Error ? error.message : String(error)); }
+      });
+      await this.refresh();
+    } finally { this.retryPending = false; this.bump(); }
+  }
+
   /** Enter in the input: start the goal in the team's home channel, for the team's project. */
   async submitInput(): Promise<void> {
     const input = this.input;
@@ -500,13 +521,14 @@ export class TerminalUiModel {
       this.confirm = undefined;
       this.revision++;
       if ((text ?? value).toLowerCase() === "y") {
+        if (target.action === "retry") { this.retrying = target; return "retry"; }
         if (target.action === "rollback") return "rollback";
         if (target.action === "propose") { this.proposing = target; return "propose"; }
         if (target.action === "approve") { this.approving = target; return "approve"; }
         this.sprinting = target;
         return "sprint";
       }
-      this.notice = (target.action === "rollback" ? "Rollback" : target.action === "propose" ? "Proposal request" : target.action === "approve" ? "Approval" : "Sprint " + target.action) + " cancelled; nothing changed.";
+      this.notice = (target.action === "retry" ? "Retry" : target.action === "rollback" ? "Rollback" : target.action === "propose" ? "Proposal request" : target.action === "approve" ? "Approval" : "Sprint " + target.action) + " cancelled; nothing changed.";
       return "none";
     }
     this.notice = undefined;
@@ -520,7 +542,15 @@ export class TerminalUiModel {
       this.revision++;
       return "refresh";
     }
-    if (text === "A") {
+    if (text === "T") {
+      const seat = this.seat;
+      const target = seat && this.live[seat.id]?.retry;
+      if (this.page === "teams" || !seat?.roles.includes("Developer")) this.notice = "Choose a Developer seat to retry a failed assignment.";
+      else if (!this.processes?.retry) this.notice = "Assignments cannot be retried from this screen.";
+      else if (this.retrying || this.retryPending) this.notice = "A retry is already in progress.";
+      else if (!target) this.notice = "No eligible failed assignment for this seat.";
+      else this.confirm = { ...target, action: "retry" };
+    } else if (text === "A") {
       const target = this.reviewGoal();
       if (this.page !== "seat") this.notice = "Open Chick's seat to approve a proposal.";
       else if (!this.goals) this.notice = "Proposals cannot be approved from this screen.";

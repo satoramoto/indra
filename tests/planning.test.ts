@@ -271,11 +271,31 @@ async function awaitingReview(own = "chick") {
 const approvalCommits = (store: PlanningStore) => git(store.checkout, "log", "--format=%s").split("\n").filter((line) => line.startsWith("Approve goal"));
 
 describe("plan approval", () => {
-  it("assigns every outcome to a Developer seat in the proposal", async () => {
-    const { store, chat, runtime } = await awaitingReview();
-    expect(runtime.prompts.at(-1)).toContain("seat-003 (Aaron), seat-004 (Corey)");
-    expect(runtime.prompts.at(-1)).not.toContain("seat-001");
-    expect((await store.read()).planningGoals![0].proposal!.outcomes.map((item) => item.seatId)).toEqual(["seat-003", "seat-004"]);
+  it.each(["memo reaction", "terminal request"] as const)("gives %s drafts small outcomes with separate file owners and human review", async (trigger) => {
+    const store = await fixture(); const chat = new FakeChat(); const runtime = new FakeRuntime();
+    const bridge = new PlanningBridge(store, chat, runtime);
+    const goal = await bridge.start("Explore project");
+    if (trigger === "memo reaction") chat.react(goal.mattermost.rootPostId, MEMO);
+    else await PlanningBridge.requestProposal(store, goal.id);
+    await bridge.poll();
+    expect(runtime.prompts).toHaveLength(2);
+    const prompt = runtime.prompts.at(-1);
+    expect(prompt).toContain("small, focused on one concern, and independently verifiable");
+    expect(prompt).toContain("state its acceptance criteria and targeted tests");
+    expect(prompt).toContain("In each outcome's description, list every file it will touch, including test files");
+    expect(prompt).toContain("Outcomes assigned to different seats must not touch the same file");
+    expect(prompt).toContain("Name each dependency by outcome title and owning seat ID, and state the order in which dependent work must land");
+    expect(prompt).toContain("For any shared-file wiring, name one owning outcome and seat; list its files only under that owner and make the other outcomes depend on it");
+    expect(prompt).toContain("Assign every outcome to one of these Developer seats by its seat ID: seat-003 (Aaron), seat-004 (Corey)");
+    expect(prompt).not.toContain("seat-001");
+    expect(prompt).toContain("Give each seat at most one outcome; only when there are more outcomes than seats may a seat take more, spread as evenly as possible");
+    expect(prompt).toContain("This is a draft for human review");
+    expect(prompt).toContain("This is planning only");
+    expect(prompt).toContain("do not edit files, run implementation, deploy, or claim approval");
+    const saved = (await store.read()).planningGoals![0];
+    expect(saved.stage).toBe("awaiting-review");
+    expect(saved.assignments).toBeUndefined();
+    expect(saved.proposal!.outcomes.map((item) => item.seatId)).toEqual(["seat-003", "seat-004"]);
     expect(chat.posts.at(-1)?.message).toContain("Learn project** → Aaron (seat-003)");
     expect(chat.posts.at(-1)?.message).toContain(`a person reacts :${CHECK}: on this post`);
     expect(chat.posts.at(-1)?.message).not.toContain("/approve");
