@@ -122,7 +122,7 @@ export class PlanningBridge {
     catch (error) { throw new Error(`Planning root post ${root.id} was created, but state persistence failed; inspect that post and retry after repair.`, { cause: error }); }
     const metadata: RuntimeRecord = { lastSeenAt: Math.max(0, root.create_at - 5000), processedPostIds: [root.id], runs: [] };
     await this.store.saveRuntime(id, metadata);
-    const run = await this.runtime.message(prompt(goal, "Start this planning conversation. State what you understand and ask the most useful clarifying question.", false, []), briefSchema, undefined, { timeoutMs: CLARIFY_TIMEOUT_MS });
+    const run = await this.runtime.message(prompt(goal, "Start this planning conversation. State what you understand and ask the most useful clarifying question.", false, []), briefSchema, undefined, { timeoutMs: CLARIFY_TIMEOUT_MS, purpose: "clarify" });
     metadata.sessionId = run.sessionId;
     metadata.runs.push({ startedAt: run.startedAt, finishedAt: run.finishedAt, usage: run.usage });
     await this.store.saveRuntime(id, metadata);
@@ -335,7 +335,7 @@ export class PlanningBridge {
     let run: Awaited<ReturnType<AgentRuntime["message"]>>;
     let draft: NonNullable<PlanningGoal["proposal"]> | undefined;
     try {
-      run = await this.runtime.message(prompt(goal, message, drafting, developers), drafting ? proposalSchema : briefSchema, metadata.sessionId, { timeoutMs: drafting ? DRAFT_TIMEOUT_MS : CLARIFY_TIMEOUT_MS });
+      run = await this.runtime.message(prompt(goal, message, drafting, developers), drafting ? proposalSchema : briefSchema, metadata.sessionId, { timeoutMs: drafting ? DRAFT_TIMEOUT_MS : CLARIFY_TIMEOUT_MS, purpose: drafting ? "draft" : "clarify" });
       if (drafting) draft = proposal(run.response, developers);
     } catch (error) {
       if (!drafting) throw error;

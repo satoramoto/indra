@@ -6,6 +6,8 @@ import { attachTmux } from "./tmux-attach.js";
 import { currentSession, displayText, GOAL_INPUT_LIMIT, newestPlanningRecord, TerminalUiModel, type SessionReadPort, type StateSyncPort, type TerminalSession, type TerminalSprint, type UiApproval, type UiRetry, type UiRollback, type UiView, type UpdatePort } from "./terminal-ui.js";
 import { engineLabel, SPRINT_STAGES, type SprintBuild } from "./session-snapshot.js";
 import type { GoalStarter, SeatLive, SeatProcessPort } from "./supervisor.js";
+import type { PaneTailSource } from "./pane-tail.js";
+import { PaneTailPanel, paneTailLines } from "./pane-tail-panel.js";
 
 const theme = {
   background: "#111827", panel: "#1F2937", selected: "#243B53",
@@ -124,6 +126,8 @@ export interface TerminalAppProps {
   model: TerminalUiModel;
   revision: Accessor<number>;
   onKey: (name: string, ctrl?: boolean, text?: string) => void;
+  /** Reads the selected seat's live pane while its detail is visible. */
+  paneTail?: PaneTailSource;
 }
 
 export function TerminalApp(props: TerminalAppProps) {
@@ -162,6 +166,11 @@ export function TerminalApp(props: TerminalAppProps) {
       target?.scrollBy(key.name === "pageup" ? -1 : 1, "viewport");
     } else props.onKey(key.name, key.ctrl, key.sequence);
   });
+  const paneTail = (panelWidth: () => number) => (
+    <Show when={props.paneTail && seat()}>
+      <PaneTailPanel source={props.paneTail!} seat={seat} width={panelWidth} lines={() => paneTailLines(dimensions().height)} />
+    </Show>
+  );
 
   const seatDetail = () => {
     props.revision();
@@ -283,6 +292,7 @@ export function TerminalApp(props: TerminalAppProps) {
             <Show when={!wide()}><For each={sprints()}>{(sprint) => <SprintCard model={props.model} sprint={sprint} />}</For></Show>
           </scrollbox>
           <Show when={wide()}><scrollbox id="sprint-scroll" ref={sprintScroll} width="38%" height="100%" scrollY>
+            {paneTail(() => Math.floor((dimensions().width - 2) * 0.38) - 6)}
             <Show when={!hasPlanningLoops()}>{seatDetail()}</Show>
             <For each={sprints()}>{(sprint) => <SprintCard model={props.model} sprint={sprint} />}</For>
           </scrollbox></Show>
@@ -290,7 +300,7 @@ export function TerminalApp(props: TerminalAppProps) {
       </Show>
 
       <Show when={page() === "seat"}>
-        <scrollbox id="detail-scroll" ref={detailScroll} flexGrow={1} scrollY>{seatDetail()}</scrollbox>
+        <scrollbox id="detail-scroll" ref={detailScroll} flexGrow={1} scrollY>{paneTail(() => dimensions().width - 8)}{seatDetail()}</scrollbox>
       </Show>
 
       <box flexShrink={0} flexDirection="column">
@@ -334,6 +344,8 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
   view?: UiView;
   /** Saves the view and returns the exit code that asks the launcher to start the UI again. */
   reload?: (view: UiView) => Promise<number>;
+  /** Reads the selected seat's live pane while its detail is visible. */
+  paneTail?: PaneTailSource;
 } = {}): Promise<number> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error("The terminal UI needs an interactive TTY. Use --once for redirected output.");
   const model = new TerminalUiModel(state, sessions, options.processes, options.goals, options.sync, options.update);
@@ -416,7 +428,7 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
         });
       }
     };
-    render(() => <TerminalApp model={model} revision={revision} onKey={key} />, renderer)
+    render(() => <TerminalApp model={model} revision={revision} onKey={key} paneTail={options.paneTail} />, renderer)
       .then(() => {
         if (!active) return;
         timer = setInterval(() => { void refresh(); }, Math.max(500, options.pollMs ?? 2000));

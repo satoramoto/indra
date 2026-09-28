@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { join, resolve } from "node:path";
 import { developerSeats, PlanningStore, type PlanningDocument } from "./planning.js";
-import { defaultAppDir, NoChannelError, NoCredentialError, SystemTmux, TmuxHost, turnLockFile, type HostRecord, type TmuxRunner } from "./tmux-host.js";
+import { defaultAppDir, hostedProcessFor, NoChannelError, NoCredentialError, SystemTmux, TmuxHost, turnLockFile, type HostRecord, type TmuxRunner } from "./tmux-host.js";
 import { readBuildStamp } from "./build-stamp.js";
 import { withFileLock } from "./state-commit.js";
 
@@ -100,8 +100,7 @@ export class Supervisor implements SeatProcessPort {
   }
 
   private host(seat: SeatRow): TmuxHost {
-    const hosted = seat.roles.includes("Team Lead") ? { kind: "bridge" as const } : { kind: "seat" as const, seatId: seat.id };
-    return new TmuxHost(this.checkout, this.runner, this.appDir, this.readinessTimeoutMs, hosted);
+    return new TmuxHost(this.checkout, this.runner, this.appDir, this.readinessTimeoutMs, hostedProcessFor(seat));
   }
 
   private async seat(seatId: string): Promise<SeatRow> {

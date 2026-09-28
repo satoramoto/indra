@@ -11,6 +11,10 @@ export interface TmuxRunner { run(args: string[]): Promise<string> }
 export interface HostRecord { socket: string; session: string; paneId: string; tmuxIdentity: string; readyNonce: string; stateCheckout: string; appDir: string; startedAt: string; /** The build stamp ID in `dist/` when the process started. */ build?: string }
 /** What an Indra-owned tmux session runs: Chick's planning bridge, or one Developer seat's runner. */
 export type HostedProcess = { kind: "bridge" } | { kind: "seat"; seatId: string };
+/** Team Lead seats share Chick's planning bridge; every other seat has its own runner. */
+export function hostedProcessFor(seat: { id: string; roles: string[] }): HostedProcess {
+  return seat.roles.includes("Team Lead") ? { kind: "bridge" } : { kind: "seat", seatId: seat.id };
+}
 /** `no-channel`: the bot could not join its team's Mattermost team or home channel; the ready file carries the message. */
 export type Readiness = "ready" | "no-credential" | "no-channel";
 

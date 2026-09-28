@@ -200,7 +200,7 @@ export class DeveloperSeat {
           for (;;) {
             const checks = await this.shell.run("gh", ["pr", "checks", record.prUrl!, "--watch"], record.worktree);
             if (checks.code !== 0) throw new SeatError(`CI did not pass on ${record.prUrl}.`);
-            try { await this.merge(record.prUrl!, project); break; }
+            try { await this.merge(record.prUrl!, project, record.branch, baseBranch(goal)); break; }
             catch (error) {
               if (updates >= MAX_MAIN_UPDATES || !(await this.updateFromMain(goal, outcome, record, project))) throw error;
               updates++;
@@ -246,7 +246,7 @@ export class DeveloperSeat {
   private async codex(role: SeatTaskRecord["sessions"][number]["role"], record: SeatTaskRecord, write: WriteAccess | undefined, prompt: string, schema: string): Promise<AgentResult> {
     let run: AgentResult;
     // Every session is new: no session id is ever passed, so the reviewer never shares the builder's context.
-    try { run = await this.runtimeFor(record.worktree, write).message(prompt, schema); }
+    try { run = await this.runtimeFor(record.worktree, write).message(prompt, schema, undefined, { purpose: role === "developer" ? "build" : role === "reviewer" ? "review" : "fix" }); }
     catch { this.log(`Agent ${role} session error.`); throw new SeatError(`Agent ${role} session failed.`); }
     record.sessions.push({ role, sessionId: run.sessionId, startedAt: run.startedAt, finishedAt: run.finishedAt, usage: run.usage });
     await this.save(record);
@@ -260,7 +260,16 @@ export class DeveloperSeat {
    * Merges by URL from the project checkout so gh never touches local branches.
    * The PR's state is the only success signal; gh's exit code is not.
    */
-  private async merge(prUrl: string, project: string): Promise<void> {
+  private async merge(prUrl: string, project: string, branch: string, base: string): Promise<void> {
+    // Verify the PR is this assignment's own (head and base) before touching it at all.
+    const view = await this.sh("gh", ["pr", "view", prUrl, "--json", "isDraft,headRefName,baseRefName,state"], project);
+    let pr: { isDraft?: boolean; headRefName?: string; baseRefName?: string };
+    try { pr = JSON.parse(view.stdout) as typeof pr; } catch { throw new SeatError(`gh pr view returned no details for ${prUrl}.`); }
+    if (pr.headRefName !== branch || pr.baseRefName !== base) {
+      throw new SeatError(`${prUrl} is ${pr.headRefName} -> ${pr.baseRefName}, not ${branch} -> ${base}; not merging.`);
+    }
+    // Codex sometimes opens the assignment PR as a draft, which GitHub refuses to merge; mark this PR ready first.
+    if (pr.isDraft === true) await this.sh("gh", ["pr", "ready", prUrl], project);
     let stderr = "";
     for (let attempt = 0; attempt < 2; attempt++) {
       if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, this.mergeRetryMs));
