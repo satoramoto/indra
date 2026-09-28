@@ -2,13 +2,14 @@ import { describe, expect, it } from "vitest";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PlanningStore, validatePlanningGoal } from "../src/planning.js";
+import { PlanningStore, validateOutcomeSeats, validatePlanningGoal } from "../src/planning.js";
 import { PlanningBridge, type PlanningChat, type Post } from "../src/planning-bridge.js";
 import type { AgentRuntime, AgentResult } from "../src/codex-runtime.js";
 
 async function fixture(withField = true) {
   const dir = await mkdtemp(join(tmpdir(), "indra-plan-"));
-  const state = { $schema: "./schema/v1/state.schema.json", schemaVersion: 1, teams: [{ id: "team-001", slug: "yahaha", displayName: "Yahaha", externalIdentities: { mattermost: { teamId: "team" } }, seats: [{ id: "seat-001", displayName: "Chick", roles: ["Team Lead"], externalIdentities: { mattermost: { userId: "chick", username: "chickcorea" } } }] }], sprints: [], ...(withField ? { planningGoals: [] } : {}) };
+  const seat = (id: string, displayName: string, role: string, userId: string) => ({ id, displayName, roles: [role], externalIdentities: { mattermost: { userId, username: userId } } });
+  const state = { $schema: "./schema/v1/state.schema.json", schemaVersion: 1, teams: [{ id: "team-001", slug: "yahaha", displayName: "Yahaha", externalIdentities: { mattermost: { teamId: "team" } }, seats: [{ ...seat("seat-001", "Chick", "Team Lead", "chick"), externalIdentities: { mattermost: { userId: "chick", username: "chickcorea" } } }, seat("seat-003", "Aaron", "Developer", "aaron"), seat("seat-004", "Corey", "Developer", "corey")] }], sprints: [], ...(withField ? { planningGoals: [] } : {}) };
   await writeFile(join(dir, "state.json"), JSON.stringify(state));
   return new PlanningStore(dir);
 }
@@ -16,19 +17,25 @@ async function fixture(withField = true) {
 class FakeChat implements PlanningChat {
   posts: Post[] = [];
   next = 0;
-  async ownUserId() { return "chick"; }
+  bots = new Set(["chick", "george"]);
+  constructor(private readonly own = "chick") {}
+  async ownUserId() { return this.own; }
   async post(channelId: string, message: string, rootId = "", deliveryId?: string) {
-    const post = { id: `post${++this.next}`, user_id: "chick", channel_id: channelId, root_id: rootId, message, create_at: Date.now() + this.next, props: { indra_delivery_id: deliveryId } };
+    const post = { id: `post${++this.next}`, user_id: this.own, channel_id: channelId, root_id: rootId, message, create_at: Date.now() + this.next, props: { indra_delivery_id: deliveryId } };
     this.posts.push(post); return post;
   }
   async since(channelId: string, _timestamp: number) { return this.posts.filter((post) => post.channel_id === channelId); }
-  human(rootId: string, message: string) { this.posts.push({ id: `post${++this.next}`, user_id: "ryan", channel_id: "channel", root_id: rootId, message, create_at: Date.now() + this.next }); }
+  async isBot(userId: string) { return this.bots.has(userId); }
+  human(rootId: string, message: string, userId = "ryan") { this.posts.push({ id: `post${++this.next}`, user_id: userId, channel_id: "channel", root_id: rootId, message, create_at: Date.now() + this.next }); }
 }
 class FakeRuntime implements AgentRuntime {
   sessions: (string | undefined)[] = [];
-  async message(_prompt: string, schemaPath: string, sessionId?: string): Promise<AgentResult> {
+  prompts: string[] = [];
+  outcomes = [{ title: "Learn project", description: "Inspect it and report findings", seatId: "seat-003" }, { title: "Write tests", description: "Cover the planning flow", seatId: "seat-004" }];
+  async message(prompt: string, schemaPath: string, sessionId?: string): Promise<AgentResult> {
     this.sessions.push(sessionId);
-    const response = schemaPath.endsWith("proposal.json") ? { summary: "Roadmap", outcomes: [{ title: "Learn project", description: "Inspect it and report findings" }], risks: [], openQuestions: [] } : { reply: "What matters most?", summary: "Explore project", decisions: [], openQuestions: ["Priority?"] };
+    this.prompts.push(prompt);
+    const response = schemaPath.endsWith("proposal.json") ? { summary: "Roadmap", outcomes: this.outcomes, risks: [], openQuestions: [] } : { reply: "What matters most?", summary: "Explore project", decisions: [], openQuestions: ["Priority?"] };
     return { sessionId: sessionId ?? "session-1", response, startedAt: "2026-01-01T00:00:00Z", finishedAt: "2026-01-01T00:01:00Z" };
   }
 }
@@ -132,6 +139,136 @@ describe("planning bridge", () => {
     const store = await fixture(); const chat = new FakeChat(); const runtime = new FakeRuntime();
     const goal = await new PlanningBridge(store, chat, runtime).start("Goal", "channel", []);
     expect(() => validatePlanningGoal({ ...goal, brief: { ...goal.brief, decisions: [""] } })).toThrow("Invalid planning brief");
-    expect(() => validatePlanningGoal({ ...goal, stage: "awaiting-review", proposal: { id: "proposal-1", createdAt: new Date().toISOString(), summary: "Roadmap", outcomes: [{ id: "outcome-1", title: "Do", description: "Describe" }], risks: [""], openQuestions: [] } })).toThrow("Invalid proposal");
+    expect(() => validatePlanningGoal({ ...goal, stage: "awaiting-review", proposal: { id: "proposal-1", createdAt: new Date().toISOString(), summary: "Roadmap", outcomes: [{ id: "outcome-1", title: "Do", description: "Describe", seatId: "seat-003" }], risks: [""], openQuestions: [] } })).toThrow("Invalid proposal");
+  });
+});
+
+async function awaitingReview(own = "chick") {
+  const store = await fixture(); const chat = new FakeChat(own); const runtime = new FakeRuntime();
+  const bridge = new PlanningBridge(store, chat, runtime);
+  const goal = await bridge.start("Explore project", "channel", []);
+  chat.human(goal.mattermost.rootPostId, "/proposal");
+  await bridge.poll();
+  expect((await store.read()).planningGoals![0].stage).toBe("awaiting-review");
+  return { store, chat, runtime, bridge, goal };
+}
+
+describe("plan approval", () => {
+  it("assigns every outcome to a Developer seat in the proposal", async () => {
+    const { store, chat, runtime } = await awaitingReview();
+    expect(runtime.prompts.at(-1)).toContain("seat-003 (Aaron), seat-004 (Corey)");
+    expect(runtime.prompts.at(-1)).not.toContain("seat-001");
+    expect((await store.read()).planningGoals![0].proposal!.outcomes.map((item) => item.seatId)).toEqual(["seat-003", "seat-004"]);
+    expect(chat.posts.at(-1)?.message).toContain("Learn project** → Aaron (seat-003)");
+    expect(chat.posts.at(-1)?.message).toContain("/approve");
+  });
+
+  it("rejects a proposal that stacks outcomes on one seat or uses a non-Developer seat", async () => {
+    expect(() => validateOutcomeSeats([{ id: "outcome-1", title: "A", description: "A", seatId: "seat-003" }, { id: "outcome-2", title: "B", description: "B", seatId: "seat-003" }], ["seat-003", "seat-004"])).toThrow("spread");
+    expect(() => validateOutcomeSeats([{ id: "outcome-1", title: "A", description: "A", seatId: "seat-001" }], ["seat-003"])).toThrow("not a Developer seat");
+    expect(() => validateOutcomeSeats([1, 2, 3].map((n) => ({ id: `outcome-${n}`, title: "A", description: "A", seatId: n === 3 ? "seat-003" : `seat-00${n + 2}` })), ["seat-003", "seat-004"])).not.toThrow();
+    const store = await fixture(); const chat = new FakeChat(); const runtime = new FakeRuntime();
+    runtime.outcomes = [{ title: "A", description: "A", seatId: "seat-003" }, { title: "B", description: "B", seatId: "seat-003" }];
+    const bridge = new PlanningBridge(store, chat, runtime);
+    const goal = await bridge.start("Explore project", "channel", []);
+    chat.human(goal.mattermost.rootPostId, "/proposal");
+    await expect(bridge.poll()).rejects.toThrow("invalid proposal");
+    expect((await store.read()).planningGoals![0].stage).toBe("drafting");
+  });
+
+  it("approves on a human /approve, queues one assignment per outcome, and stays idempotent across restarts", async () => {
+    const { store, chat, runtime, bridge, goal } = await awaitingReview();
+    chat.human(goal.mattermost.rootPostId, "/approve");
+    await bridge.poll();
+    const saved = (await store.read()).planningGoals![0];
+    expect(saved.stage).toBe("approved");
+    expect(saved.assignments).toEqual([
+      { outcomeId: "outcome-1", seatId: "seat-003", status: "queued", updatedAt: saved.updatedAt },
+      { outcomeId: "outcome-2", seatId: "seat-004", status: "queued", updatedAt: saved.updatedAt },
+    ]);
+    const confirmation = chat.posts.at(-1)!;
+    expect(confirmation.root_id).toBe(goal.mattermost.rootPostId);
+    expect(confirmation.message).toContain("approved");
+    expect(confirmation.message).toContain("Learn project → Aaron (seat-003)");
+    expect(confirmation.message).toContain("Write tests → Corey (seat-004)");
+    const count = chat.posts.length;
+    await new PlanningBridge(store, chat, runtime).poll();
+    expect(chat.posts).toHaveLength(count);
+    chat.human(goal.mattermost.rootPostId, "/approve");
+    await bridge.poll();
+    expect(chat.posts.at(-1)?.message).toContain("Learn project → Aaron (seat-003)");
+    expect((await store.read()).planningGoals![0]).toEqual(saved);
+    expect(runtime.sessions).toHaveLength(2);
+  });
+
+  it("posts the confirmation after a restart when delivery failed after approval was saved", async () => {
+    const { store, chat, runtime, bridge, goal } = await awaitingReview();
+    chat.human(goal.mattermost.rootPostId, "/approve");
+    const original = chat.post.bind(chat);
+    chat.post = async () => { throw new Error("network down"); };
+    await expect(bridge.poll()).rejects.toThrow("network down");
+    expect((await store.read()).planningGoals![0].stage).toBe("approved");
+    const record = await store.runtime(goal.id);
+    delete record.pending;
+    await store.saveRuntime(goal.id, record);
+    chat.post = original;
+    await new PlanningBridge(store, chat, runtime).poll();
+    expect(chat.posts.at(-1)?.message).toContain("Learn project → Aaron (seat-003)");
+    expect((await store.read()).planningGoals![0].assignments).toHaveLength(2);
+  });
+
+  it("refuses approval from a bot or from Chick's seat", async () => {
+    const { store, chat, bridge, goal } = await awaitingReview("bridge");
+    chat.bots.delete("chick");
+    chat.human(goal.mattermost.rootPostId, "/approve", "george");
+    chat.human(goal.mattermost.rootPostId, "/approve", "chick");
+    await bridge.poll();
+    expect((await store.read()).planningGoals![0].stage).toBe("awaiting-review");
+    expect((await store.read()).planningGoals![0].assignments).toBeUndefined();
+    expect(chat.posts.slice(-2).map((post) => post.message)).toEqual(["Only a human can approve a proposal. Nothing changed.", "Only a human can approve a proposal. Nothing changed."]);
+  });
+
+  it("ignores /approve posted by its own account", async () => {
+    const { store, chat, bridge, goal } = await awaitingReview();
+    chat.bots.delete("chick");
+    chat.human(goal.mattermost.rootPostId, "/approve", "chick");
+    const count = chat.posts.length;
+    await bridge.poll();
+    expect(chat.posts).toHaveLength(count);
+    expect((await store.read()).planningGoals![0].stage).toBe("awaiting-review");
+  });
+
+  it("explains why /approve does nothing before a proposal exists", async () => {
+    const store = await fixture(); const chat = new FakeChat(); const runtime = new FakeRuntime();
+    const bridge = new PlanningBridge(store, chat, runtime);
+    const goal = await bridge.start("Explore project", "channel", []);
+    chat.human(goal.mattermost.rootPostId, "/approve");
+    await bridge.poll();
+    expect(chat.posts.at(-1)?.message).toContain("Nothing to approve");
+    expect(chat.posts.at(-1)?.message).toContain("clarifying");
+    expect(runtime.sessions).toHaveLength(1);
+    const saved = (await store.read()).planningGoals![0];
+    expect(saved.stage).toBe("clarifying");
+    expect(saved.assignments).toBeUndefined();
+  });
+
+  it("validates the approved stage, outcome seats, and assignments", async () => {
+    const { store, goal } = await awaitingReview();
+    const current = (await store.read()).planningGoals![0];
+    const now = new Date().toISOString();
+    const assignment = { outcomeId: "outcome-1", seatId: "seat-003", status: "queued" as const, updatedAt: now };
+    const approved = { ...current, stage: "approved" as const, assignments: [assignment] };
+    expect(() => validatePlanningGoal(approved)).not.toThrow();
+    expect(() => validatePlanningGoal({ ...approved, proposal: undefined, assignments: undefined })).toThrow("Proposal must exist");
+    expect(() => validatePlanningGoal({ ...current, assignments: [assignment] })).toThrow("only at approved");
+    expect(() => validatePlanningGoal({ ...approved, assignments: [{ ...assignment, outcomeId: "outcome-9" }] })).toThrow("unknown outcome");
+    expect(() => validatePlanningGoal({ ...approved, assignments: [{ ...assignment, status: "done" as "queued" }] })).toThrow("Invalid assignment");
+    expect(() => validatePlanningGoal({ ...approved, assignments: [assignment, assignment] })).toThrow("only one assignment");
+    expect(() => validatePlanningGoal({ ...current, proposal: { ...current.proposal!, outcomes: [{ ...current.proposal!.outcomes[0], seatId: undefined as unknown as string }] } })).toThrow("Invalid proposal");
+    const replace = (patch: object) => store.update((state) => { Object.assign(state.planningGoals![0], patch); });
+    await expect(replace({ stage: "approved", assignments: [{ ...assignment, seatId: "seat-999" }] })).rejects.toThrow("outside the team");
+    await expect(replace({ proposal: { ...current.proposal!, outcomes: [{ ...current.proposal!.outcomes[0], seatId: "seat-001" }] } })).rejects.toThrow("not a Developer seat");
+    await replace({ stage: "approved", assignments: [assignment] });
+    expect((await store.read()).planningGoals![0].id).toBe(goal.id);
   });
 });
