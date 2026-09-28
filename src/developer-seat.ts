@@ -2,8 +2,7 @@ import { execFile } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentResult, AgentRuntime } from "./codex-runtime.js";
-import type { ApprovedOutcome, Assignment } from "./assignment.js";
-import type { PlanningGoal, PlanningStore } from "./planning.js";
+import type { PlanningAssignment as Assignment, PlanningGoal, PlanningOutcome as ApprovedOutcome, PlanningStore } from "./planning.js";
 
 export interface ShellResult { code: number; stdout: string; stderr: string }
 export interface Shell { run(command: string, args: string[], cwd: string): Promise<ShellResult> }
@@ -164,7 +163,7 @@ export class DeveloperSeat {
   }
 
   private outcome(goal: PlanningGoal, outcomeId: string): ApprovedOutcome {
-    return goal.proposal?.outcomes.find((item) => item.id === outcomeId) ?? { id: outcomeId, title: outcomeId, description: "" };
+    return goal.proposal?.outcomes.find((item) => item.id === outcomeId) ?? { id: outcomeId, title: outcomeId, description: "", seatId: this.seat.id };
   }
 
   private recordName(goalId: string, outcomeId: string): string { return `seat-${this.seat.id}-${goalId}-${outcomeId}`; }

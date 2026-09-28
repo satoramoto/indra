@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { PlanningStore } from "../src/planning.js";
 import { DeveloperSeat, loadDeveloperSeat, type SeatChat, type SeatTaskRecord, type Shell, type ShellResult } from "../src/developer-seat.js";
 import type { AgentResult, AgentRuntime } from "../src/codex-runtime.js";
-import type { Assignment } from "../src/assignment.js";
+import type { PlanningAssignment as Assignment } from "../src/planning.js";
 import { parseOptions } from "../src/cli.js";
 
 const PR = "https://github.com/satoramoto/indra/pull/9";
@@ -141,7 +141,7 @@ describe("developer seat", () => {
 
   it("rejects assignments on unapproved goals and leaves other seats' work alone", async () => {
     const unapproved = await fixture([queued("outcome-1", "2026-01-01T00:00:00Z")], "awaiting-review");
-    await expect(unapproved.read()).rejects.toThrow("approved goal");
+    await expect(unapproved.read()).rejects.toThrow("only at approved stage");
     const { seat, store: approved } = await setup([queued("outcome-3", "2026-01-01T00:00:00Z", "seat-003")]);
     expect(await seat.tick()).toBe("idle");
     expect((await approved.read()).planningGoals![0].assignments![0].status).toBe("queued");

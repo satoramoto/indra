@@ -28,6 +28,12 @@ export class MattermostPlanningChat implements PlanningChat {
     return await response.json() as unknown;
   }
   async ownUserId(): Promise<string> { return (await this.call("/users/me") as { id: string }).id; }
+  /** Mattermost omits `is_bot` for people, so only an explicit `true` marks a bot. */
+  async isBot(userId: string): Promise<boolean> {
+    const user = await this.call(`/users/${encodeURIComponent(userId)}`) as { id?: string; is_bot?: boolean };
+    if (user.id !== userId) throw new Error("Mattermost returned an invalid user.");
+    return user.is_bot === true;
+  }
   async post(channelId: string, message: string, rootId?: string, deliveryId?: string): Promise<Post> {
     return await this.call("/posts", "POST", { channel_id: channelId, message, root_id: rootId ?? "", props: deliveryId ? { indra_delivery_id: deliveryId } : {} }) as Post;
   }
