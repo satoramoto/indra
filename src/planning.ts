@@ -1,7 +1,8 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { parseState } from "./local-state.js";
+import { StateCommitError, StateGit, withFileLock } from "./state-commit.js";
 
 export interface PlanningGoal {
   id: string; teamId: string; seatId: string; participantSeatIds: string[]; goal: string; projectRefs: string[];
@@ -83,6 +84,22 @@ function validateDocument(state: PlanningDocument): void {
   }
 }
 
+/** The team's Mattermost channel for new planning threads, when state records one. */
+export function planningChannelId(state: PlanningDocument, teamId: string): string | undefined {
+  const team = (state.teams as { id: string; externalIdentities?: { mattermost?: { planningChannelId?: string } } }[]).find((item) => item.id === teamId);
+  return team?.externalIdentities?.mattermost?.planningChannelId;
+}
+
+/** Written to the runtime directory just before state.json, removed once the change is committed. */
+interface CommitIntent { sha256: string; message: string }
+const COMMIT_INTENT = "state-commit";
+const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
+async function atomicWrite(file: string, content: string): Promise<void> {
+  const temp = `${file}.${randomUUID()}.tmp`;
+  await writeFile(temp, content, { flag: "wx", mode: 0o600 });
+  await rename(temp, file);
+}
+
 export class PlanningStore {
   constructor(readonly checkout: string, readonly runtimeDir = `${checkout}.runtime`) {}
   async read(): Promise<PlanningDocument> {
@@ -91,15 +108,48 @@ export class PlanningStore {
     validateDocument(raw);
     return raw;
   }
-  async update(mutator: (state: PlanningDocument) => void): Promise<void> {
-    const state = await this.read();
-    mutator(state);
-    validateDocument(state);
-    parseState(state);
+  /**
+   * Applies one change to state.json and commits it in the checkout with `message`, under a lock
+   * shared by every Indra process. The commit contains only state.json. A change that cannot be
+   * committed is rolled back and throws; uncommitted edits someone else made to state.json make the
+   * write fail instead of being committed. Pushing runs afterwards in the background, best effort.
+   */
+  async update(mutator: (state: PlanningDocument) => void, message: string | ((state: PlanningDocument) => string)): Promise<void> {
+    const git = new StateGit(this.checkout);
     const file = join(this.checkout, "state.json");
-    const temp = `${file}.${randomUUID()}.tmp`;
-    await writeFile(temp, `${JSON.stringify(state, null, 2)}\n`, { flag: "wx", mode: 0o600 });
-    await rename(temp, file);
+    const changed = await withFileLock(join(this.runtimeDir, "state.lock"), async () => {
+      await this.recoverCommit(git, file);
+      await git.assertClean();
+      const before = await readFile(file, "utf8");
+      const state = JSON.parse(before) as PlanningDocument;
+      parseState(state);
+      validateDocument(state);
+      mutator(state);
+      validateDocument(state);
+      parseState(state);
+      const after = `${JSON.stringify(state, null, 2)}\n`;
+      if (after === before) return false;
+      const subject = typeof message === "function" ? message(state) : message;
+      await this.saveRuntime(COMMIT_INTENT, { sha256: sha256(after), message: subject } satisfies CommitIntent);
+      await atomicWrite(file, after);
+      try { await git.commit(subject); }
+      catch (error) {
+        await atomicWrite(file, before);
+        await git.unstage();
+        await rm(join(this.runtimeDir, `${COMMIT_INTENT}.json`), { force: true });
+        throw new StateCommitError(`Could not commit the state change "${subject}"; state.json was rolled back.`, { cause: error });
+      }
+      await rm(join(this.runtimeDir, `${COMMIT_INTENT}.json`), { force: true });
+      return true;
+    });
+    if (changed) git.pushInBackground();
+  }
+  /** Finishes the commit of a write whose process stopped between writing state.json and committing it. */
+  private async recoverCommit(git: StateGit, file: string): Promise<void> {
+    const intent = await this.readRuntimeFile<CommitIntent>(COMMIT_INTENT);
+    if (!intent) return;
+    if (await git.dirty() && sha256(await readFile(file, "utf8")) === intent.sha256) await git.commit(intent.message);
+    await rm(join(this.runtimeDir, `${COMMIT_INTENT}.json`), { force: true });
   }
   async runtime(id: string): Promise<RuntimeRecord> {
     try { return JSON.parse(await readFile(join(this.runtimeDir, `${id}.json`), "utf8")) as RuntimeRecord; }

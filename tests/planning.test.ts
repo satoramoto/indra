@@ -1,17 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { PlanningStore, validateOutcomeSeats, validatePlanningGoal } from "../src/planning.js";
+import { PlanningStore, planningChannelId, validateOutcomeSeats, validatePlanningGoal } from "../src/planning.js";
+import { git, stateCheckout } from "./state-checkout.js";
 import { PlanningBridge, type PlanningChat, type Post } from "../src/planning-bridge.js";
 import type { AgentRuntime, AgentResult } from "../src/codex-runtime.js";
 
-async function fixture(withField = true) {
-  const dir = await mkdtemp(join(tmpdir(), "indra-plan-"));
+async function fixture(withField = true, planningChannel?: string) {
   const seat = (id: string, displayName: string, role: string, userId: string) => ({ id, displayName, roles: [role], externalIdentities: { mattermost: { userId, username: userId } } });
-  const state = { $schema: "./schema/v1/state.schema.json", schemaVersion: 1, teams: [{ id: "team-001", slug: "yahaha", displayName: "Yahaha", externalIdentities: { mattermost: { teamId: "team" } }, seats: [{ ...seat("seat-001", "Chick", "Team Lead", "chick"), externalIdentities: { mattermost: { userId: "chick", username: "chickcorea" } } }, seat("seat-003", "Aaron", "Developer", "aaron"), seat("seat-004", "Corey", "Developer", "corey")] }], sprints: [], ...(withField ? { planningGoals: [] } : {}) };
-  await writeFile(join(dir, "state.json"), JSON.stringify(state));
-  return new PlanningStore(dir);
+  const state = { $schema: "./schema/v1/state.schema.json", schemaVersion: 1, teams: [{ id: "team-001", slug: "yahaha", displayName: "Yahaha", externalIdentities: { mattermost: { teamId: "team", ...(planningChannel ? { planningChannelId: planningChannel } : {}) } }, seats: [{ ...seat("seat-001", "Chick", "Team Lead", "chick"), externalIdentities: { mattermost: { userId: "chick", username: "chickcorea" } } }, seat("seat-003", "Aaron", "Developer", "aaron"), seat("seat-004", "Corey", "Developer", "corey")] }], sprints: [], ...(withField ? { planningGoals: [] } : {}) };
+  return new PlanningStore(await stateCheckout("indra-plan-", state));
 }
 
 class FakeChat implements PlanningChat {
@@ -77,6 +73,23 @@ describe("planning bridge", () => {
     expect((await store.read()).planningGoals?.[0].stage).toBe("awaiting-review");
   });
 
+  it("starts in the team's recorded planning channel when no channel is passed", async () => {
+    const store = await fixture(true, "planning-channel"); const chat = new FakeChat();
+    expect(planningChannelId(await store.read(), "team-001")).toBe("planning-channel");
+    const goal = await new PlanningBridge(store, chat, new FakeRuntime()).start("Explore project", undefined, []);
+    expect(goal.mattermost.channelId).toBe("planning-channel");
+    expect(chat.posts[0].channel_id).toBe("planning-channel");
+    const explicit = await new PlanningBridge(store, chat, new FakeRuntime()).start("Explore project", "other", []);
+    expect(explicit.mattermost.channelId).toBe("other");
+  });
+
+  it("refuses to start without a passed or recorded planning channel", async () => {
+    const store = await fixture(); const chat = new FakeChat();
+    expect(planningChannelId(await store.read(), "team-001")).toBeUndefined();
+    await expect(new PlanningBridge(store, chat, new FakeRuntime()).start("Goal", undefined, [])).rejects.toThrow("planningChannelId");
+    expect(chat.posts).toHaveLength(0);
+  });
+
   it("rejects invalid participant before posting", async () => {
     const store = await fixture(); const chat = new FakeChat();
     await expect(new PlanningBridge(store, chat, new FakeRuntime()).start("Goal", "channel", [], ["missing"])).rejects.toThrow("participant");
@@ -131,7 +144,7 @@ describe("planning bridge", () => {
 
   it("rejects invalid planning references before writing state", async () => {
     const store = await fixture();
-    await expect(store.update((state) => { state.planningGoals = [{ id: "goal-bad", teamId: "missing", seatId: "seat-001", participantSeatIds: [], goal: "Goal", projectRefs: [], stage: "clarifying", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), mattermost: { channelId: "channel", rootPostId: "root" }, brief: { summary: "Goal", decisions: [], openQuestions: [] } }]; })).rejects.toThrow("Unknown planning team");
+    await expect(store.update((state) => { state.planningGoals = [{ id: "goal-bad", teamId: "missing", seatId: "seat-001", participantSeatIds: [], goal: "Goal", projectRefs: [], stage: "clarifying", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), mattermost: { channelId: "channel", rootPostId: "root" }, brief: { summary: "Goal", decisions: [], openQuestions: [] } }]; }, "Add a bad goal")).rejects.toThrow("Unknown planning team");
     expect((await store.read()).planningGoals).toEqual([]);
   });
 
@@ -199,6 +212,16 @@ describe("plan approval", () => {
     expect(chat.posts.at(-1)?.message).toContain("Learn project → Aaron (seat-003)");
     expect((await store.read()).planningGoals![0]).toEqual(saved);
     expect(runtime.sessions).toHaveLength(2);
+    // Each state change is its own commit; the repeated /approve changed nothing and committed nothing.
+    expect(git(store.checkout, "log", "--format=%s").trim().split("\n").reverse()).toEqual([
+      "Initial state",
+      `Start planning goal ${goal.id}`,
+      `Update brief for goal ${goal.id}`,
+      `Start drafting a proposal for goal ${goal.id}`,
+      `Draft proposal for goal ${goal.id}: 2 outcomes`,
+      `Approve goal ${goal.id}: 2 assignments`,
+    ]);
+    expect(git(store.checkout, "status", "--porcelain")).toBe("");
   });
 
   it("posts the confirmation after a restart when delivery failed after approval was saved", async () => {
@@ -265,7 +288,7 @@ describe("plan approval", () => {
     expect(() => validatePlanningGoal({ ...approved, assignments: [{ ...assignment, status: "done" as "queued" }] })).toThrow("Invalid assignment");
     expect(() => validatePlanningGoal({ ...approved, assignments: [assignment, assignment] })).toThrow("only one assignment");
     expect(() => validatePlanningGoal({ ...current, proposal: { ...current.proposal!, outcomes: [{ ...current.proposal!.outcomes[0], seatId: undefined as unknown as string }] } })).toThrow("Invalid proposal");
-    const replace = (patch: object) => store.update((state) => { Object.assign(state.planningGoals![0], patch); });
+    const replace = (patch: object) => store.update((state) => { Object.assign(state.planningGoals![0], patch); }, "Replace goal fields");
     await expect(replace({ stage: "approved", assignments: [{ ...assignment, seatId: "seat-999" }] })).rejects.toThrow("outside the team");
     await expect(replace({ proposal: { ...current.proposal!, outcomes: [{ ...current.proposal!.outcomes[0], seatId: "seat-001" }] } })).rejects.toThrow("not a Developer seat");
     await replace({ stage: "approved", assignments: [assignment] });

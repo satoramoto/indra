@@ -64,7 +64,7 @@ export class DeveloperSeat {
       if (target.status !== "queued") throw new SeatError("Assignment is no longer queued.");
       Object.assign(target, { status: "running", updatedAt: new Date().toISOString() });
       delete target.note; delete target.prUrl;
-    });
+    }, `Seat ${this.seat.id} claims ${goal.id}/${assignment.outcomeId}: running`);
     const branch = `${this.seat.id}/${goal.id}-${assignment.outcomeId}`;
     const record: SeatTaskRecord = { goalId: goal.id, outcomeId: assignment.outcomeId, step: "worktree", branch, worktree: join(this.store.runtimeDir, "worktrees", `${goal.id}-${assignment.outcomeId}`), sessions: [] };
     await this.save(record);
@@ -156,7 +156,7 @@ export class DeveloperSeat {
   }
 
   private async setStatus(goalId: string, outcomeId: string, change: Partial<Assignment>): Promise<void> {
-    await this.store.update((state) => { Object.assign(this.find(state.planningGoals, goalId, outcomeId), change, { updatedAt: new Date().toISOString() }); });
+    await this.store.update((state) => { Object.assign(this.find(state.planningGoals, goalId, outcomeId), change, { updatedAt: new Date().toISOString() }); }, `Seat ${this.seat.id} marks ${goalId}/${outcomeId} ${change.status ?? "updated"}`);
   }
 
   private find(goals: PlanningGoal[] | undefined, goalId: string, outcomeId: string): Assignment {
