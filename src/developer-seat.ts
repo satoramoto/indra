@@ -1,14 +1,14 @@
 import { execFile } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { AgentResult, AgentRuntime } from "./codex-runtime.js";
+import type { AgentResult, AgentRuntime, WriteAccess } from "./codex-runtime.js";
 import type { PlanningAssignment as Assignment, PlanningGoal, PlanningOutcome as ApprovedOutcome, PlanningStore } from "./planning.js";
 
 export interface ShellResult { code: number; stdout: string; stderr: string }
 export interface Shell { run(command: string, args: string[], cwd: string): Promise<ShellResult> }
 export interface SeatChat { post(channelId: string, message: string, rootId?: string): Promise<unknown> }
-/** Creates a Codex runtime in `cwd`; `writableDirs` are extra directories it may write (the shared Git dir). */
-export type RuntimeFactory = (cwd: string, writableDirs: string[]) => AgentRuntime;
+/** Creates a Codex runtime in `cwd`: read-only without `write`, otherwise workspace-write plus the given extra dirs (the shared Git dir). */
+export type RuntimeFactory = (cwd: string, write?: WriteAccess) => AgentRuntime;
 
 export interface SeatIdentity { id: string; displayName: string; username: string; roles: string[] }
 type Step = "worktree" | "build" | "review" | "fix" | "ci" | "done";
@@ -92,7 +92,7 @@ export class DeveloperSeat {
         await this.advance(record, "build");
       }
       if (record.step === "build") {
-        const run = await this.codex("developer", record, [record.gitDir!], buildPrompt(this.seat, goal, outcome, record.branch), developerSchema);
+        const run = await this.codex("developer", record, { extraDirs: [record.gitDir!] }, buildPrompt(this.seat, goal, outcome, record.branch), developerSchema);
         const prUrl = prUrlFrom(run.response);
         record.prUrl = prUrl;
         await this.advance(record, "review");
@@ -100,13 +100,15 @@ export class DeveloperSeat {
         await this.say(goal, `Opened ${prUrl} for **${outcome.title}**. Starting a fresh review.`);
       }
       if (record.step === "review") {
-        const run = await this.codex("reviewer", record, [], reviewPrompt(goal, outcome, record.prUrl!), reviewSchema);
+        // The reviewer is read-only with no network; the seat posts its findings on the PR.
+        const run = await this.codex("reviewer", record, undefined, reviewPrompt(goal, outcome, record.prUrl!), reviewSchema);
         record.findings = findingsFrom(run.response);
+        await this.sh("gh", ["pr", "comment", record.prUrl!, "--body", reviewComment(record.findings, run.response)], record.worktree);
         await this.advance(record, record.findings.length ? "fix" : "ci");
         await this.say(goal, `Review of ${record.prUrl} done: ${record.findings.length ? `${record.findings.length} finding(s); fixing.` : "no findings."}`);
       }
       if (record.step === "fix") {
-        await this.codex("fix", record, [record.gitDir!], fixPrompt(outcome, record.prUrl!, record.branch, record.findings ?? []), developerSchema);
+        await this.codex("fix", record, { extraDirs: [record.gitDir!] }, fixPrompt(outcome, record.prUrl!, record.branch, record.findings ?? []), developerSchema);
         await this.advance(record, "ci");
       }
       if (record.step === "ci") {
@@ -136,10 +138,10 @@ export class DeveloperSeat {
     await this.say(goal, `Failed **${this.outcome(goal, outcomeId).title}** (${outcomeId}): ${note} Going idle.`);
   }
 
-  private async codex(role: SeatTaskRecord["sessions"][number]["role"], record: SeatTaskRecord, writable: string[], prompt: string, schema: string): Promise<AgentResult> {
+  private async codex(role: SeatTaskRecord["sessions"][number]["role"], record: SeatTaskRecord, write: WriteAccess | undefined, prompt: string, schema: string): Promise<AgentResult> {
     let run: AgentResult;
     // Every session is new: no session id is ever passed, so the reviewer never shares the builder's context.
-    try { run = await this.runtimeFor(record.worktree, writable).message(prompt, schema); }
+    try { run = await this.runtimeFor(record.worktree, write).message(prompt, schema); }
     catch (error) { this.log(`Codex ${role} session error: ${error instanceof Error ? error.message : String(error)}`); throw new SeatError(`Codex ${role} session failed.`); }
     record.sessions.push({ role, sessionId: run.sessionId, startedAt: run.startedAt, finishedAt: run.finishedAt, usage: run.usage });
     await this.save(record);
@@ -201,11 +203,17 @@ ${outcome.description}`;
 
 function reviewPrompt(goal: PlanningGoal, outcome: ApprovedOutcome, prUrl: string): string {
   return `You are a fresh reviewer in Indra. You did not write this change. Review pull request ${prUrl} (checked out in this worktree) against the repository's AGENTS.md review checklist.
-Flag only real bugs and project-rule violations, never style or naming. Post each finding on the PR with gh (line comments where possible, otherwise \`gh pr review ${prUrl} --comment\`). Do not edit files, commit, push or merge.
-Return only JSON: findings (one line per finding; empty when there are none) and summary.
+Flag only real bugs and project-rule violations, never style or naming. You run read-only without network: do not edit files, commit, push, merge or post anything; Indra posts your findings on the PR.
+Return only JSON: findings (one line per finding, with file and line where possible; empty when there are none) and summary.
 Goal: ${goal.goal}
 Outcome ${outcome.id}: ${outcome.title}
 ${outcome.description}`;
+}
+
+function reviewComment(findings: string[], response: unknown): string {
+  const summary = (response as { summary?: unknown } | undefined)?.summary;
+  const head = `**Indra review:** ${typeof summary === "string" && summary.trim() ? summary.trim() : "done"}`;
+  return findings.length ? `${head}\n\nFindings:\n${findings.map((item) => `- ${item}`).join("\n")}` : `${head}\n\nNo findings.`;
 }
 
 function fixPrompt(outcome: ApprovedOutcome, prUrl: string, branch: string, findings: string[]): string {

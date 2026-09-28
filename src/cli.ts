@@ -167,7 +167,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         const store = new PlanningStore(options.checkout);
         const seat = await loadDeveloperSeat(store, options.seatId);
         const chat = new MattermostPlanningChat(await readBotToken(seat.username));
-        const runner = new DeveloperSeat(store, seat, chat, processShell, (cwd, writableDirs) => new CodexRuntime(cwd, 60 * 60_000, { extraDirs: writableDirs }), (line) => console.log(`[${new Date().toISOString()}] ${line}`));
+        const runner = new DeveloperSeat(store, seat, chat, processShell, (cwd, write) => new CodexRuntime(cwd, 60 * 60_000, write), (line) => console.log(`[${new Date().toISOString()}] ${line}`));
         console.log(`Developer seat ${seat.id} (@${seat.username}) running. Stop with Ctrl-C.`);
         while (true) {
           if (await runner.tick() === "idle") await new Promise((resolve) => setTimeout(resolve, 30_000));

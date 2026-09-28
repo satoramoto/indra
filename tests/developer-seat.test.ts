@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PlanningStore } from "../src/planning.js";
 import { DeveloperSeat, loadDeveloperSeat, type SeatChat, type SeatTaskRecord, type Shell, type ShellResult } from "../src/developer-seat.js";
-import type { AgentResult, AgentRuntime } from "../src/codex-runtime.js";
+import { sandboxArgs, type AgentResult, type AgentRuntime, type WriteAccess } from "../src/codex-runtime.js";
 import type { PlanningAssignment as Assignment } from "../src/planning.js";
 import { parseOptions } from "../src/cli.js";
 
@@ -49,12 +49,13 @@ class FakeShell implements Shell {
   }
 }
 class FakeCodex {
-  runs: { cwd: string; writable: string[]; schema: string; sessionId?: string; prompt: string }[] = [];
+  runs: { cwd: string; sandbox: string[]; schema: string; sessionId?: string; prompt: string }[] = [];
   findings = ["Bug in foo"];
   fail = false;
-  factory = (cwd: string, writable: string[]): AgentRuntime => ({
+  factory = (cwd: string, write?: WriteAccess): AgentRuntime => ({
     message: async (prompt: string, schema: string, sessionId?: string): Promise<AgentResult> => {
-      this.runs.push({ cwd, writable, schema, sessionId, prompt });
+      // Record the sandbox arguments CodexRuntime would pass for this write access.
+      this.runs.push({ cwd, sandbox: sandboxArgs(write), schema, sessionId, prompt });
       if (this.fail) throw new Error("codex down");
       const response = schema.endsWith("review.json") ? { findings: this.findings, summary: "Reviewed" } : { prUrl: PR, summary: "Done" };
       return { sessionId: `session-${this.runs.length}`, response, startedAt: "t0", finishedAt: "t1" };
@@ -95,14 +96,16 @@ describe("developer seat", () => {
       "git fetch origin main @/proj",
       "git rev-parse --path-format=absolute --git-common-dir @/proj",
       `git worktree add --no-track -b seat-002/goal-abc-outcome-1 ${worktree} origin/main @/proj`,
+      `gh pr comment ${PR} --body **Indra review:** Reviewed\n\nFindings:\n- Bug in foo @${worktree}`,
       `gh pr view ${PR} --json state --jq .state @/proj`,
       `gh pr checks ${PR} --watch @${worktree}`,
       `git checkout --detach @${worktree}`,
       `gh pr merge ${PR} --squash --delete-branch @${worktree}`,
       `git worktree remove --force ${worktree} @/proj`,
     ]);
-    // Three new sessions: none resumes another, and the reviewer cannot write the Git directory.
-    expect(codex.runs.map((run) => [run.schema.split("/").at(-1), run.sessionId, run.writable])).toEqual([["developer.json", undefined, ["/proj/.git"]], ["review.json", undefined, []], ["developer.json", undefined, ["/proj/.git"]]]);
+    // Three new sessions: none resumes another. Build and fix write with network; the reviewer is read-only.
+    const write = ["--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true", "--add-dir", "/proj/.git"];
+    expect(codex.runs.map((run) => [run.schema.split("/").at(-1), run.sessionId, run.sandbox])).toEqual([["developer.json", undefined, write], ["review.json", undefined, ["--sandbox", "read-only"]], ["developer.json", undefined, write]]);
     expect(codex.runs[2].prompt).toContain("Bug in foo");
     const record = JSON.parse(await readFile(join(store.runtimeDir, "seat-seat-002-goal-abc-outcome-1.json"), "utf8")) as SeatTaskRecord;
     expect(record.sessions.map((item) => [item.role, item.sessionId])).toEqual([["developer", "session-1"], ["reviewer", "session-2"], ["fix", "session-3"]]);

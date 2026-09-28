@@ -10,12 +10,17 @@ export interface AgentRuntime { message(prompt: string, schemaPath: string, sess
  */
 export interface WriteAccess { extraDirs: string[] }
 
+/** Sandbox arguments for a new session: read-only without write access. */
+export function sandboxArgs(write?: WriteAccess): string[] {
+  return write ? ["--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true", ...write.extraDirs.flatMap((dir) => ["--add-dir", dir])] : ["--sandbox", "read-only"];
+}
+
 /** Uses the logged-in Codex CLI and an explicit session id; never uses --last. Read-only unless given write access. */
 export class CodexRuntime implements AgentRuntime {
   constructor(private readonly cwd: string, private readonly timeoutMs = 300_000, private readonly write?: WriteAccess) {}
   async message(prompt: string, schemaPath: string, sessionId?: string, signal?: AbortSignal): Promise<AgentResult> {
     const startedAt = new Date().toISOString();
-    const sandbox = this.write ? ["--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true", ...this.write.extraDirs.flatMap((dir) => ["--add-dir", dir])] : ["--sandbox", "read-only"];
+    const sandbox = sandboxArgs(this.write);
     const args = sessionId ? ["exec", "resume", sessionId, "--json", "-c", "sandbox_mode=\"read-only\"", "-"] : ["exec", "--json", ...sandbox, "--output-schema", schemaPath, "-"];
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);

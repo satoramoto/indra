@@ -74,7 +74,7 @@ It refuses a Team Lead seat or a seat that is not in `state.json`. Run one proce
 
 1. fetches `origin main` in the goal's target project (`projectRefs[0]`, a local Git checkout) and creates a fresh worktree and branch `SEAT_ID/GOAL_ID-OUTCOME_ID` from `origin/main` under `<state-checkout>.runtime/worktrees/`;
 2. runs a new Codex session that implements the outcome under the project's AGENTS.md, runs the targeted tests once, commits, pushes and opens a PR; the assignment becomes `in-review` with its `prUrl`;
-3. runs a separate, new Codex session as the reviewer, which posts its findings on the PR;
+3. runs a separate, new Codex session as the reviewer, read-only and without network, which returns its findings; the seat posts them on the PR as one comment with `gh pr comment`;
 4. if there are findings, runs one new Codex fix session;
 5. waits once with `gh pr checks --watch`, merges with `gh pr merge --squash --delete-branch` when CI is green, marks the assignment `merged`, removes the worktree and goes idle.
 
