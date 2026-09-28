@@ -20,6 +20,8 @@ type Step = "worktree" | "build" | "review" | "fix" | "ci" | "done";
 /** Lives in `<state-checkout>.runtime`, never in state.json. */
 export interface SeatTaskRecord {
   goalId: string; outcomeId: string; step: Step; branch: string; worktree: string; gitDir?: string; prUrl?: string; findings?: string[];
+  /** A prior attempt's PR remains visible in state until this attempt opens its replacement. */
+  retainedPrUrl?: string;
   /** Conflict-resolution rounds used on merges of main into the branch; at most MAX_CONFLICT_ROUNDS. */
   conflictRounds?: number;
   sessions: { role: "developer" | "reviewer" | "fix"; sessionId: string; startedAt: string; finishedAt: string; usage?: unknown }[];
@@ -86,6 +88,7 @@ export class DeveloperSeat {
       // Keep unrecognized metadata and retained checkouts intact. A new attempt must not collide with either.
       if (saved) await this.store.saveRuntime(`${this.recordName(goal.id, assignment.outcomeId)}-retained-${randomUUID()}`, saved);
       const record = this.newRecord(goal.id, assignment.outcomeId);
+      if (assignment.prUrl) record.retainedPrUrl = assignment.prUrl;
       await this.save(record);
       await this.say(goal, `Claimed **${this.outcome(goal, assignment.outcomeId).title}** (${assignment.outcomeId}). Starting work.`);
       await this.work(goal, record);
@@ -97,7 +100,7 @@ export class DeveloperSeat {
     const record = saved ?? await this.store.readRuntimeFile<SeatTaskRecord>(this.recordName(goal.id, assignment.outcomeId));
     if (!record || !this.ownsRecord(goal, assignment.outcomeId, record)) { await this.fail(goal, assignment.outcomeId, "Interrupted without a usable assignment record; not resumed."); return; }
     const beforePR = ["worktree", "build"].includes(record.step);
-    if ((!beforePR && !record.prUrl) || (assignment.prUrl && assignment.prUrl !== record.prUrl)) {
+    if ((!beforePR && !record.prUrl) || (assignment.prUrl && assignment.prUrl !== record.prUrl && assignment.prUrl !== record.retainedPrUrl)) {
       await this.fail(goal, assignment.outcomeId, "Assignment PR does not match its saved step; not resumed."); return;
     }
     if (record.step === "done") record.step = "ci";

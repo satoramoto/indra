@@ -519,6 +519,39 @@ describe("developer seat", () => {
     expect((await assignment("outcome-1")).status).toBe("merged");
   });
 
+  it.each(["missing", "unusable"])("can re-queue a replacement attempt again when an old PR has %s runtime", async (runtime) => {
+    const oldPR = "https://github.com/satoramoto/indra/pull/8";
+    const { store, shell, codex, make, assignment } = await setup([{ ...queued("outcome-1", "2026-01-01T00:00:00Z"), prUrl: oldPR }], SPRINT);
+    if (runtime === "unusable") await retainRecord(store, shell, { outcomeId: "outcome-2", prUrl: oldPR });
+    else shell.refs.add(`refs/heads/${BRANCH}`);
+    codex.fail = true;
+    await make().tick();
+    expect(await assignment("outcome-1")).toMatchObject({ status: "failed", prUrl: oldPR, note: "build: Codex developer session failed." });
+    const attempt = (await store.readRuntimeFile<SeatTaskRecord>(RECORD))!;
+    expect(attempt.branch).not.toBe(BRANCH);
+    expect(attempt.retainedPrUrl).toBe(oldPR);
+    await store.update((state) => { state.planningGoals![0].assignments![0].status = "queued"; }, "Re-queue replacement attempt");
+    codex.fail = false;
+    shell.calls = [];
+    await make().tick();
+    expect(shell.calls.some((call) => call.startsWith("git worktree add"))).toBe(false);
+    expect(codex.runs[1].cwd).toBe(attempt.worktree);
+    expect(await assignment("outcome-1")).toMatchObject({ status: "merged", prUrl: PR });
+    expect(await store.readRuntimeFile<SeatTaskRecord>(RECORD)).toMatchObject({ branch: attempt.branch, worktree: attempt.worktree, retainedPrUrl: oldPR, prUrl: PR });
+  });
+
+  it("resumes a replacement PR saved just before the assignment's PR URL was updated", async () => {
+    const oldPR = "https://github.com/satoramoto/indra/pull/8";
+    const { store, shell, codex, make, assignment } = await setup([{ ...reviewing(), status: "running", prUrl: oldPR }]);
+    await retainRecord(store, shell, { step: "review", retainedPrUrl: oldPR });
+    codex.findings = [];
+    await make().tick();
+    expect(codex.runs).toHaveLength(1);
+    expect(codex.runs[0].schema).toMatch(/review.json$/);
+    expect(shell.calls.some((call) => call.startsWith("git worktree add"))).toBe(false);
+    expect(await assignment("outcome-1")).toMatchObject({ status: "merged", prUrl: PR });
+  });
+
   it("reuses the review helper after a restart between posting findings and advancing the step", async () => {
     const { store, shell, codex, make, assignment } = await setup([reviewing()]);
     await retainRecord(store, shell, { step: "review" });
