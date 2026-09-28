@@ -1,5 +1,23 @@
 import { transformAsync } from "@babel/core";
+import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { defineConfig, type Plugin } from "vitest/config";
+import { publishBuild } from "./src/build-publish.js";
+
+/** Writes build-stamp.json into the output after every successful build (also each `npm run dev` rebuild), so running code sees it is outdated. */
+function buildStamp(): Plugin {
+  return {
+    name: "indra-build-stamp",
+    apply: "build",
+    writeBundle(options) {
+      let sha = "";
+      try { sha = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); } catch { /* Not a Git checkout. */ }
+      writeFileSync(join(options.dir ?? "dist", "build-stamp.json"), JSON.stringify({ id: randomUUID(), sha, builtAt: new Date().toISOString() }));
+    },
+  };
+}
 
 function solidTerminalTransform(): Plugin {
   return {
@@ -26,11 +44,11 @@ function solidTerminalTransform(): Plugin {
 }
 
 export default defineConfig({
-  plugins: [solidTerminalTransform()],
+  plugins: [solidTerminalTransform(), buildStamp(), publishBuild()],
   build: {
     target: "node26",
     minify: false,
-    lib: { entry: { cli: "src/cli.ts", "terminal-ui": "src/terminal-ui-solid.tsx" }, formats: ["es"] },
+    lib: { entry: { cli: "src/cli.ts", launcher: "src/launcher.ts", "terminal-ui": "src/terminal-ui-solid.tsx" }, formats: ["es"] },
     rollupOptions: { external: [/^node:/, /^@opentui\//, /^solid-js/] },
   },
   test: {

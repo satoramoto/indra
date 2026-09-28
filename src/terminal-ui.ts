@@ -2,6 +2,20 @@ import type { StateInventory, StateSeat, StateSnapshot, StateTeam } from "./stat
 import type { GoalStarter, SeatLive, SeatProcessPort } from "./supervisor.js";
 import { missingTeamHome, missingTeamMessage } from "./planning.js";
 import type { StateSyncResult } from "./state-commit.js";
+import type { BuildStamp } from "./build-stamp.js";
+import type { UpdateResult } from "./self-update.js";
+
+/** Keeps Indra's own code current: pulls and builds new commits, and says when `dist/` holds a newer build. */
+export interface UpdatePort {
+  /** The build this UI process runs; undefined when `dist/` had no stamp at start. */
+  running?: BuildStamp;
+  /** True under the `npm start` launcher, which restarts the UI when it exits for a reload. */
+  canReload: boolean;
+  check(): Promise<UpdateResult>;
+  current(): Promise<BuildStamp | undefined>;
+}
+/** What a reload restores. */
+export interface UiView { page: UiPage; teamId?: string; seatId?: string }
 
 /** Structural read port. A stable seat is never treated as a running agent without a runtime session. */
 export interface TerminalSession {
@@ -83,14 +97,106 @@ export class TerminalUiModel {
   syncResult?: StateSyncResult;
   syncing = false;
 
-  constructor(private readonly state: StateInventory, private readonly sessions: SessionReadPort, private readonly processes?: SeatProcessPort, private readonly goals?: GoalStarter, private readonly stateSync?: StateSyncPort) {}
+  /** The last finished check of Indra's own checkout; undefined until the first one ends. */
+  updateResult?: UpdateResult;
+  updating = false;
+  /** Set once `dist/` holds a different build than this UI runs; the UI reloads at its next safe point. */
+  reloadWanted = false;
+  /** Actions in flight (goal start, approval, stop or restart, hosting); the UI never reloads under one. */
+  private busy = 0;
+  /** Settles when the update in progress (install, build, switch and restarts) ends. */
+  private updateRun?: Promise<void>;
+
+  constructor(private readonly state: StateInventory, private readonly sessions: SessionReadPort, private readonly processes?: SeatProcessPort, private readonly goals?: GoalStarter, private readonly stateSync?: StateSyncPort, private readonly update?: UpdatePort) {}
 
   private bump(): void { this.revision++; this.changed?.(); }
 
-  /** Syncs the state checkout first, then hosts the processes, so they start from the remote's state. */
+  /**
+   * Every action that spawns Indra code (s, n, A, hosting) goes through here. It waits while an update may be
+   * changing node_modules or dist, and does not run at all after a failed dependency install.
+   */
+  private async tracked(work: () => Promise<void>): Promise<void> {
+    while (this.updateRun) await this.updateRun;
+    if (this.updateResult?.installFailed) {
+      this.notice = "Not started: Indra is blocked because a dependency install failed; it retries on the next update check.";
+      this.bump();
+      return;
+    }
+    this.busy++;
+    try { await work(); } finally { this.busy--; }
+  }
+
+  /** Syncs the state checkout first, then hosts the processes, so they start from the remote's state; then checks for new code. */
   async start(): Promise<void> {
     await this.syncState();
     await this.ensureProcesses();
+    await this.updateCode();
+  }
+
+  /**
+   * Pulls and builds new Indra commits. Once this UI runs the newest build, restarts hosted processes that run an
+   * older one, each at its own safe point; an older UI leaves that to the reloaded one.
+   */
+  async updateCode(): Promise<void> {
+    if (!this.update || this.updating || this.busy) return;
+    this.updating = true;
+    let release = () => {};
+    this.updateRun = new Promise((done) => { release = done; });
+    this.bump();
+    try {
+      this.updateResult = await this.update.check();
+      // After a failed install node_modules may be half written: no reload and no restarts until one succeeds.
+      if (this.updateResult.installFailed) return;
+      const reloading = await this.checkBuild() && this.update.canReload;
+      if (!reloading && this.processes?.upgrade) {
+        const { problems } = await this.processes.upgrade();
+        if (problems.length) this.notice = "Could not restart after an update: " + problems.join("; ");
+        await this.refresh();
+      }
+    } catch (error) { this.updateResult = { outcome: "blocked", message: "update check failed: " + (error instanceof Error ? error.message : String(error)), at: new Date().toISOString() }; }
+    finally {
+      this.updating = false;
+      this.updateRun = undefined;
+      release();
+      this.bump();
+    }
+  }
+
+  /** True once `dist/` holds a different build than this UI runs (a self-update or an `npm run dev` rebuild). */
+  async checkBuild(): Promise<boolean> {
+    if (!this.update || this.reloadWanted) return this.reloadWanted;
+    const current = await this.update.current().catch(() => undefined);
+    if (current && current.id !== this.update.running?.id) { this.reloadWanted = true; this.bump(); }
+    return this.reloadWanted;
+  }
+
+  /** A reload is due and nothing is in flight: no typing, confirmation, state sync, update or action. */
+  readyToReload(): boolean {
+    return this.reloadWanted && !!this.update?.canReload && !this.updateResult?.installFailed && !this.input && !this.confirm && !this.syncing && !this.updating && this.busy === 0;
+  }
+
+  view(): UiView { return { page: this.page, ...(this.teamId ? { teamId: this.teamId } : {}), ...(this.seatId ? { seatId: this.seatId } : {}) }; }
+
+  /** Restores a view saved before a reload; the next refresh drops a team or seat that no longer exists. */
+  restore(view: UiView): void {
+    if (!["teams", "team", "seat"].includes(view.page)) return;
+    this.page = view.page;
+    this.teamId = typeof view.teamId === "string" ? view.teamId : undefined;
+    this.seatId = typeof view.seatId === "string" ? view.seatId : undefined;
+  }
+
+  /** One line for the screen: the running version and the update state; undefined without an updater. */
+  updateLine(): { text: string; ok: boolean } | undefined {
+    if (!this.update) return undefined;
+    const version = "Indra " + (this.update.running?.sha.slice(0, 7) || "unknown build");
+    const last = this.updateResult;
+    const waiting = this.teams.flatMap((team) => team.seats).filter((seat) => this.live[seat.id]?.updatePending).map((seat) => seat.displayName);
+    if (last?.installFailed) return { text: version + " · blocked: " + last.message + " · retrying on the next check", ok: false };
+    if (this.reloadWanted) return { text: version + " · update pending · " + (this.update.canReload ? "reloads when idle" : "new build ready; restart Indra to use it"), ok: true };
+    if (this.updating) return { text: version + " · updating…", ok: true };
+    if (last && (last.outcome === "blocked" || last.outcome === "failed")) return { text: version + " · blocked · " + last.message, ok: false };
+    if (waiting.length) return { text: version + " · update pending · " + waiting.join(", ") + " restart when idle", ok: true };
+    return { text: version + " · " + (last ? "up to date" : "checking for updates…"), ok: true };
   }
 
   /** Pulls the state checkout's remote changes and pushes Indra's; a changed state.json refreshes the screen. */
@@ -116,11 +222,14 @@ export class TerminalUiModel {
 
   /** Hosts the bridge and seat runners that are not already running; problems become the notice. */
   async ensureProcesses(): Promise<void> {
-    if (!this.processes) return;
-    try {
-      const problems = await this.processes.ensureAll();
-      if (problems.length) this.notice = "Could not start: " + problems.join("; ");
-    } catch (error) { this.notice = "Could not start seat processes: " + (error instanceof Error ? error.message : String(error)); }
+    const processes = this.processes;
+    if (!processes) return;
+    await this.tracked(async () => {
+      try {
+        const problems = await processes.ensureAll();
+        if (problems.length) this.notice = "Could not start: " + problems.join("; ");
+      } catch (error) { this.notice = "Could not start seat processes: " + (error instanceof Error ? error.message : String(error)); }
+    });
     await this.refresh();
     this.bump();
   }
@@ -131,10 +240,13 @@ export class TerminalUiModel {
     if (!seat || !this.processes) return;
     this.notice = (action === "stop" ? "Stopping " : "Restarting ") + seat.displayName + "…";
     this.bump();
-    try {
-      await this.processes[action](seat.id);
-      this.notice = (action === "stop" ? "Stopped " : "Restarted ") + seat.displayName + ".";
-    } catch (error) { this.notice = `Could not ${action} ${seat.displayName}: ` + (error instanceof Error ? error.message : String(error)); }
+    const processes = this.processes;
+    await this.tracked(async () => {
+      try {
+        await processes[action](seat.id);
+        this.notice = (action === "stop" ? "Stopped " : "Restarted ") + seat.displayName + ".";
+      } catch (error) { this.notice = `Could not ${action} ${seat.displayName}: ` + (error instanceof Error ? error.message : String(error)); }
+    });
     await this.refresh();
     this.bump();
   }
@@ -148,8 +260,11 @@ export class TerminalUiModel {
     this.input = undefined;
     this.notice = "Starting planning goal… Chick will post in the team's home channel.";
     this.bump();
-    try { this.notice = await this.goals.start(goal); }
-    catch (error) { this.notice = "Could not start the planning goal: " + (error instanceof Error ? error.message : String(error)); }
+    const goals = this.goals;
+    await this.tracked(async () => {
+      try { this.notice = await goals.start(goal); }
+      catch (error) { this.notice = "Could not start the planning goal: " + (error instanceof Error ? error.message : String(error)); }
+    });
     this.bump();
   }
 
@@ -165,8 +280,11 @@ export class TerminalUiModel {
     if (!target || !this.goals) return;
     this.notice = "Approving " + target.goalId + "…";
     this.bump();
-    try { this.notice = await this.goals.approve(target.goalId); }
-    catch (error) { this.notice = "Could not approve " + target.goalId + ": " + (error instanceof Error ? error.message : String(error)); }
+    const goals = this.goals;
+    await this.tracked(async () => {
+      try { this.notice = await goals.approve(target.goalId); }
+      catch (error) { this.notice = "Could not approve " + target.goalId + ": " + (error instanceof Error ? error.message : String(error)); }
+    });
     await this.refresh();
     this.bump();
   }

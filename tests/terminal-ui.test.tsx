@@ -2,7 +2,8 @@ import { testRender } from "@opentui/solid";
 import { createSignal } from "solid-js";
 import { describe, expect, it } from "vitest";
 import { StateInventory, type StateSnapshot } from "../src/state-domain.js";
-import { TerminalUiModel, type SessionReadResult, type StateSyncPort } from "../src/terminal-ui.js";
+import { TerminalUiModel, type SessionReadResult, type StateSyncPort, type UpdatePort } from "../src/terminal-ui.js";
+import type { UpdateResult } from "../src/self-update.js";
 import type { StateSyncResult } from "../src/state-commit.js";
 import { TerminalApp } from "../src/terminal-ui-solid.js";
 import { attachTmux, parseOwnedTmuxTarget } from "../src/tmux-attach.js";
@@ -272,6 +273,79 @@ describe("terminal UI", () => {
     const failing = new TerminalUiModel(new StateInventory({ read: async () => state }), { readSessions: async () => ({ connection: "connected", sessions: [] }) }, undefined, undefined, { sync: async () => { throw new Error("lock timeout"); } });
     await failing.syncState();
     expect(failing.syncLine()?.text).toContain("ERROR · State sync failed: lock timeout");
+  });
+
+  it("shows the running version and update state, restarts outdated processes, and reloads only when nothing is in flight", async () => {
+    const calls: string[] = [];
+    let onDisk = { id: "build-1", sha: "abc1234def", builtAt: "now" };
+    let result: UpdateResult = { outcome: "up-to-date", message: "up to date at abc1234", at: "now" };
+    const update: UpdatePort = { running: { id: "build-1", sha: "abc1234def", builtAt: "now" }, canReload: true, check: async () => { calls.push("check"); return result; }, current: async () => onDisk };
+    let live: Record<string, SeatLive> = { "seat-002": { process: "running", updatePending: true } };
+    const processes: SeatProcessPort = { ensureAll: async () => { calls.push("ensureAll"); return []; }, read: async () => live, stop: async () => {}, restart: async () => {}, upgrade: async () => { calls.push("upgrade"); return { pending: ["seat-002"], problems: [] }; } };
+    const model = new TerminalUiModel(new StateInventory({ read: async () => snapshot }), { readSessions: async () => ({ connection: "connected", sessions: [] }) }, processes, undefined, undefined, update);
+    model.restore({ page: "seat", teamId: "team-001", seatId: "seat-003" });
+    await model.refresh();
+    expect([model.page, model.seat?.id]).toEqual(["seat", "seat-003"]);
+    await model.start();
+    expect(calls).toEqual(["ensureAll", "check", "upgrade"]);
+    expect(model.updateLine()).toEqual({ ok: true, text: "Indra abc1234 · update pending · George Duke restart when idle" });
+    live = { "seat-002": { process: "running" } };
+    await model.refresh();
+    expect(model.updateLine()?.text).toBe("Indra abc1234 · up to date");
+
+    result = { outcome: "blocked", message: "the Indra checkout has uncommitted changes", at: "now" };
+    await model.updateCode();
+    expect(model.updateLine()).toEqual({ ok: false, text: "Indra abc1234 · blocked · the Indra checkout has uncommitted changes" });
+
+    // A new build lands while the owner is typing a goal: the reload waits until the input closes.
+    result = { outcome: "built", message: "built fed4321", at: "now" };
+    onDisk = { id: "build-2", sha: "fed4321abc", builtAt: "later" };
+    model.input = { value: "half a goal" };
+    calls.length = 0;
+    await model.updateCode();
+    expect(calls).toEqual(["check"]);
+    expect(model.reloadWanted).toBe(true);
+    expect(model.readyToReload()).toBe(false);
+    expect(model.updateLine()?.text).toBe("Indra abc1234 · update pending · reloads when idle");
+    model.key("escape");
+    expect(model.readyToReload()).toBe(true);
+    expect(model.view()).toEqual({ page: "seat", teamId: "team-001", seatId: "seat-003" });
+  });
+
+  it("holds restarts, goals and reloads while an update runs, and refuses them after a failed dependency install", async () => {
+    const calls: string[] = [];
+    let finish: (result: UpdateResult) => void = () => {};
+    const update: UpdatePort = { running: { id: "build-1", sha: "abc1234def", builtAt: "now" }, canReload: true, check: () => new Promise((done) => { calls.push("check"); finish = done; }), current: async () => ({ id: "build-2", sha: "fed4321abc", builtAt: "now" }) };
+    const processes: SeatProcessPort = { ensureAll: async () => [], read: async () => ({}), stop: async () => {}, restart: async () => { calls.push("restart"); }, upgrade: async () => { calls.push("upgrade"); return { pending: [], problems: [] }; } };
+    const goals: GoalStarter = { start: async () => { calls.push("start"); return "ok"; }, approve: async () => { calls.push("approve"); return "ok"; } };
+    const model = new TerminalUiModel(new StateInventory({ read: async () => homed }), { readSessions: async () => ({ connection: "connected", sessions: [] }) }, processes, goals, undefined, update);
+    await model.refresh();
+    model.restore({ page: "seat", teamId: "team-001", seatId: "seat-002" });
+    await model.refresh();
+
+    const updating = model.updateCode();
+    const restart = model.control("restart");
+    model.input = { value: "a goal" };
+    const submit = model.submitInput();
+    await new Promise((done) => setTimeout(done, 20));
+    expect(calls).toEqual(["check"]);
+    expect(model.readyToReload()).toBe(false);
+    finish({ outcome: "blocked", message: "dependency install failed: npm ci failed: ENOSPC", at: "now", installFailed: true });
+    await Promise.all([updating, restart, submit]);
+    // The install failed: no reload, no restarts, and the held actions do not run on a half-installed node_modules.
+    expect(calls).toEqual(["check"]);
+    expect(model.reloadWanted).toBe(false);
+    expect(model.updateLine()).toEqual({ ok: false, text: "Indra abc1234 · blocked: dependency install failed: npm ci failed: ENOSPC · retrying on the next check" });
+
+    // The next check installs and builds: the new build is live, then held actions run again.
+    const retry = model.updateCode();
+    const again = model.control("restart");
+    await new Promise((done) => setTimeout(done, 20));
+    expect(calls).toEqual(["check", "check"]);
+    finish({ outcome: "built", message: "built fed4321", at: "now" });
+    await Promise.all([retry, again]);
+    expect(calls).toEqual(["check", "check", "restart"]);
+    expect(model.readyToReload()).toBe(true);
   });
 
   it("starts a new planning goal from a typed line alone, with the team's home channel and project from state", async () => {

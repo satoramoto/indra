@@ -1,12 +1,16 @@
 import { execFile } from "node:child_process";
 import { join, resolve } from "node:path";
 import { PlanningStore, type PlanningDocument } from "./planning.js";
-import { defaultAppDir, NoCredentialError, SystemTmux, TmuxHost, type TmuxRunner } from "./tmux-host.js";
+import { defaultAppDir, NoCredentialError, SystemTmux, TmuxHost, turnLockFile, type HostRecord, type TmuxRunner } from "./tmux-host.js";
+import { readBuildStamp } from "./build-stamp.js";
+import { withFileLock } from "./state-commit.js";
 
 export type ProcessState = "running" | "stopped" | "no credential";
 /** What the team view shows for a seat beyond its stable state record. */
 export interface SeatLive {
   process: ProcessState;
+  /** Running an older build than `dist/`; it is restarted at its next safe point. */
+  updatePending?: boolean;
   assignment?: { title: string; status: string; prUrl?: string };
   activity?: { message: string; at: string };
   attach?: { kind: "tmux"; target: string };
@@ -17,6 +21,8 @@ export interface SeatProcessPort {
   read(): Promise<Record<string, SeatLive>>;
   stop(seatId: string): Promise<void>;
   restart(seatId: string): Promise<void>;
+  /** Restarts processes running an older build, each only at a safe point; see Supervisor.upgrade. */
+  upgrade?(): Promise<{ pending: string[]; problems: string[] }>;
 }
 export interface GoalStarter {
   /** Starts a planning goal in the team's home channel, for the team's project, and returns a one-line result for the screen. */
@@ -33,6 +39,11 @@ const ACTIVE = ["running", "in-review"];
 
 function seatsOf(state: PlanningDocument): SeatRow[] {
   return (state.teams as { seats: SeatRow[] }[]).flatMap((team) => team.seats);
+}
+
+/** True when the seat holds a running or in-review assignment on an approved goal. */
+function holdsWork(state: PlanningDocument, seatId: string): boolean {
+  return (state.planningGoals ?? []).some((goal) => goal.stage === "approved" && (goal.assignments ?? []).some((item) => item.seatId === seatId && ACTIVE.includes(item.status)));
 }
 
 /**
@@ -88,9 +99,9 @@ export class Supervisor implements SeatProcessPort {
     return problems;
   }
 
-  async processState(host: TmuxHost): Promise<{ process: ProcessState; target?: string }> {
+  async processState(host: TmuxHost): Promise<{ process: ProcessState; target?: string; record?: HostRecord }> {
     const verified = await host.verifiedRecord().catch(() => undefined);
-    if (verified) return { process: "running", target: host.attachTarget(verified) };
+    if (verified) return { process: "running", target: host.attachTarget(verified), record: verified };
     const record = await host.readRecord().catch(() => undefined);
     if (record && record.session === host.session && await host.readiness(record).catch(() => undefined) === "no-credential") return { process: "no credential" };
     return { process: "stopped" };
@@ -99,20 +110,56 @@ export class Supervisor implements SeatProcessPort {
   async read(): Promise<Record<string, SeatLive>> {
     const state = await this.store.read();
     const live: Record<string, SeatLive> = {};
+    const stamp = await readBuildStamp(this.appDir);
     for (const seat of seatsOf(state)) {
-      const { process, target } = await this.processState(this.host(seat));
+      const { process, target, record } = await this.processState(this.host(seat));
       const held = (state.planningGoals ?? []).filter((goal) => goal.stage === "approved").flatMap((goal) => (goal.assignments ?? []).filter((item) => item.seatId === seat.id).map((assignment) => ({ goal, assignment })));
       const current = held.find((item) => ACTIVE.includes(item.assignment.status))
         ?? held.filter((item) => item.assignment.status === "queued").sort((a, b) => a.assignment.updatedAt.localeCompare(b.assignment.updatedAt))[0];
       const activity = await this.store.readRuntimeFile<{ message?: unknown; at?: unknown }>(activityRecordName(seat.id)).catch(() => undefined);
       live[seat.id] = {
         process,
+        ...(record && stamp && record.build !== stamp.id ? { updatePending: true } : {}),
         ...(current ? { assignment: { title: current.goal.proposal?.outcomes.find((item) => item.id === current.assignment.outcomeId)?.title ?? current.assignment.outcomeId, status: current.assignment.status, prUrl: current.assignment.prUrl } } : {}),
         ...(typeof activity?.message === "string" && typeof activity.at === "string" ? { activity: { message: activity.message, at: activity.at } } : {}),
         ...(target ? { attach: { kind: "tmux" as const, target } } : {}),
       };
     }
     return live;
+  }
+
+  /**
+   * Restarts each verified hosted process whose build is older than `dist/`, only at a safe point: the supervisor
+   * takes the process's turn lock (so no bridge poll or seat step is in flight), and a seat runner must also hold
+   * no running or in-review assignment. A process that is busy stays up and is named in `pending`; the next call
+   * tries again. Only this checkout's own verified sessions are stopped, through TmuxHost.
+   */
+  async upgrade(): Promise<{ pending: string[]; problems: string[] }> {
+    const stamp = await readBuildStamp(this.appDir);
+    const pending: string[] = [];
+    const problems: string[] = [];
+    if (!stamp) return { pending, problems };
+    const seen = new Set<string>();
+    for (const seat of seatsOf(await this.store.read())) {
+      const host = this.host(seat);
+      if (seen.has(host.session)) continue;
+      seen.add(host.session);
+      const record = await host.verifiedRecord().catch(() => undefined);
+      if (!record || record.build === stamp.id) continue;
+      const label = host.hosted.kind === "bridge" ? "bridge" : seat.id;
+      let stopped = false as boolean;
+      try {
+        await withFileLock(turnLockFile(this.checkout, host.hosted), async () => {
+          // Read under the lock: a seat runner claims work only while it holds this lock.
+          if (host.hosted.kind === "seat" && holdsWork(await this.store.read(), seat.id)) return;
+          stopped = await host.stop();
+        }, 1000);
+      } catch { /* The turn lock is held: a poll or step is in flight. */ }
+      if (!stopped) { pending.push(label); continue; }
+      try { await host.start(); }
+      catch (error) { if (!(error instanceof NoCredentialError)) problems.push(`${label}: ${error instanceof Error ? error.message : String(error)}`); }
+    }
+    return { pending, problems };
   }
 
   async stop(seatId: string): Promise<void> {
