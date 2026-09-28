@@ -5,6 +5,7 @@ import { StateInventory, type StateSnapshot } from "../src/state-domain.js";
 import { TerminalUiModel, type SessionReadResult } from "../src/terminal-ui.js";
 import { TerminalApp } from "../src/terminal-ui-solid.js";
 import { attachTmux, parseOwnedTmuxTarget } from "../src/tmux-attach.js";
+import type { GoalStarter, SeatLive, SeatProcessPort } from "../src/supervisor.js";
 
 const names = ["Chick Corea", "George Duke", "Aaron Magner", "Corey Henry", "Jordan Rudess"];
 const snapshot: StateSnapshot = {
@@ -174,6 +175,117 @@ describe("terminal UI", () => {
       const detail = setup.captureCharFrame();
       expect(detail).toContain("Planning goal: New goal");
       expect(detail).toContain("Stage: drafting");
+    } finally { setup.renderer.destroy(); }
+  });
+
+  it("shows each seat's process, held assignment and thread activity, and stops or restarts the selected seat", async () => {
+    const controls: string[] = [];
+    const live: Record<string, SeatLive> = {
+      "seat-001": { process: "running", attach: { kind: "tmux", target: "indra-abc:chick-abc" } },
+      "seat-002": { process: "running", assignment: { title: "Second", status: "in-review", prUrl: "https://github.com/o/r/pull/2" }, activity: { message: "Opened PR 2", at: "2026-01-02T00:00:00Z" }, attach: { kind: "tmux", target: "indra-abc:dev-seat-002-abc" } },
+      "seat-003": { process: "no credential" },
+      "seat-004": { process: "stopped" },
+      "seat-005": { process: "running", assignment: { title: "Third", status: "queued" } },
+    };
+    const processes: SeatProcessPort = {
+      ensureAll: async () => [],
+      read: async () => live,
+      stop: async (seatId) => { controls.push("stop " + seatId); },
+      restart: async (seatId) => { controls.push("restart " + seatId); },
+    };
+    const model = new TerminalUiModel(new StateInventory({ read: async () => snapshot }), { readSessions: async () => ({ connection: "connected", sessions: [] }) }, processes);
+    await model.refresh();
+    const [revision, setRevision] = createSignal(model.revision);
+    const wide = await testRender(() => <TerminalApp model={model} revision={revision} onKey={() => {}} />, { width: 120, height: 30 });
+    try {
+      await wide.renderOnce();
+      const frame = wide.captureCharFrame();
+      expect(frame).toMatch(/George Duke {2}· {2}Developer {2}· {2}RUNNING/);
+      expect(frame).toContain("Second · in-review · https://github.com/o/r/pull/2");
+      expect(frame).toContain("Latest: Opened PR 2");
+      expect(frame).toMatch(/Aaron Magner {2}· {2}Developer {2}· {2}NO CREDENTIAL/);
+      expect(frame).toMatch(/Corey Henry {2}· {2}Developer {2}· {2}STOPPED/);
+      expect(frame).toContain("Third · queued");
+      expect(frame).toContain("No thread activity yet.");
+    } finally { wide.renderer.destroy(); }
+    const narrow = await testRender(() => <TerminalApp model={model} revision={revision} onKey={() => {}} />, { width: 80, height: 24 });
+    try {
+      await narrow.renderOnce();
+      const frame = narrow.captureCharFrame();
+      for (const name of names) expect(frame).toContain(name);
+      expect(frame).toContain("NO CREDENTIAL");
+      expect(frame).toContain("Second · in-review");
+    } finally { narrow.renderer.destroy(); }
+
+    for (const _ of [1, 2, 3]) model.key("down");
+    expect(model.seat?.id).toBe("seat-002");
+    expect(model.key("x")).toBe("stop");
+    await model.control("stop");
+    expect(model.key("s")).toBe("restart");
+    await model.control("restart");
+    expect(controls).toEqual(["stop seat-002", "restart seat-002"]);
+    expect(model.notice).toContain("Restarted George Duke");
+    model.key("enter");
+    expect(model.attachTarget()).toBe("indra-abc:dev-seat-002-abc");
+    setRevision(model.revision);
+    const detail = await testRender(() => <TerminalApp model={model} revision={revision} onKey={() => {}} />, { width: 80, height: 24 });
+    try {
+      await detail.renderOnce();
+      const frame = detail.captureCharFrame();
+      expect(frame).toContain("Process: running (seat runner)");
+      expect(frame).toContain("Assignment: Second · in-review");
+    } finally { detail.renderer.destroy(); }
+  });
+
+  it("starts a new planning goal from a typed line, asking for a channel once when state has none", async () => {
+    const started: [string, string][] = [];
+    let channelReads = 0;
+    const goals: GoalStarter = {
+      channelFor: async () => { channelReads++; return undefined; },
+      start: async (goal, channel) => { started.push([goal, channel]); return "Planning goal plan-1: https://example/pl/root"; },
+    };
+    const model = new TerminalUiModel(new StateInventory({ read: async () => snapshot }), { readSessions: async () => ({ connection: "connected", sessions: [] }) }, undefined, goals);
+    await model.refresh();
+    const type = (text: string) => { for (const char of text) model.key(char === " " ? "space" : char.toLowerCase(), char); };
+    model.key("n");
+    expect(model.input).toEqual({ kind: "goal", value: "" });
+    type("Fix tsx");
+    model.key("backspace");
+    model.key("backspace");
+    type("ests");
+    expect(model.key("q", "q")).toBe("none");
+    expect(model.input?.value).toBe("Fix testsq");
+    model.key("backspace");
+    const [revision, setRevision] = createSignal(model.revision);
+    const setup = await testRender(() => <TerminalApp model={model} revision={revision} onKey={() => {}} />, { width: 120, height: 30 });
+    try {
+      await setup.renderOnce();
+      expect(setup.captureCharFrame()).toContain("New planning goal: Fix tests▏");
+      expect(model.key("return")).toBe("submit");
+      await model.submitInput();
+      expect(model.input).toEqual({ kind: "channel", value: "", goal: "Fix tests" });
+      setRevision(model.revision);
+      await setup.renderOnce();
+      expect(setup.captureCharFrame()).toContain("Mattermost channel ID:");
+      type("not-a-channel");
+      await model.submitInput();
+      expect(model.notice).toContain("26 lowercase letters");
+      expect(started).toEqual([]);
+      model.input!.value = "";
+      type("abcdefghijklmnopqrstuvwxyz");
+      await model.submitInput();
+      expect(started).toEqual([["Fix tests", "abcdefghijklmnopqrstuvwxyz"]]);
+      expect(model.input).toBeUndefined();
+      expect(model.notice).toContain("Planning goal plan-1");
+      model.key("n");
+      type("Second goal");
+      expect(model.key("enter")).toBe("submit");
+      await model.submitInput();
+      expect(started[1]).toEqual(["Second goal", "abcdefghijklmnopqrstuvwxyz"]);
+      expect(channelReads).toBe(1);
+      model.key("n");
+      model.key("escape");
+      expect(model.input).toBeUndefined();
     } finally { setup.renderer.destroy(); }
   });
 

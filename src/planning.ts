@@ -24,6 +24,14 @@ export function developerSeats(state: PlanningDocument, teamId: string): SeatRec
   return (team?.seats ?? []).filter((seat) => Array.isArray(seat.roles) && seat.roles.includes("Developer"));
 }
 
+/**
+ * The Mattermost channel where a team's planning threads start.
+ * Stub until the planning-channel lookup lands in state; undefined makes the terminal UI ask for a channel ID.
+ */
+export function planningChannelId(_state: PlanningDocument, _teamId: string): string | undefined {
+  return undefined;
+}
+
 /** Every outcome needs a distinct Developer seat until the seats run out; then no seat takes more than its fair share. */
 export function validateOutcomeSeats(outcomes: PlanningOutcome[], developerSeatIds: string[]): void {
   if (!developerSeatIds.length) throw new Error("The team has no Developer seat to assign outcomes to.");
