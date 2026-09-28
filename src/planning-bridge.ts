@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { AgentRuntime } from "./codex-runtime.js";
 import { schemaPathOf } from "./reload.js";
-import { planningId } from "./codex-runtime.js";
+import { CLARIFY_TIMEOUT_MS, DRAFT_TIMEOUT_MS, planningId } from "./codex-runtime.js";
 import { PlanningStore, developerSeats, missingTeamMessage, requireTeamHome, teamProject, validateOutcomeSeats, type MergeKind, type PlanningDocument, type PlanningGoal, type RuntimeRecord, type SprintIntegration } from "./planning.js";
 import { processShell, stderrExcerpt, type Shell } from "./developer-seat.js";
 import { SprintGitHub, sprintBranch } from "./sprint.js";
@@ -122,7 +122,7 @@ export class PlanningBridge {
     catch (error) { throw new Error(`Planning root post ${root.id} was created, but state persistence failed; inspect that post and retry after repair.`, { cause: error }); }
     const metadata: RuntimeRecord = { lastSeenAt: Math.max(0, root.create_at - 5000), processedPostIds: [root.id], runs: [] };
     await this.store.saveRuntime(id, metadata);
-    const run = await this.runtime.message(prompt(goal, "Start this planning conversation. State what you understand and ask the most useful clarifying question.", false, []), briefSchema);
+    const run = await this.runtime.message(prompt(goal, "Start this planning conversation. State what you understand and ask the most useful clarifying question.", false, []), briefSchema, undefined, { timeoutMs: CLARIFY_TIMEOUT_MS });
     metadata.sessionId = run.sessionId;
     metadata.runs.push({ startedAt: run.startedAt, finishedAt: run.finishedAt, usage: run.usage });
     await this.store.saveRuntime(id, metadata);
@@ -335,11 +335,12 @@ export class PlanningBridge {
     let run: Awaited<ReturnType<AgentRuntime["message"]>>;
     let draft: NonNullable<PlanningGoal["proposal"]> | undefined;
     try {
-      run = await this.runtime.message(prompt(goal, message, drafting, developers), drafting ? proposalSchema : briefSchema, metadata.sessionId);
+      run = await this.runtime.message(prompt(goal, message, drafting, developers), drafting ? proposalSchema : briefSchema, metadata.sessionId, { timeoutMs: drafting ? DRAFT_TIMEOUT_MS : CLARIFY_TIMEOUT_MS });
       if (drafting) draft = proposal(run.response, developers);
     } catch (error) {
       if (!drafting) throw error;
-      const reason = stderrExcerpt(error instanceof Error ? error.message : String(error), 300);
+      const raw = error instanceof Error ? error.message : String(error);
+      const reason = stderrExcerpt(raw.replace(/^Codex run timed out/, "Codex draft timed out"), 300);
       console.error(`Planning draft for goal ${id} failed (${reason}); reverting to clarifying.`);
       metadata.lastDraftError = { at: new Date().toISOString(), message: reason };
       await this.revertDraft(goal, metadata, inputKey, since);

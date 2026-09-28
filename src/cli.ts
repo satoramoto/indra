@@ -11,7 +11,7 @@ import { PlanningBridge } from "./planning-bridge.js";
 import { CHICK_USERNAME, MattermostAccessError, MattermostPlanningChat, readBotToken, readChickToken, type BotTokenOptions } from "./planning-mattermost.js";
 import { readServiceToken, stageServiceToken } from "./service-account.js";
 import { DeveloperSeat, loadDeveloperSeat, processShell } from "./developer-seat.js";
-import { CodexRuntime } from "./codex-runtime.js";
+import { CodexRuntime, DEVELOPER_SESSION_TIMEOUT_MS } from "./codex-runtime.js";
 import { defaultAppDir, signalReady, TmuxHost, turnLockFile } from "./tmux-host.js";
 import { withFileLock } from "./state-commit.js";
 import { readBuildStamp } from "./build-stamp.js";
@@ -216,7 +216,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         const chat = new MattermostPlanningChat(await hostedToken(options.checkout, options.readyNonce, (tokenOptions) => readBotToken(seat.username, tokenOptions)), seat.username);
         await joinTeamHome(options.checkout, options.readyNonce, store, chat, seat.username);
         if (options.readyNonce) await signalReady(options.checkout, options.readyNonce);
-        const runner = new DeveloperSeat(store, seat, chat, processShell, (cwd, write) => new CodexRuntime(cwd, 60 * 60_000, write), (line) => console.log(`[${new Date().toISOString()}] ${line}`));
+        const runner = new DeveloperSeat(store, seat, chat, processShell, (cwd, write) => new CodexRuntime(cwd, DEVELOPER_SESSION_TIMEOUT_MS, write), (line) => console.log(`[${new Date().toISOString()}] ${line}`));
         console.log(`Developer seat ${seat.id} (@${seat.username}) running. Stop with Ctrl-C.`);
         while (true) {
           // Each step holds the turn lock, so the supervisor only restarts this runner for an update between steps.
