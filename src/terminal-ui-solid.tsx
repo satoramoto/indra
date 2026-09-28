@@ -79,13 +79,13 @@ function SprintCard(props: { sprint: TerminalSprint; model: TerminalUiModel }) {
   const loop = () => props.sprint.loop;
   return <box flexDirection="column" flexShrink={0} padding={1} border borderColor="#42536B" backgroundColor={theme.panel}>
     <text fg={theme.heading} wrapMode="char">{props.sprint.draft ? "DRAFT SPRINT" : "SPRINT"} · {displayText(props.sprint.id)}</text>
-    <text fg={theme.regular} wrapMode="word">{displayText(props.sprint.goal, 8000)}</text>
     <text fg={theme.accent}>Current stage: {loop().stage}</text>
     <text wrapMode="word">
       <For each={SPRINT_STAGES}>{(stage, index) => <span style={{ fg: stage === loop().stage ? theme.accent : theme.muted }}>
         {(index() ? " → " : "") + (stage === loop().stage ? `[${stage}]` : stage)}
       </span>}</For><span style={{ fg: theme.muted }}> → Goal</span>
     </text>
+    <text fg={theme.regular} wrapMode="word">{displayText(props.sprint.goal, 160)}</text>
     <text fg={theme.heading}>Build · tickets</text>
     <Show when={loop().tickets.length} fallback={<text fg={theme.muted}>No tickets assigned yet.</text>}>
       <For each={loop().tickets}>{(ticket) => <box flexDirection="column" flexShrink={0} paddingLeft={1}>

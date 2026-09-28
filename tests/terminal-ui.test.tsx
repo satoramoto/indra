@@ -860,6 +860,7 @@ describe("visible sprint loop", () => {
     const processes: SeatProcessPort = { read: vi.fn(async () => ({})), ensureAll: vi.fn(async () => []), stop: vi.fn(), restart: vi.fn(), retry: vi.fn() };
     const goals: GoalStarter = { start: vi.fn(), propose: vi.fn(), approve: vi.fn(), sprint: vi.fn() };
     const session = projectedSession("goal-one", ticketLoop);
+    session.goal = "Make the full sprint loop visible while preserving every outcome, approval, and integration detail. ".repeat(15);
     const model = new TerminalUiModel(new StateInventory({ read: async () => ({ ...homed, sprints: [] }) }), { readSessions: async () => ({ connection: "disconnected", sessions: [session] }) }, processes, goals);
     await model.refresh();
     const setup = await testRender(() => <TerminalApp model={model} revision={() => model.revision} onKey={() => {}} />, { width: 140, height: 35 });
