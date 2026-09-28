@@ -64,7 +64,8 @@ const reactionKey = (reaction: Reaction) => `reaction:${reaction.post_id}:${reac
 /** The input key of an owner approval made through `planning approve`. */
 const ownerApprovalKey = (goalId: string) => `owner-approve:${goalId}`;
 /** The input key of an owner proposal request made through `planning propose`. */
-const ownerProposalKey = (goalId: string) => `owner-propose:${goalId}`;
+/** One key per owner request, so a request whose draft failed doesn't block the next one. */
+const ownerProposalKey = (goalId: string, requestedAt: number) => `owner-propose:${goalId}:${requestedAt}`;
 const reviewing = (goal: PlanningGoal) => goal.stage === "awaiting-review" || goal.stage === "approved";
 
 function prompt(goal: PlanningGoal, input: string, drafting: boolean, developers: Seat[]): string {
@@ -234,7 +235,8 @@ export class PlanningBridge {
 
   /**
    * The owner's request recorded by `planning propose`. If a 📝 already moved the goal past drafting, the request is
-   * dropped without a post: the proposal is drafted once. A failed draft leaves the request for the next poll.
+   * dropped without a post: the proposal is drafted once. The request is consumed either way: a failed draft reverts the goal to clarifying with
+   * one reply, and the owner can request again.
    */
   private async ownerProposal(id: string): Promise<void> {
     const goal = (await this.store.read()).planningGoals?.find((item) => item.id === id);
@@ -243,7 +245,7 @@ export class PlanningBridge {
     if (metadata.pending) await this.deliver(goal, metadata);
     const request = metadata.proposalRequest;
     if (!request) return;
-    const key = ownerProposalKey(id);
+    const key = ownerProposalKey(id, request.requestedAt);
     delete metadata.proposalRequest;
     if (reviewing(goal) || metadata.processedPostIds.includes(key)) { await this.store.saveRuntime(id, metadata); return; }
     await this.draft(goal, metadata, key, request.requestedAt);
@@ -310,7 +312,7 @@ export class PlanningBridge {
     return await store.withGoalLock(id, async () => {
       const goal = check((await store.read()).planningGoals?.find((item) => item.id === id));
       const metadata = await store.runtime(id);
-      if (metadata.proposalRequest || metadata.processedPostIds.includes(ownerProposalKey(id))) return { goal, alreadyRequested: true };
+      if (metadata.proposalRequest) return { goal, alreadyRequested: true };
       metadata.proposalRequest = { requestedAt: Date.now() };
       await store.saveRuntime(id, metadata);
       return { goal, alreadyRequested: false };

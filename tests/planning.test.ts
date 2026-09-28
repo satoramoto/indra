@@ -435,6 +435,25 @@ describe("plan approval", () => {
     expect(git(store.checkout, "log", "--format=%s").split("\n").filter((line) => line.startsWith("Draft proposal"))).toHaveLength(1);
   });
 
+  it("consumes a terminal request whose draft fails, reverts to clarifying with one reply, and accepts a new request", async () => {
+    const store = await fixture(); const chat = new FakeChat(); const runtime = new FakeRuntime();
+    const goal = await new PlanningBridge(store, chat, runtime).start("Explore project");
+    await PlanningBridge.requestProposal(store, goal.id);
+    let attempts = 0;
+    const failing: AgentRuntime = { message: async () => { attempts += 1; throw new Error("invalid proposal"); } };
+    const broken = new PlanningBridge(store, chat, failing);
+    await broken.poll();
+    await broken.poll();
+    expect(attempts).toBe(1);
+    expect((await store.read()).planningGoals![0].stage).toBe("clarifying");
+    expect((await store.runtime(goal.id)).proposalRequest).toBeUndefined();
+    expect(chat.posts.filter((post) => post.root_id === goal.mattermost.rootPostId && post.message.includes("Drafting the proposal failed"))).toHaveLength(1);
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    expect(await PlanningBridge.requestProposal(store, goal.id)).toMatchObject({ alreadyRequested: false });
+    await new PlanningBridge(store, chat, runtime).poll();
+    expect((await store.read()).planningGoals![0].stage).toBe("awaiting-review");
+  });
+
   it("refuses a terminal proposal request for an unknown goal or one past clarifying", async () => {
     const { store, chat, goal } = await awaitingReview();
     const posts = chat.posts.length;
