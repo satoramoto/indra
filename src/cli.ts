@@ -87,7 +87,7 @@ export async function runConsistencyCheck(state: StateInventory, reader: TeamMem
 
 type Options = { mode: "help" } | { mode: "seat"; seatId: string; checkout: string } | { mode: "state"; checkout: string; once: boolean } | { mode: "ui"; checkout: string } | { mode: "mattermost"; slug: string } | { mode: "mattermost"; checkout: string; once: boolean } | { mode: "planning"; action: "start" | "serve" | "host" | "status"; checkout: string; channel?: string; goal?: string; projects: string[]; participants: string[]; readyNonce?: string };
 
-const usage = "Usage: npm start -- [--state PATH] [--once] | --ui [--state PATH] | --mattermost [--state PATH] [--once] | --mattermost --team SLUG | planning start --goal TEXT --channel CHANNEL_ID [--project PATH] [--participant SEAT_ID] [--state PATH] | planning serve|host|status [--state PATH] | seat run --seat SEAT_ID [--state PATH]\nPlanning serves only Chick's Yahaha thread. Reply in the thread to clarify; send /proposal there to request a draft.";
+const usage = "Usage: npm start -- [--state PATH] [--once] | --ui [--state PATH] | --mattermost [--state PATH] [--once] | --mattermost --team SLUG | planning start --goal TEXT [--channel CHANNEL_ID] [--project PATH] [--participant SEAT_ID] [--state PATH] | planning serve|host|status [--state PATH] | seat run --seat SEAT_ID [--state PATH]\nPlanning serves only Chick's Yahaha thread. Reply in the thread to clarify; send /proposal there to request a draft.";
 
 export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_REPO): Options {
   if (args.length === 1 && (args[0] === "--help" || args[0] === "-h")) return { mode: "help" };
@@ -121,7 +121,7 @@ export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_
       else if (key === "--ready-nonce" && !readyNonce && action === "serve" && /^[a-f0-9-]{36}$/.test(value)) readyNonce = value;
       else throw new StateDataError(usage);
     }
-    if (action === "start" && (!goal || !channel)) throw new StateDataError(usage);
+    if (action === "start" && !goal) throw new StateDataError(usage);
     if (action !== "start" && (goal || channel || projects.length || participants.length)) throw new StateDataError(usage);
     const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
     return { mode: "planning", action, checkout: resolve(checkout || stateEnv || resolve(projectRoot, "..", "indra-state")), goal, channel, projects, participants, readyNonce };
@@ -211,7 +211,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       const runtime = new CodexRuntime(process.cwd());
       const bridge = new PlanningBridge(store, chat, runtime);
       if (options.action === "start") {
-        const goal = await bridge.start(options.goal!, options.channel!, options.projects, options.participants);
+        const goal = await bridge.start(options.goal!, options.channel,options.projects, options.participants);
         console.log(`Planning goal ${goal.id}: ${SERVER}/yahaha/pl/${goal.mattermost.rootPostId}`);
         return 0;
       }

@@ -63,7 +63,8 @@ function team(value: unknown, index: number): StateTeam {
   const identities = record(data.externalIdentities, `${path}.externalIdentities`);
   fields(identities, `${path}.externalIdentities`, ["mattermost"]);
   const mattermost = record(identities.mattermost, `${path}.externalIdentities.mattermost`);
-  fields(mattermost, `${path}.externalIdentities.mattermost`, ["teamId"]);
+  fields(mattermost, `${path}.externalIdentities.mattermost`, ["teamId", "planningChannelId"]);
+  if (mattermost.planningChannelId !== undefined) string(mattermost.planningChannelId, `${path}.externalIdentities.mattermost.planningChannelId`);
   const seats = array(data.seats, `${path}.seats`).map((value, index) => {
     const seatPath = `${path}.seats[${index}]`;
     const seat = record(value, seatPath);
