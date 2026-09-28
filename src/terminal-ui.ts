@@ -1,5 +1,6 @@
 import type { StateInventory, StateSeat, StateSnapshot, StateTeam } from "./state-domain.js";
 import type { GoalStarter, SeatLive, SeatProcessPort } from "./supervisor.js";
+import { missingTeamHome, missingTeamMessage } from "./planning.js";
 
 /** Structural read port. A stable seat is never treated as a running agent without a runtime session. */
 export interface TerminalSession {
@@ -27,9 +28,11 @@ export interface SessionReadPort {
 }
 
 export type UiPage = "teams" | "team" | "seat";
-export type UiAction = "none" | "refresh" | "quit" | "attach" | "stop" | "restart" | "submit";
-/** The one-line text input: a new planning goal, then (once per UI session) a channel ID. */
-export interface UiInput { kind: "goal" | "channel"; value: string; goal?: string }
+export type UiAction = "none" | "refresh" | "quit" | "attach" | "stop" | "restart" | "submit" | "approve";
+/** The one-line text input for a new planning goal. The channel and project come from the team in state. */
+export interface UiInput { value: string }
+/** A goal whose proposal the owner is approving from the terminal. */
+export interface UiApproval { goalId: string; goal: string }
 
 /** Remove terminal controls from state and runtime text before giving it to the renderer. */
 export function displayText(value: string | undefined, limit = 400): string {
@@ -63,8 +66,10 @@ export class TerminalUiModel {
   /** Live process, assignment and thread activity per seat ID; empty without a process supervisor. */
   live: Record<string, SeatLive> = {};
   input?: UiInput;
-  /** The channel ID typed in this UI session; it is also saved to the team in state. */
-  channelId?: string;
+  /** Set while the y/n question for approving a proposal is open. */
+  confirm?: UiApproval;
+  /** The approval the owner confirmed, until `approveConfirmed` runs it. */
+  private approving?: UiApproval;
   /** Called after changes made outside a key press or refresh, so the screen redraws. */
   changed?: () => void;
 
@@ -97,31 +102,35 @@ export class TerminalUiModel {
     this.bump();
   }
 
-  /** Enter in the input: start the goal, or ask for a channel first when state has none. */
+  /** Enter in the input: start the goal in the team's home channel, for the team's project. */
   async submitInput(): Promise<void> {
     const input = this.input;
     if (!input || !this.goals || !this.teamId) return;
-    const value = input.value.trim();
-    if (!value) return;
-    let goal = value; let channel: string | undefined;
-    if (input.kind === "channel") {
-      if (!/^[a-z0-9]{26}$/.test(value)) { this.notice = "A Mattermost channel ID is 26 lowercase letters and digits."; this.bump(); return; }
-      try { await this.goals.saveChannel(this.teamId, value); }
-      catch (error) { this.notice = "Could not save the planning channel: " + (error instanceof Error ? error.message : String(error)); this.bump(); return; }
-      goal = input.goal!; channel = this.channelId = value;
-    } else {
-      try { channel = this.channelId ?? await this.goals.channelFor(this.teamId); }
-      catch (error) { this.notice = "Could not read the planning channel: " + (error instanceof Error ? error.message : String(error)); this.bump(); return; }
-      if (!channel) { this.input = { kind: "channel", value: "", goal }; this.bump(); return; }
-    }
+    const goal = input.value.trim();
+    if (!goal) return;
     this.input = undefined;
-    this.notice = "Starting planning goal… Chick will post in Mattermost.";
+    this.notice = "Starting planning goal… Chick will post in the team's home channel.";
     this.bump();
-    try { this.notice = await this.goals.start(goal, channel); }
-    catch (error) {
-      if (input.kind === "channel") this.channelId = undefined;
-      this.notice = "Could not start the planning goal: " + (error instanceof Error ? error.message : String(error));
-    }
+    try { this.notice = await this.goals.start(goal); }
+    catch (error) { this.notice = "Could not start the planning goal: " + (error instanceof Error ? error.message : String(error)); }
+    this.bump();
+  }
+
+  /** The selected seat's newest goal whose proposal awaits review. */
+  reviewGoal(): TerminalSession | undefined {
+    return this.seat ? newestPlanningRecord(this.sessionsFor(this.seat.id).filter((session) => session.stage === "awaiting-review")) : undefined;
+  }
+
+  /** Runs the approval the owner confirmed with y; the CLI posts the same thread confirmation as a ✅ reaction. */
+  async approveConfirmed(): Promise<void> {
+    const target = this.approving;
+    this.approving = undefined;
+    if (!target || !this.goals) return;
+    this.notice = "Approving " + target.goalId + "…";
+    this.bump();
+    try { this.notice = await this.goals.approve(target.goalId); }
+    catch (error) { this.notice = "Could not approve " + target.goalId + ": " + (error instanceof Error ? error.message : String(error)); }
+    await this.refresh();
     this.bump();
   }
 
@@ -181,13 +190,29 @@ export class TerminalUiModel {
       this.revision++;
       return "none";
     }
+    if (this.confirm) {
+      const target = this.confirm;
+      this.confirm = undefined;
+      this.revision++;
+      if ((text ?? value).toLowerCase() === "y") { this.approving = target; return "approve"; }
+      this.notice = "Approval cancelled; nothing changed.";
+      return "none";
+    }
     this.notice = undefined;
     const input = value.toLowerCase();
     if (input === "q") return "quit";
     if (input === "r") return "refresh";
-    if (input === "n") {
-      if (!this.goals || !this.teamId) this.notice = "Planning goals cannot be started from this screen.";
-      else this.input = { kind: "goal", value: "" };
+    if (text === "A") {
+      const target = this.reviewGoal();
+      if (this.page !== "seat") this.notice = "Open Chick's seat to approve a proposal.";
+      else if (!this.goals) this.notice = "Proposals cannot be approved from this screen.";
+      else if (!target) this.notice = "No proposal is awaiting review for this seat.";
+      else this.confirm = { goalId: target.id, goal: target.goal };
+    } else if (input === "n") {
+      const missing = missingTeamHome(this.team);
+      if (!this.goals || !this.team) this.notice = "Planning goals cannot be started from this screen.";
+      else if (missing.length) this.notice = "Cannot start a planning goal: " + missingTeamMessage(this.team.displayName, missing);
+      else this.input = { value: "" };
     } else if (input === "s" || input === "x") {
       if (this.page === "teams" || !this.seat) this.notice = "Choose a seat first.";
       else if (!this.processes) this.notice = "Seat processes are not managed from this screen.";

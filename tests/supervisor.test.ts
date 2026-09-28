@@ -165,14 +165,14 @@ describe("seat process supervisor", () => {
 });
 
 describe("CLI goal starter", () => {
-  it("saves a typed planning channel to the team as a state commit", async () => {
-    const state = { $schema: "./schema/v1/state.schema.json", schemaVersion: 1, sprints: [], planningGoals: [], teams: [{ id: "team-001", slug: "yahaha", displayName: "Yahaha", externalIdentities: { mattermost: { teamId: "team" } }, seats: [seat("seat-001", "Chick", ["Team Lead"])] }] };
-    const dir = await stateCheckout("indra-goal-starter-", state);
-    const starter = new CliGoalStarter(dir, dir);
-    expect(await starter.channelFor("team-001")).toBeUndefined();
-    await starter.saveChannel("team-001", "abcdefghijklmnopqrstuvwxyz");
-    expect(await starter.channelFor("team-001")).toBe("abcdefghijklmnopqrstuvwxyz");
-    expect(git(dir, "log", "-1", "--format=%s").trim()).toBe("Record the planning channel for team team-001");
-    expect(git(dir, "status", "--porcelain").trim()).toBe("");
+  it("starts goals with only the goal text and approves through planning approve", async () => {
+    const calls: string[][] = [];
+    const starter = new CliGoalStarter("/state", "/app", async (args) => { calls.push(args); return args[1] === "start" ? "Planning goal goal-1: link" : "Approved goal goal-1: 2 outcome(s) queued for Developer seats."; });
+    expect(await starter.start("Fix tests")).toBe("Planning goal goal-1: link");
+    expect(await starter.approve("goal-1")).toContain("Approved goal goal-1");
+    expect(calls).toEqual([
+      ["planning", "start", "--state", "/state", "--goal", "Fix tests"],
+      ["planning", "approve", "--state", "/state", "--goal", "goal-1"],
+    ]);
   });
 });

@@ -2,7 +2,8 @@ import { execFile } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentResult, AgentRuntime, WriteAccess } from "./codex-runtime.js";
-import type { PlanningAssignment as Assignment, PlanningGoal, PlanningOutcome as ApprovedOutcome, PlanningStore } from "./planning.js";
+import { missingTeamMessage, teamProject, type PlanningAssignment as Assignment, type PlanningGoal, type PlanningOutcome as ApprovedOutcome, type PlanningStore } from "./planning.js";
+import { ensureProjectCheckout, ProjectCheckoutError, projectCheckoutPath } from "./project-checkout.js";
 import { activityRecordName } from "./supervisor.js";
 
 export interface ShellResult { code: number; stdout: string; stderr: string }
@@ -85,9 +86,7 @@ export class DeveloperSeat {
     const outcome = this.outcome(goal, record.outcomeId);
     try {
       if (record.step === "worktree") {
-        const project = goal.projectRefs[0];
-        if (!project) throw new SeatError("Goal has no target project.");
-        await this.sh("git", ["fetch", "origin", "main"], project);
+        const project = await ensureProjectCheckout(this.shell, this.store.runtimeDir, await this.github(goal));
         record.gitDir = (await this.sh("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], project)).stdout.trim();
         await this.sh("git", ["worktree", "add", "--no-track", "-b", record.branch, record.worktree, "origin/main"], project);
         await this.advance(record, "build");
@@ -113,7 +112,7 @@ export class DeveloperSeat {
         await this.advance(record, "ci");
       }
       if (record.step === "ci") {
-        const project = goal.projectRefs[0];
+        const project = projectCheckoutPath(this.store.runtimeDir, await this.github(goal));
         const state = (await this.sh("gh", ["pr", "view", record.prUrl!, "--json", "state", "--jq", ".state"], project)).stdout.trim();
         if (state !== "MERGED") {
           const checks = await this.shell.run("gh", ["pr", "checks", record.prUrl!, "--watch"], record.worktree);
@@ -128,7 +127,7 @@ export class DeveloperSeat {
         if (removed.code !== 0) this.log(`Could not remove worktree ${record.worktree}.`);
       }
     } catch (error) {
-      const reason = error instanceof SeatError ? error.message : "unexpected error";
+      const reason = error instanceof SeatError || error instanceof ProjectCheckoutError ? error.message : "unexpected error";
       this.log(`Assignment ${goal.id}/${record.outcomeId} failed at ${record.step}: ${error instanceof Error ? error.message : String(error)}`);
       await this.fail(goal, record.outcomeId, `${record.step}: ${reason}`.slice(0, 200));
     }
@@ -167,6 +166,13 @@ export class DeveloperSeat {
 
   private outcome(goal: PlanningGoal, outcomeId: string): ApprovedOutcome {
     return goal.proposal?.outcomes.find((item) => item.id === outcomeId) ?? { id: outcomeId, title: outcomeId, description: "", seatId: this.seat.id };
+  }
+
+  /** The goal's project is its team's `project.github` in state; Indra works in its own clone of it. */
+  private async github(goal: PlanningGoal): Promise<string> {
+    const github = teamProject(await this.store.read(), goal.teamId);
+    if (!github) throw new SeatError(missingTeamMessage(goal.teamId, ["project.github"]));
+    return github;
   }
 
   private recordName(goalId: string, outcomeId: string): string { return `seat-${this.seat.id}-${goalId}-${outcomeId}`; }

@@ -36,7 +36,12 @@ export function validateOutcomeSeats(outcomes: PlanningOutcome[], developerSeatI
   const limit = Math.ceil(outcomes.length / developerSeatIds.length);
   if ([...counts.values()].some((count) => count > limit)) throw new Error(`Outcomes must be spread across Developer seats (at most ${limit} per seat).`);
 }
-export interface RuntimeRecord { sessionId?: string; lastSeenAt: number; processedPostIds: string[]; pending?: { inputPostId: string; message: string; since: number }; runs: { startedAt: string; finishedAt: string; usage?: unknown }[] }
+/**
+ * A goal's bridge metadata in `<state-checkout>.runtime`. `processedPostIds` holds every handled input: thread post IDs
+ * and reaction keys. `pending.proposal` marks a reply that announces the proposal; once delivered, its post ID joins
+ * `proposalPostIds`, the posts a ✅ reaction approves.
+ */
+export interface RuntimeRecord { sessionId?: string; lastSeenAt: number; processedPostIds: string[]; proposalPostIds?: string[]; pending?: { inputPostId: string; message: string; since: number; proposal?: boolean }; runs: { startedAt: string; finishedAt: string; usage?: unknown }[] }
 export interface PlanningDocument { $schema: string; schemaVersion: number; teams: unknown[]; sprints: unknown[]; planningGoals?: PlanningGoal[] }
 
 export function validatePlanningGoal(goal: PlanningGoal): void {
@@ -76,10 +81,35 @@ function validateDocument(state: PlanningDocument): void {
   }
 }
 
-/** The team's Mattermost channel for new planning threads, when state records one. */
-export function planningChannelId(state: PlanningDocument, teamId: string): string | undefined {
-  const team = (state.teams as { id: string; externalIdentities?: { mattermost?: { planningChannelId?: string } } }[]).find((item) => item.id === teamId);
-  return team?.externalIdentities?.mattermost?.planningChannelId;
+type TeamHomeRecord = { id: string; project?: { github?: string }; externalIdentities?: { mattermost?: { homeChannelId?: string } } };
+
+/** The team's home channel, where Chick opens planning threads, when state records one. */
+export function homeChannelId(state: PlanningDocument, teamId: string): string | undefined {
+  return (state.teams as TeamHomeRecord[]).find((item) => item.id === teamId)?.externalIdentities?.mattermost?.homeChannelId;
+}
+
+/** The team's GitHub project as `owner/repo`, when state records one. */
+export function teamProject(state: PlanningDocument, teamId: string): string | undefined {
+  return (state.teams as TeamHomeRecord[]).find((item) => item.id === teamId)?.project?.github;
+}
+
+/** The state fields a team still needs before planning can start; empty when it has both. */
+export function missingTeamHome(team: { homeChannelId?: string; project?: { github?: string } } | undefined): string[] {
+  return [
+    ...(team?.homeChannelId ? [] : ["externalIdentities.mattermost.homeChannelId"]),
+    ...(team?.project?.github ? [] : ["project.github"]),
+  ];
+}
+
+/** The team's home channel and project, or an error naming each state field that is missing. */
+export function requireTeamHome(state: PlanningDocument, teamId: string): { channelId: string; github: string } {
+  const channelId = homeChannelId(state, teamId); const github = teamProject(state, teamId);
+  if (!channelId || !github) throw new Error(missingTeamMessage(teamId, missingTeamHome({ homeChannelId: channelId, project: { github } })));
+  return { channelId, github };
+}
+
+export function missingTeamMessage(team: string, missing: string[]): string {
+  return `Team ${team} has no ${missing.join(" or ")} in state.json; record ${missing.length === 1 ? "it" : "them"} in indra-state first.`;
 }
 
 /** Written to the runtime directory just before state.json, removed once the change is committed. */
@@ -142,6 +172,10 @@ export class PlanningStore {
     if (!intent) return;
     if (await git.dirty() && sha256(await readFile(file, "utf8")) === intent.sha256) await git.commit(intent.message);
     await rm(join(this.runtimeDir, `${COMMIT_INTENT}.json`), { force: true });
+  }
+  /** Serializes work on one goal's runtime metadata across Indra processes (the bridge and `planning approve`). */
+  async withGoalLock<T>(id: string, work: () => Promise<T>): Promise<T> {
+    return await withFileLock(join(this.runtimeDir, `${id}.lock`), work);
   }
   async runtime(id: string): Promise<RuntimeRecord> {
     try { return JSON.parse(await readFile(join(this.runtimeDir, `${id}.json`), "utf8")) as RuntimeRecord; }
