@@ -60,6 +60,26 @@ The bridge uses Chick's 1Password bot item (`Mattermost bot - chickcorea`) and t
 
 `planning host` launches the same bridge in a dedicated detached tmux session. It uses an Indra-owned socket and exact session name derived from the state checkout, and reuses an already verified pane on repeated calls. It records the tmux server/session identity and pane in `<state-checkout>.runtime/tmux-host.json`, then waits for the bridge's first successful poll before reporting readiness. `planning status` prints a neutral JSON session snapshot, including an attach target only while that exact, live pane remains available. A connected bridge can show an idle seat between Codex turns. The target is `socket:session`; split it and pass the pieces as argv to `tmux -L SOCKET attach-session -t =SESSION`. Attaching or detaching does not stop the bridge. A stale or missing ownership record is never grounds to kill or attach another session. The host command requires the built `dist/cli.js` (`npm run build` first).
 
+## Developer seats
+
+A Developer seat picks up approved work and runs the dev loop on it with Codex:
+
+```sh
+npm start -- seat run --seat SEAT_ID --state /path/to/indra-state
+```
+
+It refuses a Team Lead seat or a seat that is not in `state.json`. Run one process per seat. The seat reads approved goals (`stage: "approved"`) and their `assignments`. A seat owns at most one `running` or `in-review` assignment. When idle, it claims its own oldest `queued` assignment and marks it `running` in `state.json` before doing any work. It then:
+
+1. fetches `origin main` in the goal's target project (`projectRefs[0]`, a local Git checkout) and creates a fresh worktree and branch `SEAT_ID/GOAL_ID-OUTCOME_ID` from `origin/main` under `<state-checkout>.runtime/worktrees/`;
+2. runs a new Codex session that implements the outcome under the project's AGENTS.md, runs the targeted tests once, commits, pushes and opens a PR; the assignment becomes `in-review` with its `prUrl`;
+3. runs a separate, new Codex session as the reviewer, which posts its findings on the PR;
+4. if there are findings, runs one new Codex fix session;
+5. waits once with `gh pr checks --watch`, merges with `gh pr merge --squash --delete-branch` when CI is green, marks the assignment `merged`, removes the worktree and goes idle.
+
+Any failure marks the assignment `failed` with a short `note` and the seat goes idle; a failed task's worktree is kept for inspection. On restart the seat resumes an `in-review` assignment from its recorded step; a `running` assignment that never opened a PR is marked `failed` rather than rebuilt. It never takes a second assignment while one is in flight. With nothing queued it checks again every 30 seconds.
+
+Codex runs in the `workspace-write` sandbox with network access, so it can push and use `gh`; the builder and fix sessions may also write the project's shared Git directory, and the reviewer may not. They use the logged-in Codex CLI and `gh`. The seat posts short progress replies (claimed, PR opened, review done, merged or failed) in the goal thread as its own bot, using the 1Password item `Mattermost bot - USERNAME` (the seat's Mattermost username), as Chick's bridge does. A missing item stops the seat with an error naming it. Codex session IDs, usage and the task's step live in `<state-checkout>.runtime/seat-SEAT_ID-GOAL_ID-OUTCOME_ID.json`, not in `state.json`.
+
 ## Existing live Mattermost inventory
 
 The previous read-only live inventory remains available explicitly:

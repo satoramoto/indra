@@ -4,14 +4,19 @@ import type { PlanningChat, Post } from "./planning-bridge.js";
 
 const execFileAsync = promisify(execFile);
 const SERVER = "https://mattermost.newegypt.io";
-const BOT_TOKEN_REF = "op://Agent Rig/Mattermost bot - chickcorea/access_token";
+/** 1Password reference for a seat's Mattermost bot token, named after the bot's username. */
+export const botTokenRef = (username: string) => `op://Agent Rig/Mattermost bot - ${username}/access_token`;
 
-export async function readChickToken(): Promise<string> {
+export async function readBotToken(username: string, ref = botTokenRef(username)): Promise<string> {
   try {
-    const { stdout } = await execFileAsync("op", ["read", process.env.INDRA_CHICK_TOKEN_REF ?? BOT_TOKEN_REF], { timeout: 30_000, encoding: "utf8" });
+    const { stdout } = await execFileAsync("op", ["read", ref], { timeout: 30_000, encoding: "utf8" });
     if (stdout.trim()) return stdout.trim();
   } catch { /* hide secret manager details */ }
-  throw new Error("1Password could not supply Chick's bot token. Check item field metadata and desktop authorization.");
+  throw new Error(`1Password could not supply the bot token for @${username}. Expected item '${ref}'; check it exists and desktop authorization.`);
+}
+
+export async function readChickToken(): Promise<string> {
+  return await readBotToken("chickcorea", process.env.INDRA_CHICK_TOKEN_REF ?? botTokenRef("chickcorea"));
 }
 
 export class MattermostPlanningChat implements PlanningChat {
