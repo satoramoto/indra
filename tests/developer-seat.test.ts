@@ -41,6 +41,7 @@ class FakeShell implements Shell {
   checksCode = 0;
   merges: { code: number; stderr: string; merged: boolean }[] = [];
   merged = false;
+  draft = false;
   /** Each mergeability check takes the next status; by default the PR is current with main. */
   mainStatus: { mergeable: string; mergeStateStatus: string }[] = [];
   /** Each `git merge origin/main` takes the next exit code (1 = conflicts); by default it merges cleanly. */
@@ -81,12 +82,15 @@ class FakeShell implements Shell {
     }
     if (line.startsWith("gh api") && args.includes("--paginate")) return { code: 0, stdout: JSON.stringify([this.comments]), stderr: "" };
     if (line.startsWith("gh pr comment")) this.comments.push({ body: args.at(-1)! });
+    if (line.startsWith("gh pr merge") && this.draft) return { code: 1, stdout: "", stderr: "GraphQL: Pull Request is still a draft (mergePullRequest)" };
     if (line.startsWith("gh pr merge")) {
       // Each merge attempt takes the next outcome; by default gh succeeds and the PR merges.
       const outcome = this.merges.shift() ?? { code: 0, stderr: "", merged: true };
       this.merged = outcome.merged;
       return { code: outcome.code, stdout: "", stderr: outcome.stderr };
     }
+    if (line.startsWith("gh pr view") && args.includes("isDraft")) return { code: 0, stdout: `${this.draft}\n`, stderr: "" };
+    if (line.startsWith("gh pr ready")) this.draft = false;
     if (line.startsWith("gh pr view") && args.includes("mergeable,mergeStateStatus")) return { code: 0, stdout: JSON.stringify(this.mainStatus.shift() ?? { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" }), stderr: "" };
     if (line.startsWith("git merge --no-edit origin/")) {
       const code = this.unfinishedMerge ? 128 : this.mainMerges.shift() ?? 0;
@@ -173,6 +177,7 @@ describe("developer seat", () => {
       `gh pr view ${PR} --json state --jq .state @${project}`,
       `gh pr view ${PR} --json mergeable,mergeStateStatus @${project}`,
       `gh pr checks ${PR} --watch @${worktree}`,
+      `gh pr view ${PR} --json isDraft --jq .isDraft @${project}`,
       `gh pr merge ${PR} --squash @${project}`,
       `gh pr view ${PR} --json state --jq .state @${project}`,
       `gh api -X DELETE repos/satoramoto/indra/git/refs/heads/seat-002/goal-abc-outcome-1 @${project}`,
@@ -201,6 +206,18 @@ describe("developer seat", () => {
     await seat.tick();
     expect((await assignment("outcome-1")).status).toBe("merged");
     expect(shell.calls.filter((call) => call.startsWith("gh pr merge"))).toHaveLength(1);
+  });
+
+  it("marks its own draft assignment PR ready before merging", async () => {
+    const { store, shell, seat, assignment } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
+    shell.draft = true;
+    await seat.tick();
+    const project = join(store.runtimeDir, "projects", "satoramoto", "indra");
+    const ready = shell.calls.indexOf(`gh pr ready ${PR} @${project}`);
+    expect(ready).toBeGreaterThan(0);
+    expect(shell.calls[ready + 1]).toBe(`gh pr merge ${PR} --squash @${project}`);
+    expect(shell.calls.filter((call) => call.startsWith("gh pr ready"))).toEqual([`gh pr ready ${PR} @${project}`]);
+    expect((await assignment("outcome-1")).status).toBe("merged");
   });
 
   it("retries a merge GitHub briefly refused", async () => {
@@ -238,12 +255,13 @@ describe("developer seat", () => {
     const worktree = join(store.runtimeDir, "worktrees", "goal-abc-outcome-1");
     const project = join(store.runtimeDir, "projects", "satoramoto", "indra");
     const ci = shell.calls.indexOf(`gh pr view ${PR} --json mergeable,mergeStateStatus @${project}`);
-    expect(shell.calls.slice(ci, ci + 6)).toEqual([
+    expect(shell.calls.slice(ci, ci + 7)).toEqual([
       `gh pr view ${PR} --json mergeable,mergeStateStatus @${project}`,
       `git -c credential.helper= -c credential.helper=!gh auth git-credential fetch origin main @${project}`,
       `git merge --no-edit origin/main @${worktree}`,
       ownPush(worktree),
       `gh pr checks ${PR} --watch @${worktree}`,
+      `gh pr view ${PR} --json isDraft --jq .isDraft @${project}`,
       `gh pr merge ${PR} --squash @${project}`,
     ]);
     onlyOwnPushes(shell.calls, worktree);
@@ -259,10 +277,11 @@ describe("developer seat", () => {
     await seat.tick();
     const worktree = join(store.runtimeDir, "worktrees", "goal-abc-outcome-1");
     const conflictAt = shell.calls.indexOf(`git merge --no-edit origin/main @${worktree}`);
-    expect(shell.calls.slice(conflictAt + 1, conflictAt + 5)).toEqual([
+    expect(shell.calls.slice(conflictAt + 1, conflictAt + 6)).toEqual([
       `git merge-base --is-ancestor origin/main HEAD @${worktree}`,
       ownPush(worktree),
       `gh pr checks ${PR} --watch @${worktree}`,
+      `gh pr view ${PR} --json isDraft --jq .isDraft @${join(store.runtimeDir, "projects", "satoramoto", "indra")}`,
       `gh pr merge ${PR} --squash @${join(store.runtimeDir, "projects", "satoramoto", "indra")}`,
     ]);
     onlyOwnPushes(shell.calls, worktree);

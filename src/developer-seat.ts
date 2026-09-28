@@ -259,6 +259,9 @@ export class DeveloperSeat {
    * The PR's state is the only success signal; gh's exit code is not.
    */
   private async merge(prUrl: string, project: string): Promise<void> {
+    // Codex sometimes opens the assignment PR as a draft, which GitHub refuses to merge; mark this PR ready first.
+    const draft = await this.sh("gh", ["pr", "view", prUrl, "--json", "isDraft", "--jq", ".isDraft"], project);
+    if (draft.stdout.trim() === "true") await this.sh("gh", ["pr", "ready", prUrl], project);
     let stderr = "";
     for (let attempt = 0; attempt < 2; attempt++) {
       if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, this.mergeRetryMs));
