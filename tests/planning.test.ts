@@ -79,17 +79,38 @@ describe("planning bridge", () => {
     expect(runtime.sessions).toHaveLength(3);
   });
 
-  it("does not consume a failed memo request and leaves drafting recoverable", async () => {
+  it("reverts a failed draft to clarifying, posts once without error details, and drafts again only on a new memo", async () => {
     const store = await fixture(); const chat = new FakeChat(); const runtime = new FakeRuntime();
     const bridge = new PlanningBridge(store, chat, runtime);
     const goal = await bridge.start("Explore project");
     chat.react(goal.mattermost.rootPostId, MEMO);
-    const failing: AgentRuntime = { message: async () => { throw new Error("runtime down"); } };
-    await expect(new PlanningBridge(store, chat, failing).poll()).rejects.toThrow("runtime down");
-    expect((await store.read()).planningGoals?.[0].stage).toBe("drafting");
-    expect((await store.runtime(goal.id)).processedPostIds.some((key) => key.startsWith("reaction:"))).toBe(false);
+    const failing: AgentRuntime = { message: async () => { throw new Error("runtime down secret-token"); } };
+    await new PlanningBridge(store, chat, failing).poll();
+    expect((await store.read()).planningGoals?.[0].stage).toBe("clarifying");
+    const failures = chat.posts.filter((post) => post.message.includes("Drafting the proposal failed"));
+    expect(failures).toHaveLength(1);
+    expect(failures[0].message).not.toContain("secret-token");
+    expect(failures[0].message).toContain(`:${MEMO}:`);
+    const before = runtime.prompts.length;
+    await bridge.poll();
+    expect(runtime.prompts.length).toBe(before);
+    expect(chat.posts.filter((post) => post.message.includes("Drafting the proposal failed"))).toHaveLength(1);
+    chat.react(goal.mattermost.rootPostId, MEMO, "george-human");
     await bridge.poll();
     expect((await store.read()).planningGoals?.[0].stage).toBe("awaiting-review");
+  });
+
+  it("recovers a goal left in drafting with no run in flight at bridge start, once, without drafting", async () => {
+    const store = await fixture(); const chat = new FakeChat(); const runtime = new FakeRuntime();
+    const goal = await new PlanningBridge(store, chat, runtime).start("Explore project");
+    await store.update((state) => { state.planningGoals![0].stage = "drafting"; }, "Simulate a crash mid-draft");
+    const before = runtime.prompts.length;
+    const restarted = new PlanningBridge(store, chat, runtime);
+    await restarted.poll();
+    await restarted.poll();
+    expect((await store.read()).planningGoals?.[0].stage).toBe("clarifying");
+    expect(runtime.prompts.length).toBe(before);
+    expect(chat.posts.filter((post) => post.root_id === goal.mattermost.rootPostId && post.message.includes("Drafting the proposal failed"))).toHaveLength(1);
   });
 
   it("starts in the team's home channel with the team's project, and the goal post names the memo reaction", async () => {
@@ -230,8 +251,9 @@ describe("plan approval", () => {
     const bridge = new PlanningBridge(store, chat, runtime);
     const goal = await bridge.start("Explore project");
     chat.react(goal.mattermost.rootPostId, MEMO);
-    await expect(bridge.poll()).rejects.toThrow("invalid proposal");
-    expect((await store.read()).planningGoals![0].stage).toBe("drafting");
+    await bridge.poll();
+    expect((await store.read()).planningGoals![0].stage).toBe("clarifying");
+    expect((await store.read()).planningGoals![0].proposal).toBeUndefined();
   });
 
   it("approves on a person's check mark on the proposal post, queues one assignment per outcome, and stays idempotent across restarts", async () => {
