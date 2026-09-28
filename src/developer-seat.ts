@@ -244,7 +244,7 @@ export class DeveloperSeat {
   private async codex(role: SeatTaskRecord["sessions"][number]["role"], record: SeatTaskRecord, write: WriteAccess | undefined, prompt: string, schema: string): Promise<AgentResult> {
     let run: AgentResult;
     // Every session is new: no session id is ever passed, so the reviewer never shares the builder's context.
-    try { run = await this.runtimeFor(record.worktree, write).message(prompt, schema); }
+    try { run = await this.runtimeFor(record.worktree, write).message(prompt, schema, undefined, { purpose: role === "developer" ? "build" : role === "reviewer" ? "review" : "fix" }); }
     catch (error) { this.log(`Codex ${role} session error: ${error instanceof Error ? error.message : String(error)}`); throw new SeatError(`Codex ${role} session failed.`); }
     record.sessions.push({ role, sessionId: run.sessionId, startedAt: run.startedAt, finishedAt: run.finishedAt, usage: run.usage });
     await this.save(record);

@@ -1,8 +1,10 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { codexProgress } from "./codex-progress.js";
 
 export interface AgentResult { sessionId: string; response: unknown; usage?: unknown; startedAt: string; finishedAt: string }
-export interface MessageOptions { signal?: AbortSignal; timeoutMs?: number }
+/** `purpose` labels this run's live progress lines, e.g. "build", "review", "fix", "draft". */
+export interface MessageOptions { signal?: AbortSignal; timeoutMs?: number; purpose?: string }
 export interface AgentRuntime { message(prompt: string, schemaPath: string, sessionId?: string, options?: MessageOptions): Promise<AgentResult> }
 
 /** Short turns: Chick's clarifying replies. */
@@ -41,7 +43,9 @@ export class CodexRuntime implements AgentRuntime {
       child.stdin.end(prompt);
       let output = ""; let stderr = "";
       child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
-      child.stdout.on("data", (part: string) => { output += part; if (output.length > 10_000_000) controller.abort(); });
+      const progress = codexProgress({ purpose: options.purpose, cwd: this.cwd });
+      child.stdout.on("end", () => progress.end());
+      child.stdout.on("data", (part: string) => { output += part; progress.push(part); if (output.length > 10_000_000) controller.abort(); });
       child.stderr.on("data", (part: string) => { stderr += part; if (stderr.length > 100_000) controller.abort(); });
       const code = await new Promise<number | null>((resolve, reject) => { child.on("error", reject); child.on("close", resolve); }).catch((error: unknown) => { if (timedOut) throw new Error(`Codex run timed out after ${minutes(timeoutMs)}.`); throw error; });
       if (timedOut) throw new Error(`Codex run timed out after ${minutes(timeoutMs)}.`);
