@@ -117,19 +117,20 @@ Install and sign in to the chosen CLI before using it. Claude uses the logged-in
 
 Claude uses `plan` permissions for planning/review and `acceptEdits` for Developer build/fix. Its sandbox is required: unavailable sandbox support fails the run, and unsandboxed retries are disabled. Planning/review permits file reads and read-only shell exploration, denies filesystem writes and network access, and exposes no edit, browser, MCP or subagent tools. Developer turns can edit the worktree and the explicit extra directories (the shared Git directory), and run sandboxed commands with network access. Claude's own protected paths and managed policies still apply; an operation those policies deny fails without bypassing permissions. User/project/local settings, hooks, slash commands and unconfigured MCP servers cannot expand these grants. See [Claude sandboxing](https://code.claude.com/docs/en/sandboxing) for platform dependencies. The adapter passes no API-key/token environment variables. It bounds stdout to 10 MB and stderr to 100 KB, terminates cancelled/timed-out processes, and withholds provider diagnostics from failures.
 
-Optional persona content lives in **`seat-personas.json` at the Indra application root**, alongside this README, using this contract:
+Optional persona content lives in **`personas/yahaha.json` under the Indra application root**, using this contract:
 
 ```json
 {
   "seat-001": {
     "voice": "A short description of how this seat speaks.",
     "background": "A short, factual background.",
-    "funFact": "A verified fun fact, with a source link if useful."
+    "funFact": "A verified fun fact, with a source link if useful.",
+    "postPrefix": "A short recurring phrase for progress posts."
   }
 }
 ```
 
-Each field is a nonempty string of at most 1,000 characters. Missing files or seat profiles preserve the current prompts and posts exactly. The loader resolves the existing application root from source, `dist/` and versioned `builds/<id>/` bundles, independent of the team's project working directory. Profiles add voice/background/fact context above either engine and a background/fact footer to Chick's and Developers' thread posts. Original task and authorization wording, channel/root IDs, delivery IDs and recovery behavior are preserved. This adapter supplies the loader and decorators; the dependent persona outcome supplies the repository's actual profiles.
+Each field is a nonempty string of at most 1,000 characters; `postPrefix` is optional. Missing files or seat profiles preserve the current prompts and posts exactly. The loader resolves the existing application root from source, `dist/` and versioned `builds/<id>/` bundles, independent of the team's project working directory. Profiles add voice/background/fact context above either engine. Chick's and Developers' thread posts use the authored prefix, or a background/fact footer when no prefix is supplied. Original task and authorization wording, channel/root IDs, delivery IDs and recovery behavior are preserved. This adapter supplies the loader and decorators; the dependent persona outcome supplies the repository's actual profiles.
 
 ## Live Mattermost check and inventory
 

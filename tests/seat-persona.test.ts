@@ -10,13 +10,15 @@ import { stateCheckout } from "./state-checkout.js";
 
 const profile: SeatPersona = { voice: "Warm, curious and concise.", background: "A keyboard player who enjoys collaboration.", funFact: "The piano has 88 keys." };
 const dirs: string[] = [];
-async function root() { const dir = await mkdtemp(join(tmpdir(), "indra-persona-")); dirs.push(dir); return dir; }
+async function root() { const dir = await mkdtemp(join(tmpdir(), "indra-persona-")); dirs.push(dir); await mkdir(join(dir, "personas")); return dir; }
 afterEach(async () => { await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true }))); });
 
 describe("repository seat personas", () => {
   it.each(["src/seat-persona.ts", "dist/cli.js", "builds/abc123/cli.js"])("loads profiles from the application root for %s", async (path) => {
-    const dir = await root(); await writeFile(join(dir, SEAT_PERSONAS_FILE), JSON.stringify({ "seat-001": profile }));
-    expect(await loadSeatPersonas(pathToFileURL(join(dir, path)).href)).toEqual({ "seat-001": profile });
+    const dir = await root(); const content = { "seat-001": { ...profile, postPrefix: "Let's find the next phrase." } };
+    // The literal path belongs to the dependent persona outcome, independently of the loader's constant.
+    await writeFile(join(dir, "personas", "yahaha.json"), JSON.stringify(content));
+    expect(await loadSeatPersonas(pathToFileURL(join(dir, path)).href)).toEqual(content);
   });
 
   it("preserves behavior and object identity when profiles are missing", async () => {
@@ -26,9 +28,9 @@ describe("repository seat personas", () => {
     expect(personaPrompt("Exact prompt")).toBe("Exact prompt"); expect(personaPost("Exact post")).toBe("Exact post");
   });
 
-  it.each(["null", "[]", "malformed", '{"seat-001":{"voice":"Hello"}}', JSON.stringify({ "seat-001": { ...profile, funFact: "" } }), JSON.stringify({ "seat-001": { ...profile, token: "private" } })])("rejects malformed profiles without echoing their contents", async (value) => {
+  it.each(["null", "[]", "malformed", '{"seat-001":{"voice":"Hello"}}', JSON.stringify({ "seat-001": { ...profile, funFact: "" } }), JSON.stringify({ "seat-001": { ...profile, token: "private" } }), JSON.stringify({ "seat-001": { ...profile, postPrefix: null } }), JSON.stringify({ "seat-001": { ...profile, postPrefix: "" } })])("rejects malformed profiles without echoing their contents", async (value) => {
     const dir = await root(); await writeFile(join(dir, SEAT_PERSONAS_FILE), value);
-    await expect(loadSeatPersonas(pathToFileURL(join(dir, "src/seat-persona.ts")).href)).rejects.toThrow("Invalid seat-personas.json");
+    await expect(loadSeatPersonas(pathToFileURL(join(dir, "src/seat-persona.ts")).href)).rejects.toThrow("Invalid personas/yahaha.json");
   });
 
   it("distinguishes unreadable profiles from missing profiles", async () => {
@@ -68,6 +70,14 @@ describe("repository seat personas", () => {
     await decorated.ensureHomeMembership("team", "home"); expect(chat.ensureHomeMembership).toHaveBeenCalledWith("team", "home");
   });
 
+  it("uses the optional authored post prefix without changing authorization text or delivery arguments", async () => {
+    const content = { ...profile, postPrefix: "One useful step at a time." };
+    const post = vi.fn().mockResolvedValue({ id: "delivered" });
+    const message = "No work has been approved or executed. A person reacts :white_check_mark: on this post.";
+    await withPersonaChat({ post }, content).post("home", message, "root", "delivery");
+    expect(post).toHaveBeenCalledWith("home", `${content.postPrefix}\n\n${message}`, "root", "delivery");
+  });
+
   it("recovers a pending delivery by its original marker after a post succeeded but the connection failed", async () => {
     const seat = { id: "seat-001", displayName: "Chick", roles: ["Team Lead"], externalIdentities: { mattermost: { userId: "chick", username: "chickcorea" } } };
     const checkout = await stateCheckout("indra-persona-delivery-", { $schema: "./schema/v1/state.schema.json", schemaVersion: 1, teams: [{ id: "team-001", slug: "yahaha", displayName: "Yahaha", project: { github: "satoramoto/indra" }, externalIdentities: { mattermost: { teamId: "team", homeChannelId: "home" } }, seats: [seat] }], sprints: [] });
@@ -84,11 +94,11 @@ describe("repository seat personas", () => {
       }),
     };
     const runtime = { message: vi.fn().mockResolvedValue({ sessionId: "original", response: { summary: "Brief", reply: "What matters?", decisions: [], openQuestions: [] }, startedAt: "start", finishedAt: "finish" }) };
-    const bridge = new PlanningBridge(store, withPersonaChat(chat, profile), withPersonaRuntime(runtime, profile));
+    const bridge = new PlanningBridge(store, withPersonaChat(chat, { ...profile, postPrefix: "First phrase." }), withPersonaRuntime(runtime, profile));
     await expect(bridge.start("Plan a feature", [])).rejects.toThrow("Response lost");
     const goal = (await store.read()).planningGoals![0];
     expect((await store.runtime(goal.id)).pending).toBeDefined();
-    await new PlanningBridge(store, withPersonaChat(chat, { ...profile, funFact: "A changed footer." }), withPersonaRuntime(runtime, profile)).poll();
+    await new PlanningBridge(store, withPersonaChat(chat, { ...profile, postPrefix: "A changed phrase." }), withPersonaRuntime(runtime, profile)).poll();
     expect(chat.post).toHaveBeenCalledTimes(2); expect(runtime.message).toHaveBeenCalledTimes(1);
     expect((await store.runtime(goal.id)).pending).toBeUndefined();
     expect(posts[1].props?.indra_delivery_id).toBeDefined(); expect(posts[1].root_id).toBe(posts[0].id);
