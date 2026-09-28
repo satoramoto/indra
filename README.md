@@ -1,6 +1,6 @@
 # Indra
 
-Indra reads stable team seats and draft sprint records from an `indra-state` Git checkout. The planning commands connect Chick's durable seat to an authenticated Codex CLI session and a dedicated Mattermost thread.
+Indra reads stable team seats and draft sprint records from an `indra-state` Git checkout. The planning commands connect Chick's durable seat to an authenticated coding-agent CLI session and a dedicated Mattermost thread.
 
 ## Direction
 
@@ -14,7 +14,7 @@ Indra is a startup simulator: a control plane where stable team seats in Matterm
 
 **People and state.** The only human step is approving plans. Agents merge their own PRs once CI is green and the fresh reviewer has approved. Indra writes planning records to `indra-state`. Indra reads live Mattermost (the existing `--mattermost` mode) to confirm it matches `indra-state`; that read stays read-only.
 
-**POC milestone.** The full team loop runs on the Indra repository itself: a goal is set, Chick plans, a human approves, a Developer seat does the work in a worktree, opens a PR, starts a fresh reviewer, fixes, merges, then goes idle. Codex runs every seat first. The Claude Code adapter and handing a seat from one engine to another come later.
+**POC milestone.** The full team loop runs on the Indra repository itself: a goal is set, Chick plans, a human approves, a Developer seat does the work in a worktree, opens a PR, starts a fresh reviewer, fixes, merges, then goes idle. Codex is the default; each seat can select Claude Code for new sessions. Existing sessions stay on their originating engine.
 
 **Planned PR order.**
 
@@ -81,7 +81,7 @@ The bridge uses Chick's 1Password bot item (`Mattermost bot - chickcorea`) and t
 
 ## Developer seats
 
-A Developer seat picks up approved work and runs the dev loop on it with Codex:
+A Developer seat picks up approved work and runs the dev loop on it with its selected engine:
 
 ```sh
 npm start -- seat run --seat SEAT_ID --state /path/to/indra-state
@@ -99,6 +99,37 @@ It refuses a Team Lead seat or a seat that is not in `state.json`. Run one proce
 Any failure marks the assignment `failed` with a short `note` and the seat goes idle; a failed task's worktree is kept for inspection. On restart the seat resumes an `in-review` assignment from its recorded step; a `running` assignment that never opened a PR is marked `failed` rather than rebuilt. It never takes a second assignment while one is in flight. With nothing queued it checks again every 30 seconds.
 
 Codex runs in the `workspace-write` sandbox with network access, so it can push and use `gh`; the builder and fix sessions may also write the project's shared Git directory, and the reviewer may not. They use the logged-in Codex CLI and `gh`. The seat posts short progress replies (claimed, PR opened, review done, merged or failed) in the goal thread as its own bot, using the 1Password item `Mattermost bot - USERNAME` (the seat's Mattermost username), as Chick's bridge does. A missing item stops the seat with an error naming it. Codex session IDs, usage and the task's step live in `<state-checkout>.runtime/seat-SEAT_ID-GOAL_ID-OUTCOME_ID.json`, not in `state.json`.
+
+## Seat engines and optional personas
+
+Create `<state-checkout>.runtime/seat-engines.json` to select an engine by the seat ID in `state.json`:
+
+```json
+{
+  "seat-001": "claude",
+  "seat-005": "codex"
+}
+```
+
+The file is a plain seat-ID-to-engine object. Only `codex` and `claude` are accepted; unknown seat IDs, invalid JSON, invalid engines and unreadable files stop the command with a configuration error. A missing file or omitted seat selects Codex. This is machine-local configuration, never part of `state.json` or a Git commit. Restart the bridge or seat runner after changing it. Planning start/serve/approve/integrate/merge/rollback and Developer build/review/fix all use this selection. `planning propose` still only records the owner's request without a credential or model call.
+
+Install and sign in to the chosen CLI before using it. Claude uses the logged-in `claude` executable, following the [Claude Code CLI reference](https://code.claude.com/docs/en/cli-reference). The adapter pipes prompts on stdin, supplies `--json-schema` on every turn and accepts only a successful JSON result with `structured_output` and a session UUID. Usage and timestamps keep the existing runtime-record format. Claude handles are stored as **`claude:<UUID>`**; existing bare Codex IDs remain unchanged. A saved handle always selects its originating engine even after the seat configuration changes. Chick resumes that exact session; each Developer build, review and fix remains a fresh session. No cross-engine migration, automatic fallback or interrupted-turn replay occurs.
+
+Claude uses `plan` permissions for planning/review and `acceptEdits` for Developer build/fix. Its sandbox is required: unavailable sandbox support fails the run, and unsandboxed retries are disabled. Planning/review permits file reads and read-only shell exploration, denies filesystem writes and network access, and exposes no edit, browser, MCP or subagent tools. Developer turns can edit the worktree and the explicit extra directories (the shared Git directory), and run sandboxed commands with network access. Claude's own protected paths and managed policies still apply; an operation those policies deny fails without bypassing permissions. User/project/local settings, hooks, slash commands and unconfigured MCP servers cannot expand these grants. See [Claude sandboxing](https://code.claude.com/docs/en/sandboxing) for platform dependencies. The adapter passes no API-key/token environment variables. It bounds stdout to 10 MB and stderr to 100 KB, terminates cancelled/timed-out processes, and withholds provider diagnostics from failures.
+
+Optional persona content lives in **`seat-personas.json` at the Indra application root**, alongside this README, using this contract:
+
+```json
+{
+  "seat-001": {
+    "voice": "A short description of how this seat speaks.",
+    "background": "A short, factual background.",
+    "funFact": "A verified fun fact, with a source link if useful."
+  }
+}
+```
+
+Each field is a nonempty string of at most 1,000 characters. Missing files or seat profiles preserve the current prompts and posts exactly. The loader resolves the existing application root from source, `dist/` and versioned `builds/<id>/` bundles, independent of the team's project working directory. Profiles add voice/background/fact context above either engine and a background/fact footer to Chick's and Developers' thread posts. Original task and authorization wording, channel/root IDs, delivery IDs and recovery behavior are preserved. This adapter supplies the loader and decorators; the dependent persona outcome supplies the repository's actual profiles.
 
 ## Live Mattermost check and inventory
 
