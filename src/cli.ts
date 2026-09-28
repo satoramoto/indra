@@ -239,6 +239,11 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
           canReload: process.env[LAUNCHER_ENV] === "1",
           check: () => updater.check(),
           current: () => readBuildStamp(defaultAppDir),
+          paused: () => updater.paused(),
+          setPaused: (paused) => updater.setPaused(paused),
+          rollbackPlan: () => updater.rollbackPlan(),
+          rollback: () => updater.rollback(),
+          rolledBack: () => updater.rolledBack(),
         },
         view,
         reload: async (current) => {

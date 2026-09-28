@@ -8,8 +8,13 @@ export const stampFile = (appDir: string) => join(appDir, "dist", "build-stamp.j
 
 /** The stamp of the build now in `dist/`, or undefined while there is none (or it is being rewritten). */
 export async function readBuildStamp(appDir: string): Promise<BuildStamp | undefined> {
+  return readStampIn(join(appDir, "dist"));
+}
+
+/** The stamp of the build in `dir` (a `builds/<name>` directory or `dist`), or undefined without a valid one. */
+export async function readStampIn(dir: string): Promise<BuildStamp | undefined> {
   try {
-    const stamp = JSON.parse(await readFile(stampFile(appDir), "utf8")) as Partial<BuildStamp>;
+    const stamp = JSON.parse(await readFile(join(dir, "build-stamp.json"), "utf8")) as Partial<BuildStamp>;
     return typeof stamp.id === "string" && stamp.id ? { id: stamp.id, sha: typeof stamp.sha === "string" ? stamp.sha : "", builtAt: typeof stamp.builtAt === "string" ? stamp.builtAt : "" } : undefined;
   } catch { return undefined; }
 }

@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { execFileSync, spawn } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readBuildStamp } from "../src/build-stamp.js";
-import { pruneBuilds, SelfUpdater } from "../src/self-update.js";
+import { pruneBuilds, SelfUpdater, switchDist } from "../src/self-update.js";
 import { git } from "./state-checkout.js";
 
 const head = (dir: string, ref = "HEAD") => git(dir, "rev-parse", ref).trim();
@@ -61,7 +61,8 @@ fi
     git(upstream, "commit", "--quiet", "-am", `Change ${file}`);
     git(upstream, "push", "--quiet");
   };
-  return { app, remote, updater: new SelfUpdater(app, npm, undefined, join(root, "state.runtime")), npmCalls, merge };
+  const runtime = join(root, "state.runtime");
+  return { app, remote, runtime, npm, updater: new SelfUpdater(app, npm, undefined, runtime), npmCalls, merge };
 }
 
 describe("self-update", () => {
@@ -179,6 +180,76 @@ console.log(JSON.stringify({ reads, misses }));
     await writeFile(join(runtime, "builds-in-use", "2.json"), JSON.stringify({ pid: dead.pid, build: join(app, "builds", "stale-record") }));
     await pruneBuilds(app, ["current", "previous"], { runtimeDir: runtime });
     expect((await readdir(join(app, "builds"))).sort()).toEqual(["current", "fresh", "previous", "used"]);
+  });
+
+  it("keeps the pause setting across restarts and neither pulls, builds nor switches while paused", async () => {
+    const { app, runtime, npm, updater, npmCalls, merge } = await fixture();
+    const before = head(app);
+    await updater.setPaused(true);
+    // A new updater stands in for Indra after a reload or restart: the setting lives in the runtime directory.
+    const restarted = new SelfUpdater(app, npm, undefined, runtime);
+    expect(await restarted.paused()).toBe(true);
+    await merge("code.ts", "export const version = 2;\n");
+    expect(await restarted.check()).toMatchObject({ outcome: "paused", message: "1 new commit waiting on origin/main" });
+    expect(head(app)).toBe(before);
+    expect(await npmCalls()).toEqual([]);
+    expect(await readBuildStamp(app)).toMatchObject({ id: "running" });
+    await restarted.setPaused(false);
+    expect(await updater.check()).toMatchObject({ outcome: "built" });
+    expect(await readBuildStamp(app)).toMatchObject({ sha: head(app) });
+  });
+
+  it("rolls back to the previous build atomically and pauses, so the next check does not rebuild", async () => {
+    const { app, updater, npmCalls, merge } = await fixture();
+    await merge("code.ts", "export const version = 2;\n");
+    expect(await updater.check()).toMatchObject({ outcome: "built" });
+    const good = head(app);
+    await merge("code.ts", "export const version = 3;\n");
+    expect(await updater.check()).toMatchObject({ outcome: "built" });
+    const bad = head(app);
+    expect(await updater.rolledBack()).toBeUndefined();
+    const plan = await updater.rollbackPlan();
+    expect(plan).toMatchObject({ from: { sha: bad }, to: { sha: good } });
+    expect(await updater.rollback()).toMatchObject({ rolledBack: true, message: `Rolled back to ${good.slice(0, 7)} from ${bad.slice(0, 7)}; updates paused (U resumes).` });
+    expect((await lstat(join(app, "dist"))).isSymbolicLink()).toBe(true);
+    expect(await readBuildStamp(app)).toMatchObject({ sha: good });
+    expect(await updater.paused()).toBe(true);
+    expect(await updater.rolledBack()).toEqual({ sha: good, fromSha: bad });
+    // The bad commit is not rebuilt while paused.
+    expect(await updater.check()).toMatchObject({ outcome: "paused" });
+    expect(await readBuildStamp(app)).toMatchObject({ sha: good });
+    expect(await npmCalls()).toEqual(["run build", "run build"]);
+    // The build rolled back from is now the rollback target, so a second R undoes the rollback.
+    expect(await updater.rollbackPlan()).toMatchObject({ from: { sha: good }, to: { sha: bad } });
+  });
+
+  it("does nothing on rollback when there is no previous build", async () => {
+    const { app, updater } = await fixture();
+    expect(await updater.rollbackPlan()).toBeUndefined();
+    expect(await updater.rollback()).toEqual({ rolledBack: false, message: "No previous build to roll back to; nothing changed." });
+    expect((await lstat(join(app, "dist"))).isDirectory()).toBe(true);
+    expect(await readBuildStamp(app)).toMatchObject({ id: "running" });
+    expect(await updater.paused()).toBe(false);
+    expect(await updater.rolledBack()).toBeUndefined();
+  });
+
+  it("never prunes the rollback target, even when a caller does not name it", async () => {
+    const app = await mkdtemp(join(tmpdir(), "indra-prune-"));
+    const runtime = join(app, "state.runtime");
+    const hour = 60 * 60_000;
+    const names = ["first", "second", "third"];
+    for (const name of names) {
+      await mkdir(join(app, "builds", name), { recursive: true });
+      await writeFile(join(app, "builds", name, "cli.js"), "");
+    }
+    await switchDist(app, "first", { runtimeDir: runtime });
+    await switchDist(app, "second", { runtimeDir: runtime });
+    expect(await readlink(join(app, "dist-previous"))).toBe(join("builds", "first"));
+    // All builds are now past the grace period and none is named by the caller: only the live build and the rollback target stay.
+    for (const name of names) await utimes(join(app, "builds", name), new Date(Date.now() - hour), new Date(Date.now() - hour));
+    await pruneBuilds(app, [], { runtimeDir: runtime });
+    expect((await readdir(join(app, "builds"))).sort()).toEqual(["first", "second"]);
+    expect(await new SelfUpdater(app, "npm", undefined, runtime).rollbackPlan()).toMatchObject({ build: "first" });
   });
 
   it("blocks without remembering the commit when npm ci fails, keeps the running build, and retries the install next time", async () => {
