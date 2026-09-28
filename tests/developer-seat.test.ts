@@ -1,14 +1,16 @@
-import { describe, expect, it } from "vitest";
-import { mkdir, readFile } from "node:fs/promises";
+import { describe, expect, it, vi } from "vitest";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { git, stateCheckout } from "./state-checkout.js";
 import { PlanningStore } from "../src/planning.js";
-import { DeveloperSeat, loadDeveloperSeat, type SeatChat, type SeatTaskRecord, type Shell, type ShellResult } from "../src/developer-seat.js";
+import { DeveloperSeat, loadDeveloperSeat, processShell, type SeatChat, type SeatTaskRecord, type Shell, type ShellResult } from "../src/developer-seat.js";
 import { sandboxArgs, type AgentResult, type AgentRuntime, type WriteAccess } from "../src/codex-runtime.js";
 import type { PlanningAssignment as Assignment } from "../src/planning.js";
 import { parseOptions } from "../src/cli.js";
 
 const PR = "https://github.com/satoramoto/indra/pull/9";
+const BRANCH = "seat-002/goal-abc-outcome-1";
+const RECORD = "seat-seat-002-goal-abc-outcome-1";
 const seat = (id: string, name: string, roles: string[]) => ({ id, displayName: name, roles, externalIdentities: { mattermost: { userId: id, username: name.toLowerCase() } } });
 
 const SPRINT = { branch: "sprint/goal-abc", baseSha: "a".repeat(40), status: "collecting" };
@@ -45,6 +47,18 @@ class FakeShell implements Shell {
   mainMerges: number[] = [];
   /** Each "is origin/main merged into HEAD" check takes the next exit code; by default it is. */
   resolved: number[] = [];
+  refs = new Set<string>();
+  worktrees = new Map<string, { branch: string; gitDir: string }>();
+  unfinishedMerge = false;
+  inspectCode?: number;
+  abortCode = 0;
+  comments: { body: string }[] = [];
+  async retain(worktree: string, branch: string, gitDir: string) {
+    await mkdir(worktree, { recursive: true });
+    await mkdir(gitDir, { recursive: true });
+    this.worktrees.set(worktree, { branch, gitDir });
+    this.refs.add(`refs/heads/${branch}`);
+  }
   onFirst?: () => Promise<void>;
   async run(command: string, args: string[], cwd: string): Promise<ShellResult> {
     if (this.onFirst) { const hook = this.onFirst; this.onFirst = undefined; await hook(); }
@@ -52,7 +66,21 @@ class FakeShell implements Shell {
     this.calls.push(line);
     // `gh repo clone` makes the checkout Indra then moves into place.
     if (line.startsWith("gh repo clone")) await mkdir(join(args[3], ".git"), { recursive: true });
-    if (line.startsWith("git rev-parse")) return { code: 0, stdout: "/proj/.git\n", stderr: "" };
+    if (line.startsWith("git show-ref")) return { code: this.refs.has(args.at(-1)!) ? 0 : 1, stdout: "", stderr: "" };
+    if (line.startsWith("git worktree add")) {
+      if (this.worktrees.has(args[5]) || this.refs.has(`refs/heads/${args[4]}`)) return { code: 128, stdout: "", stderr: "already exists" };
+      await this.retain(args[5], args[4], join(cwd, ".git"));
+    }
+    if (line.startsWith("git rev-parse") && args.includes("MERGE_HEAD")) return { code: this.inspectCode ?? (this.unfinishedMerge ? 0 : 1), stdout: this.unfinishedMerge ? "a".repeat(40) : "", stderr: "" };
+    if (line.startsWith("git rev-parse") && args.includes("--show-toplevel")) return { code: this.worktrees.has(cwd) ? 0 : 128, stdout: cwd, stderr: "" };
+    if (line.startsWith("git rev-parse")) return { code: 0, stdout: this.worktrees.get(cwd)?.gitDir ?? join(cwd, ".git"), stderr: "" };
+    if (line.startsWith("git symbolic-ref")) return { code: 0, stdout: `refs/heads/${this.worktrees.get(cwd)?.branch}`, stderr: "" };
+    if (line.startsWith("git merge --abort")) {
+      if (!this.abortCode) this.unfinishedMerge = false;
+      return { code: this.abortCode, stdout: "", stderr: "" };
+    }
+    if (line.startsWith("gh api") && args.includes("--paginate")) return { code: 0, stdout: JSON.stringify([this.comments]), stderr: "" };
+    if (line.startsWith("gh pr comment")) this.comments.push({ body: args.at(-1)! });
     if (line.startsWith("gh pr merge")) {
       // Each merge attempt takes the next outcome; by default gh succeeds and the PR merges.
       const outcome = this.merges.shift() ?? { code: 0, stderr: "", merged: true };
@@ -60,8 +88,16 @@ class FakeShell implements Shell {
       return { code: outcome.code, stdout: "", stderr: outcome.stderr };
     }
     if (line.startsWith("gh pr view") && args.includes("mergeable,mergeStateStatus")) return { code: 0, stdout: JSON.stringify(this.mainStatus.shift() ?? { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" }), stderr: "" };
-    if (line.startsWith("git merge --no-edit origin/")) return { code: this.mainMerges.shift() ?? 0, stdout: "", stderr: "" };
-    if (line.startsWith("git merge-base --is-ancestor")) return { code: this.resolved.shift() ?? 0, stdout: "", stderr: "" };
+    if (line.startsWith("git merge --no-edit origin/")) {
+      const code = this.unfinishedMerge ? 128 : this.mainMerges.shift() ?? 0;
+      this.unfinishedMerge = code !== 0;
+      return { code, stdout: "", stderr: "" };
+    }
+    if (line.startsWith("git merge-base --is-ancestor")) {
+      const code = this.resolved.shift() ?? 0;
+      if (!code) this.unfinishedMerge = false;
+      return { code, stdout: "", stderr: "" };
+    }
     if (line.startsWith("gh pr view")) return { code: 0, stdout: this.merged ? "MERGED\n" : "OPEN\n", stderr: "" };
     if (line.startsWith("gh pr checks")) return { code: this.checksCode, stdout: "", stderr: "" };
     return { code: 0, stdout: "", stderr: "" };
@@ -91,6 +127,18 @@ async function setup(assignments: Assignment[], integration?: object) {
   return { store, chat, shell, codex, seat: make(), make, assignment };
 }
 
+async function retainRecord(store: PlanningStore, shell: FakeShell, changes: Partial<SeatTaskRecord> = {}) {
+  const record: SeatTaskRecord = {
+    goalId: "goal-abc", outcomeId: "outcome-1", step: "ci", branch: BRANCH,
+    worktree: join(store.runtimeDir, "worktrees", "goal-abc-outcome-1"), gitDir: join(store.runtimeDir, "projects", "satoramoto", "indra", ".git"), prUrl: PR, sessions: [], ...changes,
+  };
+  await shell.retain(record.worktree, record.branch, record.gitDir!);
+  await store.saveRuntime(RECORD, record);
+  return record;
+}
+
+const reviewing = (): Assignment => ({ outcomeId: "outcome-1", seatId: "seat-002", status: "in-review", updatedAt: "2026-01-01T00:00:00Z", prUrl: PR });
+
 describe("developer seat", () => {
   it("parses seat run and refuses a Team Lead or unknown seat", async () => {
     expect(parseOptions(["seat", "run", "--seat", "seat-002", "--state", "/tmp/s"])).toEqual({ mode: "seat", seatId: "seat-002", checkout: "/tmp/s" });
@@ -116,9 +164,12 @@ describe("developer seat", () => {
     expect(shell.calls[0]).toMatch(new RegExp(`^gh repo clone satoramoto/indra ${project}\\.[0-9a-f-]+\\.clone @${join(store.runtimeDir, "projects", "satoramoto")}$`));
     expect(shell.calls.slice(1)).toEqual([
       `git -c credential.helper= -c credential.helper=!gh auth git-credential fetch origin main @${project}`,
+      `git show-ref --verify --quiet refs/heads/${BRANCH} @${project}`,
+      `git show-ref --verify --quiet refs/remotes/origin/${BRANCH} @${project}`,
       `git rev-parse --path-format=absolute --git-common-dir @${project}`,
       `git worktree add --no-track -b seat-002/goal-abc-outcome-1 ${worktree} origin/main @${project}`,
-      `gh pr comment ${PR} --body **Indra review:** Reviewed\n\nFindings:\n- Bug in foo @${worktree}`,
+      `gh api repos/satoramoto/indra/issues/9/comments?per_page=100 --method GET --paginate --slurp @${worktree}`,
+      expect.stringContaining(`gh pr comment ${PR} --body **Indra review:** Reviewed\n\nFindings:\n- Bug in foo\n\n<!-- indra-review:`),
       `gh pr view ${PR} --json state --jq .state @${project}`,
       `gh pr view ${PR} --json mergeable,mergeStateStatus @${project}`,
       `gh pr checks ${PR} --watch @${worktree}`,
@@ -129,7 +180,7 @@ describe("developer seat", () => {
       `git branch -D seat-002/goal-abc-outcome-1 @${project}`,
     ]);
     // Three new sessions: none resumes another. Build and fix write with network; the reviewer is read-only.
-    const write = ["--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true", "--add-dir", "/proj/.git"];
+    const write = ["--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true", "--add-dir", join(project, ".git")];
     expect(codex.runs.map((run) => [run.schema.split("/").at(-1), run.sessionId, run.sandbox])).toEqual([["developer.json", undefined, write], ["review.json", undefined, ["--sandbox", "read-only"]], ["developer.json", undefined, write]]);
     expect(codex.runs[2].prompt).toContain("Bug in foo");
     const record = JSON.parse(await readFile(join(store.runtimeDir, "seat-seat-002-goal-abc-outcome-1.json"), "utf8")) as SeatTaskRecord;
@@ -215,7 +266,7 @@ describe("developer seat", () => {
       `gh pr merge ${PR} --squash @${join(store.runtimeDir, "projects", "satoramoto", "indra")}`,
     ]);
     onlyOwnPushes(shell.calls, worktree);
-    const write = ["--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true", "--add-dir", "/proj/.git"];
+    const write = ["--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true", "--add-dir", join(store.runtimeDir, "projects", "satoramoto", "indra", ".git")];
     expect(codex.runs).toHaveLength(3);
     expect(codex.runs[2]).toMatchObject({ cwd: worktree, sandbox: write, sessionId: undefined });
     expect(codex.runs[2].prompt).toContain("keeping the intent of both sides");
@@ -234,7 +285,7 @@ describe("developer seat", () => {
     const worktree = join(store.runtimeDir, "worktrees", "goal-abc-outcome-1");
     const project = join(store.runtimeDir, "projects", "satoramoto", "indra");
     const fetch = `git -c credential.helper= -c credential.helper=!gh auth git-credential fetch origin main sprint/goal-abc @${project}`;
-    expect(shell.calls.slice(1, 4)).toEqual([fetch, `git rev-parse --path-format=absolute --git-common-dir @${project}`, `git worktree add --no-track -b seat-002/goal-abc-outcome-1 ${worktree} origin/sprint/goal-abc @${project}`]);
+    expect(shell.calls).toEqual(expect.arrayContaining([fetch, `git rev-parse --path-format=absolute --git-common-dir @${project}`, `git worktree add --no-track -b seat-002/goal-abc-outcome-1 ${worktree} origin/sprint/goal-abc @${project}`]));
     expect(codex.runs[0].prompt).toContain("gh pr create --base sprint/goal-abc");
     expect(shell.calls).toContain(`gh pr edit ${PR} --base sprint/goal-abc @${worktree}`);
     const conflictAt = shell.calls.indexOf(`git merge --no-edit origin/sprint/goal-abc @${worktree}`);
@@ -327,9 +378,7 @@ describe("developer seat", () => {
 
   it("on restart resumes an in-review assignment from its recorded step instead of claiming another", async () => {
     const { store, codex, shell, make, assignment } = await setup([{ outcomeId: "outcome-1", seatId: "seat-002", status: "in-review", updatedAt: "2026-01-01T00:00:00Z", prUrl: PR }, queued("outcome-2", "2025-01-01T00:00:00Z")]);
-    const worktree = join(store.runtimeDir, "worktrees", "goal-abc-outcome-1");
-    const record: SeatTaskRecord = { goalId: "goal-abc", outcomeId: "outcome-1", step: "ci", branch: "b", worktree, gitDir: "/proj/.git", prUrl: PR, sessions: [] };
-    await store.saveRuntime("seat-seat-002-goal-abc-outcome-1", record);
+    await retainRecord(store, shell);
     await make().tick();
     expect(codex.runs).toHaveLength(0);
     expect(shell.calls.some((call) => call.startsWith("git worktree add"))).toBe(false);
@@ -337,11 +386,270 @@ describe("developer seat", () => {
     expect((await assignment("outcome-2")).status).toBe("queued");
   });
 
+  it.each([undefined, SPRINT])("aborts a stale merge before retrying its base without using a conflict round (%j)", async (integration) => {
+    const { store, shell, codex, make, assignment } = await setup([reviewing()], integration);
+    const record = await retainRecord(store, shell, { conflictRounds: 2 });
+    shell.unfinishedMerge = true;
+    shell.mainStatus = [conflicting];
+    await make().tick();
+    const aborted = shell.calls.indexOf(`git merge --abort @${record.worktree}`);
+    const merged = shell.calls.indexOf(`git merge --no-edit origin/${integration?.branch ?? "main"} @${record.worktree}`);
+    expect(aborted).toBeGreaterThan(shell.calls.indexOf(`git symbolic-ref --quiet HEAD @${record.worktree}`));
+    expect(merged).toBeGreaterThan(aborted);
+    expect(shell.calls.filter((call) => call.startsWith("git merge --abort"))).toHaveLength(1);
+    expect(codex.runs).toHaveLength(0);
+    expect((await store.readRuntimeFile<SeatTaskRecord>(RECORD))?.conflictRounds).toBe(2);
+    expect((await assignment("outcome-1")).status).toBe("merged");
+    if (integration) expect(shell.calls.some((call) => call.includes("origin/main"))).toBe(false);
+    onlyOwnPushes(shell.calls, record.worktree);
+  });
+
+  it("leaves a clean resumed worktree alone", async () => {
+    const { store, shell, codex, make, assignment } = await setup([reviewing()]);
+    await retainRecord(store, shell, { conflictRounds: 1 });
+    await make().tick();
+    expect(shell.calls.some((call) => call.startsWith("git merge --abort"))).toBe(false);
+    expect(codex.runs).toHaveLength(0);
+    expect((await store.readRuntimeFile<SeatTaskRecord>(RECORD))?.conflictRounds).toBe(1);
+    expect((await assignment("outcome-1")).status).toBe("merged");
+  });
+
+  it.each(["abort", "inspect"])("stops resumed work when merge %s fails", async (failure) => {
+    const { store, shell, codex, make, assignment } = await setup([reviewing()], SPRINT);
+    await retainRecord(store, shell, { conflictRounds: 1 });
+    shell.unfinishedMerge = true;
+    shell.abortCode = failure === "abort" ? 1 : 0;
+    shell.inspectCode = failure === "inspect" ? 128 : undefined;
+    shell.mainStatus = [conflicting];
+    await make().tick();
+    expect(await assignment("outcome-1")).toMatchObject({ status: "failed", note: failure === "abort" ? "ci: git merge --abort failed (exit 1)." : "ci: Could not inspect unfinished merge." });
+    expect(shell.calls.some((call) => call.startsWith("git merge --no-edit") || call.startsWith("gh ") || call.includes(" push "))).toBe(false);
+    expect(codex.runs).toHaveLength(0);
+    expect((await store.readRuntimeFile<SeatTaskRecord>(RECORD))?.conflictRounds).toBe(1);
+  });
+
+  it.each(["branch", "project", "path", "assignment"])("does not abort or run sessions when the saved %s is not owned", async (mismatch) => {
+    const { store, shell, codex, make, assignment } = await setup([reviewing()]);
+    const record = await retainRecord(store, shell);
+    shell.unfinishedMerge = true;
+    const checkout = shell.worktrees.get(record.worktree)!;
+    if (mismatch === "branch") checkout.branch = "someone-elses-branch";
+    if (mismatch === "project") { checkout.gitDir = join(store.runtimeDir, "other", ".git"); await mkdir(checkout.gitDir, { recursive: true }); }
+    if (mismatch === "path") record.worktree = join(store.runtimeDir, "worktrees", "someone-else");
+    if (mismatch === "assignment") record.outcomeId = "outcome-2";
+    await store.saveRuntime(RECORD, record);
+    await make().tick();
+    expect((await assignment("outcome-1")).status).toBe("failed");
+    expect(shell.calls.some((call) => call.startsWith("git merge") || call.startsWith("gh "))).toBe(false);
+    expect(codex.runs).toHaveLength(0);
+  });
+
+  it("counts only the genuine conflict after recovering an interrupted merge", async () => {
+    const { store, shell, codex, make, assignment } = await setup([reviewing()], SPRINT);
+    await retainRecord(store, shell, { conflictRounds: 1 });
+    shell.unfinishedMerge = true;
+    shell.mainStatus = [conflicting];
+    shell.mainMerges = [1];
+    await make().tick();
+    expect(codex.runs).toHaveLength(1);
+    expect(codex.runs[0].prompt).toContain("Merging origin/sprint/goal-abc");
+    expect((await store.readRuntimeFile<SeatTaskRecord>(RECORD))?.conflictRounds).toBe(2);
+    expect((await assignment("outcome-1")).status).toBe("merged");
+  });
+
+  it("does not retry a genuine conflict when aborting its unresolved merge fails", async () => {
+    const { store, shell, codex, make, assignment } = await setup([reviewing()]);
+    await retainRecord(store, shell);
+    shell.mainStatus = [conflicting];
+    shell.mainMerges = [1];
+    shell.resolved = [1];
+    shell.abortCode = 1;
+    await make().tick();
+    expect(await assignment("outcome-1")).toMatchObject({ status: "failed", note: "ci: git merge --abort failed (exit 1)." });
+    expect(shell.calls.filter((call) => call.startsWith("git merge --no-edit"))).toHaveLength(1);
+    expect(shell.calls.some((call) => call.includes(" push ") || call.startsWith("gh pr checks"))).toBe(false);
+    expect(codex.runs).toHaveLength(1);
+  });
+
+  it("re-queues failed CI using its existing PR, branch, worktree and runtime history", async () => {
+    const { store, shell, codex, seat, make, assignment } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")], SPRINT);
+    shell.checksCode = 1;
+    await seat.tick();
+    expect((await assignment("outcome-1")).status).toBe("failed");
+    const saved = (await store.readRuntimeFile<SeatTaskRecord>(RECORD))!;
+    await store.update((state) => { state.planningGoals![0].assignments![0].status = "queued"; }, "Re-queue failed assignment");
+    shell.checksCode = 0;
+    shell.calls = [];
+    const sessions = codex.runs.length;
+    shell.onFirst = async () => { expect(await assignment("outcome-1")).toMatchObject({ status: "running", prUrl: PR }); };
+    await make().tick();
+    const resumed = (await store.readRuntimeFile<SeatTaskRecord>(RECORD))!;
+    expect(resumed).toMatchObject({ branch: saved.branch, worktree: saved.worktree, prUrl: PR, sessions: saved.sessions });
+    expect(codex.runs).toHaveLength(sessions);
+    expect(shell.calls.some((call) => call.startsWith("git worktree add"))).toBe(false);
+    expect(await assignment("outcome-1")).toMatchObject({ status: "merged", prUrl: PR });
+  });
+
+  it.each([undefined, SPRINT])("grants a fresh conflict budget when a failed assignment is explicitly re-queued (%j)", async (integration) => {
+    const { store, shell, codex, make, assignment } = await setup([reviewing()], integration);
+    await retainRecord(store, shell);
+    shell.mainStatus = [conflicting];
+    shell.mainMerges = [1, 1];
+    shell.resolved = [1, 1];
+    await make().tick();
+    expect((await assignment("outcome-1")).status).toBe("failed");
+    const saved = (await store.readRuntimeFile<SeatTaskRecord>(RECORD))!;
+    expect(saved.conflictRounds).toBe(2);
+    expect(codex.runs).toHaveLength(2);
+
+    await store.update((state) => { state.planningGoals![0].assignments![0].status = "queued"; }, "Re-queue failed assignment");
+    shell.mainStatus = [conflicting];
+    shell.mainMerges = [1, 1];
+    shell.resolved = [1, 0];
+    shell.onFirst = async () => { expect((await store.readRuntimeFile<SeatTaskRecord>(RECORD))?.conflictRounds).toBe(0); };
+    await make().tick();
+
+    const retried = (await store.readRuntimeFile<SeatTaskRecord>(RECORD))!;
+    expect(retried).toMatchObject({ branch: saved.branch, worktree: saved.worktree, prUrl: PR, conflictRounds: 2 });
+    expect(retried.sessions).toHaveLength(4);
+    expect(retried.sessions.slice(0, 2)).toEqual(saved.sessions);
+    expect(codex.runs).toHaveLength(4);
+    for (const run of codex.runs.slice(2)) expect(run.prompt).toContain(`Merging origin/${integration?.branch ?? "main"}`);
+    expect(shell.calls.some((call) => call.startsWith("git worktree add"))).toBe(false);
+    expect(await assignment("outcome-1")).toMatchObject({ status: "merged", prUrl: PR });
+  });
+
+  it.each(["running", "in-review"] as const)("preserves an exhausted conflict budget when a %s assignment restarts", async (status) => {
+    const { store, shell, codex, make, assignment } = await setup([{ ...reviewing(), status }], SPRINT);
+    await retainRecord(store, shell, { conflictRounds: 2 });
+    shell.mainStatus = [conflicting];
+    shell.mainMerges = [1];
+    await make().tick();
+    expect(codex.runs).toHaveLength(0);
+    expect((await store.readRuntimeFile<SeatTaskRecord>(RECORD))?.conflictRounds).toBe(2);
+    expect(await assignment("outcome-1")).toMatchObject({ status: "failed", note: "ci: merge conflict with sprint/goal-abc could not be resolved" });
+    expect(shell.calls.some((call) => call.includes(" push ") || call.startsWith("gh pr merge"))).toBe(false);
+  });
+
+  it.each(["worktree", "build"] as const)("re-queues a saved %s step without colliding with its existing checkout", async (step) => {
+    const { store, shell, codex, make, assignment } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
+    const record = await retainRecord(store, shell, { step, prUrl: undefined });
+    await writeFile(join(record.worktree, "retained.txt"), "unfinished work");
+    codex.fail = true;
+    await make().tick();
+    expect(codex.runs).toHaveLength(1);
+    expect(codex.runs[0].cwd).toBe(record.worktree);
+    expect(shell.calls.some((call) => call.startsWith("git worktree add"))).toBe(false);
+    expect(await readFile(join(record.worktree, "retained.txt"), "utf8")).toBe("unfinished work");
+    expect(await assignment("outcome-1")).toMatchObject({ status: "failed", note: "build: Codex developer session failed." });
+  });
+
+  it.each(["worktree", "branch", "remote branch"])("starts a collision-free re-queue when runtime is absent but a retained %s exists", async (retained) => {
+    const { store, shell, codex, make, assignment } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")], SPRINT);
+    const original = join(store.runtimeDir, "worktrees", "goal-abc-outcome-1");
+    if (retained === "worktree") { await mkdir(original, { recursive: true }); await writeFile(join(original, "retained.txt"), "unfinished work"); }
+    else shell.refs.add(`${retained === "branch" ? "refs/heads" : "refs/remotes/origin"}/${BRANCH}`);
+    await make().tick();
+    const record = (await store.readRuntimeFile<SeatTaskRecord>(RECORD))!;
+    expect(record.branch).toMatch(/^seat-002\/goal-abc-outcome-1-attempt-[0-9a-f-]{36}$/);
+    expect(record.worktree).not.toBe(original);
+    expect(codex.runs[0].cwd).toBe(record.worktree);
+    expect(shell.calls).toContain(`git worktree add --no-track -b ${record.branch} ${record.worktree} origin/sprint/goal-abc @${join(store.runtimeDir, "projects", "satoramoto", "indra")}`);
+    expect(shell.calls.some((call) => call.startsWith(`git worktree remove --force ${original} @`) || call.startsWith(`git branch -D ${BRANCH} @`))).toBe(false);
+    if (retained === "worktree") expect(await readFile(join(original, "retained.txt"), "utf8")).toBe("unfinished work");
+    expect((await assignment("outcome-1")).status).toBe("merged");
+  });
+
+  it.each(["missing", "unusable"])("can re-queue a replacement attempt again when an old PR has %s runtime", async (runtime) => {
+    const oldPR = "https://github.com/satoramoto/indra/pull/8";
+    const { store, shell, codex, make, assignment } = await setup([{ ...queued("outcome-1", "2026-01-01T00:00:00Z"), prUrl: oldPR }], SPRINT);
+    if (runtime === "unusable") await retainRecord(store, shell, { outcomeId: "outcome-2", prUrl: oldPR });
+    else shell.refs.add(`refs/heads/${BRANCH}`);
+    codex.fail = true;
+    await make().tick();
+    expect(await assignment("outcome-1")).toMatchObject({ status: "failed", prUrl: oldPR, note: "build: Codex developer session failed." });
+    const attempt = (await store.readRuntimeFile<SeatTaskRecord>(RECORD))!;
+    expect(attempt.branch).not.toBe(BRANCH);
+    expect(attempt.retainedPrUrl).toBe(oldPR);
+    await store.update((state) => { state.planningGoals![0].assignments![0].status = "queued"; }, "Re-queue replacement attempt");
+    codex.fail = false;
+    shell.calls = [];
+    await make().tick();
+    expect(shell.calls.some((call) => call.startsWith("git worktree add"))).toBe(false);
+    expect(codex.runs[1].cwd).toBe(attempt.worktree);
+    expect(await assignment("outcome-1")).toMatchObject({ status: "merged", prUrl: PR });
+    expect(await store.readRuntimeFile<SeatTaskRecord>(RECORD)).toMatchObject({ branch: attempt.branch, worktree: attempt.worktree, retainedPrUrl: oldPR, prUrl: PR });
+  });
+
+  it("resumes a replacement PR saved just before the assignment's PR URL was updated", async () => {
+    const oldPR = "https://github.com/satoramoto/indra/pull/8";
+    const { store, shell, codex, make, assignment } = await setup([{ ...reviewing(), status: "running", prUrl: oldPR }]);
+    await retainRecord(store, shell, { step: "review", retainedPrUrl: oldPR });
+    codex.findings = [];
+    await make().tick();
+    expect(codex.runs).toHaveLength(1);
+    expect(codex.runs[0].schema).toMatch(/review.json$/);
+    expect(shell.calls.some((call) => call.startsWith("git worktree add"))).toBe(false);
+    expect(await assignment("outcome-1")).toMatchObject({ status: "merged", prUrl: PR });
+  });
+
+  it("reuses the review helper after a restart between posting findings and advancing the step", async () => {
+    const { store, shell, codex, make, assignment } = await setup([reviewing()]);
+    await retainRecord(store, shell, { step: "review" });
+    const save = store.saveRuntime.bind(store);
+    let interrupt = true;
+    vi.spyOn(store, "saveRuntime").mockImplementation(async (name, runtime) => {
+      if (name === RECORD && (runtime as SeatTaskRecord).step === "fix" && interrupt) { interrupt = false; throw new Error("interrupted"); }
+      await save(name, runtime);
+    });
+    await make().tick();
+    expect((await assignment("outcome-1")).status).toBe("failed");
+    expect((await store.readRuntimeFile<SeatTaskRecord>(RECORD))?.step).toBe("review");
+    await store.update((state) => { state.planningGoals![0].assignments![0].status = "queued"; }, "Re-queue interrupted review");
+    await make().tick();
+    expect(shell.comments).toHaveLength(1);
+    expect(codex.runs.filter((run) => run.schema.endsWith("review.json"))).toHaveLength(1);
+    expect(codex.runs.at(-1)?.prompt).toContain("Bug in foo");
+    expect((await assignment("outcome-1")).status).toBe("merged");
+  });
+
+  it("aborts a real Git merge only in the verified worktree and preserves retained files", async () => {
+    const { store, shell, codex, chat, assignment } = await setup([reviewing()], SPRINT);
+    const record = await retainRecord(store, shell, { conflictRounds: 2 });
+    const project = join(store.runtimeDir, "projects", "satoramoto", "indra");
+    git(project, "init", "--quiet", "--initial-branch=main");
+    await writeFile(join(project, "file.txt"), "base\n");
+    git(project, "add", "file.txt"); git(project, "commit", "--quiet", "-m", "Base");
+    git(project, "worktree", "add", "--quiet", "-b", BRANCH, record.worktree);
+    await writeFile(join(record.worktree, "file.txt"), "ours\n");
+    git(record.worktree, "commit", "--quiet", "-am", "Seat work");
+    await writeFile(join(project, "file.txt"), "theirs\n");
+    git(project, "commit", "--quiet", "-am", "Sprint work");
+    git(project, "update-ref", "refs/remotes/origin/sprint/goal-abc", "HEAD");
+    const conflict = await processShell.run("git", ["merge", "--no-edit", "origin/sprint/goal-abc"], record.worktree);
+    expect(conflict.code).toBe(1);
+    await writeFile(join(record.worktree, "retained.txt"), "unfinished work");
+    shell.checksCode = 1; // Keep the worktree available for inspection after recovery.
+    const commands: string[] = [];
+    const realGit: Shell = { run: async (command, args, cwd) => {
+      commands.push(`${command} ${args.join(" ")} @${cwd}`);
+      return command === "git" ? processShell.run(command, args, cwd) : shell.run(command, args, cwd);
+    } };
+    await new DeveloperSeat(store, await loadDeveloperSeat(store, "seat-002"), chat, realGit, codex.factory).tick();
+    expect(await assignment("outcome-1")).toMatchObject({ status: "failed", note: `ci: CI did not pass on ${PR}.` });
+    expect(commands.filter((call) => call.startsWith("git merge --abort"))).toEqual([`git merge --abort @${record.worktree}`]);
+    expect((await processShell.run("git", ["rev-parse", "--quiet", "--verify", "MERGE_HEAD"], record.worktree)).code).toBe(1);
+    expect(await readFile(join(record.worktree, "file.txt"), "utf8")).toBe("ours\n");
+    expect(await readFile(join(record.worktree, "retained.txt"), "utf8")).toBe("unfinished work");
+    expect(await readFile(join(project, "file.txt"), "utf8")).toBe("theirs\n");
+    expect((await store.readRuntimeFile<SeatTaskRecord>(RECORD))?.conflictRounds).toBe(2);
+  });
+
   it("on restart fails a running assignment that never opened a PR, then takes the next one on a later tick", async () => {
     const { codex, make, assignment } = await setup([{ outcomeId: "outcome-1", seatId: "seat-002", status: "running", updatedAt: "2026-01-01T00:00:00Z" }, queued("outcome-2", "2025-01-01T00:00:00Z")]);
     const seat = make();
     await seat.tick();
-    expect(await assignment("outcome-1")).toMatchObject({ status: "failed", note: "Interrupted before the PR opened; not resumed." });
+    expect(await assignment("outcome-1")).toMatchObject({ status: "failed", note: "Interrupted without a usable assignment record; not resumed." });
     expect((await assignment("outcome-2")).status).toBe("queued");
     expect(codex.runs).toHaveLength(0);
     await seat.tick();

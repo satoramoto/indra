@@ -1,6 +1,9 @@
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { lstat, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import type { AgentResult, AgentRuntime, WriteAccess } from "./codex-runtime.js";
+import { postReviewOnce } from "./developer-review.js";
 import { missingTeamMessage, teamProject, type PlanningAssignment as Assignment, type PlanningGoal, type PlanningOutcome as ApprovedOutcome, type PlanningStore } from "./planning.js";
 import { ensureProjectCheckout, ProjectCheckoutError, projectCheckoutPath } from "./project-checkout.js";
 import { schemaPathOf } from "./reload.js";
@@ -17,7 +20,9 @@ type Step = "worktree" | "build" | "review" | "fix" | "ci" | "done";
 /** Lives in `<state-checkout>.runtime`, never in state.json. */
 export interface SeatTaskRecord {
   goalId: string; outcomeId: string; step: Step; branch: string; worktree: string; gitDir?: string; prUrl?: string; findings?: string[];
-  /** Conflict-resolution rounds used on merges of main into the branch; at most MAX_CONFLICT_ROUNDS. */
+  /** A prior attempt's PR remains visible in state until this attempt opens its replacement. */
+  retainedPrUrl?: string;
+  /** Conflict-resolution rounds used in this attempt; reset on explicit re-queue, preserved on restart. */
   conflictRounds?: number;
   sessions: { role: "developer" | "reviewer" | "fix"; sessionId: string; startedAt: string; finishedAt: string; usage?: unknown }[];
 }
@@ -74,31 +79,92 @@ export class DeveloperSeat {
       const target = this.find(state.planningGoals, goal.id, assignment.outcomeId);
       if (target.status !== "queued") throw new SeatError("Assignment is no longer queued.");
       Object.assign(target, { status: "running", updatedAt: new Date().toISOString() });
-      delete target.note; delete target.prUrl;
+      delete target.note;
     }, `Seat ${this.seat.id} claims ${goal.id}/${assignment.outcomeId}: running`);
-    const branch = `${this.seat.id}/${goal.id}-${assignment.outcomeId}`;
-    const record: SeatTaskRecord = { goalId: goal.id, outcomeId: assignment.outcomeId, step: "worktree", branch, worktree: join(this.store.runtimeDir, "worktrees", `${goal.id}-${assignment.outcomeId}`), sessions: [] };
-    await this.save(record);
-    await this.say(goal, `Claimed **${this.outcome(goal, assignment.outcomeId).title}** (${assignment.outcomeId}). Starting work on branch \`${branch}\`.`);
-    await this.work(goal, record);
+    const saved = await this.store.readRuntimeFile<SeatTaskRecord>(this.recordName(goal.id, assignment.outcomeId));
+    if (saved && this.ownsRecord(goal, assignment.outcomeId, saved)) {
+      // Claiming a queued retry grants a fresh budget; resuming active work above keeps its spent rounds.
+      saved.conflictRounds = 0;
+      await this.save(saved);
+      await this.resume(goal, assignment, saved);
+    } else {
+      // Keep unrecognized metadata and retained checkouts intact. A new attempt must not collide with either.
+      if (saved) await this.store.saveRuntime(`${this.recordName(goal.id, assignment.outcomeId)}-retained-${randomUUID()}`, saved);
+      const record = this.newRecord(goal.id, assignment.outcomeId);
+      if (assignment.prUrl) record.retainedPrUrl = assignment.prUrl;
+      await this.save(record);
+      await this.say(goal, `Claimed **${this.outcome(goal, assignment.outcomeId).title}** (${assignment.outcomeId}). Starting work.`);
+      await this.work(goal, record);
+    }
     return "worked";
   }
 
-  private async resume(goal: PlanningGoal, assignment: Assignment): Promise<void> {
-    const record = await this.store.readRuntimeFile<SeatTaskRecord>(this.recordName(goal.id, assignment.outcomeId));
-    const resumable = assignment.status === "in-review" && assignment.prUrl && record?.prUrl === assignment.prUrl && ["review", "fix", "ci"].includes(record.step);
-    if (!resumable) { await this.fail(goal, assignment.outcomeId, "Interrupted before the PR opened; not resumed."); return; }
+  private async resume(goal: PlanningGoal, assignment: Assignment, saved?: SeatTaskRecord): Promise<void> {
+    const record = saved ?? await this.store.readRuntimeFile<SeatTaskRecord>(this.recordName(goal.id, assignment.outcomeId));
+    if (!record || !this.ownsRecord(goal, assignment.outcomeId, record)) { await this.fail(goal, assignment.outcomeId, "Interrupted without a usable assignment record; not resumed."); return; }
+    const beforePR = ["worktree", "build"].includes(record.step);
+    if ((!beforePR && !record.prUrl) || (assignment.prUrl && assignment.prUrl !== record.prUrl && assignment.prUrl !== record.retainedPrUrl)) {
+      await this.fail(goal, assignment.outcomeId, "Assignment PR does not match its saved step; not resumed."); return;
+    }
+    if (record.step === "done") record.step = "ci";
     this.log(`Resuming ${goal.id}/${assignment.outcomeId} at ${record.step}.`);
-    await this.work(goal, record);
+    await this.work(goal, record, true);
   }
 
-  private async work(goal: PlanningGoal, record: SeatTaskRecord): Promise<void> {
+  private newRecord(goalId: string, outcomeId: string, suffix = ""): SeatTaskRecord {
+    const name = `${goalId}-${outcomeId}${suffix}`;
+    return { goalId, outcomeId, step: "worktree", branch: `${this.seat.id}/${name}`, worktree: join(this.store.runtimeDir, "worktrees", name), sessions: [] };
+  }
+
+  private ownsRecord(goal: PlanningGoal, outcomeId: string, record: SeatTaskRecord): boolean {
+    const branch = `${this.seat.id}/${goal.id}-${outcomeId}`;
+    if (record.goalId !== goal.id || record.outcomeId !== outcomeId || !record.branch?.startsWith(branch)) return false;
+    const suffix = record.branch.slice(branch.length);
+    return (!suffix || /^-attempt-[0-9a-f-]{36}$/.test(suffix)) && record.worktree === this.newRecord(goal.id, outcomeId, suffix).worktree
+      && ["worktree", "build", "review", "fix", "ci", "done"].includes(record.step) && Array.isArray(record.sessions);
+  }
+
+  /** Verify both the assignment identity and Git's actual checkout before any recovery command or session. */
+  private async verifyWorktree(goal: PlanningGoal, record: SeatTaskRecord): Promise<void> {
+    if (!this.ownsRecord(goal, record.outcomeId, record)) throw new SeatError("Worktree is not owned by this assignment.");
+    const project = projectCheckoutPath(this.store.runtimeDir, await this.github(goal));
+    const commonDir = async (cwd: string) => realpath((await this.sh("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd)).stdout.trim());
+    const expected = await commonDir(project);
+    const actual = await commonDir(record.worktree);
+    const top = await realpath((await this.sh("git", ["rev-parse", "--show-toplevel"], record.worktree)).stdout.trim());
+    const branch = (await this.sh("git", ["symbolic-ref", "--quiet", "HEAD"], record.worktree)).stdout.trim();
+    if (actual !== expected || top !== await realpath(record.worktree) || branch !== `refs/heads/${record.branch}` || (record.gitDir && await realpath(record.gitDir) !== expected)) {
+      throw new SeatError("Worktree is not owned by this assignment.");
+    }
+    record.gitDir = expected;
+  }
+
+  private async recoverMerge(record: SeatTaskRecord): Promise<void> {
+    const pending = await this.shell.run("git", ["rev-parse", "--quiet", "--verify", "MERGE_HEAD"], record.worktree);
+    if (pending.code === 1) return;
+    if (pending.code !== 0) throw new SeatError("Could not inspect unfinished merge.");
+    // This is recovery, not another conflict-resolution round. A failed abort stops all subsequent work.
+    await this.sh("git", ["merge", "--abort"], record.worktree);
+  }
+
+  private async work(goal: PlanningGoal, record: SeatTaskRecord, resuming = false): Promise<void> {
     const outcome = this.outcome(goal, record.outcomeId);
     const base = baseBranch(goal);
     try {
+      if (resuming && (record.step !== "worktree" || await pathExists(record.worktree))) {
+        await this.verifyWorktree(goal, record);
+        await this.recoverMerge(record);
+        if (record.step === "worktree") await this.advance(record, "build");
+        if (record.prUrl) await this.setStatus(goal.id, record.outcomeId, { status: "in-review", prUrl: record.prUrl });
+      }
       if (record.step === "worktree") {
         const project = await ensureProjectCheckout(this.shell, this.store.runtimeDir, await this.github(goal), base);
+        // A missing runtime file must not cause `worktree add -b` to collide with retained work or refs.
+        while (await pathExists(record.worktree) || await this.branchExists(record.branch, project)) {
+          Object.assign(record, this.newRecord(goal.id, record.outcomeId, `-attempt-${randomUUID()}`));
+        }
         record.gitDir = (await this.sh("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], project)).stdout.trim();
+        await this.save(record);
         await this.sh("git", ["worktree", "add", "--no-track", "-b", record.branch, record.worktree, `origin/${base}`], project);
         await this.advance(record, "build");
       }
@@ -114,9 +180,10 @@ export class DeveloperSeat {
       }
       if (record.step === "review") {
         // The reviewer is read-only with no network; the seat posts its findings on the PR.
-        const run = await this.codex("reviewer", record, undefined, reviewPrompt(goal, outcome, record.prUrl!), reviewSchema);
-        record.findings = findingsFrom(run.response);
-        await this.sh("gh", ["pr", "comment", record.prUrl!, "--body", reviewComment(record.findings, run.response)], record.worktree);
+        record.findings = await postReviewOnce({
+          store: this.store, recordName: this.recordName(goal.id, record.outcomeId), prUrl: record.prUrl!, worktree: record.worktree, shell: this.shell,
+          review: async () => (await this.codex("reviewer", record, undefined, reviewPrompt(goal, outcome, record.prUrl!), reviewSchema)).response,
+        });
         await this.advance(record, record.findings.length ? "fix" : "ci");
         await this.say(goal, `Review of ${record.prUrl} done: ${record.findings.length ? `${record.findings.length} finding(s); fixing.` : "no findings."}`);
       }
@@ -157,6 +224,15 @@ export class DeveloperSeat {
       this.log(`Assignment ${goal.id}/${record.outcomeId} failed at ${record.step}: ${error instanceof Error ? error.message : String(error)}`);
       await this.fail(goal, record.outcomeId, `${record.step}: ${reason}`.slice(0, 200));
     }
+  }
+
+  private async branchExists(branch: string, project: string): Promise<boolean> {
+    for (const ref of [`refs/heads/${branch}`, `refs/remotes/origin/${branch}`]) {
+      const found = await this.shell.run("git", ["show-ref", "--verify", "--quiet", ref], project);
+      if (found.code === 0) return true;
+      if (found.code !== 1) throw new SeatError("Could not inspect retained assignment branches.");
+    }
+    return false;
   }
 
   private async fail(goal: PlanningGoal, outcomeId: string, note: string): Promise<void> {
@@ -206,7 +282,7 @@ export class DeveloperSeat {
   /**
    * When the PR is behind or conflicting with its base (the sprint branch, or main for a goal without one), merges
    * the fetched base into the seat's own branch in its own worktree (never a rebase or force-push) and pushes that
-   * branch. Conflicts get one Codex fix session per round, at most MAX_CONFLICT_ROUNDS per assignment. Returns true
+   * branch. Conflicts get one Codex fix session per round, at most MAX_CONFLICT_ROUNDS per attempt. Returns true
    * when it pushed, so CI must run again.
    */
   private async updateFromMain(goal: PlanningGoal, outcome: ApprovedOutcome, record: SeatTaskRecord, project: string): Promise<boolean> {
@@ -218,7 +294,7 @@ export class DeveloperSeat {
       if (merged.code === 0) break;
       const rounds = record.conflictRounds ?? 0;
       if (rounds >= MAX_CONFLICT_ROUNDS) {
-        await this.shell.run("git", ["merge", "--abort"], record.worktree);
+        await this.sh("git", ["merge", "--abort"], record.worktree);
         throw new SeatError(conflictNote(base));
       }
       record.conflictRounds = rounds + 1;
@@ -228,7 +304,7 @@ export class DeveloperSeat {
       // Resolved means the merge is committed: the base is now an ancestor of HEAD.
       const resolved = await this.shell.run("git", ["merge-base", "--is-ancestor", `origin/${base}`, "HEAD"], record.worktree);
       if (resolved.code === 0) break;
-      await this.shell.run("git", ["merge", "--abort"], record.worktree);
+      await this.sh("git", ["merge", "--abort"], record.worktree);
       if (record.conflictRounds >= MAX_CONFLICT_ROUNDS) throw new SeatError(conflictNote(base));
     }
     await this.sh("git", [...GH_CREDENTIAL, "push", "origin", `HEAD:refs/heads/${record.branch}`], record.worktree);
@@ -286,11 +362,7 @@ function prUrlFrom(response: unknown): string {
   return url.trim();
 }
 
-function findingsFrom(response: unknown): string[] {
-  const findings = (response as { findings?: unknown } | undefined)?.findings;
-  if (!Array.isArray(findings) || findings.some((item) => typeof item !== "string")) throw new SeatError("Reviewer session returned invalid findings.");
-  return (findings as string[]).filter((item) => item.trim());
-}
+const pathExists = (path: string) => lstat(path).then(() => true, (error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return false; throw error; });
 
 function buildPrompt(seat: SeatIdentity, goal: PlanningGoal, outcome: ApprovedOutcome, branch: string, base: string): string {
   return `You are ${seat.displayName}, a Developer seat in Indra, working one approved outcome in this git worktree (branch ${branch}, created from origin/${base}).
@@ -309,12 +381,6 @@ Return only JSON: findings (one line per finding, with file and line where possi
 Goal: ${goal.goal}
 Outcome ${outcome.id}: ${outcome.title}
 ${outcome.description}`;
-}
-
-function reviewComment(findings: string[], response: unknown): string {
-  const summary = (response as { summary?: unknown } | undefined)?.summary;
-  const head = `**Indra review:** ${typeof summary === "string" && summary.trim() ? summary.trim() : "done"}`;
-  return findings.length ? `${head}\n\nFindings:\n${findings.map((item) => `- ${item}`).join("\n")}` : `${head}\n\nNo findings.`;
 }
 
 function fixPrompt(outcome: ApprovedOutcome, prUrl: string, branch: string, findings: string[]): string {
