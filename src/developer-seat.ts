@@ -116,14 +116,19 @@ export class DeveloperSeat {
         if (state !== "MERGED") {
           const checks = await this.shell.run("gh", ["pr", "checks", record.prUrl!, "--watch"], record.worktree);
           if (checks.code !== 0) throw new SeatError(`CI did not pass on ${record.prUrl}.`);
-          await this.sh("git", ["checkout", "--detach"], record.worktree);
-          await this.sh("gh", ["pr", "merge", record.prUrl!, "--squash", "--delete-branch"], record.worktree);
+          await this.merge(record.prUrl!, project);
         }
         await this.setStatus(goal.id, record.outcomeId, { status: "merged", prUrl: record.prUrl });
         await this.advance(record, "done");
         await this.say(goal, `Merged ${record.prUrl} for **${outcome.title}**. Going idle.`);
+        // Cleanup is best-effort: none of it can fail a merged assignment.
+        const github = await this.github(goal);
+        const deleted = await this.shell.run("gh", ["api", "-X", "DELETE", `repos/${github}/git/refs/heads/${record.branch}`], project);
+        if (deleted.code !== 0) this.log(`Could not delete remote branch ${record.branch}.`);
         const removed = await this.shell.run("git", ["worktree", "remove", "--force", record.worktree], project);
         if (removed.code !== 0) this.log(`Could not remove worktree ${record.worktree}.`);
+        const branchGone = await this.shell.run("git", ["branch", "-D", record.branch], project);
+        if (branchGone.code !== 0) this.log(`Could not delete local branch ${record.branch}.`);
       }
     } catch (error) {
       const reason = error instanceof SeatError || error instanceof ProjectCheckoutError ? error.message : "unexpected error";
@@ -145,6 +150,25 @@ export class DeveloperSeat {
     record.sessions.push({ role, sessionId: run.sessionId, startedAt: run.startedAt, finishedAt: run.finishedAt, usage: run.usage });
     await this.save(record);
     return run;
+  }
+
+  /** Wait before retrying a merge GitHub briefly refused (for example while checks re-evaluate after another merge). */
+  mergeRetryMs = 15_000;
+
+  /**
+   * Merges by URL from the project checkout so gh never touches local branches.
+   * The PR's state is the only success signal; gh's exit code is not.
+   */
+  private async merge(prUrl: string, project: string): Promise<void> {
+    let stderr = "";
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, this.mergeRetryMs));
+      const result = await this.shell.run("gh", ["pr", "merge", prUrl, "--squash"], project);
+      stderr = result.stderr;
+      const state = await this.shell.run("gh", ["pr", "view", prUrl, "--json", "state", "--jq", ".state"], project);
+      if (state.stdout.trim() === "MERGED") return;
+    }
+    throw new SeatError(`gh pr merge failed: ${stderrExcerpt(stderr)}`);
   }
 
   private async sh(command: string, args: string[], cwd: string): Promise<ShellResult> {
@@ -235,6 +259,16 @@ Return only JSON: prUrl (${prUrl}) and summary.
 Outcome ${outcome.id}: ${outcome.title}
 Findings:
 ${findings.map((item) => `- ${item}`).join("\n")}`;
+}
+
+/** A short, single-line excerpt of command stderr with anything token-shaped removed. */
+export function stderrExcerpt(stderr: string): string {
+  const text = stderr
+    .replace(/\b(gh[opusr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b/g, "[redacted]")
+    .replace(/(https?:\/\/)[^\s/@]+@/g, "$1[redacted]@")
+    .replace(/\s+/g, " ")
+    .trim();
+  return (text || "no output").slice(0, 120);
 }
 
 /** Runs commands without a shell; output is kept in memory only. */
