@@ -4,8 +4,9 @@ import { randomUUID } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { defineConfig, type Plugin } from "vitest/config";
+import { publishBuild } from "./src/build-publish.js";
 
-/** Writes dist/build-stamp.json after every successful build (also each `npm run dev` rebuild), so running code sees it is outdated. */
+/** Writes build-stamp.json into the output after every successful build (also each `npm run dev` rebuild), so running code sees it is outdated. */
 function buildStamp(): Plugin {
   return {
     name: "indra-build-stamp",
@@ -43,7 +44,7 @@ function solidTerminalTransform(): Plugin {
 }
 
 export default defineConfig({
-  plugins: [solidTerminalTransform(), buildStamp()],
+  plugins: [solidTerminalTransform(), buildStamp(), publishBuild()],
   build: {
     target: "node26",
     minify: false,
