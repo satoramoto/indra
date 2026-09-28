@@ -6,9 +6,9 @@ import { LocalStateRepository, StateDataError } from "./local-state.js";
 import { MattermostClient, MattermostInventory } from "./mattermost.js";
 import { printState } from "./state-cli.js";
 import { StateInventory } from "./state-domain.js";
-import { PlanningStore } from "./planning.js";
+import { botTeamHome, PlanningStore } from "./planning.js";
 import { PlanningBridge } from "./planning-bridge.js";
-import { MattermostPlanningChat, readBotToken, readChickToken, type BotTokenOptions } from "./planning-mattermost.js";
+import { CHICK_USERNAME, MattermostAccessError, MattermostPlanningChat, readBotToken, readChickToken, type BotTokenOptions } from "./planning-mattermost.js";
 import { readServiceToken, stageServiceToken } from "./service-account.js";
 import { DeveloperSeat, loadDeveloperSeat, processShell } from "./developer-seat.js";
 import { CodexRuntime } from "./codex-runtime.js";
@@ -95,6 +95,25 @@ export async function hostedToken(checkout: string, readyNonce: string | undefin
   catch (error) {
     if (readyNonce) {
       await signalReady(checkout, readyNonce, "no-credential").catch(() => {});
+      // Stay alive briefly so the host sees the signal from a verified pane rather than a vanished one.
+      await new Promise((done) => setTimeout(done, lingerMs));
+    }
+    throw error;
+  }
+}
+
+/**
+ * Before a process's first post: makes sure its bot is in its team's Mattermost team and home channel from state
+ * (nothing to do while state has no home). A hosted process whose join is refused tells the tmux host "no channel",
+ * with the message naming the bot and channel, and then fails; it is not restarted in a loop.
+ */
+export async function joinTeamHome(checkout: string, readyNonce: string | undefined, store: PlanningStore, chat: Pick<MattermostPlanningChat, "ensureHomeMembership">, username: string, lingerMs = 5000): Promise<void> {
+  const home = botTeamHome(await store.read(), username);
+  if (!home) return;
+  try { await chat.ensureHomeMembership(home.teamId, home.channelId); }
+  catch (error) {
+    if (readyNonce && error instanceof MattermostAccessError) {
+      await signalReady(checkout, readyNonce, "no-channel", error.message).catch(() => {});
       // Stay alive briefly so the host sees the signal from a verified pane rather than a vanished one.
       await new Promise((done) => setTimeout(done, lingerMs));
     }
@@ -189,7 +208,8 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       try {
         const store = new PlanningStore(options.checkout);
         const seat = await loadDeveloperSeat(store, options.seatId);
-        const chat = new MattermostPlanningChat(await hostedToken(options.checkout, options.readyNonce, (tokenOptions) => readBotToken(seat.username, tokenOptions)));
+        const chat = new MattermostPlanningChat(await hostedToken(options.checkout, options.readyNonce, (tokenOptions) => readBotToken(seat.username, tokenOptions)), seat.username);
+        await joinTeamHome(options.checkout, options.readyNonce, store, chat, seat.username);
         if (options.readyNonce) await signalReady(options.checkout, options.readyNonce);
         const runner = new DeveloperSeat(store, seat, chat, processShell, (cwd, write) => new CodexRuntime(cwd, 60 * 60_000, write), (line) => console.log(`[${new Date().toISOString()}] ${line}`));
         console.log(`Developer seat ${seat.id} (@${seat.username}) running. Stop with Ctrl-C.`);
@@ -250,7 +270,8 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       if (options.action === "approve") {
         // Run by the terminal UI: like a hosted process, it reads Chick's token only with the staged service account token.
         try {
-          const chat = new MattermostPlanningChat(await readChickToken({ serviceToken: await readServiceToken(options.checkout), headless: true }));
+          const chat = new MattermostPlanningChat(await readChickToken({ serviceToken: await readServiceToken(options.checkout), headless: true }), CHICK_USERNAME);
+          await joinTeamHome(options.checkout, undefined, store, chat, CHICK_USERNAME);
           const { goal, alreadyApproved } = await new PlanningBridge(store, chat, new CodexRuntime(process.cwd())).approve(options.goal!);
           console.log(alreadyApproved ? `Goal ${goal.id} was already approved; no new assignments.` : `Approved goal ${goal.id}: ${goal.assignments?.length ?? 0} outcome(s) queued for Developer seats.`);
           return 0;
@@ -261,7 +282,8 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       }
       if (options.action === "start") {
         try {
-          const chat = new MattermostPlanningChat(await hostedToken(options.checkout, options.readyNonce, readChickToken));
+          const chat = new MattermostPlanningChat(await hostedToken(options.checkout, options.readyNonce, readChickToken), CHICK_USERNAME);
+          await joinTeamHome(options.checkout, undefined, store, chat, CHICK_USERNAME);
           const goal = await new PlanningBridge(store, chat, new CodexRuntime(process.cwd())).start(options.goal!, options.participants);
           console.log(`Planning goal ${goal.id}: ${SERVER}/yahaha/pl/${goal.mattermost.rootPostId}`);
           return 0;
@@ -271,8 +293,9 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         }
       }
       recordRunningBuild(`${options.checkout}.runtime`, import.meta.url);
-      const chat = new MattermostPlanningChat(await hostedToken(options.checkout, options.readyNonce, readChickToken));
-      const bridge = new PlanningBridge(store, chat, new CodexRuntime(process.cwd()));
+      const chat = new MattermostPlanningChat(await hostedToken(options.checkout, options.readyNonce, readChickToken), CHICK_USERNAME);
+      await joinTeamHome(options.checkout, options.readyNonce, store, chat, CHICK_USERNAME);
+      const bridge =new PlanningBridge(store, chat, new CodexRuntime(process.cwd()));
       console.log("Chick planning bridge running. Stop with Ctrl-C.");
       let ready = false;
       while (true) {
@@ -314,6 +337,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
   } catch (error) {
     if (error instanceof StateDataError) console.error(`State error: ${error.message}`);
     else if (error instanceof InventoryError) console.error(`Connection/error: ${error.message}`);
+    else if (error instanceof MattermostAccessError) console.error(`Mattermost access: ${error.message}`);
     else if (error instanceof Error && error.name !== "AbortError") console.error("Connection/error: The inventory could not complete.");
     return 1;
   }

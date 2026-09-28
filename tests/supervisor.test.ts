@@ -138,6 +138,19 @@ describe("seat process supervisor", () => {
     expect(live["seat-001"].process).toBe("running");
   });
 
+  it("shows a seat whose bot cannot join its home channel as no channel, naming the bot and channel", async () => {
+    const { dir, tmux, supervisor } = await fixture();
+    const message = "@george can't join the home channel home (HTTP 403): add it or make the channel public.";
+    tmux.onStart = async (session, nonce) => { await (session.startsWith("dev-seat-002") ? signalReady(dir, nonce, "no-channel", message) : signalReady(dir, nonce)); };
+    // Shown on the seat rather than as a start-up notice, like a missing credential.
+    expect(await supervisor.ensureAll()).toEqual([]);
+    tmux.sessions.delete([...tmux.sessions.keys()].find((name) => name.startsWith("dev-seat-002"))!);
+    const live = await supervisor.read();
+    expect(live["seat-002"]).toMatchObject({ process: "no channel", problem: message });
+    expect(live["seat-003"].process).toBe("running");
+    expect(tmux.launches()).toHaveLength(3);
+  });
+
   it("restarts processes on an older build only at a safe point: a busy seat and a bridge mid-poll wait", async () => {
     const { dir, tmux, supervisor } = await fixture();
     const stamp = (id: string) => writeFile(join(dir, "dist", "build-stamp.json"), JSON.stringify({ id, sha: "abc1234", builtAt: "now" }));

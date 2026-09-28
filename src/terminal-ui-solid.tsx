@@ -34,7 +34,7 @@ function activityLine(model: TerminalUiModel, seat: StateSeat, limit: number): s
   return "Planning goal: " + displayText(session.goal, limit) + " · stage: " + displayText(session.stage, 30);
 }
 
-const processColor: Record<SeatLive["process"], string> = { running: theme.running, stopped: theme.idle, "no credential": theme.error };
+const processColor: Record<SeatLive["process"], string> = { running: theme.running, stopped: theme.idle, "no credential": theme.error, "no channel": theme.error };
 const isDeveloper = (seat: StateSeat) => seat.roles.includes("Developer");
 const processLabel = (live: SeatLive) => live.process.toUpperCase() + (live.updatePending ? " · UPDATE PENDING" : "");
 
@@ -94,6 +94,7 @@ export function TerminalApp(props: TerminalAppProps) {
         {live ? (
           <box flexDirection="column" gap={0}>
             <text fg={processColor[live.process]}>Process: {live.process}{live.updatePending ? " · update pending (restarts when idle)" : ""}{isDeveloper(selected) ? " (seat runner)" : " (planning bridge)"}  ·  s restart  ·  x stop</text>
+            <Show when={live.problem}><text fg={theme.error}>{displayText(live.problem, 300)}</text></Show>
             <Show when={isDeveloper(selected)}>
               <text fg={theme.regular}>Assignment: {assignmentLine(live, 160)}</text>
               <text fg={theme.muted}>{threadActivity(live, 300)}{live.activity ? "  (" + displayText(live.activity.at) + ")" : ""}</text>
@@ -171,16 +172,18 @@ export function TerminalApp(props: TerminalAppProps) {
                 const activity = () => { props.revision(); const value = dev(); return value ? threadActivity(value, wide() ? 100 : 60) : activityLine(props.model, item, wide() ? 100 : 60); };
                 const headline = () => {
                   const value = live();
-                  const suffix = wide() ? (value ? "  ·  " + processLabel(value) : "") : "  ·  " + (dev() ? processLabel(dev()!) : status().label);
+                  const suffix = wide() ? (value ? "  ·  " + processLabel(value) : "") : "  ·  " + (dev() ? processLabel(dev()!) : value?.problem ? processLabel(value) : status().label);
                   return (selected() ? "▶ " : "  ") + displayText(item.displayName, wide() ? 80 : 22) + "  ·  " + displayText(item.roles.join(", ") || "No role", wide() ? 80 : 16) + suffix;
                 };
-                const second = () => { const value = dev(); return value ? { text: assignmentLine(value, wide() ? 60 : 40), color: processColor[value.process] } : { text: status().label, color: status().color }; };
+                // A process that could not start says why, e.g. which bot cannot join which channel; the seat detail shows it in full.
+                const problem = () => { const value = live(); return value?.problem ? displayText(value.problem, 60) : undefined; };
+                const second = () => { const value = dev(); const reason = problem(); if (reason) return { text: reason, color: theme.error }; return value ? { text: assignmentLine(value, wide() ? 60 : 40), color: processColor[value.process] } : { text: status().label, color: status().color }; };
                 return (
                   <box height={wide() ? 3 : 2} flexDirection="column" paddingLeft={1} backgroundColor={selected() ? theme.selected : theme.panel}>
                     <text fg={selected() ? theme.accent : theme.regular}>{headline()}</text>
                     <Show when={wide()}><text fg={second().color}>  {second().text}</text></Show>
-                    <text fg={theme.muted}>
-                      {"  "}{!wide() && dev()?.assignment ? assignmentLine(dev()!, 60) : activity()}
+                    <text fg={!wide() && problem() ? theme.error : theme.muted}>
+                      {"  "}{!wide() && problem() ? problem() : !wide() && dev()?.assignment ? assignmentLine(dev()!, 60) : activity()}
                     </text>
                   </box>
                 );

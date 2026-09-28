@@ -26,6 +26,7 @@ Reviewers flag only these, each with the file, the line and a one-line reason:
 
 - **Credentials:** no token, password or API key in command arguments, environment variables, the `indra-state` repository, logs or error messages. Credentials come from 1Password at run time.
 - **Mattermost inventory:** the `--mattermost` mode sends only `GET` requests and refuses redirects. It never writes to Mattermost.
+- **Mattermost writes:** Chick's bridge and the Developer seat runners write only their own posts, plus one exception: each may add its own bot to its team's Mattermost team and home channel from `indra-state`, with its own token and only after a `GET` shows it is not a member. Nothing adds other users or joins other channels.
 - **State writes:** anything written to `state.json` stays valid against the v1 schema and Indra's reference checks. Runtime metadata (session IDs, delivery cursors, usage) stays in `<state-checkout>.runtime`, not in Git.
 - **tmux:** never kill, reuse or attach a tmux session or pane that Indra doesn't own and hasn't verified. A stale or missing ownership record is not grounds to act on another session.
 - **Approval:** nothing approves or starts proposal work without the human plan approval step: a person's ✅ reaction on Chick's proposal post, or the owner's `planning approve` from the terminal UI. Both go through the same approval code. Reactions are read with `GET` only, and reactions from bots, the bridge's own account or Chick's seat never count.

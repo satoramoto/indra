@@ -188,7 +188,7 @@ describe("planning bridge", () => {
 
   it("reads reactions from Mattermost with GET only", async () => {
     const requests: { url: string; method?: string }[] = [];
-    const chat = new MattermostPlanningChat("token", async (url, init) => {
+    const chat = new MattermostPlanningChat("token", "chickcorea", async (url, init) => {
       requests.push({ url: String(url), method: init?.method });
       return new Response(JSON.stringify([{ user_id: "ryan", post_id: "p1", emoji_name: CHECK, create_at: 5 }, { user_id: 7 }]), { status: 200 });
     });

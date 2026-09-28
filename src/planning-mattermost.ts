@@ -26,17 +26,50 @@ export async function readBotToken(username: string, options: BotTokenOptions = 
   throw new Error(`1Password could not supply the bot token for @${username}. Expected item '${ref}'; check it exists and ${options.serviceToken ? "the service account's vault access" : "desktop authorization"}.`);
 }
 
+/** Chick's bot username; the planning bridge posts as this bot. */
+export const CHICK_USERNAME = "chickcorea";
+
 export async function readChickToken(options: Omit<BotTokenOptions, "ref"> = {}): Promise<string> {
-  return await readBotToken("chickcorea", { ...options, ref: process.env.INDRA_CHICK_TOKEN_REF ?? botTokenRef("chickcorea") });
+  return await readBotToken(CHICK_USERNAME, { ...options, ref: process.env.INDRA_CHICK_TOKEN_REF ?? botTokenRef(CHICK_USERNAME) });
 }
 
+/** Mattermost refused this bot a team, channel or post; the message names the bot and the channel or team. */
+export class MattermostAccessError extends Error { override name = "MattermostAccessError"; }
+
 export class MattermostPlanningChat implements PlanningChat {
-  constructor(private readonly token: string, private readonly request: typeof fetch = fetch) {}
-  private async call(path: string, method = "GET", body?: unknown): Promise<unknown> {
+  /** `username` is the bot this token belongs to; it only names the bot in error messages. */
+  constructor(private readonly token: string, private readonly username: string, private readonly request: typeof fetch = fetch) {}
+  private async send(path: string, method = "GET", body?: unknown): Promise<Response> {
     const url = new URL(`/api/v4${path}`, SERVER);
-    const response = await this.request(url, { method, headers: { Authorization: `Bearer ${this.token}`, "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined, redirect: "manual", signal: AbortSignal.timeout(20_000) });
+    return await this.request(url, { method, headers: { Authorization: `Bearer ${this.token}`, "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined, redirect: "manual", signal: AbortSignal.timeout(20_000) });
+  }
+  private async call(path: string, method = "GET", body?: unknown): Promise<unknown> {
+    const response = await this.send(path, method, body);
     if (!response.ok) throw new Error(`Mattermost ${method} failed (HTTP ${response.status}).`);
     return await response.json() as unknown;
+  }
+  /** GET only: true when the member record exists; Mattermost answers 403 or 404 to a non-member. */
+  private async isMember(path: string): Promise<boolean> {
+    const response = await this.send(path);
+    if (response.ok) return true;
+    if (response.status === 403 || response.status === 404) return false;
+    throw new Error(`Mattermost GET failed (HTTP ${response.status}).`);
+  }
+  /**
+   * Makes this bot a member of its team's Mattermost team and home channel, joining with its own token only when
+   * a GET shows it is not one already. A refused join is a MattermostAccessError naming the bot and the channel.
+   */
+  async ensureHomeMembership(teamId: string, channelId: string): Promise<void> {
+    const me = await this.ownUserId();
+    const team = encodeURIComponent(teamId); const channel = encodeURIComponent(channelId); const user = encodeURIComponent(me);
+    if (!await this.isMember(`/teams/${team}/members/${user}`)) {
+      const response = await this.send(`/teams/${team}/members`, "POST", { team_id: teamId, user_id: me });
+      if (!response.ok) throw new MattermostAccessError(`@${this.username} can't join the Mattermost team ${teamId} (HTTP ${response.status}): add it to the team.`);
+    }
+    if (!await this.isMember(`/channels/${channel}/members/${user}`)) {
+      const response = await this.send(`/channels/${channel}/members`, "POST", { user_id: me });
+      if (!response.ok) throw new MattermostAccessError(`@${this.username} can't join the home channel ${channelId} (HTTP ${response.status}): add it or make the channel public.`);
+    }
   }
   async ownUserId(): Promise<string> { return (await this.call("/users/me") as { id: string }).id; }
   /** Mattermost omits `is_bot` for people, so only an explicit `true` marks a bot. */
@@ -46,7 +79,10 @@ export class MattermostPlanningChat implements PlanningChat {
     return user.is_bot === true;
   }
   async post(channelId: string, message: string, rootId?: string, deliveryId?: string): Promise<Post> {
-    return await this.call("/posts", "POST", { channel_id: channelId, message, root_id: rootId ?? "", props: deliveryId ? { indra_delivery_id: deliveryId } : {} }) as Post;
+    const response = await this.send("/posts", "POST", { channel_id: channelId, message, root_id: rootId ?? "", props: deliveryId ? { indra_delivery_id: deliveryId } : {} });
+    if (response.status === 403) throw new MattermostAccessError(`@${this.username} can't post in channel ${channelId} (HTTP 403): add it to the channel or make the channel public.`);
+    if (!response.ok) throw new Error(`Mattermost POST failed (HTTP ${response.status}).`);
+    return await response.json() as Post;
   }
   /** GET only; Mattermost may answer `null` for a post without reactions. */
   async reactions(postId: string): Promise<Reaction[]> {

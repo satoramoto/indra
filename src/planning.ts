@@ -88,6 +88,17 @@ export function homeChannelId(state: PlanningDocument, teamId: string): string |
   return (state.teams as TeamHomeRecord[]).find((item) => item.id === teamId)?.externalIdentities?.mattermost?.homeChannelId;
 }
 
+/**
+ * The Mattermost team and home channel of the team whose seat posts as `username`, when state records both.
+ * Each bot joins only these, and only for itself.
+ */
+export function botTeamHome(state: PlanningDocument, username: string): { teamId: string; channelId: string } | undefined {
+  const teams = state.teams as (TeamHomeRecord & { externalIdentities?: { mattermost?: { teamId?: string } }; seats?: { externalIdentities?: { mattermost?: { username?: string } } }[] })[];
+  const team = teams.find((item) => (item.seats ?? []).some((seat) => seat.externalIdentities?.mattermost?.username === username));
+  const teamId = team?.externalIdentities?.mattermost?.teamId; const channelId = team?.externalIdentities?.mattermost?.homeChannelId;
+  return teamId && channelId ? { teamId, channelId } : undefined;
+}
+
 /** The team's GitHub project as `owner/repo`, when state records one. */
 export function teamProject(state: PlanningDocument, teamId: string): string | undefined {
   return (state.teams as TeamHomeRecord[]).find((item) => item.id === teamId)?.project?.github;
