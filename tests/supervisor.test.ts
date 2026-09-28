@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PlanningStore } from "../src/planning.js";
+import { PlanningStore, type PlanningGoal } from "../src/planning.js";
 import { signalReady, TmuxHost, turnLockFile, type TmuxRunner } from "../src/tmux-host.js";
 import { withFileLock } from "../src/state-commit.js";
 import { activityRecordName, CliGoalStarter, Supervisor } from "../src/supervisor.js";
@@ -218,6 +218,130 @@ describe("seat process supervisor", () => {
     const live = await supervisor.read();
     expect(live["seat-002"]).toMatchObject({ process: "stopped", assignment: { title: "Second", status: "in-review", prUrl: "https://github.com/o/r/pull/2" }, activity: { message: "Opened PR 2" } });
     expect(live["seat-003"].assignment).toBeUndefined();
+  });
+});
+
+function failedGoal(id = "goal-retry", updatedAt = "2026-01-02T00:00:00Z"): PlanningGoal {
+  return {
+    id, teamId: "team-001", seatId: "seat-001", participantSeatIds: [], goal: "Fix the terminal", projectRefs: [], stage: "approved",
+    createdAt: "2026-01-01T00:00:00Z", updatedAt, mattermost: { channelId: "channel", rootPostId: "root" },
+    brief: { summary: "Fix it", decisions: [], openQuestions: [] },
+    proposal: { id: "proposal-1", createdAt: updatedAt, summary: "Plan", risks: [], openQuestions: [], outcomes: [{ id: "outcome-1", title: "Retry failed work", description: "Add T", seatId: "seat-002" }] },
+    assignments: [{ outcomeId: "outcome-1", seatId: "seat-002", status: "failed", updatedAt, note: "Interrupted", prUrl: "https://github.com/o/r/pull/1" }],
+    integration: { branch: `sprint/${id}`, baseSha: "a".repeat(40), status: "collecting" },
+  };
+}
+
+async function retryFixture(goals = [failedGoal()]) {
+  const fixtureValue = await fixture();
+  const store = new PlanningStore(fixtureValue.dir);
+  await store.update((state) => { state.planningGoals = goals; }, "Add failed assignments");
+  const target = (await fixtureValue.supervisor.read())["seat-002"].retry!;
+  return { ...fixtureValue, store, target };
+}
+
+describe("failed assignment retries", () => {
+  it("offers the newest eligible failure for each Developer, skipping other statuses and missing or closed sprints", async () => {
+    const old = failedGoal("goal-old", "2026-01-01T00:00:00Z");
+    const legacy = failedGoal("goal-legacy", "2026-01-07T00:00:00Z");
+    delete legacy.integration; // A legacy goal would target main, so it cannot be retried.
+    const newest = failedGoal();
+    newest.proposal!.outcomes.push({ id: "outcome-2", title: "Newer failure", description: "Fix it", seatId: "seat-002" });
+    newest.assignments!.push({ outcomeId: "outcome-2", seatId: "seat-002", status: "failed", updatedAt: "2026-01-03T00:00:00Z" });
+    const closed = failedGoal("goal-closed", "2026-01-04T00:00:00Z");
+    Object.assign(closed.integration!, { status: "pr-open", prUrl: "https://github.com/o/r/pull/2" });
+    const other = failedGoal("goal-other", "2026-01-05T00:00:00Z");
+    other.proposal!.outcomes[0].seatId = other.assignments![0].seatId = "seat-003";
+    const lead = failedGoal("goal-lead", "2026-01-05T00:00:00Z");
+    lead.assignments![0].seatId = "seat-001";
+    const active = (["queued", "running", "in-review", "merged"] as const).map((status) => {
+      const goal = failedGoal(`goal-${status}`, "2026-01-06T00:00:00Z");
+      goal.assignments![0].status = status;
+      return goal;
+    });
+    const { supervisor } = await retryFixture([old, newest, closed, other, lead, legacy, ...active]);
+    const live = await supervisor.read();
+    expect(live["seat-002"].retry).toEqual({ seatId: "seat-002", goalId: "goal-retry", goal: "Fix the terminal", outcomeId: "outcome-2", title: "Newer failure", updatedAt: "2026-01-03T00:00:00Z" });
+    expect(live["seat-003"].retry?.goalId).toBe("goal-other");
+    expect(live["seat-001"].retry).toBeUndefined();
+  });
+
+  it("commits one re-queue to the same seat, preserving the prior PR and runner metadata, even for simultaneous requests", async () => {
+    const { store, supervisor, target, dir } = await retryFixture();
+    const runtime = { worktree: "/retained/worktree", step: "review", prUrl: "https://github.com/o/r/pull/1" };
+    await store.saveRuntime("seat-seat-002-goal-retry-outcome-1", runtime);
+    const before = git(dir, "rev-list", "--count", "HEAD");
+    const results = await Promise.allSettled([supervisor.retry(target), supervisor.retry(target)]);
+    expect(results.filter((item) => item.status === "fulfilled")).toEqual([{ status: "fulfilled", value: "Re-queued goal-retry/outcome-1 for seat-002." }]);
+    const failure = results.find((item) => item.status === "rejected");
+    expect(failure?.status === "rejected" && failure.reason.message).toContain("queued, not failed");
+    const state = await store.read(); // Also validates the saved schema and references.
+    expect(state.planningGoals![0].assignments).toEqual([{ outcomeId: "outcome-1", seatId: "seat-002", status: "queued", updatedAt: expect.any(String), prUrl: runtime.prUrl }]);
+    expect(state.planningGoals![0].assignments![0].updatedAt).not.toBe(target.updatedAt);
+    expect(state.planningGoals![0].updatedAt).toBe(state.planningGoals![0].assignments![0].updatedAt);
+    expect(await store.readRuntimeFile("seat-seat-002-goal-retry-outcome-1")).toEqual(runtime);
+    expect(Number(git(dir, "rev-list", "--count", "HEAD")) - Number(before)).toBe(1);
+    expect(git(dir, "show", "--format=", "--name-only", "HEAD").trim()).toBe("state.json");
+    expect((await supervisor.read())["seat-002"]).toMatchObject({ assignment: { status: "queued" } });
+    expect((await supervisor.read())["seat-002"].retry).toBeUndefined();
+    await expect(supervisor.retry(target)).rejects.toThrow("queued, not failed");
+  });
+
+  it.each(["queued", "running", "in-review", "merged"] as const)("refuses a stale selection that became %s", async (status) => {
+    const { store, supervisor, target, dir } = await retryFixture();
+    await store.update((state) => { state.planningGoals![0].assignments![0].status = status; }, "Advance assignment");
+    const head = git(dir, "rev-parse", "HEAD");
+    await expect(supervisor.retry(target)).rejects.toThrow(`${status}, not failed`);
+    expect(git(dir, "rev-parse", "HEAD")).toBe(head);
+  });
+
+  it("refuses an old confirmation after a subsequent failure, and accepts a fresh confirmation", async () => {
+    const { store, supervisor, target } = await retryFixture();
+    await store.update((state) => { state.planningGoals![0].assignments![0].updatedAt = "2026-01-03T00:00:00Z"; }, "Record a later failure");
+    await expect(supervisor.retry(target)).rejects.toThrow("changed since confirmation");
+    expect((await store.read()).planningGoals![0].assignments![0].status).toBe("failed");
+    await expect(supervisor.retry((await supervisor.read())["seat-002"].retry!)).resolves.toContain("Re-queued");
+  });
+
+  it("refuses a confirmation whose sprint integration was removed instead of queuing work on main", async () => {
+    const { store, supervisor, target, dir } = await retryFixture();
+    await store.update((state) => { delete state.planningGoals![0].integration; }, "Remove sprint integration");
+    const head = git(dir, "rev-parse", "HEAD");
+    await expect(supervisor.retry(target)).rejects.toThrow("no sprint integration branch");
+    expect(git(dir, "rev-parse", "HEAD")).toBe(head);
+    expect((await supervisor.read())["seat-002"].retry).toBeUndefined();
+    expect((await store.read()).planningGoals![0].assignments![0].status).toBe("failed");
+  });
+
+  it.each(["pr-open", "merged", "reverted"] as const)("refuses retries once sprint integration is %s", async (status) => {
+    const { store, supervisor, target } = await retryFixture();
+    // The bridge holds this same lock while opening the integration PR. A retry must wait and reread its result.
+    let result: Promise<unknown>;
+    await store.withGoalLock(target.goalId, async () => {
+      result = expect(supervisor.retry(target)).rejects.toThrow(`is ${status}; it no longer accepts retries`);
+      await store.update((state) => {
+        Object.assign(state.planningGoals![0].integration!, { status, prUrl: "https://github.com/o/r/pull/2", ...(status !== "pr-open" ? { mergedSha: "b".repeat(40) } : {}), ...(status === "reverted" ? { revertPrUrl: "https://github.com/o/r/pull/3" } : {}) });
+      }, "Close sprint integration");
+    });
+    await result!;
+    expect((await supervisor.read())["seat-002"].retry).toBeUndefined();
+    expect((await store.read()).planningGoals![0].assignments![0].status).toBe("failed");
+  });
+
+  it("rechecks ownership, Developer role and approval without picking a different failure", async () => {
+    const { store, supervisor, target } = await retryFixture([failedGoal(), failedGoal("goal-older", "2026-01-01T00:00:00Z")]);
+    await store.update((state) => { state.planningGoals![0].assignments![0].seatId = "seat-003"; }, "Reassign outcome");
+    await expect(supervisor.retry(target)).rejects.toThrow("no longer assigned to seat-002");
+    await expect(supervisor.retry({ ...target, seatId: "seat-001" })).rejects.toThrow("not a Developer");
+    await store.update((state) => {
+      const goal = state.planningGoals![0];
+      goal.stage = "awaiting-review";
+      delete goal.assignments; delete goal.integration;
+    }, "Remove approval");
+    await expect(supervisor.retry(target)).rejects.toThrow("no longer approved");
+    await store.update((state) => { state.planningGoals!.shift(); }, "Remove goal");
+    await expect(supervisor.retry(target)).rejects.toThrow("no longer approved or available");
+    expect((await store.read()).planningGoals![0].assignments![0].status).toBe("failed");
   });
 });
 
