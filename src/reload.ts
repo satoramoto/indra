@@ -16,6 +16,11 @@ export function appRootOf(moduleUrl: string): string {
   return basename(dirname(dir)) === "builds" ? resolve(dir, "..", "..") : resolve(dir, "..");
 }
 
+/** A Codex output schema in the checkout's `schemas/` directory, found from the app root so it works from `builds/<build>/`. */
+export function schemaPathOf(moduleUrl: string, name: string): string {
+  return resolve(appRootOf(moduleUrl), "schemas", name);
+}
+
 /** True when this module is the process's entry point, also when it was started through the `dist` symlink. */
 export function isEntry(moduleUrl: string): boolean {
   const entry = process.argv[1];
