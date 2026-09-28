@@ -15,11 +15,11 @@ class FakeTmux implements TmuxRunner {
   onStart: (session: string, nonce: string) => Promise<void> = async () => {};
   async run(args: string[]): Promise<string> {
     this.calls.push(args);
-    const target = args.includes("-t") ? args[args.indexOf("-t") + 1].replace(/^=/, "") : "";
+    const target = args.includes("-t") ? args[args.indexOf("-t") + 1].replace(/^=/, "").replace(/:$/, "") : "";
     const live = this.sessions.get(target);
-    if (args.includes("display-message")) { if (!live) throw new Error("gone"); return live.identity; }
+    if (args.includes("display-message")) return "100";
     if (args.includes("list-panes")) { if (!live) throw new Error("gone"); return `${live.pane}:0`; }
-    if (args.includes("list-sessions")) return [...this.sessions.keys()].join("\n");
+    if (args.includes("list-sessions")) return [...this.sessions].map(([name, { identity }]) => args.at(-1)!.includes("session_created") ? `${name} ${identity.split(":")[1]}` : name).join("\n");
     if (args.includes("kill-session")) { if (!live) throw new Error("gone"); this.sessions.delete(target); return ""; }
     if (args.includes("new-session")) {
       const name = args[args.indexOf("-s") + 1];

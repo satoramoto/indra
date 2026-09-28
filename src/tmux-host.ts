@@ -70,8 +70,8 @@ export class TmuxHost {
     if (!record) return undefined;
     if (record.socket !== this.socket || record.session !== this.session || record.stateCheckout !== resolve(this.stateCheckout) || record.appDir !== this.appDir || !/^[a-f0-9-]{36}$/.test(record.readyNonce) || !/^\d+:\d+$/.test(record.tmuxIdentity) || !/^%\d+$/.test(record.paneId)) throw new Error("Tmux host metadata does not match this checkout.");
     try {
-      const identity = await this.runner.run(["-L", this.socket, "display-message", "-p", "-t", `=${this.session}`, "-F", "#{pid}:#{session_created}"]);
-      const panes = await this.runner.run(["-L", this.socket, "list-panes", "-t", `=${this.session}`, "-F", "#{pane_id}:#{pane_dead}"]);
+      const identity = await this.identity();
+      const panes = await this.runner.run(["-L", this.socket, "list-panes", "-t", this.target(), "-F", "#{pane_id}:#{pane_dead}"]);
       return identity === record.tmuxIdentity && panes.split("\n").includes(`${record.paneId}:0`) ? record : undefined;
     } catch { return undefined; }
   }
@@ -92,8 +92,12 @@ export class TmuxHost {
     const output = await this.runner.run(["-L", this.socket, "new-session", "-d", "-P", "-F", "#{session_name}:#{pane_id}", "-s", this.session, "-c", this.appDir, process.execPath, "--experimental-ffi", "--use-system-ca", this.cli, ...this.command(readyNonce)]);
     const [name, paneId] = output.split(":");
     if (name !== this.session || !/^%\d+$/.test(paneId ?? "")) throw new Error(`Tmux started but returned an unexpected pane identity; inspect socket ${this.socket} before retrying.`);
-    const tmuxIdentity = await this.runner.run(["-L", this.socket, "display-message", "-p", "-t", `=${this.session}`, "-F", "#{pid}:#{session_created}"]);
-    if (!/^\d+:\d+$/.test(tmuxIdentity)) throw new Error("Tmux did not return a stable server and session identity.");
+    const tmuxIdentity = await this.identity().catch(() => undefined);
+    if (!tmuxIdentity) {
+      // Never leave a session we just created without an ownership record.
+      await this.runner.run(["-L", this.socket, "kill-session", "-t", this.target()]).catch(() => undefined);
+      throw new Error("Tmux did not return a stable server and session identity.");
+    }
     const record: HostRecord = { socket: this.socket, session: this.session, paneId, tmuxIdentity, readyNonce, stateCheckout: resolve(this.stateCheckout), appDir: this.appDir, startedAt: new Date().toISOString() };
     await mkdir(dirname(this.recordFile), { recursive: true, mode: 0o700 });
     const temp = `${this.recordFile}.${randomUUID()}.tmp`;
@@ -111,8 +115,20 @@ export class TmuxHost {
   async stop(): Promise<boolean> {
     const record = await this.verifiedRecord();
     if (!record) return false;
-    await this.runner.run(["-L", this.socket, "kill-session", "-t", `=${this.session}`]);
+    await this.runner.run(["-L", this.socket, "kill-session", "-t", this.target()]);
     return true;
+  }
+
+  /** Exact-name target. The trailing colon makes tmux resolve the session's current window and pane, which tmux 3.6a needs for pane and format lookups. */
+  private target(): string { return `=${this.session}:`; }
+
+  /** Server pid plus the exact session's creation time, or undefined when tmux cannot give both. */
+  private async identity(): Promise<string | undefined> {
+    const pid = (await this.runner.run(["-L", this.socket, "display-message", "-p", "#{pid}"])).trim();
+    const sessions = await this.runner.run(["-L", this.socket, "list-sessions", "-F", "#{session_name} #{session_created}"]);
+    const created = sessions.split("\n").map((line) => line.trim().split(" ")).find(([name]) => name === this.session)?.[1];
+    const identity = `${pid}:${created ?? ""}`;
+    return /^\d+:\d+$/.test(identity) ? identity : undefined;
   }
 
   readyFile(nonce: string): string { return readyFile(this.stateCheckout, nonce); }
