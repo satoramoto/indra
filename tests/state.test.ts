@@ -109,8 +109,9 @@ describe("local state checkout", () => {
     expect(String(error)).toContain("Set --state PATH or INDRA_STATE_REPO");
   });
 
-  it("selects state by default and keeps Mattermost opt-in", () => {
-    expect(parseOptions([], "/tmp/fixture")).toEqual({ mode: "state", checkout: "/tmp/fixture", once: false });
+  it("opens the terminal UI by default and keeps Mattermost opt-in", () => {
+    expect(parseOptions([], "/tmp/fixture")).toEqual({ mode: "ui", checkout: "/tmp/fixture" });
+    expect(parseOptions(["--ui"], "/tmp/fixture")).toEqual({ mode: "ui", checkout: "/tmp/fixture" });
     expect(parseOptions(["--state", "/tmp/explicit", "--once"], "/tmp/fixture")).toEqual({ mode: "state", checkout: "/tmp/explicit", once: true });
     expect(parseOptions(["--mattermost", "--team", "yahaha"])).toEqual({ mode: "mattermost", slug: "yahaha" });
     expect(() => parseOptions(["--team", "yahaha"])).toThrow("requires --mattermost");

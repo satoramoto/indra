@@ -5,16 +5,16 @@ import { readToken } from "./credential.js";
 import { Inventory, InventoryError, type Seat, type Team } from "./domain.js";
 import { LocalStateRepository, StateDataError } from "./local-state.js";
 import { MattermostClient, MattermostInventory } from "./mattermost.js";
-import { interactiveState, printState } from "./state-cli.js";
+import { printState } from "./state-cli.js";
 import { StateInventory } from "./state-domain.js";
 import { PlanningStore } from "./planning.js";
 import { PlanningBridge } from "./planning-bridge.js";
 import { MattermostPlanningChat, readBotToken, readChickToken } from "./planning-mattermost.js";
 import { DeveloperSeat, loadDeveloperSeat, processShell } from "./developer-seat.js";
 import { CodexRuntime } from "./codex-runtime.js";
-import { TmuxHost } from "./tmux-host.js";
+import { signalReady, TmuxHost } from "./tmux-host.js";
 import { LocalSessionReader } from "./session-snapshot.js";
-import { mkdir, writeFile } from "node:fs/promises";
+import { CliGoalStarter, Supervisor } from "./supervisor.js";
 import { checkConsistency, printConsistency, type TeamMemberReader } from "./consistency.js";
 
 export const SERVER = "https://mattermost.newegypt.io";
@@ -79,13 +79,26 @@ export async function interactive(inventory: Inventory, read: Read, write: Write
   }
 }
 
+/** Reads a hosted process's bot token; when it is missing, tells the tmux host "no credential" before failing. */
+async function hostedToken(checkout: string, readyNonce: string | undefined, read: () => Promise<string>): Promise<string> {
+  try { return await read(); }
+  catch (error) {
+    if (readyNonce) {
+      await signalReady(checkout, readyNonce, "no-credential").catch(() => {});
+      // Stay alive briefly so the host sees the signal from a verified pane rather than a vanished one.
+      await new Promise((done) => setTimeout(done, 5000));
+    }
+    throw error;
+  }
+}
+
 /** Prints the live Mattermost vs state report; returns the exit code (1 when anything differs). */
 export async function runConsistencyCheck(state: StateInventory, reader: TeamMemberReader, write: Write): Promise<number> {
   const reports = await checkConsistency(await state.current(), reader);
   return printConsistency(reports, timestamp(), write) > 0 ? 1 : 0;
 }
 
-type Options = { mode: "help" } | { mode: "seat"; seatId: string; checkout: string } | { mode: "state"; checkout: string; once: boolean } | { mode: "ui"; checkout: string } | { mode: "mattermost"; slug: string } | { mode: "mattermost"; checkout: string; once: boolean } | { mode: "planning"; action: "start" | "serve" | "host" | "status"; checkout: string; channel?: string; goal?: string; projects: string[]; participants: string[]; readyNonce?: string };
+type Options = { mode: "help" } | { mode: "seat"; seatId: string; checkout: string; readyNonce?: string } | { mode: "state"; checkout: string; once: boolean } | { mode: "ui"; checkout: string } | { mode: "mattermost"; slug: string } | { mode: "mattermost"; checkout: string; once: boolean } | { mode: "planning"; action: "start" | "serve" | "host" | "status"; checkout: string; channel?: string; goal?: string; projects: string[]; participants: string[]; readyNonce?: string };
 
 const usage = "Usage: npm start -- [--state PATH] [--once] | --ui [--state PATH] | --mattermost [--state PATH] [--once] | --mattermost --team SLUG | planning start --goal TEXT [--channel CHANNEL_ID] [--project PATH] [--participant SEAT_ID] [--state PATH] | planning serve|host|status [--state PATH] | seat run --seat SEAT_ID [--state PATH]\nPlanning serves only Chick's Yahaha thread. Reply in the thread to clarify; send /proposal there to request a draft.";
 
@@ -93,17 +106,18 @@ export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_
   if (args.length === 1 && (args[0] === "--help" || args[0] === "-h")) return { mode: "help" };
   if (args[0] === "seat") {
     if (args[1] !== "run") throw new StateDataError(usage);
-    let checkout: string | undefined; let seatId: string | undefined;
+    let checkout: string | undefined; let seatId: string | undefined; let readyNonce: string | undefined;
     for (let index = 2; index < args.length; index++) {
       const key = args[index]; const value = args[++index];
       if (!value || value.startsWith("--")) throw new StateDataError(usage);
       if (key === "--state" && !checkout) checkout = value;
       else if (key === "--seat" && !seatId) seatId = value;
+      else if (key === "--ready-nonce" && !readyNonce && /^[a-f0-9-]{36}$/.test(value)) readyNonce = value;
       else throw new StateDataError(usage);
     }
     if (!seatId) throw new StateDataError(usage);
     const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-    return { mode: "seat", seatId, checkout: resolve(checkout || stateEnv || resolve(projectRoot, "..", "indra-state")) };
+    return { mode: "seat", seatId, checkout: resolve(checkout || stateEnv || resolve(projectRoot, "..", "indra-state")), ...(readyNonce ? { readyNonce } : {}) };
   }
   if (args[0] === "planning") {
     const action = args[1];
@@ -152,7 +166,8 @@ export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_
   const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
   const stateCheckout = resolve(checkout || stateEnv || resolve(projectRoot, "..", "indra-state"));
   if (mattermost) return { mode: "mattermost", checkout: stateCheckout, once };
-  return ui ? { mode: "ui", checkout: stateCheckout } : { mode: "state", checkout: stateCheckout, once };
+  // The terminal UI is the default; --ui is kept as an alias.
+  return once ? { mode: "state", checkout: stateCheckout, once } : { mode: "ui", checkout: stateCheckout };
 }
 
 export async function main(args: string[] = process.argv.slice(2)): Promise<number> {
@@ -166,7 +181,8 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       try {
         const store = new PlanningStore(options.checkout);
         const seat = await loadDeveloperSeat(store, options.seatId);
-        const chat = new MattermostPlanningChat(await readBotToken(seat.username));
+        const chat = new MattermostPlanningChat(await hostedToken(options.checkout, options.readyNonce, () => readBotToken(seat.username)));
+        if (options.readyNonce) await signalReady(options.checkout, options.readyNonce);
         const runner = new DeveloperSeat(store, seat, chat, processShell, (cwd, write) => new CodexRuntime(cwd, 60 * 60_000, write), (line) => console.log(`[${new Date().toISOString()}] ${line}`));
         console.log(`Developer seat ${seat.id} (@${seat.username}) running. Stop with Ctrl-C.`);
         while (true) {
@@ -179,21 +195,16 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
     }
     if (options.mode === "ui") {
       const { runTerminalUi } = await import("./terminal-ui-solid.js");
-      return await runTerminalUi(new StateInventory(new LocalStateRepository(options.checkout)), new LocalSessionReader(options.checkout));
+      return await runTerminalUi(new StateInventory(new LocalStateRepository(options.checkout)), new LocalSessionReader(options.checkout), {
+        processes: new Supervisor(options.checkout),
+        goals: new CliGoalStarter(options.checkout),
+      });
     }
     if (options.mode === "state") {
       const inventory = new StateInventory(new LocalStateRepository(options.checkout));
       console.log(`State checkout: ${options.checkout}`);
-      if (options.once) {
-        printState(await inventory.current(), timestamp(), console.log);
-        return 0;
-      }
-      const rl = createInterface({ input: process.stdin, output: process.stdout });
-      try {
-        return await interactiveState(inventory, (prompt) => rl.question(prompt), console.log);
-      } finally {
-        rl.close();
-      }
+      printState(await inventory.current(), timestamp(), console.log);
+      return 0;
     }
     if (options.mode === "planning") {
       if (options.action === "host") {
@@ -207,7 +218,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         return 0;
       }
       const store = new PlanningStore(options.checkout);
-      const chat = new MattermostPlanningChat(await readChickToken());
+      const chat = new MattermostPlanningChat(await hostedToken(options.checkout, options.readyNonce, readChickToken));
       const runtime = new CodexRuntime(process.cwd());
       const bridge = new PlanningBridge(store, chat, runtime);
       if (options.action === "start") {
@@ -220,9 +231,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       while (true) {
         await bridge.poll();
         if (!ready && options.readyNonce) {
-          const host = new TmuxHost(options.checkout);
-          await mkdir(host.runtimeDir, { recursive: true, mode: 0o700 });
-          await writeFile(host.readyFile(options.readyNonce), JSON.stringify({ nonce: options.readyNonce, pid: process.pid, readyAt: new Date().toISOString() }), { flag: "wx", mode: 0o600 });
+          await signalReady(options.checkout, options.readyNonce);
           ready = true;
         }
         await new Promise((resolve) => setTimeout(resolve, 3000));

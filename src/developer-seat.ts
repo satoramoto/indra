@@ -3,6 +3,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentResult, AgentRuntime, WriteAccess } from "./codex-runtime.js";
 import type { PlanningAssignment as Assignment, PlanningGoal, PlanningOutcome as ApprovedOutcome, PlanningStore } from "./planning.js";
+import { activityRecordName } from "./supervisor.js";
 
 export interface ShellResult { code: number; stdout: string; stderr: string }
 export interface Shell { run(command: string, args: string[], cwd: string): Promise<ShellResult> }
@@ -175,7 +176,10 @@ export class DeveloperSeat {
   /** Progress posts are best effort; a Mattermost outage does not fail the work. */
   private async say(goal: PlanningGoal, message: string): Promise<void> {
     try { await this.chat.post(goal.mattermost.channelId, message, goal.mattermost.rootPostId); }
-    catch { this.log("Could not post progress to the goal thread."); }
+    catch { this.log("Could not post progress to the goal thread."); return; }
+    // The terminal UI shows this as the seat's newest thread activity.
+    try { await this.store.saveRuntime(activityRecordName(this.seat.id),{ message, at: new Date().toISOString() }); }
+    catch { this.log("Could not record thread activity."); }
   }
 }
 

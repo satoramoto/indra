@@ -25,21 +25,17 @@ Indra is a startup simulator: a control plane where stable team seats in Matterm
 
 ## Run
 
-Requires Node.js 26.4.0 or newer for the OpenTUI Solid terminal screen. The launcher passes Node's `--experimental-ffi` flag; it does not change the system Node installation. Keep the separate `indra-state` checkout beside this project, or pass its directory explicitly:
-
 ```sh
-npm ci
-npm run build
 npm start
-npm start -- --state /path/to/indra-state
-npm start -- --ui --state /path/to/indra-state
 ```
 
-The default is the sibling `../indra-state` directory. `INDRA_STATE_REPO` also sets the checkout path; `--state` takes precedence. The terminal shows recorded teams, seats, roles, and draft sprint details. Enter `r` to reread `state.json` after a file edit or Git checkout change, or `q` to quit. `--once` prints one snapshot and exits, useful for scripts and a quick check:
+That is the only thing to run. The terminal UI opens on the team and makes sure Chick's planning bridge and one runner per Developer seat are running; you never start or manage those processes yourself. Each seat row shows its process (running, stopped or no credential), the assignment it holds (outcome, status, PR link) and its newest thread activity. Keys: `n` starts a new planning goal (type the goal, then Enter), `s` restarts the selected seat's process, `x` stops it, Enter opens the seat's detail and `a` attaches to its tmux session read-only. `q` quits and leaves every process running. Plan review and approval happen in the Mattermost thread with `/proposal` and `/approve`.
 
-```sh
-npm start -- --state /path/to/indra-state --once
-```
+## Under the hood
+
+First run in a checkout: `npm ci` then `npm run build`. Node.js 26.4.0 or newer is required; the launcher passes Node's `--experimental-ffi` flag without changing the system Node. The state checkout is the sibling `../indra-state` by default; `INDRA_STATE_REPO` or `--state PATH` overrides it (`--state` wins). `npm start -- --once` prints one state snapshot and exits.
+
+On open, the UI hosts each missing process in its own detached tmux session on an Indra-owned socket, exactly as `planning host` does: Chick's `planning serve` for the Team Lead seat and `seat run --seat SEAT_ID` for each Developer seat. A verified live session is reused, never duplicated; a session Indra does not own is never touched. Ownership records live in `<state-checkout>.runtime/tmux-host.json` (bridge) and `tmux-seat-SEAT_ID.json` (seats). A process whose 1Password bot item is missing signals that before it exits, and its seat shows **no credential**. A new goal runs `planning start` with this Indra checkout as the project; the channel comes from state's planning channel, or the UI asks for a channel ID once per session. The manual commands below still work for debugging.
 
 The app validates the version 1 structure and references before showing a snapshot. Each seat's `roles` holds exactly one of the two roles, `Team Lead` or `Developer`, and each team has exactly one Team Lead. Validation errors name the invalid field or reference. A failed refresh never presents malformed data as an empty roster. The `indra-state` repository contains [the formal JSON Schema](https://github.com/satoramoto/indra-state/blob/main/schema/v1/state.schema.json); `state.json` carries `$schema` and `schemaVersion`. The current sprint's work and allocations are **draft proposals**, not approved assignments or active execution.
 
@@ -124,6 +120,6 @@ npm run build
 
 `npm run dev` watches source files and rebuilds the CLI and terminal UI; run `npm start` in a second terminal after the initial build. Vite compiles Solid TSX with the universal transform and Vitest runs fixture and native renderer tests. There is no web server or HTTP preview.
 
-`npm start -- --ui --state PATH` opens the read-only OpenTUI Solid screen with the local state and runtime session reader. It polls state and session snapshots every two seconds, keeps the selected stable seat during refresh, and labels disconnected occupancy as unknown while still showing recorded planning goals and activity. The team view shows each seat's role and newest recorded activity; Enter opens its detail. An attach action is available only for a verified Indra-owned tmux target and opens a read-only bridge event/log view. Detaching or quitting does not pause or stop the bridge. The 80-column view keeps all five Yahaha seats in the roster and moves the expanded detail to its own screen.
+`npm start -- --state PATH` opens the OpenTUI Solid screen with the local state, the runtime session reader and the seat process supervisor (`src/supervisor.ts`); `--ui` is an alias. It polls state, session and process snapshots every two seconds, keeps the selected stable seat during refresh, and labels disconnected occupancy as unknown while still showing recorded planning goals and activity. The team view shows each seat's role and newest recorded activity; Enter opens its detail. An attach action is available only for a verified Indra-owned tmux target and opens a read-only bridge event/log view. Detaching or quitting does not pause or stop the bridge. The 80-column view keeps all five Yahaha seats in the roster and moves the expanded detail to its own screen.
 
 `src/state-domain.ts` defines neutral inventory records. `src/planning.ts` owns state writes and local resume metadata. `src/planning-bridge.ts` routes Chick's thread and validates model output. `src/codex-runtime.ts` and `src/planning-mattermost.ts` are the provider adapters. There is no HTTP preview server.
