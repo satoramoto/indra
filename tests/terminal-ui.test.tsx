@@ -1,6 +1,7 @@
 import { testRender } from "@opentui/solid";
+import type { ScrollBoxRenderable } from "@opentui/core";
 import { createSignal } from "solid-js";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { StateInventory, type StateSnapshot } from "../src/state-domain.js";
 import { GOAL_INPUT_LIMIT, TerminalUiModel, type SessionReadResult, type StateSyncPort, type TerminalSession, type UpdatePort } from "../src/terminal-ui.js";
 import type { UpdateResult } from "../src/self-update.js";
@@ -8,6 +9,7 @@ import type { StateSyncResult } from "../src/state-commit.js";
 import { TerminalApp } from "../src/terminal-ui-solid.js";
 import { attachTmux, parseOwnedTmuxTarget } from "../src/tmux-attach.js";
 import type { AssignmentRetry, GoalStarter, SeatLive, SeatProcessPort } from "../src/supervisor.js";
+import type { SprintBuild, SprintLoop } from "../src/session-snapshot.js";
 
 const names = ["Chick Corea", "George Duke", "Aaron Magner", "Corey Henry", "Jordan Rudess"];
 const snapshot: StateSnapshot = {
@@ -825,5 +827,150 @@ describe("terminal UI", () => {
       { args: ["-L", "indra-bridge", "has-session", "-t", "=chick-123"], stdio: "ignore" },
       { args: ["-L", "indra-bridge", "attach-session", "-r", "-t", "=chick-123"], stdio: "inherit" },
     ]);
+  });
+});
+
+const projectedSession = (id: string, loop: SprintLoop): TerminalSession => ({
+  id, teamId: "team-001", seatId: "seat-001", goal: `Sprint ${id}`, status: "idle", engine: "codex", stage: "approved", recentActivity: [], loop,
+});
+const ticketLoop: SprintLoop = {
+  stage: "Build",
+  tickets: (["queued", "building", "in review", "merged", "failed"] as const).map((status, index) => ({
+    id: `ticket-${index}`, title: `Outcome ${index} stays visible`, seatId: "seat-002", status, prUrl: `https://github.com/example/indra/pull/${index + 30}`,
+  })),
+  integration: { branch: "sprint/goal-one", baseSha: "a".repeat(40), status: "collecting" },
+};
+
+async function scrollFrames(setup: Awaited<ReturnType<typeof testRender>>, id: string): Promise<string[]> {
+  const scroll = setup.renderer.root.findDescendantById(id) as ScrollBoxRenderable;
+  expect(scroll).toBeDefined();
+  const frames: string[] = [];
+  for (let top = 0; top < scroll.scrollHeight; top += 5) {
+    scroll.scrollTo(top);
+    await setup.renderOnce();
+    frames.push(setup.captureCharFrame().split("\n").map((line) => line.slice(scroll.x, scroll.x + scroll.width)).join("\n"));
+  }
+  return frames;
+}
+const compactFrame = (text: string) => text.replace(/[\s│┃║]/g, "");
+const visibleIn = (frames: string[], text: string) => frames.some((frame) => compactFrame(frame).includes(compactFrame(text)));
+
+describe("visible sprint loop", () => {
+  it("highlights the current stage in text and color without starting or approving work", async () => {
+    const processes: SeatProcessPort = { read: vi.fn(async () => ({})), ensureAll: vi.fn(async () => []), stop: vi.fn(), restart: vi.fn(), retry: vi.fn() };
+    const goals: GoalStarter = { start: vi.fn(), propose: vi.fn(), approve: vi.fn(), sprint: vi.fn() };
+    const session = projectedSession("goal-one", ticketLoop);
+    session.goal = "Make the full sprint loop visible while preserving every outcome, approval, and integration detail. ".repeat(15);
+    const model = new TerminalUiModel(new StateInventory({ read: async () => ({ ...homed, sprints: [] }) }), { readSessions: async () => ({ connection: "disconnected", sessions: [session] }) }, processes, goals);
+    await model.refresh();
+    const setup = await testRender(() => <TerminalApp model={model} revision={() => model.revision} onKey={() => {}} />, { width: 140, height: 35 });
+    try {
+      await setup.renderOnce();
+      expect(setup.captureCharFrame()).toContain("Current stage: Build");
+      const spans = setup.captureSpans().lines.flatMap((line) => line.spans);
+      const current = spans.find((span) => span.text.includes("[Build]"));
+      expect(current?.fg.toInts().slice(0, 3)).toEqual([103, 232, 249]);
+      expect(spans.find((span) => span.text.includes("Clarify"))?.fg.toInts()).not.toEqual(current?.fg.toInts());
+      const frames = await scrollFrames(setup, "sprint-scroll");
+      for (const ticket of ticketLoop.tickets) {
+        expect(visibleIn(frames, `${ticket.title} · ${ticket.status}`)).toBe(true);
+        expect(visibleIn(frames, ticket.prUrl!)).toBe(true);
+      }
+      for (const action of [processes.ensureAll, processes.stop, processes.restart, processes.retry, goals.start, goals.propose, goals.approve, goals.sprint]) expect(action).not.toHaveBeenCalled();
+      expect(model.confirm).toBeUndefined();
+    } finally { setup.renderer.destroy(); }
+  });
+
+  it.each([80, 44])("keeps multiple sprints, completed/failed tickets, and integration links readable at %s columns", async (width) => {
+    const first = projectedSession("goal-one", ticketLoop);
+    const second = projectedSession("goal-two", {
+      stage: "Merge", tickets: [{ id: "failed", title: "Failed ticket retained", seatId: "seat-003", status: "failed", prUrl: "https://github.com/example/indra/pull/99" }],
+      integration: { branch: "sprint/goal-two", baseSha: "b".repeat(40), status: "pr-open", prUrl: "https://github.com/example/indra/pull/100" },
+    });
+    const fixture = harness();
+    fixture.state({ ...homed, sprints: [] });
+    fixture.sessions({ connection: "disconnected", sessions: [first, second] });
+    await fixture.model.refresh();
+    const setup = await testRender(() => <TerminalApp model={fixture.model} revision={() => fixture.model.revision} onKey={() => {}} />, { width, height: 24 });
+    try {
+      await setup.renderOnce();
+      const frames = await scrollFrames(setup, "team-scroll");
+      for (const text of ["SPRINT · goal-one", "SPRINT · goal-two", "Current stage: Build", "Current stage: Merge", "Build · tickets", "Integrate · integration PR", "Failed ticket retained · failed", "Seat: George Duke (seat-002)", "Seat: Aaron Magner (seat-003)", second.loop!.integration!.prUrl!, second.loop!.tickets[0].prUrl!]) {
+        expect(visibleIn(frames, text), text).toBe(true);
+      }
+      expect(visibleIn(frames, "Goal → Clarify → Propose → Approve → [Build] → Review → Integrate → Merge → Updated → Goal")).toBe(true);
+      for (const ticket of ticketLoop.tickets) {
+        expect(visibleIn(frames, `${ticket.title} · ${ticket.status}`)).toBe(true);
+        expect(visibleIn(frames, ticket.prUrl!)).toBe(true);
+      }
+    } finally { setup.renderer.destroy(); }
+  });
+
+  it("lets keyboard users page through sprint history", async () => {
+    const fixture = harness(); fixture.sessions({ connection: "connected", sessions: [projectedSession("goal-one", ticketLoop)] });
+    await fixture.model.refresh();
+    const setup = await testRender(() => <TerminalApp model={fixture.model} revision={() => fixture.model.revision} onKey={(name, _ctrl, text) => { fixture.model.key(name, text); }} />, { width: 80, height: 24 });
+    try {
+      await setup.renderOnce();
+      const scroll = setup.renderer.root.findDescendantById("team-scroll") as ScrollBoxRenderable;
+      expect(scroll.scrollTop).toBe(0);
+      setup.mockInput.pressKey("\u001b[6~");
+      await setup.renderOnce();
+      expect(scroll.scrollTop).toBeGreaterThan(10);
+      setup.mockInput.pressKey("\u001b[5~");
+      await setup.renderOnce();
+      expect(scroll.scrollTop).toBe(0);
+      fixture.model.confirm = { action: "approve", goalId: "goal-one", goal: "Sprint goal-one" };
+      setup.mockInput.pressKey("\u001b[6~");
+      await setup.renderOnce();
+      expect(fixture.model.confirm).toBeUndefined();
+      expect(fixture.model.notice).toContain("cancelled; nothing changed");
+      expect(scroll.scrollTop).toBe(0);
+    } finally { setup.renderer.destroy(); }
+  });
+
+  it.each<[SprintBuild["status"], string]>([
+    ["running", "Running build contains the integration commit."],
+    ["reload-pending", "Pending reload:"], ["update-pending", "Update pending:"],
+    ["unavailable", "Build evidence unavailable; Updated is not confirmed."],
+    ["revert-open", "Revert PR open; awaiting human merge confirmation."],
+    ["reverted", "Reverted on main; running revert build is unverified."],
+  ])("renders %s build evidence explicitly", async (status, message) => {
+    const fixture = harness(); fixture.state({ ...homed, sprints: [] });
+    fixture.sessions({ connection: "connected", sessions: [projectedSession("goal-built", { stage: status === "running" ? "Updated" : "Merge", tickets: [], build: { status } })] });
+    await fixture.model.refresh();
+    const setup = await testRender(() => <TerminalApp model={fixture.model} revision={() => fixture.model.revision} onKey={() => {}} />, { width: 120, height: 40 });
+    try {
+      await setup.renderOnce();
+      const frames = await scrollFrames(setup, "sprint-scroll");
+      expect(visibleIn(frames, message), frames[0]).toBe(true);
+      expect(visibleIn(frames, `Current stage: ${status === "running" ? "Updated" : "Merge"}`)).toBe(true);
+    } finally { setup.renderer.destroy(); }
+  });
+
+  it("starts draft sprints at Goal without inventing queued work", async () => {
+    const fixture = harness(); await fixture.model.refresh();
+    expect(fixture.model.sprintsForTeam()[0].loop).toMatchObject({ stage: "Goal", tickets: [] });
+    const setup = await testRender(() => <TerminalApp model={fixture.model} revision={() => fixture.model.revision} onKey={() => {}} />, { width: 80, height: 24 });
+    try {
+      await setup.renderOnce();
+      const frames = await scrollFrames(setup, "team-scroll");
+      expect(visibleIn(frames, "Current stage: Goal")).toBe(true);
+      expect(visibleIn(frames, "[Goal] → Clarify")).toBe(true);
+    } finally { setup.renderer.destroy(); }
+  });
+
+  it.each([["codex", "legacy-123", "Codex"], ["claude", "claude:123", "Claude Code"], ["unknown", "future:123", "Unknown engine"]] as const)("renders %s session labels without claiming another engine", async (engine, sessionId, label) => {
+    const fixture = harness();
+    fixture.sessions({ connection: "connected", sessions: [{ ...projectedSession("goal-engine", { stage: "Clarify", tickets: [] }), engine, sessionId }] });
+    await fixture.model.refresh(); fixture.model.seatId = "seat-001"; fixture.model.page = "seat";
+    const setup = await testRender(() => <TerminalApp model={fixture.model} revision={() => fixture.model.revision} onKey={() => {}} />, { width: 100, height: 40 });
+    try {
+      await setup.renderOnce();
+      const frame = setup.captureCharFrame();
+      expect(frame).toContain(`IDLE SESSION · ${label}`);
+      expect(frame).toContain(`${label} session: ${sessionId}`);
+      if (engine !== "codex") expect(frame).not.toContain("Codex");
+    } finally { setup.renderer.destroy(); }
   });
 });
