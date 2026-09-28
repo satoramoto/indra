@@ -239,9 +239,10 @@ describe("terminal UI", () => {
 
   it("starts a new planning goal from a typed line, asking for a channel once when state has none", async () => {
     const started: [string, string][] = [];
-    let channelReads = 0;
+    let channelReads = 0; let saved: string | undefined; const saves: string[] = [];
     const goals: GoalStarter = {
-      channelFor: async () => { channelReads++; return undefined; },
+      channelFor: async () => { channelReads++; return saved; },
+      saveChannel: async (_team, channel) => { saves.push(channel); saved = channel; },
       start: async (goal, channel) => { started.push([goal, channel]); return "Planning goal plan-1: https://example/pl/root"; },
     };
     const model = new TerminalUiModel(new StateInventory({ read: async () => snapshot }), { readSessions: async () => ({ connection: "connected", sessions: [] }) }, undefined, goals);
@@ -283,6 +284,16 @@ describe("terminal UI", () => {
       await model.submitInput();
       expect(started[1]).toEqual(["Second goal", "abcdefghijklmnopqrstuvwxyz"]);
       expect(channelReads).toBe(1);
+      expect(saves).toEqual(["abcdefghijklmnopqrstuvwxyz"]);
+      // A new UI session reads the saved channel from state and never asks again.
+      const next = new TerminalUiModel(new StateInventory({ read: async () => snapshot }), { readSessions: async () => ({ connection: "connected", sessions: [] }) }, undefined, goals);
+      await next.refresh();
+      next.key("n");
+      for (const char of "Third") next.key(char.toLowerCase(), char);
+      await next.submitInput();
+      expect(next.input).toBeUndefined();
+      expect(started[2]).toEqual(["Third", "abcdefghijklmnopqrstuvwxyz"]);
+      expect(saves).toHaveLength(1);
       model.key("n");
       model.key("escape");
       expect(model.input).toBeUndefined();

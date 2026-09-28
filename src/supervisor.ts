@@ -20,6 +20,8 @@ export interface SeatProcessPort {
 }
 export interface GoalStarter {
   channelFor(teamId: string): Promise<string | undefined>;
+  /** Records the team's planning channel in state (committed), so it is never asked for again. */
+  saveChannel(teamId: string, channelId: string): Promise<void>;
   /** Starts a planning goal and returns a one-line result for the screen. */
   start(goal: string, channelId: string): Promise<string>;
 }
@@ -119,6 +121,14 @@ export class CliGoalStarter implements GoalStarter {
 
   async channelFor(teamId: string): Promise<string | undefined> {
     return planningChannelId(await this.store.read(), teamId);
+  }
+
+  async saveChannel(teamId: string, channelId: string): Promise<void> {
+    await this.store.update((state) => {
+      const team = (state.teams as { id: string; externalIdentities?: { mattermost?: Record<string, unknown> } }[]).find((item) => item.id === teamId);
+      if (!team) throw new Error(`No team ${teamId} in state.`);
+      team.externalIdentities = { ...team.externalIdentities, mattermost: { ...team.externalIdentities?.mattermost, planningChannelId: channelId } };
+    }, `Record the planning channel for team ${teamId}`);
   }
 
   start(goal: string, channelId: string): Promise<string> {

@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PlanningStore } from "../src/planning.js";
 import { signalReady, TmuxHost, type TmuxRunner } from "../src/tmux-host.js";
-import { activityRecordName, Supervisor } from "../src/supervisor.js";
+import { activityRecordName, CliGoalStarter, Supervisor } from "../src/supervisor.js";
+import { git, stateCheckout } from "./state-checkout.js";
 
 /** A tmux server with several sessions. `onStart` decides how a new hosted process behaves. */
 class FakeTmux implements TmuxRunner {
@@ -37,11 +38,10 @@ class FakeTmux implements TmuxRunner {
 const seat = (id: string, name: string, roles: string[]) => ({ id, displayName: name, roles, externalIdentities: { mattermost: { userId: id, username: name.toLowerCase() } } });
 
 async function fixture() {
-  const dir = await mkdtemp(join(tmpdir(), "indra-supervisor-"));
+  const state = { $schema: "./schema/v1/state.schema.json", schemaVersion: 1, sprints: [], planningGoals: [], teams: [{ id: "team-001", slug: "yahaha", displayName: "Yahaha", externalIdentities: { mattermost: { teamId: "team" } }, seats: [seat("seat-001", "Chick", ["Team Lead"]), seat("seat-002", "George", ["Developer"]), seat("seat-003", "Herbie", ["Developer"])] }] };
+  const dir = await stateCheckout("indra-supervisor-", state);
   await mkdir(join(dir, "dist"));
   await writeFile(join(dir, "dist", "cli.js"), "");
-  const state = { $schema: "./schema/v1/state.schema.json", schemaVersion: 1, sprints: [], planningGoals: [], teams: [{ id: "team-001", slug: "yahaha", displayName: "Yahaha", externalIdentities: { mattermost: { teamId: "team" } }, seats: [seat("seat-001", "Chick", ["Team Lead"]), seat("seat-002", "George", ["Developer"]), seat("seat-003", "Herbie", ["Developer"])] }] };
-  await writeFile(join(dir, "state.json"), JSON.stringify(state));
   const tmux = new FakeTmux();
   tmux.onStart = async (_session, nonce) => { await signalReady(dir, nonce); };
   return { dir, tmux, supervisor: new Supervisor(dir, tmux, dir, 1000) };
@@ -133,10 +133,23 @@ describe("seat process supervisor", () => {
           { outcomeId: "outcome-3", seatId: "seat-003", status: "merged", updatedAt: "2026-01-02T00:00:00Z" },
         ],
       }];
-    });
+    }, "Add a planning goal");
     await store.saveRuntime(activityRecordName("seat-002"), { message: "Opened PR 2", at: "2026-01-02T00:00:00Z" });
     const live = await supervisor.read();
     expect(live["seat-002"]).toMatchObject({ process: "stopped", assignment: { title: "Second", status: "in-review", prUrl: "https://github.com/o/r/pull/2" }, activity: { message: "Opened PR 2" } });
     expect(live["seat-003"].assignment).toBeUndefined();
+  });
+});
+
+describe("CLI goal starter", () => {
+  it("saves a typed planning channel to the team as a state commit", async () => {
+    const state = { $schema: "./schema/v1/state.schema.json", schemaVersion: 1, sprints: [], planningGoals: [], teams: [{ id: "team-001", slug: "yahaha", displayName: "Yahaha", externalIdentities: { mattermost: { teamId: "team" } }, seats: [seat("seat-001", "Chick", ["Team Lead"])] }] };
+    const dir = await stateCheckout("indra-goal-starter-", state);
+    const starter = new CliGoalStarter(dir, dir);
+    expect(await starter.channelFor("team-001")).toBeUndefined();
+    await starter.saveChannel("team-001", "abcdefghijklmnopqrstuvwxyz");
+    expect(await starter.channelFor("team-001")).toBe("abcdefghijklmnopqrstuvwxyz");
+    expect(git(dir, "log", "-1", "--format=%s").trim()).toBe("Record the planning channel for team team-001");
+    expect(git(dir, "status", "--porcelain").trim()).toBe("");
   });
 });

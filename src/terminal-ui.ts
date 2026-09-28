@@ -63,7 +63,7 @@ export class TerminalUiModel {
   /** Live process, assignment and thread activity per seat ID; empty without a process supervisor. */
   live: Record<string, SeatLive> = {};
   input?: UiInput;
-  /** A channel ID typed once in this UI session, used when state has no planning channel. */
+  /** The channel ID typed in this UI session; it is also saved to the team in state. */
   channelId?: string;
   /** Called after changes made outside a key press or refresh, so the screen redraws. */
   changed?: () => void;
@@ -106,6 +106,8 @@ export class TerminalUiModel {
     let goal = value; let channel: string | undefined;
     if (input.kind === "channel") {
       if (!/^[a-z0-9]{26}$/.test(value)) { this.notice = "A Mattermost channel ID is 26 lowercase letters and digits."; this.bump(); return; }
+      try { await this.goals.saveChannel(this.teamId, value); }
+      catch (error) { this.notice = "Could not save the planning channel: " + (error instanceof Error ? error.message : String(error)); this.bump(); return; }
       goal = input.goal!; channel = this.channelId = value;
     } else {
       try { channel = this.channelId ?? await this.goals.channelFor(this.teamId); }
