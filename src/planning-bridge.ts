@@ -114,6 +114,9 @@ export class PlanningBridge {
   private async pollGoal(goal: PlanningGoal, own: string): Promise<void> {
     const metadata = await this.store.runtime(goal.id);
     if (metadata.pending) await this.deliver(goal, metadata);
+    // Drafts run inside this goal's lock, so a goal still in `drafting` here was left by a crash, restart or older build.
+    const current = (await this.store.read()).planningGoals?.find((item) => item.id === goal.id);
+    if (current?.stage === "drafting") { await this.revertDraft(current, metadata, `draft-recovery:${current.updatedAt}`, Date.now()); return; }
     let budget = this.maxQueue;
     if (!reviewing(goal)) {
       const posts = (await this.chat.since(goal.mattermost.channelId, metadata.lastSeenAt)).filter((post) => post.root_id === goal.mattermost.rootPostId && post.user_id !== own && !metadata.processedPostIds.includes(post.id)).sort((a, b) => a.create_at - b.create_at).slice(0, budget);
@@ -158,12 +161,21 @@ export class PlanningBridge {
     const id = goal.id;
     if (drafting) await this.store.update((state) => { const found = state.planningGoals!.find((item) => item.id === id)!; found.stage = "drafting"; found.updatedAt = new Date().toISOString(); }, `Start drafting a proposal for goal ${id}`);
     const developers = drafting ? developerSeats(await this.store.read(), goal.teamId).map((seat) => ({ id: seat.id, displayName: seat.displayName ?? seat.id })) : [];
-    const run = await this.runtime.message(prompt(goal, message, drafting, developers), drafting ? proposalSchema : briefSchema, metadata.sessionId);
+    let run: Awaited<ReturnType<AgentRuntime["message"]>>;
+    let draft: NonNullable<PlanningGoal["proposal"]> | undefined;
+    try {
+      run = await this.runtime.message(prompt(goal, message, drafting, developers), drafting ? proposalSchema : briefSchema, metadata.sessionId);
+      if (drafting) draft = proposal(run.response, developers);
+    } catch (error) {
+      if (!drafting) throw error;
+      console.error(`Planning draft for goal ${id} failed; reverting to clarifying.`);
+      await this.revertDraft(goal, metadata, inputKey, since);
+      return;
+    }
     metadata.sessionId = run.sessionId;
     metadata.runs.push({ startedAt: run.startedAt, finishedAt: run.finishedAt, usage: run.usage });
     await this.store.saveRuntime(id, metadata);
-    if (drafting) {
-      const draft = proposal(run.response, developers);
+    if (draft) {
       await this.store.update((state) => { const found = state.planningGoals!.find((item) => item.id === id)!; found.proposal = draft; found.stage = "awaiting-review"; found.updatedAt = new Date().toISOString(); }, `Draft proposal for goal ${id}: ${draft.outcomes.length} outcome${draft.outcomes.length === 1 ? "" : "s"}`);
       metadata.pending = { inputPostId: inputKey, since, message: proposalMessage({ ...goal, proposal: draft }, teamSeats(await this.store.read(), goal.teamId)), proposal: true };
     } else {
@@ -172,6 +184,14 @@ export class PlanningBridge {
       metadata.pending = { inputPostId: inputKey, since, message: update.reply };
     }
     await this.store.saveRuntime(id, metadata);
+    await this.deliver(goal, metadata);
+  }
+
+  /** Puts a goal whose draft failed or was interrupted back to clarifying and queues one reply saying so. */
+  private async revertDraft(goal: PlanningGoal, metadata: RuntimeRecord, inputKey: string, since: number): Promise<void> {
+    await this.store.update((state) => { const found = state.planningGoals!.find((item) => item.id === goal.id)!; if (found.stage === "drafting") { found.stage = "clarifying"; found.updatedAt = new Date().toISOString(); } }, `Revert goal ${goal.id} to clarifying after a failed draft`);
+    metadata.pending = { inputPostId: inputKey, since, message: `Drafting the proposal failed, so goal ${goal.id} is back to clarifying. React :${PROPOSE_EMOJI}: on the goal post again (or press P in the UI) to retry.` };
+    await this.store.saveRuntime(goal.id, metadata);
     await this.deliver(goal, metadata);
   }
 
