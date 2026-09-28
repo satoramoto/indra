@@ -135,17 +135,20 @@ type GoalAction = typeof GOAL_ACTIONS[number];
 const isGoalAction = (action: string | undefined): action is GoalAction => (GOAL_ACTIONS as readonly (string | undefined)[]).includes(action);
 
 /** All model and posting paths use the seat from state, local engine selection and optional Indra profiles. */
-async function seatServices(store: PlanningStore, username: string) {
+async function seatServices(store: PlanningStore, username: string, seatId?: string) {
   const state = await store.read();
-  const seats = (state.teams as { seats: { id: string; externalIdentities: { mattermost: { username: string } } }[] }[]).flatMap((team) => team.seats);
-  const seat = seats.find((item) => item.externalIdentities.mattermost.username === username);
+  const teams = state.teams as { slug: string; seats: { id: string; externalIdentities: { mattermost: { username: string } } }[] }[];
+  const seats = teams.flatMap((team) => team.seats);
+  const candidates = seatId === undefined ? teams.find((team) => team.slug === "yahaha")?.seats ?? [] : seats.filter((item) => item.id === seatId);
+  const seat = candidates.find((item) => item.externalIdentities.mattermost.username === username);
   if (!seat) throw new StateDataError("The bot's seat is not present in state.");
   const [engines, profiles] = await Promise.all([loadSeatEngines(store.runtimeDir, seats.map((item) => item.id)), loadSeatPersonas(import.meta.url)])
     .catch((error: Error) => { throw new StateDataError(error.message); });
-  const profile = profiles[seat.id];
+  const profile = Object.hasOwn(profiles, seat.id) ? profiles[seat.id] : undefined;
+  const engine = Object.hasOwn(engines, seat.id) ? engines[seat.id] : "codex";
   return {
     chat: (token: string) => withPersonaChat(new MattermostPlanningChat(token, username), profile),
-    runtime: (cwd: string, timeoutMs?: number, write?: WriteAccess) => withPersonaRuntime(new SeatRuntime(engines[seat.id] ?? "codex", cwd, timeoutMs, write), profile),
+    runtime: (cwd: string, timeoutMs?: number, write?: WriteAccess) => withPersonaRuntime(new SeatRuntime(engine, cwd, timeoutMs, write), profile),
   };
 }
 
@@ -230,7 +233,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       try {
         const store = new PlanningStore(options.checkout);
         const seat = await loadDeveloperSeat(store, options.seatId);
-        const services = await seatServices(store, seat.username);
+        const services = await seatServices(store, seat.username, seat.id);
         const chat = services.chat(await hostedToken(options.checkout, options.readyNonce, (tokenOptions) => readBotToken(seat.username, tokenOptions)));
         await joinTeamHome(options.checkout, options.readyNonce, store, chat, seat.username);
         if (options.readyNonce) await signalReady(options.checkout, options.readyNonce);

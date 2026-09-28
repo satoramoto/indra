@@ -89,9 +89,10 @@ export class ClaudeRuntime implements AgentRuntime {
       };
       const cancel = (message: string) => {
         if (settled) return;
-        stop("SIGTERM");
-        killTimer = setTimeout(() => stop("SIGKILL"), 1000); killTimer.unref();
+        // Keep escalation alive even if the parent exits first; its owned descendants can outlive it.
+        killTimer = setTimeout(() => stop("SIGKILL"), 1000);
         finish(new Error(message));
+        stop("SIGTERM");
       };
       const abort = () => cancel("Claude run cancelled.");
       const timer = setTimeout(() => cancel(`Claude run timed out after ${Math.round(timeoutMs / 60_000)} min.`), timeoutMs);
@@ -111,7 +112,7 @@ export class ClaudeRuntime implements AgentRuntime {
       });
       child.on("error", (error: NodeJS.ErrnoException) => finish(new Error(error.code === "ENOENT" ? "Claude executable not found; install Claude Code and sign in before selecting it for a seat." : "Claude process failed; diagnostics withheld.")));
       child.on("close", (code) => {
-        clearTimeout(killTimer);
+        if (process.platform === "win32" || !child.pid) clearTimeout(killTimer);
         finish(code === 0 ? undefined : new Error(`Claude run failed (${code ?? "cancelled"}); diagnostics withheld.`));
       });
       child.stdin.on("error", () => cancel("Claude could not read the prompt; diagnostics withheld."));

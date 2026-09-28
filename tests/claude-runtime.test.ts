@@ -126,6 +126,26 @@ describe("Claude runtime", () => {
     expect(child.kill).toHaveBeenCalledWith("SIGTERM"); expect(remove).toHaveBeenCalledWith("abort", expect.any(Function)); child.emit("close", null);
   });
 
+  it("does not resolve successfully when terminating a child closes it immediately", async () => {
+    const controller = new AbortController();
+    child.kill.mockImplementation(() => { child.emit("close", 0); return true; });
+    const run = new ClaudeRuntime(dir).message("Task", schema, undefined, { signal: controller.signal }); const check = expect(run).rejects.toThrow("cancelled");
+    await launched(); controller.abort(); await check;
+  });
+
+  it.skipIf(process.platform === "win32")("escalates for the owned process group even after its parent has exited", async () => {
+    vi.useFakeTimers();
+    Object.assign(child, { pid: 12345 });
+    const kill = vi.spyOn(process, "kill").mockReturnValue(true);
+    const controller = new AbortController();
+    const run = new ClaudeRuntime(dir).message("Task", schema, undefined, { signal: controller.signal }); const check = expect(run).rejects.toThrow("cancelled");
+    await launched(); controller.abort(); await check;
+    expect(kill).toHaveBeenCalledWith(-12345, "SIGTERM");
+    child.emit("close", 0);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(kill).toHaveBeenCalledWith(-12345, "SIGKILL");
+  });
+
   it.each(["stdout", "stderr"] as const)("bounds %s without logging a truncated secret", async (stream) => {
     const run = new ClaudeRuntime(dir).message("Task", schema); const check = expect(run).rejects.toThrow(`${stream} exceeded the output limit`);
     await launched(); child[stream].write("x".repeat((stream === "stdout" ? CLAUDE_OUTPUT_LIMIT : CLAUDE_STDERR_LIMIT) + 1)); await check;

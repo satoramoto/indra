@@ -109,6 +109,21 @@ describe("every CLI runtime/chat construction path", () => {
     expect(fakes.posts[0].message).toBe("No work has been approved or executed.");
   });
 
+  it("selects the exact Developer ID and Chick's Yahaha ID when bots also belong to another team", async () => {
+    const state = await new PlanningStore(checkout).read();
+    state.teams.unshift({ slug: "another-team", seats: [
+      { id: "seat-other-lead", externalIdentities: { mattermost: { username: "chickcorea" } } },
+      { id: "seat-other-dev", externalIdentities: { mattermost: { username: "developer" } } },
+    ] });
+    await configure({ "seat-other-lead": "codex", "seat-other-dev": "codex", "seat-lead": "claude", "seat-dev": "claude" });
+    vi.mocked(loadSeatPersonas).mockResolvedValue({ "seat-lead": chick, "seat-dev": developer });
+    await planning("start");
+    expect(fakes.calls[0]).toMatchObject({ engine: "claude", prompt: expect.stringContaining(chick.voice) });
+    await main(["seat", "run", "--seat", "seat-dev", "--state", checkout]);
+    expect(fakes.calls.slice(1)).toHaveLength(3);
+    for (const call of fakes.calls.slice(1)) expect(call).toMatchObject({ engine: "claude", prompt: expect.stringContaining(developer.voice) });
+  });
+
   it.each([["claude", "legacy-session", "codex"], ["codex", "claude:12345678-1234-4321-8765-123456789abc", "claude"]])("keeps a saved Chick session on its engine after selection changes to %s", async (selected, handle, expected) => {
     await configure({ "seat-lead": selected }); fakes.resume = handle;
     await planning("serve"); expect(fakes.calls[0]).toMatchObject({ engine: expected, session: handle });
