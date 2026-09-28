@@ -98,18 +98,22 @@ class CapturedEngines {
 class WorkflowShell implements Shell {
   calls: string[] = [];
   merged = false;
+  branch = "";
+  base = "";
   async run(command: string, args: string[], cwd: string): Promise<ShellResult> {
     const line = `${command} ${args.join(" ")}`;
     this.calls.push(line);
     const ok = (stdout = ""): ShellResult => ({ code: 0, stdout, stderr: "" });
     if (line.startsWith("gh repo clone")) await mkdir(join(args[3], ".git"), { recursive: true });
-    if (line.startsWith("git worktree add")) await mkdir(args[5], { recursive: true });
+    if (line.startsWith("git worktree add")) { await mkdir(args[5], { recursive: true }); this.branch = args[4]; this.base = args[6].replace(/^origin\//, ""); }
     if (line.startsWith("git show-ref")) return { code: 1, stdout: "", stderr: "" };
     if (line.startsWith("git rev-parse")) return ok(join(cwd, ".git"));
     if (line.startsWith("gh api") && args.includes("--paginate")) return ok("[[]]");
     if (line.startsWith("gh api") && args[1]?.includes("git/ref/heads/")) return ok(SHA);
     if (line.startsWith("gh pr view") && args.includes("mergeable,mergeStateStatus")) return ok(JSON.stringify({ mergeable: "CONFLICTING", mergeStateStatus: "DIRTY" }));
     if (line.startsWith("git merge --no-edit")) return { code: 1, stdout: "", stderr: "merge conflict" };
+    // The seat verifies the PR's head and base before merging it (#44).
+    if (line.startsWith("gh pr view") && args.includes("isDraft,headRefName,baseRefName,state")) return ok(JSON.stringify({ isDraft: false, headRefName: this.branch, baseRefName: this.base, state: this.merged ? "MERGED" : "OPEN" }));
     if (line.startsWith("gh pr merge")) this.merged = true;
     if (line.startsWith("gh pr view")) return ok(this.merged ? "MERGED\n" : "OPEN\n");
     return ok();
