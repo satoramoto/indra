@@ -6,6 +6,7 @@ import type { AgentResult, AgentRuntime, WriteAccess } from "./codex-runtime.js"
 import { postReviewOnce } from "./developer-review.js";
 import { missingTeamMessage, teamProject, type PlanningAssignment as Assignment, type PlanningGoal, type PlanningOutcome as ApprovedOutcome, type PlanningStore } from "./planning.js";
 import { ensureProjectCheckout, ProjectCheckoutError, projectCheckoutPath } from "./project-checkout.js";
+import { redactSecrets } from "./redact.js";
 import { schemaPathOf } from "./reload.js";
 import { activityRecordName } from "./supervisor.js";
 
@@ -401,13 +402,12 @@ ${outcome.description}`;
 }
 
 /** A short, single-line excerpt of command stderr with anything token-shaped removed. */
-export function stderrExcerpt(stderr: string): string {
-  const text = stderr
-    .replace(/\b(gh[opusr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b/g, "[redacted]")
-    .replace(/(https?:\/\/)[^\s/@]+@/g, "$1[redacted]@")
+export function stderrExcerpt(stderr: string, max = 120): string {
+  // Redact before truncating so no partial secret survives the cut.
+  const text = redactSecrets(stderr)
     .replace(/\s+/g, " ")
     .trim();
-  return (text || "no output").slice(0, 120);
+  return (text || "no output").slice(0, max);
 }
 
 /** Runs commands without a shell; output is kept in memory only. */

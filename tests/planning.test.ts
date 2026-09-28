@@ -498,11 +498,15 @@ describe("plan approval", () => {
     const goal = await new PlanningBridge(store, chat, runtime).start("Explore project");
     await PlanningBridge.requestProposal(store, goal.id);
     let attempts = 0;
-    const failing: AgentRuntime = { message: async () => { attempts += 1; throw new Error("invalid proposal"); } };
+    const failing: AgentRuntime = { message: async () => { attempts += 1; throw new Error("invalid proposal: outcome-3 assigned to a non-Developer seat, push https://bot:ghp_secret123@github.com/x failed"); } };
     const broken = new PlanningBridge(store, chat, failing);
     await broken.poll();
     await broken.poll();
     expect(attempts).toBe(1);
+    const recorded = (await store.runtime(goal.id)).lastDraftError!;
+    expect(recorded.message).toContain("outcome-3 assigned to a non-Developer seat");
+    expect(recorded.message).not.toContain("ghp_secret123");
+    expect(chat.posts.some((post) => post.message.includes("outcome-3"))).toBe(false);
     expect((await store.read()).planningGoals![0].stage).toBe("clarifying");
     expect((await store.runtime(goal.id)).proposalRequest).toBeUndefined();
     expect(chat.posts.filter((post) => post.root_id === goal.mattermost.rootPostId && post.message.includes("Drafting the proposal failed"))).toHaveLength(1);

@@ -51,7 +51,8 @@ export function validateOutcomeSeats(outcomes: PlanningOutcome[], developerSeatI
 export interface RuntimeRecord { sessionId?: string; lastSeenAt: number; processedPostIds: string[]; proposalPostIds?: string[];
   /** Posts announcing the sprint's integration PR or its revert PR; a person's ✅ on one merges that PR. */
   mergePosts?: { id: string; kind: MergeKind }[];
-  pending?: { inputPostId: string; message: string; since: number; proposal?: boolean; mergePost?: MergeKind }; /** The owner's `planning propose`, waiting for the bridge's next poll. */ proposalRequest?: { requestedAt: number }; runs: { startedAt: string; finishedAt: string; usage?: unknown }[] }
+  pending?: { inputPostId: string; message: string; since: number; proposal?: boolean; mergePost?: MergeKind }; /** The owner's `planning propose`, waiting for the bridge's next poll. */ proposalRequest?: { requestedAt: number }; runs: { startedAt: string; finishedAt: string; usage?: unknown }[];
+  /** Why the last proposal draft failed, redacted and capped; local only, never posted. */ lastDraftError?: { at: string; message: string } }
 export interface PlanningDocument { $schema: string; schemaVersion: number; teams: unknown[]; sprints: unknown[]; planningGoals?: PlanningGoal[] }
 
 export function validatePlanningGoal(goal: PlanningGoal): void {

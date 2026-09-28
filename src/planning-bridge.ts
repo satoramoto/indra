@@ -3,7 +3,7 @@ import type { AgentRuntime } from "./codex-runtime.js";
 import { schemaPathOf } from "./reload.js";
 import { planningId } from "./codex-runtime.js";
 import { PlanningStore, developerSeats, missingTeamMessage, requireTeamHome, teamProject, validateOutcomeSeats, type MergeKind, type PlanningDocument, type PlanningGoal, type RuntimeRecord, type SprintIntegration } from "./planning.js";
-import { processShell, type Shell } from "./developer-seat.js";
+import { processShell, stderrExcerpt, type Shell } from "./developer-seat.js";
 import { SprintGitHub, sprintBranch } from "./sprint.js";
 
 export interface Post { id: string; user_id: string; channel_id: string; root_id: string; message: string; create_at: number; props?: { indra_delivery_id?: string } }
@@ -339,7 +339,9 @@ export class PlanningBridge {
       if (drafting) draft = proposal(run.response, developers);
     } catch (error) {
       if (!drafting) throw error;
-      console.error(`Planning draft for goal ${id} failed; reverting to clarifying.`);
+      const reason = stderrExcerpt(error instanceof Error ? error.message : String(error), 300);
+      console.error(`Planning draft for goal ${id} failed (${reason}); reverting to clarifying.`);
+      metadata.lastDraftError = { at: new Date().toISOString(), message: reason };
       await this.revertDraft(goal, metadata, inputKey, since);
       return;
     }
