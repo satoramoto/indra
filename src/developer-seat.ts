@@ -1,9 +1,9 @@
 import { execFile } from "node:child_process";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import type { AgentResult, AgentRuntime, WriteAccess } from "./codex-runtime.js";
 import { missingTeamMessage, teamProject, type PlanningAssignment as Assignment, type PlanningGoal, type PlanningOutcome as ApprovedOutcome, type PlanningStore } from "./planning.js";
 import { ensureProjectCheckout, ProjectCheckoutError, projectCheckoutPath } from "./project-checkout.js";
+import { schemaPathOf } from "./reload.js";
 import { activityRecordName } from "./supervisor.js";
 
 export interface ShellResult { code: number; stdout: string; stderr: string }
@@ -20,9 +20,8 @@ export interface SeatTaskRecord {
   sessions: { role: "developer" | "reviewer" | "fix"; sessionId: string; startedAt: string; finishedAt: string; usage?: unknown }[];
 }
 
-const schemas = resolve(dirname(fileURLToPath(import.meta.url)), "..", "schemas");
-const developerSchema = join(schemas, "developer.json");
-const reviewSchema = join(schemas, "review.json");
+const developerSchema = schemaPathOf(import.meta.url, "developer.json");
+const reviewSchema = schemaPathOf(import.meta.url, "review.json");
 const ACTIVE = new Set<Assignment["status"]>(["running", "in-review"]);
 
 /** A failure whose message is ours and safe to record in state and the thread. */
