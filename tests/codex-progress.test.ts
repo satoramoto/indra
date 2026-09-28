@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { codexProgress, describeCodexEvent, formatProgressLine, LineSplitter, MAX_PROGRESS_LINE } from "../src/codex-progress.js";
+import { codexProgress, describeCodexEvent, formatProgressLine, LineSplitter, MAX_PROGRESS_LINE, shellCommand, type ProgressTimers } from "../src/codex-progress.js";
 
 // Recorded from `codex exec --json` (codex-cli 0.156.1); the worktree path is replaced with /work/repo.
 const RECORDED = [
@@ -17,30 +17,42 @@ const RECORDED = [
 ];
 
 const EXPECTED = [
-  "12:34:56 [build] session started",
-  "12:34:56 [build] turn started",
-  "12:34:56 [build] agent: Todo: create the file, run both shell commands, then mark the tasks complete.",
-  "12:34:56 [build] $ ls .codex-probe",
-  "12:34:56 [build] $ ls .codex-probe -> exit 0",
-  "12:34:56 [build] $ false -> exit 1",
-  "12:34:56 [build] thinking: Preparing file creation",
-  "12:34:56 [build] files: add .codex-probe/b.txt",
-  "12:34:56 [build] agent: Todo complete: created the file.",
-  "12:34:56 [build] turn finished (usage: in 40172, cached 26752, out 377, reasoning 42)",
+  "12:34 # build",
+  "12:34 · session started",
+  "12:34 · turn started",
+  "12:34 › Todo: create the file, run both shell commands, then mark the tasks complete.",
+  "12:34 $ ✓ ls .codex-probe",
+  "12:34 $ ✗1 false",
+  "12:34 ~ Preparing file creation",
+  "12:34 ± add .codex-probe/b.txt",
+  "12:34 › Todo complete: created the file.",
+  "12:34 · turn done (in 40172, cached 26752, out 377, reasoning 42)",
 ];
 
-const now = () => new Date("2026-09-28T12:34:56.000Z");
+// Local time, so the printed HH:MM doesn't depend on the machine's time zone.
+const now = () => new Date(2026, 8, 28, 12, 34, 56);
 
-function run(chunks: string[], purpose?: string): string[] {
+class FakeTimers implements ProgressTimers {
+  pending = new Map<number, () => void>();
+  private next = 0;
+  setTimeout(run: () => void): unknown { const id = ++this.next; this.pending.set(id, run); return id; }
+  clearTimeout(handle: unknown): void { this.pending.delete(handle as number); }
+  fire(): void { const runs = [...this.pending.values()]; this.pending.clear(); for (const run of runs) run(); }
+}
+
+function run(chunks: string[], purpose?: string, timers = new FakeTimers()): string[] {
   const lines: string[] = [];
-  const progress = codexProgress({ purpose, cwd: "/work/repo", write: (line) => lines.push(line), now });
+  const progress = codexProgress({ purpose, cwd: "/work/repo", write: (line) => lines.push(line), now, timers });
   for (const chunk of chunks) progress.push(chunk);
   progress.end();
   return lines;
 }
 
+const command = (id: string, phase: "started" | "completed", cmd: string, exit: number | null = null) =>
+  JSON.stringify({ type: `item.${phase}`, item: { id, type: "command_execution", command: cmd, exit_code: exit, status: phase === "started" ? "in_progress" : exit === 0 ? "completed" : "failed" } }) + "\n";
+
 describe("codex progress", () => {
-  it("prints one readable line per meaningful recorded event", () => {
+  it("prints the purpose once, then one marked line per meaningful recorded event", () => {
     expect(run([RECORDED.map((line) => `${line}\n`).join("")], "build")).toEqual(EXPECTED);
   });
 
@@ -49,6 +61,10 @@ describe("codex progress", () => {
     expect(run([...stream], "build")).toEqual(EXPECTED);
     const cut = Math.floor(stream.length / 2);
     expect(run([stream.slice(0, cut), stream.slice(cut)], "build")).toEqual(EXPECTED);
+  });
+
+  it("prints no purpose line without a purpose", () => {
+    expect(run([`{"type":"turn.started"}\n`])).toEqual(["12:34 · turn started"]);
   });
 
   it("splits lines only on newlines and keeps a partial line until it completes", () => {
@@ -70,15 +86,51 @@ describe("codex progress", () => {
     expect(lines).toEqual([]);
   });
 
-  it("describes todo lists, tool calls, web searches and failures", () => {
-    expect(describeCodexEvent({ type: "item.updated", item: { type: "todo_list", items: [{ text: "Write tests", completed: true }, { text: "Open the PR", completed: false }] } })).toBe("todo 1/2, next: Open the PR");
-    expect(describeCodexEvent({ type: "item.started", item: { type: "mcp_tool_call", server: "github", tool: "get_pr", status: "in_progress" } })).toBe("tool: github.get_pr");
-    expect(describeCodexEvent({ type: "item.completed", item: { type: "mcp_tool_call", server: "github", tool: "get_pr", status: "failed", error: { message: "nope" } } })).toBe("tool: github.get_pr failed");
-    expect(describeCodexEvent({ type: "item.completed", item: { type: "web_search", query: "vitest docs" } })).toBe("search: vitest docs");
-    expect(describeCodexEvent({ type: "turn.failed", error: { message: "stream disconnected\nretrying" } })).toBe("turn failed: stream disconnected");
-    expect(describeCodexEvent({ type: "error", message: "Reconnecting... 1/5" })).toBe("error: Reconnecting... 1/5");
-    expect(describeCodexEvent({ type: "turn.completed" })).toBe("turn finished");
+  it("marks todo lists, tool calls, web searches and failures", () => {
+    expect(describeCodexEvent({ type: "item.updated", item: { type: "todo_list", items: [{ text: "Write tests", completed: true }, { text: "Open the PR", completed: false }] } })).toBe("· todo 1/2, next: Open the PR");
+    expect(describeCodexEvent({ type: "item.started", item: { type: "mcp_tool_call", server: "github", tool: "get_pr", status: "in_progress" } })).toBeUndefined();
+    expect(describeCodexEvent({ type: "item.completed", item: { type: "mcp_tool_call", server: "github", tool: "get_pr", status: "completed" } })).toBe("» ✓ github.get_pr");
+    expect(describeCodexEvent({ type: "item.completed", item: { type: "mcp_tool_call", server: "github", tool: "get_pr", status: "failed", error: { message: "nope" } } })).toBe("» ✗ github.get_pr");
+    expect(describeCodexEvent({ type: "item.completed", item: { type: "web_search", query: "vitest docs" } })).toBe("» search vitest docs");
+    expect(describeCodexEvent({ type: "item.completed", item: { type: "file_change", status: "failed", changes: [{ kind: "update", path: "a.ts" }] } })).toBe("± ✗ update a.ts");
+    expect(describeCodexEvent({ type: "item.completed", item: { type: "command_execution", command: "npm test", exit_code: null, status: "declined" } })).toBe("$ ✗ npm test");
+    expect(describeCodexEvent({ type: "turn.failed", error: { message: "stream disconnected\nretrying" } })).toBe("! turn failed: stream disconnected");
+    expect(describeCodexEvent({ type: "error", message: "Reconnecting... 1/5" })).toBe("! Reconnecting... 1/5");
+    expect(describeCodexEvent({ type: "turn.completed" })).toBe("· turn done");
     expect(describeCodexEvent({ type: "item.completed", item: { type: "reasoning", text: "" } })).toBeUndefined();
+  });
+
+  it("strips the shell wrapper and its quoting", () => {
+    expect(shellCommand(`/bin/zsh -lc "sed -n '1,160p' tests/state-check.test.ts"`)).toBe("sed -n '1,160p' tests/state-check.test.ts");
+    expect(shellCommand(`/bin/bash -lc 'echo '\\''hi'\\'''`)).toBe("echo 'hi'");
+    expect(shellCommand(`/bin/zsh -lc "echo \\"a\\" \\$HOME"`)).toBe(`echo "a" $HOME`);
+    expect(shellCommand(`bash -lc git status`)).toBe("git status");
+    expect(shellCommand(["/bin/zsh", "-lc", "git log --oneline"])).toBe("git log --oneline");
+    expect(shellCommand(["rg", "foo"])).toBe("rg foo");
+    expect(shellCommand("npm test\nsecond line")).toBe("npm test");
+  });
+
+  it("prints a command once, on completion, with its status before the command so a narrow cut keeps it", () => {
+    const timers = new FakeTimers();
+    const lines = run([command("c1", "started", "/bin/zsh -lc 'git log --oneline'"), command("c1", "completed", "/bin/zsh -lc 'git log --oneline'", 128)], undefined, timers);
+    expect(lines).toEqual(["12:34 $ ✗128 git log --oneline"]);
+    expect(timers.pending.size).toBe(0);
+  });
+
+  it("adds a start line only for a command still running after the slow-command delay", () => {
+    const timers = new FakeTimers();
+    const lines: string[] = [];
+    const progress = codexProgress({ purpose: "build", write: (line) => lines.push(line), now, timers });
+    progress.push(command("c1", "started", "/bin/zsh -lc 'npm test'"));
+    progress.push(command("c2", "started", "/bin/zsh -lc 'ls'"));
+    progress.push(command("c2", "completed", "/bin/zsh -lc 'ls'", 0));
+    expect(timers.pending.size).toBe(1);
+    timers.fire();
+    progress.push(command("c1", "completed", "/bin/zsh -lc 'npm test'", 0));
+    progress.push(command("c3", "started", "/bin/zsh -lc 'sleep 60'"));
+    progress.end();
+    expect(timers.pending.size).toBe(0);
+    expect(lines).toEqual(["12:34 # build", "12:34 $ ✓ ls", "12:34 $ … npm test", "12:34 $ ✓ npm test"]);
   });
 
   it("redacts secrets and caps every line", () => {
@@ -86,12 +138,21 @@ describe("codex progress", () => {
     const [line] = run([`{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc 'GH_TOKEN=${token} gh pr view'","exit_code":0}}\n`]);
     expect(line).not.toContain(token);
     expect(line).toContain("[redacted]");
-    const long = formatProgressLine(`agent: ${"word ".repeat(200)}`, now(), "review");
+    const long = formatProgressLine(`› ${"word ".repeat(200)}`, now());
     expect(long.length).toBe(MAX_PROGRESS_LINE);
-    expect(long.startsWith("12:34:56 [review] agent: word")).toBe(true);
-    // A secret straddling the cap is redacted before the line is cut.
-    const straddling = formatProgressLine(`${"x ".repeat(90)}${token}`, now());
-    expect(straddling).not.toContain("ghp_a1a1");
+    expect(long.startsWith("12:34 › word")).toBe(true);
+  });
+
+  it("redacts before capping: a secret straddling the cap whose visible prefix alone would not be redacted", () => {
+    // Only the "long mixed run" rule matches this secret; its first 11 characters alone match nothing.
+    const secret = "Zq8w3Rt5Yp1Lm9Nb7Vc4Xk2Hj6Gf0Ds8Ae";
+    const prefix = secret.slice(0, 11);
+    expect(formatProgressLine(prefix, now())).toContain(prefix);
+    // "12:34 " plus 180 characters puts the secret at column 186; the cap cuts at 197, 11 characters into it.
+    const straddling = formatProgressLine(`${"x ".repeat(90)}${secret} and more text after it`, now());
+    expect(straddling.indexOf("[redacted]")).toBe(186);
+    expect(straddling).not.toContain(secret.slice(0, 4));
+    expect(straddling.length).toBe(MAX_PROGRESS_LINE);
   });
 
   it("keeps printing after a write fails", () => {
@@ -99,5 +160,17 @@ describe("codex progress", () => {
     const progress = codexProgress({ now, write: () => { calls++; throw new Error("EPIPE"); } });
     progress.push(`{"type":"turn.started"}\n{"type":"turn.started"}\n`);
     expect(calls).toBe(2);
+  });
+
+  it("guards process.stdout against an async EPIPE once when writing to it", () => {
+    const before = process.stdout.listenerCount("error");
+    const write = process.stdout.write;
+    process.stdout.write = (() => true) as typeof process.stdout.write;
+    try {
+      codexProgress({ now }).push(`{"type":"turn.started"}\n`);
+      codexProgress({ now }).end();
+    } finally { process.stdout.write = write; }
+    expect(process.stdout.listenerCount("error")).toBe(before + 1);
+    expect(() => process.stdout.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" }))).not.toThrow();
   });
 });

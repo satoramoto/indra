@@ -5,7 +5,9 @@ import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PaneTailPoller, sanitizePaneText, TmuxPaneTail, type PaneTail, type PaneTailSeat, type PaneTailSource, type PaneTailTimers } from "../src/pane-tail.js";
-import { paneTailLines } from "../src/pane-tail-panel.js";
+import { classifyPaneLine, PANE_LINE_COLOR, PaneTailPanel, paneTailLines } from "../src/pane-tail-panel.js";
+import { formatProgressLine } from "../src/codex-progress.js";
+import { RGBA } from "@opentui/core";
 import { TmuxHost, type TmuxRunner } from "../src/tmux-host.js";
 import { StateInventory, type StateSnapshot } from "../src/state-domain.js";
 import { TerminalUiModel } from "../src/terminal-ui.js";
@@ -33,6 +35,7 @@ class FakeTmux implements TmuxRunner {
 
 const lead: PaneTailSeat = { id: "seat-001", roles: ["Team Lead"] };
 const dev: PaneTailSeat = { id: "seat-002", roles: ["Developer"] };
+const when = new Date(2026, 8, 28, 12, 34, 56);
 
 /** A checkout whose Team Lead bridge is hosted in a verified, Indra-owned session. */
 async function hosted() {
@@ -115,6 +118,63 @@ describe("pane tail", () => {
     expect(results).toHaveLength(1);
     await poller.tick();
     expect(seen).toEqual(["seat-001", "seat-001", "seat-002"]);
+  });
+
+  it("classifies progress lines by their mark, and leaves everything else plain", () => {
+    const kinds = [
+      "12:34 # review",
+      "12:34 ~ Running type checks",
+      "12:34 › The change adds the five problems",
+      "12:34 $ ✓ sed -n '1,160p' tests/state-check.test.ts",
+      "12:34 $ ✓ git log --oneline",
+      "12:34 $ … gh pr view 42",
+      "12:34 $ ✓ cd /work/repo && GH_PAGER= git status",
+      "12:34 $ ✓ github-cli --version",
+      "12:34 $ ✗1 npm test",
+      "12:34 » ✓ github.get_pr",
+      "12:34 » ✗ github.get_pr",
+      "12:34 ± add src/a.ts, update src/b.ts",
+      "12:34 ± ✗ update src/b.ts",
+      "12:34 · turn done (in 1, out 2)",
+      "12:34 ! turn failed: stream disconnected",
+      "23:44:50 [review] agent: an old-format line",
+      "plain runner output",
+      "12:34 ? unknown mark",
+      "",
+    ].map((line) => classifyPaneLine(line).kind);
+    expect(kinds).toEqual(["purpose", "thinking", "agent", "command", "git", "git", "git", "command", "fail", "tool", "fail", "files", "fail", "info", "fail", "plain", "plain", "plain", "plain"]);
+    expect(classifyPaneLine("12:34 $ ✓ git status")).toEqual({ time: "12:34", kind: "git", text: "$ ✓ git status" });
+    expect(classifyPaneLine("runner started")).toEqual({ kind: "plain", text: "runner started" });
+  });
+
+  it("colours each kind of line and dims the time in the panel", async () => {
+    const source: PaneTailSource = { capture: async () => ({ status: "ok", lines: sanitizePaneText([
+      formatProgressLine("# review", when), formatProgressLine("~ Checking the schema", when), formatProgressLine("› Looks good", when),
+      formatProgressLine("$ ✓ npm run typecheck", when), formatProgressLine("$ ✓ git diff --stat", when), formatProgressLine("± update src/a.ts", when),
+      formatProgressLine(`$ ✗2 sed -n '1,160p' ${"tests/very/long/path/".repeat(4)}file.ts`, when), "plain output",
+    ].join("\n"), { lines: 10, width: 40 }) }) };
+    const seat = () => ({ ...lead, displayName: "Chick Corea" });
+    const setup = await testRender(() => <PaneTailPanel source={source} seat={seat} width={() => 40} lines={() => 10} />, { width: 44, height: 12 });
+    try {
+      await setup.renderOnce();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      await setup.renderOnce();
+      const spans = setup.captureSpans().lines.flatMap((line) => line.spans);
+      const colourOf = (text: string) => { const span = spans.find((candidate) => candidate.text.includes(text)); expect(span, text).toBeDefined(); return span!.fg; };
+      const expectColour = (text: string, colour: string) => expect(colourOf(text).equals(RGBA.fromHex(colour)), text).toBe(true);
+      expectColour("# review", PANE_LINE_COLOR.purpose);
+      expectColour("~ Checking the schema", PANE_LINE_COLOR.thinking);
+      expectColour("› Looks good", PANE_LINE_COLOR.agent);
+      expectColour("$ ✓ npm run typecheck", PANE_LINE_COLOR.command);
+      expectColour("$ ✓ git diff --stat", PANE_LINE_COLOR.git);
+      expectColour("± update src/a.ts", PANE_LINE_COLOR.files);
+      expectColour("$ ✗2 sed -n", PANE_LINE_COLOR.fail);
+      expectColour("plain output", PANE_LINE_COLOR.plain);
+      expectColour("12:34", PANE_LINE_COLOR.time);
+      // The failed command's exit code survives the cut to the panel width.
+      expect(setup.captureCharFrame()).toMatch(/12:34 \$ ✗2 sed -n '1,160p' tests\/very\/\S*…/);
+      expect(setup.captureCharFrame()).not.toMatch(/\[(?:review|build)\]/);
+    } finally { setup.renderer.destroy(); }
   });
 
   it("fits between 8 and 15 lines", () => {
