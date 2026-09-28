@@ -3,7 +3,8 @@ import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PlanningStore } from "../src/planning.js";
-import { signalReady, TmuxHost, type TmuxRunner } from "../src/tmux-host.js";
+import { signalReady, TmuxHost, turnLockFile, type TmuxRunner } from "../src/tmux-host.js";
+import { withFileLock } from "../src/state-commit.js";
 import { activityRecordName, CliGoalStarter, Supervisor } from "../src/supervisor.js";
 import { git, stateCheckout } from "./state-checkout.js";
 
@@ -135,6 +136,49 @@ describe("seat process supervisor", () => {
     expect(live["seat-003"].process).toBe("no credential");
     expect(live["seat-002"].process).toBe("running");
     expect(live["seat-001"].process).toBe("running");
+  });
+
+  it("restarts processes on an older build only at a safe point: a busy seat and a bridge mid-poll wait", async () => {
+    const { dir, tmux, supervisor } = await fixture();
+    const stamp = (id: string) => writeFile(join(dir, "dist", "build-stamp.json"), JSON.stringify({ id, sha: "abc1234", builtAt: "now" }));
+    await stamp("build-1");
+    await supervisor.ensureAll();
+    expect(Object.values(await supervisor.read()).some((item) => item.updatePending)).toBe(false);
+    expect(await supervisor.upgrade()).toEqual({ pending: [], problems: [] });
+    expect(tmux.kills()).toHaveLength(0);
+
+    const store = new PlanningStore(dir);
+    const setStatus = (status: "in-review" | "merged") => store.update((state) => {
+      state.planningGoals = [{
+        id: "goal-abc", teamId: "team-001", seatId: "seat-001", participantSeatIds: [], goal: "Build it", projectRefs: [], stage: "approved",
+        createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z", mattermost: { channelId: "channel", rootPostId: "root" },
+        brief: { summary: "Build it", decisions: [], openQuestions: [] },
+        proposal: { id: "proposal-1", createdAt: "2026-01-01T00:00:00Z", summary: "Plan", risks: [], openQuestions: [], outcomes: [{ id: "outcome-1", title: "First", description: "Do it", seatId: "seat-002" }] },
+        assignments: [{ outcomeId: "outcome-1", seatId: "seat-002", status, updatedAt: "2026-01-01T00:00:00Z" }],
+      }];
+    }, `Assignment ${status}`);
+    await setStatus("in-review");
+    await stamp("build-2");
+    // The bridge is mid-poll: it holds its turn lock until released.
+    let release = () => {};
+    const polling = withFileLock(turnLockFile(dir, { kind: "bridge" }), () => new Promise<void>((done) => { release = done; }));
+    await new Promise((done) => setTimeout(done, 50));
+
+    expect(await supervisor.upgrade()).toEqual({ pending: ["bridge", "seat-002"], problems: [] });
+    const herbie = tmux.kills().map((args) => args[args.indexOf("-t") + 1]);
+    expect(herbie).toHaveLength(1);
+    expect(herbie[0]).toMatch(/^=dev-seat-003-/);
+    const live = await supervisor.read();
+    expect([live["seat-001"].updatePending, live["seat-002"].updatePending, live["seat-003"].updatePending]).toEqual([true, true, undefined]);
+    expect(live["seat-003"].process).toBe("running");
+
+    release();
+    await polling;
+    await setStatus("merged");
+    expect(await supervisor.upgrade()).toEqual({ pending: [], problems: [] });
+    expect(tmux.kills()).toHaveLength(3);
+    expect(tmux.launches()).toHaveLength(6);
+    expect(Object.values(await supervisor.read()).map((item) => [item.process, item.updatePending])).toEqual([["running", undefined], ["running", undefined], ["running", undefined]]);
   });
 
   it("reads the held assignment and newest thread activity", async () => {

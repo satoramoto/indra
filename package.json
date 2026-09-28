@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "vite build --watch",
     "build": "vite build",
-    "start": "node --experimental-ffi --use-system-ca dist/cli.js",
+    "start": "node dist/launcher.js",
     "test": "NODE_OPTIONS=--experimental-ffi vitest run",
     "test:watch": "NODE_OPTIONS=--experimental-ffi vitest",
     "typecheck": "tsc --noEmit"

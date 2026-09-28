@@ -4,10 +4,11 @@ import { createHash, randomUUID } from "node:crypto";
 import { access, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readBuildStamp } from "./build-stamp.js";
 
 const execFileAsync = promisify(execFile);
 export interface TmuxRunner { run(args: string[]): Promise<string> }
-export interface HostRecord { socket: string; session: string; paneId: string; tmuxIdentity: string; readyNonce: string; stateCheckout: string; appDir: string; startedAt: string }
+export interface HostRecord { socket: string; session: string; paneId: string; tmuxIdentity: string; readyNonce: string; stateCheckout: string; appDir: string; startedAt: string; /** The build stamp ID in `dist/` when the process started. */ build?: string }
 /** What an Indra-owned tmux session runs: Chick's planning bridge, or one Developer seat's runner. */
 export type HostedProcess = { kind: "bridge" } | { kind: "seat"; seatId: string };
 export type Readiness = "ready" | "no-credential";
@@ -23,6 +24,14 @@ export class SystemTmux implements TmuxRunner {
     const { stdout } = await execFileAsync("tmux", args, { encoding: "utf8", timeout: 15_000 });
     return stdout.trim();
   }
+}
+
+/**
+ * Held by a hosted process for each bridge poll or seat step, and by the supervisor while it stops the process
+ * for an update, so an update never lands in the middle of a turn.
+ */
+export function turnLockFile(stateCheckout: string, hosted: HostedProcess): string {
+  return join(`${resolve(stateCheckout)}.runtime`, hosted.kind === "bridge" ? "turn-bridge.lock" : `turn-seat-${hosted.seatId}.lock`);
 }
 
 export function readyFile(stateCheckout: string, nonce: string): string { return join(`${resolve(stateCheckout)}.runtime`, `host-ready-${nonce}.json`); }
@@ -89,6 +98,7 @@ export class TmuxHost {
     }
     await mkdir(this.runtimeDir, { recursive: true, mode: 0o700 });
     const readyNonce = randomUUID();
+    const build = (await readBuildStamp(this.appDir))?.id;
     const output = await this.runner.run(["-L", this.socket, "new-session", "-d", "-P", "-F", "#{session_name}:#{pane_id}", "-s", this.session, "-c", this.appDir, process.execPath, "--experimental-ffi", "--use-system-ca", this.cli, ...this.command(readyNonce)]);
     const [name, paneId] = output.split(":");
     if (name !== this.session || !/^%\d+$/.test(paneId ?? "")) throw new Error(`Tmux started but returned an unexpected pane identity; inspect socket ${this.socket} before retrying.`);
@@ -98,7 +108,7 @@ export class TmuxHost {
       await this.runner.run(["-L", this.socket, "kill-session", "-t", this.target()]).catch(() => undefined);
       throw new Error("Tmux did not return a stable server and session identity.");
     }
-    const record: HostRecord = { socket: this.socket, session: this.session, paneId, tmuxIdentity, readyNonce, stateCheckout: resolve(this.stateCheckout), appDir: this.appDir, startedAt: new Date().toISOString() };
+    const record: HostRecord = { socket: this.socket, session: this.session, paneId, tmuxIdentity, readyNonce, stateCheckout: resolve(this.stateCheckout), appDir: this.appDir, startedAt: new Date().toISOString(), ...(build ? { build } : {}) };
     await mkdir(dirname(this.recordFile), { recursive: true, mode: 0o700 });
     const temp = `${this.recordFile}.${randomUUID()}.tmp`;
     await writeFile(temp, JSON.stringify(record), { flag: "wx", mode: 0o600 });

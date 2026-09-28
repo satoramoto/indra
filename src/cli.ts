@@ -1,5 +1,5 @@
 import { createInterface } from "node:readline/promises";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { readToken } from "./credential.js";
 import { Inventory, InventoryError, type Seat, type Team } from "./domain.js";
@@ -13,7 +13,13 @@ import { MattermostPlanningChat, readBotToken, readChickToken, type BotTokenOpti
 import { readServiceToken, stageServiceToken } from "./service-account.js";
 import { DeveloperSeat, loadDeveloperSeat, processShell } from "./developer-seat.js";
 import { CodexRuntime } from "./codex-runtime.js";
-import { signalReady, TmuxHost } from "./tmux-host.js";
+import { defaultAppDir, signalReady, TmuxHost, turnLockFile } from "./tmux-host.js";
+import { withFileLock } from "./state-commit.js";
+import { readBuildStamp } from "./build-stamp.js";
+import { SelfUpdater } from "./self-update.js";
+import { LAUNCHER_ENV, RELOAD_EXIT_CODE } from "./reload.js";
+import { readFile, rm, writeFile, mkdir } from "node:fs/promises";
+import type { UiView } from "./terminal-ui.js";
 import { LocalSessionReader } from "./session-snapshot.js";
 import { CliGoalStarter, Supervisor } from "./supervisor.js";
 import { checkConsistency, printConsistency, type TeamMemberReader } from "./consistency.js";
@@ -188,7 +194,8 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         const runner = new DeveloperSeat(store, seat, chat, processShell, (cwd, write) => new CodexRuntime(cwd, 60 * 60_000, write), (line) => console.log(`[${new Date().toISOString()}] ${line}`));
         console.log(`Developer seat ${seat.id} (@${seat.username}) running. Stop with Ctrl-C.`);
         while (true) {
-          if (await runner.tick() === "idle") await new Promise((resolve) => setTimeout(resolve, 30_000));
+          // Each step holds the turn lock, so the supervisor only restarts this runner for an update between steps.
+          if (await withFileLock(turnLockFile(options.checkout, { kind: "seat", seatId: seat.id }), () => runner.tick(), 24 * 60 * 60_000) === "idle") await new Promise((resolve) => setTimeout(resolve, 30_000));
         }
       } catch (error) {
         console.error(`Seat error: ${error instanceof Error ? error.message : String(error)}`);
@@ -197,10 +204,27 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
     }
     if (options.mode === "ui") {
       const { runTerminalUi } = await import("./terminal-ui-solid.js");
+      // The view to restore after a reload for new code; read once, then removed.
+      const viewFile = join(`${options.checkout}.runtime`, "ui-view.json");
+      const view = await readFile(viewFile, "utf8").then((text) => JSON.parse(text) as UiView, () => undefined);
+      await rm(viewFile, { force: true });
+      const updater = new SelfUpdater(defaultAppDir);
       return await runTerminalUi(new StateInventory(new LocalStateRepository(options.checkout)), new LocalSessionReader(options.checkout), {
         processes: new Supervisor(options.checkout, undefined, undefined, undefined, undefined, () => stageServiceToken(options.checkout)),
         goals: new CliGoalStarter(options.checkout),
         sync: new PlanningStore(options.checkout),
+        update: {
+          running: await readBuildStamp(defaultAppDir),
+          canReload: process.env[LAUNCHER_ENV] === "1",
+          check: () => updater.check(),
+          current: () => readBuildStamp(defaultAppDir),
+        },
+        view,
+        reload: async (current) => {
+          // Best effort: without the saved view the reloaded UI opens on its default page.
+          await mkdir(dirname(viewFile), { recursive: true, mode: 0o700 }).then(() => writeFile(viewFile, JSON.stringify(current), { mode: 0o600 })).catch(() => undefined);
+          return RELOAD_EXIT_CODE;
+        },
       });
     }
     if (options.mode === "state") {
@@ -250,7 +274,8 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       console.log("Chick planning bridge running. Stop with Ctrl-C.");
       let ready = false;
       while (true) {
-        await bridge.poll();
+        // A poll finishes its Codex turns and saves pending deliveries before it releases the turn lock.
+        await withFileLock(turnLockFile(options.checkout, { kind: "bridge" }), () => bridge.poll(), 24 * 60 * 60_000);
         if (!ready && options.readyNonce) {
           await signalReady(options.checkout, options.readyNonce);
           ready = true;
