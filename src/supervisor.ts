@@ -1,14 +1,17 @@
 import { execFile } from "node:child_process";
 import { join, resolve } from "node:path";
 import { PlanningStore, type PlanningDocument } from "./planning.js";
-import { defaultAppDir, NoCredentialError, SystemTmux, TmuxHost, turnLockFile, type HostRecord, type TmuxRunner } from "./tmux-host.js";
+import { defaultAppDir, NoChannelError, NoCredentialError, SystemTmux, TmuxHost, turnLockFile, type HostRecord, type TmuxRunner } from "./tmux-host.js";
 import { readBuildStamp } from "./build-stamp.js";
 import { withFileLock } from "./state-commit.js";
 
-export type ProcessState = "running" | "stopped" | "no credential";
+/** `no channel`: the seat's bot could not join its team's Mattermost team or home channel. */
+export type ProcessState = "running" | "stopped" | "no credential" | "no channel";
 /** What the team view shows for a seat beyond its stable state record. */
 export interface SeatLive {
   process: ProcessState;
+  /** Why the process is not running, in its own words, e.g. which bot cannot join which channel. */
+  problem?: string;
   /** Running an older build than `dist/`; it is restarted at its next safe point. */
   updatePending?: boolean;
   assignment?: { title: string; status: string; prUrl?: string };
@@ -33,6 +36,9 @@ export interface GoalStarter {
 
 /** Newest progress post a Developer seat made in its goal thread; kept in `<state-checkout>.runtime`. */
 export const activityRecordName = (seatId: string) => `activity-${seatId}`;
+
+/** A hosted process that exited for a missing credential or an unjoinable home channel; the seat shows why, so it is not a notice. */
+const shownOnSeat = (error: unknown) => error instanceof NoCredentialError || error instanceof NoChannelError;
 
 type SeatRow = { id: string; roles: string[] };
 const ACTIVE = ["running", "in-review"];
@@ -93,17 +99,19 @@ export class Supervisor implements SeatProcessPort {
       started.add(host.session);
       try { await host.start(); }
       catch (error) {
-        if (!(error instanceof NoCredentialError)) problems.push(`${seat.id}: ${error instanceof Error ? error.message : String(error)}`);
+        if (!shownOnSeat(error)) problems.push(`${seat.id}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
     return problems;
   }
 
-  async processState(host: TmuxHost): Promise<{ process: ProcessState; target?: string; record?: HostRecord }> {
+  async processState(host: TmuxHost): Promise<{ process: ProcessState; problem?: string; target?: string; record?: HostRecord }> {
     const verified = await host.verifiedRecord().catch(() => undefined);
     if (verified) return { process: "running", target: host.attachTarget(verified), record: verified };
     const record = await host.readRecord().catch(() => undefined);
-    if (record && record.session === host.session && await host.readiness(record).catch(() => undefined) === "no-credential") return { process: "no credential" };
+    const ready = record && record.session === host.session ? await host.readyState(record).catch(() => undefined) : undefined;
+    if (ready?.readiness === "no-credential") return { process: "no credential" };
+    if (ready?.readiness === "no-channel") return { process: "no channel", ...(ready.message ? { problem: ready.message } : {}) };
     return { process: "stopped" };
   }
 
@@ -112,13 +120,14 @@ export class Supervisor implements SeatProcessPort {
     const live: Record<string, SeatLive> = {};
     const stamp = await readBuildStamp(this.appDir);
     for (const seat of seatsOf(state)) {
-      const { process, target, record } = await this.processState(this.host(seat));
+      const { process, problem, target, record } = await this.processState(this.host(seat));
       const held = (state.planningGoals ?? []).filter((goal) => goal.stage === "approved").flatMap((goal) => (goal.assignments ?? []).filter((item) => item.seatId === seat.id).map((assignment) => ({ goal, assignment })));
       const current = held.find((item) => ACTIVE.includes(item.assignment.status))
         ?? held.filter((item) => item.assignment.status === "queued").sort((a, b) => a.assignment.updatedAt.localeCompare(b.assignment.updatedAt))[0];
       const activity = await this.store.readRuntimeFile<{ message?: unknown; at?: unknown }>(activityRecordName(seat.id)).catch(() => undefined);
       live[seat.id] = {
         process,
+        ...(problem ? { problem } : {}),
         ...(record && stamp && record.build !== stamp.id ? { updatePending: true } : {}),
         ...(current ? { assignment: { title: current.goal.proposal?.outcomes.find((item) => item.id === current.assignment.outcomeId)?.title ?? current.assignment.outcomeId, status: current.assignment.status, prUrl: current.assignment.prUrl } } : {}),
         ...(typeof activity?.message === "string" && typeof activity.at === "string" ? { activity: { message: activity.message, at: activity.at } } : {}),
@@ -157,7 +166,7 @@ export class Supervisor implements SeatProcessPort {
       } catch { /* The turn lock is held: a poll or step is in flight. */ }
       if (!stopped) { pending.push(label); continue; }
       try { await host.start(); }
-      catch (error) { if (!(error instanceof NoCredentialError)) problems.push(`${label}: ${error instanceof Error ? error.message : String(error)}`); }
+      catch (error) { if (!shownOnSeat(error)) problems.push(`${label}: ${error instanceof Error ? error.message : String(error)}`); }
     }
     return { pending, problems };
   }
@@ -171,7 +180,7 @@ export class Supervisor implements SeatProcessPort {
     const credentialProblem = await this.credential();
     await host.stop();
     try { await host.start(); }
-    catch (error) { if (!(error instanceof NoCredentialError)) throw error; }
+    catch (error) { if (!shownOnSeat(error)) throw error; }
     if (credentialProblem) throw new Error(credentialProblem);
   }
 }

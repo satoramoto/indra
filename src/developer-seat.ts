@@ -182,7 +182,11 @@ export class DeveloperSeat {
   /** Progress posts are best effort; a Mattermost outage does not fail the work. */
   private async say(goal: PlanningGoal, message: string): Promise<void> {
     try { await this.chat.post(goal.mattermost.channelId, message, goal.mattermost.rootPostId); }
-    catch { this.log("Could not post progress to the goal thread."); return; }
+    catch (error) {
+      // A refused post names the bot and channel (MattermostAccessError); other failures stay generic.
+      this.log(error instanceof Error && error.name === "MattermostAccessError" ? `Could not post progress to the goal thread: ${error.message}` : "Could not post progress to the goal thread.");
+      return;
+    }
     // The terminal UI shows this as the seat's newest thread activity.
     try { await this.store.saveRuntime(activityRecordName(this.seat.id),{ message, at: new Date().toISOString() }); }
     catch { this.log("Could not record thread activity."); }

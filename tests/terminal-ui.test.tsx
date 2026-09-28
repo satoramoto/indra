@@ -241,6 +241,23 @@ describe("terminal UI", () => {
     } finally { detail.renderer.destroy(); }
   });
 
+  it("shows on the seat which bot cannot join which home channel", async () => {
+    const problem = "@chickcorea can't join the home channel home (HTTP 403): add it or make the channel public.";
+    const processes: SeatProcessPort = { ensureAll: async () => [], read: async () => ({ "seat-001": { process: "no channel", problem }, "seat-002": { process: "running" } }), stop: async () => {}, restart: async () => {} };
+    const model = new TerminalUiModel(new StateInventory({ read: async () => snapshot }), { readSessions: async () => ({ connection: "connected", sessions: [] }) }, processes);
+    await model.refresh();
+    const [revision] = createSignal(model.revision);
+    for (const size of [{ width: 120, height: 30 }, { width: 80, height: 24 }]) {
+      const view = await testRender(() => <TerminalApp model={model} revision={revision} onKey={() => {}} />, size);
+      try {
+        await view.renderOnce();
+        const frame = view.captureCharFrame();
+        expect(frame).toContain("NO CHANNEL");
+        expect(frame).toContain("@chickcorea can't join the home channel home");
+      } finally { view.renderer.destroy(); }
+    }
+  });
+
   it("syncs the state checkout before hosting processes, refreshes when state changed, and shows the last result", async () => {
     const calls: string[] = [];
     let state = snapshot;

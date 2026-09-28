@@ -11,13 +11,16 @@ export interface TmuxRunner { run(args: string[]): Promise<string> }
 export interface HostRecord { socket: string; session: string; paneId: string; tmuxIdentity: string; readyNonce: string; stateCheckout: string; appDir: string; startedAt: string; /** The build stamp ID in `dist/` when the process started. */ build?: string }
 /** What an Indra-owned tmux session runs: Chick's planning bridge, or one Developer seat's runner. */
 export type HostedProcess = { kind: "bridge" } | { kind: "seat"; seatId: string };
-export type Readiness = "ready" | "no-credential";
+/** `no-channel`: the bot could not join its team's Mattermost team or home channel; the ready file carries the message. */
+export type Readiness = "ready" | "no-credential" | "no-channel";
 
 /** The Indra checkout this code runs from (the parent of `dist/` or `src/`). */
 export const defaultAppDir = appRootOf(import.meta.url);
 
 /** The hosted process could not read its bot credential and exited. */
 export class NoCredentialError extends Error { override name = "NoCredentialError"; }
+/** The hosted process's bot could not join its home channel and exited; the message names the bot and channel. */
+export class NoChannelError extends Error { override name = "NoChannelError"; }
 
 export class SystemTmux implements TmuxRunner {
   async run(args: string[]): Promise<string> {
@@ -36,11 +39,14 @@ export function turnLockFile(stateCheckout: string, hosted: HostedProcess): stri
 
 export function readyFile(stateCheckout: string, nonce: string): string { return join(`${resolve(stateCheckout)}.runtime`, `host-ready-${nonce}.json`); }
 
-/** Written once by the hosted process: after its first successful step, or when its credential is missing. */
-export async function signalReady(stateCheckout: string, nonce: string, error?: "no-credential"): Promise<void> {
+/**
+ * Written once by the hosted process: after its first successful step, when its credential is missing, or when its
+ * bot cannot join its home channel. `message` is shown on the seat; it never holds a credential.
+ */
+export async function signalReady(stateCheckout: string, nonce: string, error?: Exclude<Readiness, "ready">, message?: string): Promise<void> {
   const file = readyFile(stateCheckout, nonce);
   await mkdir(dirname(file), { recursive: true, mode: 0o700 });
-  await writeFile(file, JSON.stringify({ nonce, pid: process.pid, readyAt: new Date().toISOString(), ...(error ? { error } : {}) }), { flag: "wx", mode: 0o600 });
+  await writeFile(file, JSON.stringify({ nonce, pid: process.pid, readyAt: new Date().toISOString(), ...(error ? { error } : {}), ...(message ? { message } : {}) }), { flag: "wx", mode: 0o600 });
 }
 
 export class TmuxHost {
@@ -114,7 +120,7 @@ export class TmuxHost {
     await writeFile(temp, JSON.stringify(record), { flag: "wx", mode: 0o600 });
     await rename(temp, this.recordFile);
     if (!await this.verifiedRecord()) {
-      if (await this.readiness(record) === "no-credential") throw new NoCredentialError("The hosted process has no bot credential.");
+      await this.throwIfRefused(record);
       throw new Error(`Tmux pane ${paneId} exited before verification; inspect socket ${this.socket} and credentials.`);
     }
     await this.waitReady(record);
@@ -144,11 +150,23 @@ export class TmuxHost {
   readyFile(nonce: string): string { return readyFile(this.stateCheckout, nonce); }
 
   async readiness(record: HostRecord): Promise<Readiness | undefined> {
+    return (await this.readyState(record))?.readiness;
+  }
+
+  /** The readiness signal plus the hosted process's own message, if it gave one. */
+  async readyState(record: HostRecord): Promise<{ readiness: Readiness; message?: string } | undefined> {
     try {
-      const ready = JSON.parse(await readFile(this.readyFile(record.readyNonce), "utf8")) as { nonce?: string; error?: string };
+      const ready = JSON.parse(await readFile(this.readyFile(record.readyNonce), "utf8")) as { nonce?: string; error?: string; message?: unknown };
       if (ready.nonce !== record.readyNonce) return undefined;
-      return ready.error === "no-credential" ? "no-credential" : "ready";
+      const readiness: Readiness = ready.error === "no-credential" || ready.error === "no-channel" ? ready.error : "ready";
+      return { readiness, ...(typeof ready.message === "string" ? { message: ready.message } : {}) };
     } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+  }
+
+  private async throwIfRefused(record: HostRecord): Promise<void> {
+    const state = await this.readyState(record);
+    if (state?.readiness === "no-credential") throw new NoCredentialError("The hosted process has no bot credential.");
+    if (state?.readiness === "no-channel") throw new NoChannelError(state.message ?? "The hosted process's bot cannot join its home channel.");
   }
 
   async isReady(record: HostRecord): Promise<boolean> { return await this.readiness(record) === "ready"; }
@@ -156,9 +174,8 @@ export class TmuxHost {
   private async waitReady(record: HostRecord): Promise<void> {
     const deadline = Date.now() + this.readinessTimeoutMs;
     while (Date.now() < deadline) {
-      const readiness = await this.readiness(record);
-      if (readiness === "no-credential") throw new NoCredentialError("The hosted process has no bot credential.");
-      if (readiness === "ready" && await this.verifiedRecord()) return;
+      await this.throwIfRefused(record);
+      if (await this.readiness(record) === "ready" && await this.verifiedRecord()) return;
       if (!await this.verifiedRecord()) throw new Error("Hosted process exited before readiness; inspect credentials and state checkout.");
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
