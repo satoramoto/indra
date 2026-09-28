@@ -127,9 +127,9 @@ export async function runConsistencyCheck(state: StateInventory, reader: TeamMem
   return printConsistency(reports, timestamp(), write) > 0 ? 1 : 0;
 }
 
-type Options = { mode: "help" } | { mode: "seat"; seatId: string; checkout: string; readyNonce?: string } | { mode: "state"; checkout: string; once: boolean } | { mode: "ui"; checkout: string } | { mode: "mattermost"; slug: string } | { mode: "mattermost"; checkout: string; once: boolean } | { mode: "planning"; action: "start" | "serve" | "host" | "status" | "approve"; checkout: string; goal?: string; participants: string[]; readyNonce?: string };
+type Options = { mode: "help" } | { mode: "seat"; seatId: string; checkout: string; readyNonce?: string } | { mode: "state"; checkout: string; once: boolean } | { mode: "ui"; checkout: string } | { mode: "mattermost"; slug: string } | { mode: "mattermost"; checkout: string; once: boolean } | { mode: "planning"; action: "start" | "serve" | "host" | "status" | "approve" | "propose"; checkout: string; goal?: string; participants: string[]; readyNonce?: string };
 
-const usage = "Usage: npm start -- [--state PATH] [--once] | --ui [--state PATH] | --mattermost [--state PATH] [--once] | --mattermost --team SLUG | planning start --goal TEXT [--participant SEAT_ID] [--state PATH] | planning approve --goal GOAL_ID [--state PATH] | planning serve|host|status [--state PATH] | seat run --seat SEAT_ID [--state PATH]\nPlanning serves only Chick's Yahaha thread, in the team's home channel and project from state. Reply in the thread to clarify; react :memo: on Chick's goal post to request a draft, and :white_check_mark: on the proposal post to approve it.";
+const usage = "Usage: npm start -- [--state PATH] [--once] | --ui [--state PATH] | --mattermost [--state PATH] [--once] | --mattermost --team SLUG | planning start --goal TEXT [--participant SEAT_ID] [--state PATH] | planning propose|approve --goal GOAL_ID [--state PATH] | planning serve|host|status [--state PATH] | seat run --seat SEAT_ID [--state PATH]\nPlanning serves only Chick's Yahaha thread, in the team's home channel and project from state. Reply in the thread to clarify; react :memo: on Chick's goal post to request a draft, and :white_check_mark: on the proposal post to approve it.";
 
 export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_REPO): Options {
   if (args.length === 1 && (args[0] === "--help" || args[0] === "-h")) return { mode: "help" };
@@ -150,7 +150,7 @@ export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_
   }
   if (args[0] === "planning") {
     const action = args[1];
-    if (action !== "start" && action !== "serve" && action !== "host" && action !== "status" && action !== "approve") throw new StateDataError(usage);
+    if (action !== "start" && action !== "serve" && action !== "host" && action !== "status" && action !== "approve" && action !== "propose") throw new StateDataError(usage);
     let checkout: string | undefined; let goal: string | undefined; let readyNonce: string | undefined;
     const participants: string[] = [];
     for (let index = 2; index < args.length; index++) {
@@ -162,7 +162,7 @@ export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_
       else if (key === "--ready-nonce" && !readyNonce && action === "serve" && /^[a-f0-9-]{36}$/.test(value)) readyNonce = value;
       else throw new StateDataError(usage);
     }
-    if ((action === "start" || action === "approve") !== !!goal) throw new StateDataError(usage);
+    if ((action === "start" || action === "approve" || action === "propose") !== !!goal) throw new StateDataError(usage);
     const projectRoot = appRootOf(import.meta.url);
     return { mode: "planning", action, checkout: resolve(checkout || stateEnv || resolve(projectRoot, "..", "indra-state")), goal, participants, ...(readyNonce ? { readyNonce } : {}) };
   }
@@ -267,6 +267,17 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         return 0;
       }
       const store = new PlanningStore(options.checkout);
+      if (options.action === "propose") {
+        // Run by the terminal UI: records the request for the bridge, which drafts through the 📝 path. No credential is read.
+        try {
+          const { goal, alreadyRequested } = await PlanningBridge.requestProposal(store, options.goal!);
+          console.log(alreadyRequested ? `A proposal for goal ${goal.id} was already requested; Chick drafts it once.` : `Requested a proposal for goal ${goal.id}; Chick drafts it on the bridge's next poll and posts it in the thread.`);
+          return 0;
+        } catch (error) {
+          console.error(`Planning error: ${error instanceof Error ? error.message : String(error)}`);
+          return 1;
+        }
+      }
       if (options.action === "approve") {
         // Run by the terminal UI: like a hosted process, it reads Chick's token only with the staged service account token.
         try {

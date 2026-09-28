@@ -63,6 +63,9 @@ function nothingToApprove(goal: PlanningGoal): string {
 const reactionKey = (reaction: Reaction) => `reaction:${reaction.post_id}:${reaction.user_id}:${reaction.emoji_name}:${reaction.create_at}`;
 /** The input key of an owner approval made through `planning approve`. */
 const ownerApprovalKey = (goalId: string) => `owner-approve:${goalId}`;
+/** The input key of an owner proposal request made through `planning propose`. */
+/** One key per owner request, so a request whose draft failed doesn't block the next one. */
+const ownerProposalKey = (goalId: string, requestedAt: number) => `owner-propose:${goalId}:${requestedAt}`;
 const reviewing = (goal: PlanningGoal) => goal.stage === "awaiting-review" || goal.stage === "approved";
 
 function prompt(goal: PlanningGoal, input: string, drafting: boolean, developers: Seat[]): string {
@@ -124,7 +127,11 @@ export class PlanningBridge {
       for (const post of posts) await this.enqueue(goal.seatId, () => this.handle(goal.id, post));
       if (!posts.length) { metadata.lastSeenAt = Math.max(metadata.lastSeenAt, Date.now() - 5000); await this.store.saveRuntime(goal.id, metadata); }
     }
-    for (const { reaction, key } of (await this.newReactions(goal, own)).slice(0, budget)) await this.enqueue(goal.seatId, () => this.react(goal.id, reaction, key));
+    const reactions = (await this.newReactions(goal, own)).slice(0, budget);
+    budget -= reactions.length;
+    for (const { reaction, key } of reactions) await this.enqueue(goal.seatId, () => this.react(goal.id, reaction, key));
+    // After the reactions, so a 📝 and a `planning propose` seen in the same poll draft once.
+    if (budget > 0 && (await this.store.runtime(goal.id)).proposalRequest) await this.enqueue(goal.seatId, () => this.ownerProposal(goal.id));
   }
 
   /** Unhandled 📝 on the goal post and ✅ on the goal or proposal posts, oldest first; the bridge's own reactions never count. */
@@ -212,13 +219,36 @@ export class PlanningBridge {
     if (!(await this.human(state, goal, reaction.user_id))) message = `Only a person can ${approving ? "approve a proposal" : "request a proposal"}; reactions from bots and Chick don't count. Nothing changed.`;
     else if (goal.stage === "approved") message = approvalMessage(goal, seats);
     else if (!approving && goal.stage === "awaiting-review") { message = proposalMessage(goal, seats); announcesProposal = true; }
-    else if (!approving) { await this.converse(goal, metadata, key, reaction.create_at, "Draft the proposal now from the brief so far.", true); return; }
+    else if (!approving) { await this.draft(goal, metadata, key, reaction.create_at); return; }
     else if (goal.stage !== "awaiting-review") message = nothingToApprove(goal);
     else if (reaction.post_id === goal.mattermost.rootPostId) message = `To approve proposal ${goal.proposal!.id}, react :${APPROVE_EMOJI}: on Chick's proposal post rather than the goal post. Nothing changed.`;
     else { await this.approveAndConfirm(id, metadata, key, reaction.create_at); return; }
     metadata.pending = { inputPostId: key, since: reaction.create_at, message, ...(announcesProposal ? { proposal: true } : {}) };
     await this.store.saveRuntime(id, metadata);
     await this.deliver(goal, metadata);
+  }
+
+  /** The one drafting path, used by the 📝 reaction and by `planning propose`. */
+  private async draft(goal: PlanningGoal, metadata: RuntimeRecord, inputKey: string, since: number): Promise<void> {
+    await this.converse(goal, metadata, inputKey, since, "Draft the proposal now from the brief so far.", true);
+  }
+
+  /**
+   * The owner's request recorded by `planning propose`. If a 📝 already moved the goal past drafting, the request is
+   * dropped without a post: the proposal is drafted once. The request is consumed either way: a failed draft reverts the goal to clarifying with
+   * one reply, and the owner can request again.
+   */
+  private async ownerProposal(id: string): Promise<void> {
+    const goal = (await this.store.read()).planningGoals?.find((item) => item.id === id);
+    if (!goal) return;
+    const metadata = await this.store.runtime(id);
+    if (metadata.pending) await this.deliver(goal, metadata);
+    const request = metadata.proposalRequest;
+    if (!request) return;
+    const key = ownerProposalKey(id, request.requestedAt);
+    delete metadata.proposalRequest;
+    if (reviewing(goal) || metadata.processedPostIds.includes(key)) { await this.store.saveRuntime(id, metadata); return; }
+    await this.draft(goal, metadata, key, request.requestedAt);
   }
 
   /**
@@ -264,6 +294,28 @@ export class PlanningBridge {
       const alreadyApproved = goal.stage === "approved";
       if (alreadyApproved && metadata.processedPostIds.includes(key)) return { goal, alreadyApproved };
       return { goal: await this.approveAndConfirm(id, metadata, key, Date.now()), alreadyApproved };
+    });
+  }
+
+  /**
+   * The owner's request for a proposal from the terminal UI, through `planning propose`. It records the request under
+   * the goal lock the bridge polls with; the bridge drafts it on its next poll through the same path as 📝, including
+   * the thread posts. It needs no Mattermost credential. Repeating it, or requesting by both routes, drafts once.
+   */
+  static async requestProposal(store: PlanningStore, id: string): Promise<{ goal: PlanningGoal; alreadyRequested: boolean }> {
+    const check = (goal: PlanningGoal | undefined): PlanningGoal => {
+      if (!goal) throw new Error(`No planning goal ${id} in state.`);
+      if (goal.stage !== "clarifying") throw new Error(`Goal ${id} is at the ${goal.stage} stage; a proposal can be requested only while it is clarifying.`);
+      return goal;
+    };
+    check((await store.read()).planningGoals?.find((item) => item.id === id));
+    return await store.withGoalLock(id, async () => {
+      const goal = check((await store.read()).planningGoals?.find((item) => item.id === id));
+      const metadata = await store.runtime(id);
+      if (metadata.proposalRequest) return { goal, alreadyRequested: true };
+      metadata.proposalRequest = { requestedAt: Date.now() };
+      await store.saveRuntime(id, metadata);
+      return { goal, alreadyRequested: false };
     });
   }
 

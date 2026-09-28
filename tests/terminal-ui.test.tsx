@@ -334,7 +334,7 @@ describe("terminal UI", () => {
     let finish: (result: UpdateResult) => void = () => {};
     const update: UpdatePort = { running: { id: "build-1", sha: "abc1234def", builtAt: "now" }, canReload: true, check: () => new Promise((done) => { calls.push("check"); finish = done; }), current: async () => ({ id: "build-2", sha: "fed4321abc", builtAt: "now" }) };
     const processes: SeatProcessPort = { ensureAll: async () => [], read: async () => ({}), stop: async () => {}, restart: async () => { calls.push("restart"); }, upgrade: async () => { calls.push("upgrade"); return { pending: [], problems: [] }; } };
-    const goals: GoalStarter = { start: async () => { calls.push("start"); return "ok"; }, approve: async () => { calls.push("approve"); return "ok"; } };
+    const goals: GoalStarter = { start: async () => { calls.push("start"); return "ok"; }, approve: async () => { calls.push("approve"); return "ok"; }, propose: async () => { calls.push("propose"); return "ok"; } };
     const model = new TerminalUiModel(new StateInventory({ read: async () => homed }), { readSessions: async () => ({ connection: "connected", sessions: [] }) }, processes, goals, undefined, update);
     await model.refresh();
     model.restore({ page: "seat", teamId: "team-001", seatId: "seat-002" });
@@ -370,6 +370,7 @@ describe("terminal UI", () => {
     const goals: GoalStarter = {
       start: async (goal) => { started.push(goal); return "Planning goal plan-1: https://example/pl/root"; },
       approve: async () => { throw new Error("not used"); },
+      propose: async () => { throw new Error("not used"); },
     };
     const model = new TerminalUiModel(new StateInventory({ read: async () => homed }), { readSessions: async () => ({ connection: "connected", sessions: [] }) }, undefined, goals);
     await model.refresh();
@@ -410,7 +411,7 @@ describe("terminal UI", () => {
   });
 
   it("names the missing state field instead of asking for a channel or project", async () => {
-    const goals: GoalStarter = { start: async () => { throw new Error("must not start"); }, approve: async () => { throw new Error("not used"); } };
+    const goals: GoalStarter = { start: async () => { throw new Error("must not start"); }, approve: async () => { throw new Error("not used"); }, propose: async () => { throw new Error("not used"); } };
     const cases: [StateSnapshot, string[], string[]][] = [
       [snapshot, ["externalIdentities.mattermost.homeChannelId", "project.github"], []],
       [{ ...homed, teams: [{ ...homed.teams[0], homeChannelId: undefined }] }, ["externalIdentities.mattermost.homeChannelId"], ["project.github"]],
@@ -429,7 +430,7 @@ describe("terminal UI", () => {
 
   it("approves the selected seat's proposal awaiting review with A and a y/n confirmation", async () => {
     const approvals: string[] = [];
-    const goals: GoalStarter = { start: async () => "unused", approve: async (goalId) => { approvals.push(goalId); return `Approved goal ${goalId}: 2 outcome(s) queued for Developer seats.`; } };
+    const goals: GoalStarter = { start: async () => "unused", approve: async (goalId) => { approvals.push(goalId); return `Approved goal ${goalId}: 2 outcome(s) queued for Developer seats.`; }, propose: async () => { throw new Error("not used"); } };
     let stage = "awaiting-review";
     const session = () => ({ id: "goal-1", teamId: "team-001", seatId: "seat-001", status: "idle" as const, engine: "codex" as const, sessionId: "codex-1", goal: "Plan the next cycle", stage, updatedAt: "2026-01-02T00:00:00Z", recentActivity: [] });
     const model = new TerminalUiModel(new StateInventory({ read: async () => homed }), { readSessions: async () => ({ connection: "connected", sessions: [session()] }) }, undefined, goals);
@@ -440,7 +441,7 @@ describe("terminal UI", () => {
     model.key("return");
     expect(model.seat?.id).toBe("seat-001");
     model.key("a", "A");
-    expect(model.confirm).toEqual({ goalId: "goal-1", goal: "Plan the next cycle" });
+    expect(model.confirm).toEqual({ action: "approve", goalId: "goal-1", goal: "Plan the next cycle" });
     const [revision, setRevision] = createSignal(model.revision);
     const setup = await testRender(() => <TerminalApp model={model} revision={revision} onKey={() => {}} />, { width: 120, height: 30 });
     try {
@@ -470,6 +471,68 @@ describe("terminal UI", () => {
       // Lowercase a still attaches rather than approving.
       expect(model.key("a", "a")).not.toBe("approve");
     } finally { setup.renderer.destroy(); }
+  });
+
+  it("requests Chick's proposal for the newest clarifying goal with P and a y/n confirmation", async () => {
+    const requests: string[] = [];
+    const goals: GoalStarter = { start: async () => "unused", approve: async () => { throw new Error("must not approve"); }, propose: async (goalId) => { requests.push(goalId); return `Requested a proposal for goal ${goalId}; Chick drafts it on the bridge's next poll and posts it in the thread.`; } };
+    let stage = "clarifying";
+    const record = (id: string, goal: string, updatedAt: string, at = stage) => ({ id, teamId: "team-001", seatId: "seat-001", status: "idle" as const, engine: "codex" as const, sessionId: "codex-" + id, goal, stage: at, updatedAt, recentActivity: [] });
+    const sessions = () => [record("goal-old", "Old goal", "2026-01-01T00:00:00Z", "clarifying"), record("goal-2", "Plan the next cycle", "2026-01-03T00:00:00Z")];
+    const model = new TerminalUiModel(new StateInventory({ read: async () => homed }), { readSessions: async () => ({ connection: "connected", sessions: sessions() }) }, undefined, goals);
+    await model.refresh();
+    expect(model.key("p", "P")).toBe("none");
+    expect(model.notice).toContain("Open Chick's seat");
+    model.key("down");
+    model.key("return");
+    expect(model.seat?.id).toBe("seat-001");
+    model.key("p", "P");
+    expect(model.confirm).toEqual({ action: "propose", goalId: "goal-2", goal: "Plan the next cycle" });
+    const [revision, setRevision] = createSignal(model.revision);
+    const setup = await testRender(() => <TerminalApp model={model} revision={revision} onKey={() => {}} />, { width: 140, height: 40 });
+    try {
+      await setup.renderOnce();
+      const frame = setup.captureCharFrame();
+      expect(frame).toContain("Request Chick's proposal for goal-2");
+      expect(frame).toContain("y request");
+      expect(frame).toContain("P propose");
+      expect(frame).toContain("A approve");
+      expect(frame).toContain("P requests Chick's proposal here");
+      // Anything but y cancels, and nothing runs.
+      expect(model.key("n", "n")).toBe("none");
+      expect(model.confirm).toBeUndefined();
+      expect(model.notice).toBe("Proposal request cancelled; nothing changed.");
+      await model.proposeConfirmed();
+      expect(requests).toEqual([]);
+      model.key("p", "P");
+      expect(model.key("y", "y")).toBe("propose");
+      stage = "drafting";
+      await model.proposeConfirmed();
+      expect(requests).toEqual(["goal-2"]);
+      expect(model.notice).toContain("Requested a proposal for goal goal-2");
+      // With the newest goal drafting, P falls back to the older clarifying goal; lowercase p does nothing.
+      model.key("p", "P");
+      expect(model.confirm).toMatchObject({ action: "propose", goalId: "goal-old" });
+      model.key("n", "n");
+      expect(model.key("p", "p")).toBe("none");
+      expect(model.confirm).toBeUndefined();
+      setRevision(model.revision);
+    } finally { setup.renderer.destroy(); }
+  });
+
+  it("shows the CLI's reason when a proposal cannot be requested", async () => {
+    const goals: GoalStarter = { start: async () => "unused", approve: async () => "unused", propose: async () => { throw new Error("Goal goal-1 is at the drafting stage; a proposal can be requested only while it is clarifying."); } };
+    const model = new TerminalUiModel(new StateInventory({ read: async () => homed }), { readSessions: async () => ({ connection: "connected", sessions: [] }) }, undefined, goals);
+    await model.refresh();
+    model.key("down");
+    model.key("return");
+    model.key("p", "P");
+    expect(model.confirm).toBeUndefined();
+    expect(model.notice).toBe("No goal is being clarified for this seat.");
+    model.confirm = { action: "propose", goalId: "goal-1", goal: "Plan" };
+    expect(model.key("y", "y")).toBe("propose");
+    await model.proposeConfirmed();
+    expect(model.notice).toBe("Could not request a proposal for goal-1: Goal goal-1 is at the drafting stage; a proposal can be requested only while it is clarifying.");
   });
 
   it("attaches to the verified tmux session in read-only mode", async () => {
