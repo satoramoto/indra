@@ -74,6 +74,7 @@ export function TerminalApp(props: TerminalAppProps) {
   const notice = createMemo(() => { props.revision(); return props.model.notice; });
 
   const input = createMemo(() => { props.revision(); return props.model.input ? { ...props.model.input } : undefined; });
+  const confirm = createMemo(() => { props.revision(); return props.model.confirm ? { ...props.model.confirm } : undefined; });
 
   useKeyboard((key) => props.onKey(key.name, key.ctrl, key.sequence));
 
@@ -106,6 +107,9 @@ export function TerminalApp(props: TerminalAppProps) {
             <text fg={theme.accent}>Planning goal: {displayText(session.goal, 160)}</text>
             <text fg={theme.regular}>Stage: {displayText(session.stage)}  ·  {props.model.sessionResult.connection === "connected" ? "Codex session" : "Last Codex session"}: {displayText(session.sessionId) || "not started"}</text>
             <text fg={theme.muted}>Updated: {displayText(session.updatedAt) || "not reported"}</text>
+            <Show when={session.stage === "awaiting-review"}>
+              <text fg={theme.idle}>Proposal awaiting review · {session.id === props.model.reviewGoal()?.id ? "A approves it here" : "A approves the newer goal first"}, or react :white_check_mark: on its proposal post</text>
+            </Show>
             <text fg={props.model.sessionResult.connection === "connected" && session.attach ? theme.running : theme.muted}>
               Bridge view: {props.model.sessionResult.connection === "connected" && session.attach ? displayText(session.attach.target) : "no verified tmux target"}
             </text>
@@ -195,15 +199,18 @@ export function TerminalApp(props: TerminalAppProps) {
         <scrollbox flexGrow={1} scrollY>{seatDetail()}</scrollbox>
       </Show>
 
-      <box height={(notice() ? 3 : 2) + (input() ? 1 : 0)} flexDirection="column">
+      <box height={(notice() ? 3 : 2) + (input() || confirm() ? 1 : 0)} flexDirection="column">
         <Show when={notice()}><text fg={theme.idle}>{displayText(notice())}</text></Show>
         <Show when={input()}>
           <text fg={theme.heading}>
-            {input()?.kind === "channel" ? "No planning channel in state. Mattermost channel ID: " : "New planning goal: "}{(input()?.value ?? "").replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").slice(-Math.max(10, dimensions().width - (input()?.kind === "channel" ? 60 : 26)))}▏
+            New planning goal: {(input()?.value ?? "").replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").slice(-Math.max(10, dimensions().width - 26))}▏
           </text>
         </Show>
+        <Show when={confirm()}>
+          <text fg={theme.heading}>Approve the proposal for {displayText(confirm()?.goalId, 40)} ({displayText(confirm()?.goal, Math.max(10, dimensions().width - 70))})? y approve · any other key cancels</text>
+        </Show>
         <text fg={theme.accent}>
-          {input() ? "Enter start  ·  Esc cancel  ·  project: this Indra checkout" : page() === "teams" ? "↑↓ choose team  ·  Enter open  ·  n new goal  ·  q quit" : page() === "team" ? "↑↓ seat · Enter details · n new goal · s restart · x stop · b teams · q quit" : "a attach  ·  s restart  ·  x stop  ·  n new goal  ·  b team  ·  q quit"}
+          {input() ? "Enter start  ·  Esc cancel  ·  " + displayText(team()?.project?.github, 80) + " · home channel" : page() === "teams" ? "↑↓ choose team  ·  Enter open  ·  n new goal  ·  q quit" : page() === "team" ? "↑↓ seat · Enter details · n new goal · s restart · x stop · b teams · q quit" : "a attach  ·  A approve  ·  s restart  ·  x stop  ·  n new goal  ·  b team  ·  q quit"}
         </text>
         <text fg={theme.muted}>Auto-update  ·  r checks now  ·  q leaves seat processes running</text>
       </box>
@@ -261,6 +268,7 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
       if (action === "quit") finish();
       else if (action === "refresh") void refresh();
       else if (action === "submit") void model.submitInput();
+      else if (action === "approve") void model.approveConfirmed();
       else if (action === "stop" || action === "restart") void model.control(action);
       else if (action === "attach") {
         const target = model.attachTarget();

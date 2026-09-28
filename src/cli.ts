@@ -103,9 +103,9 @@ export async function runConsistencyCheck(state: StateInventory, reader: TeamMem
   return printConsistency(reports, timestamp(), write) > 0 ? 1 : 0;
 }
 
-type Options = { mode: "help" } | { mode: "seat"; seatId: string; checkout: string; readyNonce?: string } | { mode: "state"; checkout: string; once: boolean } | { mode: "ui"; checkout: string } | { mode: "mattermost"; slug: string } | { mode: "mattermost"; checkout: string; once: boolean } | { mode: "planning"; action: "start" | "serve" | "host" | "status"; checkout: string; channel?: string; goal?: string; projects: string[]; participants: string[]; readyNonce?: string };
+type Options = { mode: "help" } | { mode: "seat"; seatId: string; checkout: string; readyNonce?: string } | { mode: "state"; checkout: string; once: boolean } | { mode: "ui"; checkout: string } | { mode: "mattermost"; slug: string } | { mode: "mattermost"; checkout: string; once: boolean } | { mode: "planning"; action: "start" | "serve" | "host" | "status" | "approve"; checkout: string; goal?: string; participants: string[]; readyNonce?: string };
 
-const usage = "Usage: npm start -- [--state PATH] [--once] | --ui [--state PATH] | --mattermost [--state PATH] [--once] | --mattermost --team SLUG | planning start --goal TEXT [--channel CHANNEL_ID] [--project PATH] [--participant SEAT_ID] [--state PATH] | planning serve|host|status [--state PATH] | seat run --seat SEAT_ID [--state PATH]\nPlanning serves only Chick's Yahaha thread. Reply in the thread to clarify; send /proposal there to request a draft.";
+const usage = "Usage: npm start -- [--state PATH] [--once] | --ui [--state PATH] | --mattermost [--state PATH] [--once] | --mattermost --team SLUG | planning start --goal TEXT [--participant SEAT_ID] [--state PATH] | planning approve --goal GOAL_ID [--state PATH] | planning serve|host|status [--state PATH] | seat run --seat SEAT_ID [--state PATH]\nPlanning serves only Chick's Yahaha thread, in the team's home channel and project from state. Reply in the thread to clarify; react :memo: on Chick's goal post to request a draft, and :white_check_mark: on the proposal post to approve it.";
 
 export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_REPO): Options {
   if (args.length === 1 && (args[0] === "--help" || args[0] === "-h")) return { mode: "help" };
@@ -126,24 +126,21 @@ export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_
   }
   if (args[0] === "planning") {
     const action = args[1];
-    if (action !== "start" && action !== "serve" && action !== "host" && action !== "status") throw new StateDataError(usage);
-    let checkout: string | undefined; let channel: string | undefined; let goal: string | undefined; let readyNonce: string | undefined;
-    const projects: string[] = []; const participants: string[] = [];
+    if (action !== "start" && action !== "serve" && action !== "host" && action !== "status" && action !== "approve") throw new StateDataError(usage);
+    let checkout: string | undefined; let goal: string | undefined; let readyNonce: string | undefined;
+    const participants: string[] = [];
     for (let index = 2; index < args.length; index++) {
       const key = args[index]; const value = args[++index];
       if (!value || value.startsWith("--")) throw new StateDataError(usage);
       if (key === "--state" && !checkout) checkout = value;
-      else if (key === "--channel" && !channel) channel = value;
       else if (key === "--goal" && !goal) goal = value;
-      else if (key === "--project") projects.push(value);
-      else if (key === "--participant") participants.push(value);
+      else if (key === "--participant" && action === "start") participants.push(value);
       else if (key === "--ready-nonce" && !readyNonce && action === "serve" && /^[a-f0-9-]{36}$/.test(value)) readyNonce = value;
       else throw new StateDataError(usage);
     }
-    if (action === "start" && !goal) throw new StateDataError(usage);
-    if (action !== "start" && (goal || channel || projects.length || participants.length)) throw new StateDataError(usage);
+    if ((action === "start" || action === "approve") !== !!goal) throw new StateDataError(usage);
     const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-    return { mode: "planning", action, checkout: resolve(checkout || stateEnv || resolve(projectRoot, "..", "indra-state")), goal, channel, projects, participants, readyNonce };
+    return { mode: "planning", action, checkout: resolve(checkout || stateEnv || resolve(projectRoot, "..", "indra-state")), goal, participants, ...(readyNonce ? { readyNonce } : {}) };
   }
   let mattermost = false;
   let checkout: string | undefined;
@@ -224,14 +221,31 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         return 0;
       }
       const store = new PlanningStore(options.checkout);
-      const chat = new MattermostPlanningChat(await hostedToken(options.checkout, options.readyNonce, readChickToken));
-      const runtime = new CodexRuntime(process.cwd());
-      const bridge = new PlanningBridge(store, chat, runtime);
-      if (options.action === "start") {
-        const goal = await bridge.start(options.goal!, options.channel,options.projects, options.participants);
-        console.log(`Planning goal ${goal.id}: ${SERVER}/yahaha/pl/${goal.mattermost.rootPostId}`);
-        return 0;
+      if (options.action === "approve") {
+        // Run by the terminal UI: like a hosted process, it reads Chick's token only with the staged service account token.
+        try {
+          const chat = new MattermostPlanningChat(await readChickToken({ serviceToken: await readServiceToken(options.checkout), headless: true }));
+          const { goal, alreadyApproved } = await new PlanningBridge(store, chat, new CodexRuntime(process.cwd())).approve(options.goal!);
+          console.log(alreadyApproved ? `Goal ${goal.id} was already approved; no new assignments.` : `Approved goal ${goal.id}: ${goal.assignments?.length ?? 0} outcome(s) queued for Developer seats.`);
+          return 0;
+        } catch (error) {
+          console.error(`Planning error: ${error instanceof Error ? error.message : String(error)}`);
+          return 1;
+        }
       }
+      if (options.action === "start") {
+        try {
+          const chat = new MattermostPlanningChat(await hostedToken(options.checkout, options.readyNonce, readChickToken));
+          const goal = await new PlanningBridge(store, chat, new CodexRuntime(process.cwd())).start(options.goal!, options.participants);
+          console.log(`Planning goal ${goal.id}: ${SERVER}/yahaha/pl/${goal.mattermost.rootPostId}`);
+          return 0;
+        } catch (error) {
+          console.error(`Planning error: ${error instanceof Error ? error.message : String(error)}`);
+          return 1;
+        }
+      }
+      const chat = new MattermostPlanningChat(await hostedToken(options.checkout, options.readyNonce, readChickToken));
+      const bridge = new PlanningBridge(store, chat, new CodexRuntime(process.cwd()));
       console.log("Chick planning bridge running. Stop with Ctrl-C.");
       let ready = false;
       while (true) {

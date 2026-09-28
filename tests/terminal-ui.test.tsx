@@ -16,6 +16,8 @@ const snapshot: StateSnapshot = {
   sprints: [{ id: "sprint-001", teamId: "team-001", status: "draft", phase: "planning", goal: "Review the first cycle", proposedWork: [], proposedAllocations: [] }],
 };
 
+const homed: StateSnapshot = { ...snapshot, teams: [{ ...snapshot.teams[0], homeChannelId: "o9rogqxy7br1zkrcami681sray", project: { github: "satoramoto/indra" } }] };
+
 function harness() {
   let state = snapshot;
   let sessions: SessionReadResult = { connection: "disconnected", sessions: [] };
@@ -237,19 +239,17 @@ describe("terminal UI", () => {
     } finally { detail.renderer.destroy(); }
   });
 
-  it("starts a new planning goal from a typed line, asking for a channel once when state has none", async () => {
-    const started: [string, string][] = [];
-    let channelReads = 0; let saved: string | undefined; const saves: string[] = [];
+  it("starts a new planning goal from a typed line alone, with the team's home channel and project from state", async () => {
+    const started: string[] = [];
     const goals: GoalStarter = {
-      channelFor: async () => { channelReads++; return saved; },
-      saveChannel: async (_team, channel) => { saves.push(channel); saved = channel; },
-      start: async (goal, channel) => { started.push([goal, channel]); return "Planning goal plan-1: https://example/pl/root"; },
+      start: async (goal) => { started.push(goal); return "Planning goal plan-1: https://example/pl/root"; },
+      approve: async () => { throw new Error("not used"); },
     };
-    const model = new TerminalUiModel(new StateInventory({ read: async () => snapshot }), { readSessions: async () => ({ connection: "connected", sessions: [] }) }, undefined, goals);
+    const model = new TerminalUiModel(new StateInventory({ read: async () => homed }), { readSessions: async () => ({ connection: "connected", sessions: [] }) }, undefined, goals);
     await model.refresh();
     const type = (text: string) => { for (const char of text) model.key(char === " " ? "space" : char.toLowerCase(), char); };
     model.key("n");
-    expect(model.input).toEqual({ kind: "goal", value: "" });
+    expect(model.input).toEqual({ value: "" });
     type("Fix tsx");
     model.key("backspace");
     model.key("backspace");
@@ -261,42 +261,88 @@ describe("terminal UI", () => {
     const setup = await testRender(() => <TerminalApp model={model} revision={revision} onKey={() => {}} />, { width: 120, height: 30 });
     try {
       await setup.renderOnce();
-      expect(setup.captureCharFrame()).toContain("New planning goal: Fix tests▏");
+      const frame = setup.captureCharFrame();
+      expect(frame).toContain("New planning goal: Fix tests▏");
+      expect(frame).toContain("satoramoto/indra · home channel");
       expect(model.key("return")).toBe("submit");
       await model.submitInput();
-      expect(model.input).toEqual({ kind: "channel", value: "", goal: "Fix tests" });
-      setRevision(model.revision);
-      await setup.renderOnce();
-      expect(setup.captureCharFrame()).toContain("Mattermost channel ID:");
-      type("not-a-channel");
-      await model.submitInput();
-      expect(model.notice).toContain("26 lowercase letters");
-      expect(started).toEqual([]);
-      model.input!.value = "";
-      type("abcdefghijklmnopqrstuvwxyz");
-      await model.submitInput();
-      expect(started).toEqual([["Fix tests", "abcdefghijklmnopqrstuvwxyz"]]);
+      expect(started).toEqual(["Fix tests"]);
       expect(model.input).toBeUndefined();
       expect(model.notice).toContain("Planning goal plan-1");
+      setRevision(model.revision);
+      await setup.renderOnce();
+      expect(setup.captureCharFrame()).not.toContain("channel ID");
       model.key("n");
       type("Second goal");
       expect(model.key("enter")).toBe("submit");
       await model.submitInput();
-      expect(started[1]).toEqual(["Second goal", "abcdefghijklmnopqrstuvwxyz"]);
-      expect(channelReads).toBe(1);
-      expect(saves).toEqual(["abcdefghijklmnopqrstuvwxyz"]);
-      // A new UI session reads the saved channel from state and never asks again.
-      const next = new TerminalUiModel(new StateInventory({ read: async () => snapshot }), { readSessions: async () => ({ connection: "connected", sessions: [] }) }, undefined, goals);
-      await next.refresh();
-      next.key("n");
-      for (const char of "Third") next.key(char.toLowerCase(), char);
-      await next.submitInput();
-      expect(next.input).toBeUndefined();
-      expect(started[2]).toEqual(["Third", "abcdefghijklmnopqrstuvwxyz"]);
-      expect(saves).toHaveLength(1);
+      expect(started).toEqual(["Fix tests", "Second goal"]);
       model.key("n");
       model.key("escape");
       expect(model.input).toBeUndefined();
+    } finally { setup.renderer.destroy(); }
+  });
+
+  it("names the missing state field instead of asking for a channel or project", async () => {
+    const goals: GoalStarter = { start: async () => { throw new Error("must not start"); }, approve: async () => { throw new Error("not used"); } };
+    const cases: [StateSnapshot, string[], string[]][] = [
+      [snapshot, ["externalIdentities.mattermost.homeChannelId", "project.github"], []],
+      [{ ...homed, teams: [{ ...homed.teams[0], homeChannelId: undefined }] }, ["externalIdentities.mattermost.homeChannelId"], ["project.github"]],
+      [{ ...homed, teams: [{ ...homed.teams[0], project: undefined }] }, ["project.github"], ["homeChannelId"]],
+    ];
+    for (const [state, named, unnamed] of cases) {
+      const model = new TerminalUiModel(new StateInventory({ read: async () => state }), { readSessions: async () => ({ connection: "connected", sessions: [] }) }, undefined, goals);
+      await model.refresh();
+      model.key("n");
+      expect(model.input).toBeUndefined();
+      expect(model.notice).toContain("Cannot start a planning goal: Team Yahaha has no");
+      for (const field of named) expect(model.notice).toContain(field);
+      for (const field of unnamed) expect(model.notice).not.toContain(field);
+    }
+  });
+
+  it("approves the selected seat's proposal awaiting review with A and a y/n confirmation", async () => {
+    const approvals: string[] = [];
+    const goals: GoalStarter = { start: async () => "unused", approve: async (goalId) => { approvals.push(goalId); return `Approved goal ${goalId}: 2 outcome(s) queued for Developer seats.`; } };
+    let stage = "awaiting-review";
+    const session = () => ({ id: "goal-1", teamId: "team-001", seatId: "seat-001", status: "idle" as const, engine: "codex" as const, sessionId: "codex-1", goal: "Plan the next cycle", stage, updatedAt: "2026-01-02T00:00:00Z", recentActivity: [] });
+    const model = new TerminalUiModel(new StateInventory({ read: async () => homed }), { readSessions: async () => ({ connection: "connected", sessions: [session()] }) }, undefined, goals);
+    await model.refresh();
+    expect(model.key("a", "A")).toBe("none");
+    expect(model.notice).toContain("Open Chick's seat");
+    model.key("down");
+    model.key("return");
+    expect(model.seat?.id).toBe("seat-001");
+    model.key("a", "A");
+    expect(model.confirm).toEqual({ goalId: "goal-1", goal: "Plan the next cycle" });
+    const [revision, setRevision] = createSignal(model.revision);
+    const setup = await testRender(() => <TerminalApp model={model} revision={revision} onKey={() => {}} />, { width: 120, height: 30 });
+    try {
+      await setup.renderOnce();
+      const frame = setup.captureCharFrame();
+      expect(frame).toContain("Approve the proposal for goal-1");
+      expect(frame).toContain("y approve");
+      expect(frame).toContain("A approves it here");
+      // Anything but y cancels.
+      expect(model.key("n", "n")).toBe("none");
+      expect(model.confirm).toBeUndefined();
+      expect(model.notice).toContain("cancelled");
+      await model.approveConfirmed();
+      expect(approvals).toEqual([]);
+      model.key("a", "A");
+      expect(model.key("y", "y")).toBe("approve");
+      stage = "approved";
+      await model.approveConfirmed();
+      expect(approvals).toEqual(["goal-1"]);
+      expect(model.notice).toBe("Approved goal goal-1: 2 outcome(s) queued for Developer seats.");
+      setRevision(model.revision);
+      await setup.renderOnce();
+      expect(setup.captureCharFrame()).not.toContain("A approves it here");
+      model.key("a", "A");
+      expect(model.confirm).toBeUndefined();
+      expect(model.notice).toContain("No proposal is awaiting review");
+      // Lowercase a still attaches rather than approving.
+      expect(model.key("a", "a")).not.toBe("approve");
     } finally { setup.renderer.destroy(); }
   });
 

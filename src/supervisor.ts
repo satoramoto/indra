@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { join, resolve } from "node:path";
-import { PlanningStore, planningChannelId, type PlanningDocument } from "./planning.js";
+import { PlanningStore, type PlanningDocument } from "./planning.js";
 import { defaultAppDir, NoCredentialError, SystemTmux, TmuxHost, type TmuxRunner } from "./tmux-host.js";
 
 export type ProcessState = "running" | "stopped" | "no credential";
@@ -19,11 +19,10 @@ export interface SeatProcessPort {
   restart(seatId: string): Promise<void>;
 }
 export interface GoalStarter {
-  channelFor(teamId: string): Promise<string | undefined>;
-  /** Records the team's planning channel in state (committed), so it is never asked for again. */
-  saveChannel(teamId: string, channelId: string): Promise<void>;
-  /** Starts a planning goal and returns a one-line result for the screen. */
-  start(goal: string, channelId: string): Promise<string>;
+  /** Starts a planning goal in the team's home channel, for the team's project, and returns a one-line result for the screen. */
+  start(goal: string): Promise<string>;
+  /** Approves a goal's proposal as the owner and returns a one-line result for the screen. */
+  approve(goalId: string): Promise<string>;
 }
 
 /** Newest progress post a Developer seat made in its goal thread; kept in `<state-checkout>.runtime`. */
@@ -130,30 +129,34 @@ export class Supervisor implements SeatProcessPort {
   }
 }
 
-/** Starts a planning goal through the built CLI, so Chick's credential never enters the terminal UI process. */
+/**
+ * Starts and approves planning goals through the built CLI, so Chick's credential never enters the terminal UI process.
+ * `run` executes one CLI invocation; tests replace it.
+ */
 export class CliGoalStarter implements GoalStarter {
-  constructor(private readonly checkout: string, private readonly appDir = defaultAppDir, private readonly store = new PlanningStore(checkout)) {}
+  constructor(
+    private readonly checkout: string,
+    private readonly appDir = defaultAppDir,
+    private readonly run: (args: string[], timeoutMs: number) => Promise<string> = (args, timeoutMs) => runCli(appDir, args, timeoutMs),
+  ) {}
 
-  async channelFor(teamId: string): Promise<string | undefined> {
-    return planningChannelId(await this.store.read(), teamId);
+  async start(goal: string): Promise<string> {
+    return await this.run(["planning", "start", "--state", resolve(this.checkout), "--goal", goal], 30 * 60_000) || "Planning goal started.";
   }
 
-  async saveChannel(teamId: string, channelId: string): Promise<void> {
-    await this.store.update((state) => {
-      const team = (state.teams as { id: string; externalIdentities?: { mattermost?: Record<string, unknown> } }[]).find((item) => item.id === teamId);
-      if (!team) throw new Error(`No team ${teamId} in state.`);
-      team.externalIdentities = { ...team.externalIdentities, mattermost: { ...team.externalIdentities?.mattermost, planningChannelId: channelId } };
-    }, `Record the planning channel for team ${teamId}`);
+  async approve(goalId: string): Promise<string> {
+    return await this.run(["planning", "approve", "--state", resolve(this.checkout), "--goal", goalId], 5 * 60_000) || `Approved goal ${goalId}.`;
   }
+}
 
-  start(goal: string, channelId: string): Promise<string> {
-    const args = ["--experimental-ffi", "--use-system-ca", join(this.appDir, "dist", "cli.js"), "planning", "start", "--state", resolve(this.checkout), "--goal", goal, "--channel", channelId, "--project", this.appDir];
-    return new Promise((done, fail) => {
-      execFile(process.execPath, args, { cwd: this.appDir, encoding: "utf8", timeout: 30 * 60_000 }, (error, stdout, stderr) => {
-        const last = (text: string) => text.trim().split("\n").at(-1) ?? "";
-        if (error) fail(new Error(last(stderr) || "planning start failed."));
-        else done(last(stdout) || "Planning goal started.");
-      });
+/** Runs `dist/cli.js` and resolves with its last stdout line; rejects with its last stderr line. */
+function runCli(appDir: string, cliArgs: string[], timeoutMs: number): Promise<string> {
+  const args = ["--experimental-ffi", "--use-system-ca", join(appDir, "dist", "cli.js"), ...cliArgs];
+  return new Promise((done, fail) => {
+    execFile(process.execPath, args, { cwd: appDir, encoding: "utf8", timeout: timeoutMs }, (error, stdout, stderr) => {
+      const last = (text: string) => text.trim().split("\n").at(-1) ?? "";
+      if (error) fail(new Error(last(stderr) || `planning ${cliArgs[1]} failed.`));
+      else done(last(stdout));
     });
-  }
+  });
 }

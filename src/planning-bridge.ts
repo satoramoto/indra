@@ -3,17 +3,25 @@ import { dirname, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { AgentRuntime } from "./codex-runtime.js";
 import { planningId } from "./codex-runtime.js";
-import { PlanningStore, developerSeats, planningChannelId, validateOutcomeSeats, type PlanningDocument, type PlanningGoal, type RuntimeRecord } from "./planning.js";
+import { PlanningStore, developerSeats, requireTeamHome, validateOutcomeSeats, type PlanningDocument, type PlanningGoal, type RuntimeRecord } from "./planning.js";
 
 export interface Post { id: string; user_id: string; channel_id: string; root_id: string; message: string; create_at: number; props?: { indra_delivery_id?: string } }
+export interface Reaction { user_id: string; post_id: string; emoji_name: string; create_at: number }
 export interface PlanningChat {
   ownUserId(): Promise<string>;
   post(channelId: string, message: string, rootId?: string, deliveryId?: string): Promise<Post>;
   since(channelId: string, timestamp: number): Promise<Post[]>;
-  /** Mattermost's `is_bot` flag for the user; only a human may approve a proposal. */
+  /** A post's current reactions; read with GET only. */
+  reactions(postId: string): Promise<Reaction[]>;
+  /** Mattermost's `is_bot` flag for the user; only a person may request or approve a proposal. */
   isBot(userId: string): Promise<boolean>;
 }
 type Seat = { id: string; displayName: string };
+
+/** 📝 on Chick's goal post requests a draft proposal. */
+export const PROPOSE_EMOJI = "memo";
+/** ✅ on Chick's proposal post approves it. */
+export const APPROVE_EMOJI = "white_check_mark";
 
 const briefSchema = resolve(dirname(fileURLToPath(import.meta.url)), "..", "schemas", "brief.json");
 const proposalSchema = resolve(dirname(fileURLToPath(import.meta.url)), "..", "schemas", "proposal.json");
@@ -38,40 +46,49 @@ function teamSeats(state: PlanningDocument, teamId: string): Map<string, string>
 function seatLabel(seats: Map<string, string>, seatId: string): string {
   return seats.has(seatId) ? `${seats.get(seatId)} (${seatId})` : seatId;
 }
+function rootMessage(id: string, goalText: string): string {
+  return `**Planning goal ${id} — Chick**\n${goalText}\n\nReply here to clarify. React :${PROPOSE_EMOJI}: on this post to request a draft proposal for review.`;
+}
 function proposalMessage(goal: PlanningGoal, seats: Map<string, string>): string {
   const draft = goal.proposal!;
-  return `**Draft proposal ${draft.id} — awaiting review**\n${draft.summary}\n${draft.outcomes.map((item) => `- **${item.title}** → ${seatLabel(seats, item.seatId)}: ${item.description}`).join("\n")}\n\nRecorded in indra-state as ${goal.id}. No work has been approved or executed. Send /approve in this thread to approve it.`;
+  return `**Draft proposal ${draft.id} — awaiting review**\n${draft.summary}\n${draft.outcomes.map((item) => `- **${item.title}** → ${seatLabel(seats, item.seatId)}: ${item.description}`).join("\n")}\n\nRecorded in indra-state as ${goal.id}. No work has been approved or executed. To approve it, a person reacts :${APPROVE_EMOJI}: on this post.`;
 }
 function approvalMessage(goal: PlanningGoal, seats: Map<string, string>): string {
   const titles = new Map(goal.proposal!.outcomes.map((item) => [item.id, item.title]));
   return `**Proposal ${goal.proposal!.id} approved**\n${(goal.assignments ?? []).map((item) => `- ${titles.get(item.outcomeId) ?? item.outcomeId} → ${seatLabel(seats, item.seatId)}`).join("\n")}\n\nRecorded in indra-state as ${goal.id}. Each outcome is queued for its Developer seat.`;
 }
-const isCommand = (message: string) => ["/proposal", "/approve"].includes(message.trim());
+function nothingToApprove(goal: PlanningGoal): string {
+  return `Nothing to approve: goal ${goal.id} is at the ${goal.stage} stage. :${APPROVE_EMOJI}: approves only Chick's proposal post while it awaits review${goal.stage === "clarifying" ? `; react :${PROPOSE_EMOJI}: on the goal post to request one` : ""}.`;
+}
+/** Reactions have no ID; removing and re-adding one gives a new `create_at`, so it counts as a new request. */
+const reactionKey = (reaction: Reaction) => `reaction:${reaction.post_id}:${reaction.user_id}:${reaction.emoji_name}:${reaction.create_at}`;
+/** The input key of an owner approval made through `planning approve`. */
+const ownerApprovalKey = (goalId: string) => `owner-approve:${goalId}`;
+const reviewing = (goal: PlanningGoal) => goal.stage === "awaiting-review" || goal.stage === "approved";
 
 function prompt(goal: PlanningGoal, input: string, drafting: boolean, developers: Seat[]): string {
   const seats = developers.map((seat) => `${seat.id} (${seat.displayName})`).join(", ");
   return `You are Chick Corea, the Team Lead seat in Indra. This is planning only. Read referenced projects when useful, but do not edit files, run implementation, deploy, or claim approval. Return only JSON. ${drafting ? `Create a proposed outcome-based roadmap with keys summary, outcomes (title, description and seatId), risks, openQuestions. This is a draft for human review. Assign every outcome to one of these Developer seats by its seat ID: ${seats || "none"}. Give each seat at most one outcome; only when there are more outcomes than seats may a seat take more, spread as evenly as possible.` : "Respond to the message and update the durable brief. Keys: reply, summary, decisions (agreed facts only), openQuestions. Ask focused clarification where useful."}\nGoal: ${goal.goal}\nProjects: ${goal.projectRefs.join(", ")}\nCurrent brief: ${JSON.stringify(goal.brief)}\nHuman message: ${input}`;
 }
 
-/** One process serializes each seat. Poll cursors and post ids survive restart. */
+/** One process serializes each seat. Poll cursors, handled posts and handled reactions survive restart. */
 export class PlanningBridge {
   private readonly busy = new Map<string, Promise<void>>();
   constructor(private readonly store: PlanningStore, private readonly chat: PlanningChat, private readonly runtime: AgentRuntime, private readonly maxQueue = 20) {}
 
-  /** Without an explicit channel, the thread goes to the team's recorded planning channel. */
-  async start(goalText: string, explicitChannelId: string | undefined, projectRefs: string[], participantSeatIds: string[] = []): Promise<PlanningGoal> {
+  /** Opens the thread in the team's home channel and records the team's project on the goal; both come from state. */
+  async start(goalText: string, participantSeatIds: string[] = []): Promise<PlanningGoal> {
     const state = await this.store.read();
     const team = (state.teams as { id: string; slug: string; seats: { id: string; externalIdentities: { mattermost: { username: string } } }[] }[]).find((item) => item.slug === "yahaha");
     const seat = team?.seats.find((item) => item.externalIdentities.mattermost.username === "chickcorea");
     if (!team || !seat) throw new Error("Chick's Yahaha seat is missing from state.");
-    const channelId = explicitChannelId ?? planningChannelId(state, team.id);
-    if (!channelId?.trim()) throw new Error("No planning channel: pass --channel, or record the team's externalIdentities.mattermost.planningChannelId in state.json.");
+    const { channelId, github } = requireTeamHome(state, team.id);
     if (!goalText.trim()) throw new Error("A goal is required.");
     if (participantSeatIds.some((id) => !team.seats.some((seat) => seat.id === id))) throw new Error("A participant seat is not in Yahaha.");
     const id = planningId();
-    const root = await this.chat.post(channelId, `**Planning goal ${id} — Chick**\n${goalText}\n\nReply here to clarify. Send /proposal in this thread to request a draft for review.`);
+    const root = await this.chat.post(channelId, rootMessage(id, goalText));
     const now = new Date().toISOString();
-    const goal: PlanningGoal = { id, teamId: team.id, seatId: seat.id, participantSeatIds, goal: goalText, projectRefs, stage: "clarifying", createdAt: now, updatedAt: now, mattermost: { channelId, rootPostId: root.id }, brief: { summary: goalText, decisions: [], openQuestions: [] } };
+    const goal: PlanningGoal = { id, teamId: team.id, seatId: seat.id, participantSeatIds, goal: goalText, projectRefs: [github], stage: "clarifying", createdAt: now, updatedAt: now, mattermost: { channelId, rootPostId: root.id }, brief: { summary: goalText, decisions: [], openQuestions: [] } };
     try { await this.store.update((state) => { state.planningGoals = [...(state.planningGoals ?? []), goal]; }, `Start planning goal ${id}`); }
     catch (error) { throw new Error(`Planning root post ${root.id} was created, but state persistence failed; inspect that post and retry after repair.`, { cause: error }); }
     const metadata: RuntimeRecord = { lastSeenAt: Math.max(0, root.create_at - 5000), processedPostIds: [root.id], runs: [] };
@@ -91,18 +108,32 @@ export class PlanningBridge {
   async poll(): Promise<void> {
     const own = await this.chat.ownUserId();
     const goals = (await this.store.read()).planningGoals ?? [];
-    for (const goal of goals) {
-      const metadata = await this.store.runtime(goal.id);
-      if (metadata.pending) await this.deliver(goal, metadata);
-      if (goal.stage === "awaiting-review" || goal.stage === "approved") {
-        const commands = (await this.chat.since(goal.mattermost.channelId, metadata.lastSeenAt)).filter((post) => post.root_id === goal.mattermost.rootPostId && post.user_id !== own && isCommand(post.message) && !metadata.processedPostIds.includes(post.id)).sort((a, b) => a.create_at - b.create_at);
-        for (const post of commands.slice(0, this.maxQueue)) await this.enqueue(goal.seatId, () => this.command(goal.id, post));
-        continue;
-      }
-      const posts = (await this.chat.since(goal.mattermost.channelId, metadata.lastSeenAt)).filter((post) => post.root_id === goal.mattermost.rootPostId && post.user_id !== own && !metadata.processedPostIds.includes(post.id)).sort((a, b) => a.create_at - b.create_at);
-      for (const post of posts.slice(0, this.maxQueue)) await this.enqueue(goal.seatId, () => this.handle(goal.id, post));
+    // `planning approve` runs in another process; the goal lock keeps it and this poll off each other's runtime metadata.
+    for (const goal of goals) await this.store.withGoalLock(goal.id, () => this.pollGoal(goal, own));
+  }
+
+  private async pollGoal(goal: PlanningGoal, own: string): Promise<void> {
+    const metadata = await this.store.runtime(goal.id);
+    if (metadata.pending) await this.deliver(goal, metadata);
+    let budget = this.maxQueue;
+    if (!reviewing(goal)) {
+      const posts = (await this.chat.since(goal.mattermost.channelId, metadata.lastSeenAt)).filter((post) => post.root_id === goal.mattermost.rootPostId && post.user_id !== own && !metadata.processedPostIds.includes(post.id)).sort((a, b) => a.create_at - b.create_at).slice(0, budget);
+      budget -= posts.length;
+      for (const post of posts) await this.enqueue(goal.seatId, () => this.handle(goal.id, post));
       if (!posts.length) { metadata.lastSeenAt = Math.max(metadata.lastSeenAt, Date.now() - 5000); await this.store.saveRuntime(goal.id, metadata); }
     }
+    for (const { reaction, key } of (await this.newReactions(goal, own)).slice(0, budget)) await this.enqueue(goal.seatId, () => this.react(goal.id, reaction, key));
+  }
+
+  /** Unhandled 📝 on the goal post and ✅ on the goal or proposal posts, oldest first; the bridge's own reactions never count. */
+  private async newReactions(goal: PlanningGoal, own: string): Promise<{ reaction: Reaction; key: string }[]> {
+    const metadata = await this.store.runtime(goal.id);
+    const root = goal.mattermost.rootPostId;
+    const found: Reaction[] = [];
+    for (const postId of [root, ...(metadata.proposalPostIds ?? [])]) {
+      found.push(...(await this.chat.reactions(postId)).filter((reaction) => reaction.post_id === postId && reaction.user_id !== own && (reaction.emoji_name === APPROVE_EMOJI || (reaction.emoji_name === PROPOSE_EMOJI && postId === root))));
+    }
+    return found.map((reaction) => ({ reaction, key: reactionKey(reaction) })).filter((item) => !metadata.processedPostIds.includes(item.key)).sort((a, b) => a.reaction.create_at - b.reaction.create_at);
   }
 
   private enqueue(seatId: string, work: () => Promise<void>): Promise<void> {
@@ -113,85 +144,126 @@ export class PlanningBridge {
     return next;
   }
 
+  /** A thread reply while the brief is being clarified. */
   private async handle(id: string, post: Post): Promise<void> {
     const goal = (await this.store.read()).planningGoals?.find((goal) => goal.id === id);
     if (!goal) return;
     const metadata = await this.store.runtime(id);
     if (metadata.pending) await this.deliver(goal, metadata);
-    if (goal.stage === "awaiting-review" || goal.stage === "approved") return;
-    if (metadata.processedPostIds.includes(post.id)) return;
-    if (post.message.trim() === "/approve") {
-      metadata.pending = { inputPostId: post.id, since: post.create_at, message: `Nothing to approve: goal ${id} is at the ${goal.stage} stage. /approve works only while a proposal is awaiting review${goal.stage === "clarifying" ? "; send /proposal to request one" : ""}.` };
-      await this.store.saveRuntime(id, metadata);
-      await this.deliver(goal, metadata);
-      return;
-    }
-    const drafting = post.message.trim() === "/proposal";
+    if (reviewing(goal) || metadata.processedPostIds.includes(post.id)) return;
+    await this.converse(goal, metadata, post.id, post.create_at, post.message, false);
+  }
+
+  /** Runs Chick's session on one input: a clarifying reply, or (when drafting) the request for a proposal. */
+  private async converse(goal: PlanningGoal, metadata: RuntimeRecord, inputKey: string, since: number, message: string, drafting: boolean): Promise<void> {
+    const id = goal.id;
     if (drafting) await this.store.update((state) => { const found = state.planningGoals!.find((item) => item.id === id)!; found.stage = "drafting"; found.updatedAt = new Date().toISOString(); }, `Start drafting a proposal for goal ${id}`);
     const developers = drafting ? developerSeats(await this.store.read(), goal.teamId).map((seat) => ({ id: seat.id, displayName: seat.displayName ?? seat.id })) : [];
-    const run = await this.runtime.message(prompt(goal, post.message, drafting, developers), drafting ? proposalSchema : briefSchema, metadata.sessionId);
+    const run = await this.runtime.message(prompt(goal, message, drafting, developers), drafting ? proposalSchema : briefSchema, metadata.sessionId);
     metadata.sessionId = run.sessionId;
     metadata.runs.push({ startedAt: run.startedAt, finishedAt: run.finishedAt, usage: run.usage });
     await this.store.saveRuntime(id, metadata);
     if (drafting) {
       const draft = proposal(run.response, developers);
       await this.store.update((state) => { const found = state.planningGoals!.find((item) => item.id === id)!; found.proposal = draft; found.stage = "awaiting-review"; found.updatedAt = new Date().toISOString(); }, `Draft proposal for goal ${id}: ${draft.outcomes.length} outcome${draft.outcomes.length === 1 ? "" : "s"}`);
-      metadata.pending = { inputPostId: post.id, since: post.create_at, message: proposalMessage({ ...goal, proposal: draft }, teamSeats(await this.store.read(), goal.teamId)) };
+      metadata.pending = { inputPostId: inputKey, since, message: proposalMessage({ ...goal, proposal: draft }, teamSeats(await this.store.read(), goal.teamId)), proposal: true };
     } else {
       const update = brief(run.response);
       await this.store.update((state) => { const found = state.planningGoals!.find((item) => item.id === id)!; found.brief = { summary: update.summary, decisions: update.decisions, openQuestions: update.openQuestions }; found.updatedAt = new Date().toISOString(); }, `Update brief for goal ${id}`);
-      metadata.pending = { inputPostId: post.id, since: post.create_at, message: update.reply };
+      metadata.pending = { inputPostId: inputKey, since, message: update.reply };
     }
     await this.store.saveRuntime(id, metadata);
     await this.deliver(goal, metadata);
   }
 
-  /** Thread commands once a proposal exists. Replies are rebuilt from durable state, so a restart repeats nothing. */
-  private async command(id: string, post: Post): Promise<void> {
+  /**
+   * One 📝 or ✅ reaction. The stage is read again here, so a reaction that arrives at the wrong stage gets a reply
+   * saying why nothing happened. Replies are rebuilt from durable state, so a restart repeats nothing.
+   */
+  private async react(id: string, reaction: Reaction, key: string): Promise<void> {
     const state = await this.store.read();
     const goal = state.planningGoals?.find((item) => item.id === id);
-    if (!goal || (goal.stage !== "awaiting-review" && goal.stage !== "approved")) return;
+    if (!goal) return;
     const metadata = await this.store.runtime(id);
     if (metadata.pending) await this.deliver(goal, metadata);
-    if (metadata.processedPostIds.includes(post.id)) return;
+    if (metadata.processedPostIds.includes(key)) return;
     const seats = teamSeats(state, goal.teamId);
-    let message: string;
-    if (post.message.trim() === "/proposal") message = goal.stage === "approved" ? approvalMessage(goal, seats) : proposalMessage(goal, seats);
-    else if (!(await this.human(state, goal, post))) message = "Only a human can approve a proposal. Nothing changed.";
+    const approving = reaction.emoji_name === APPROVE_EMOJI;
+    let message: string; let announcesProposal = false;
+    if (!(await this.human(state, goal, reaction.user_id))) message = `Only a person can ${approving ? "approve a proposal" : "request a proposal"}; reactions from bots and Chick don't count. Nothing changed.`;
     else if (goal.stage === "approved") message = approvalMessage(goal, seats);
-    else {
-      let approved = goal;
-      await this.store.update((state) => {
-        const found = state.planningGoals!.find((item) => item.id === id)!;
-        if (found.stage === "awaiting-review") {
-          const now = new Date().toISOString();
-          found.stage = "approved";
-          found.assignments = found.proposal!.outcomes.map((outcome) => ({ outcomeId: outcome.id, seatId: outcome.seatId, status: "queued", updatedAt: now }));
-          found.updatedAt = now;
-        }
-        approved = structuredClone(found);
-      }, () => `Approve goal ${id}: ${approved.assignments?.length ?? 0} assignment${approved.assignments?.length === 1 ? "" : "s"}`);
-      message = approvalMessage(approved, seats);
-    }
-    metadata.pending = { inputPostId: post.id, since: post.create_at, message };
+    else if (!approving && goal.stage === "awaiting-review") { message = proposalMessage(goal, seats); announcesProposal = true; }
+    else if (!approving) { await this.converse(goal, metadata, key, reaction.create_at, "Draft the proposal now from the brief so far.", true); return; }
+    else if (goal.stage !== "awaiting-review") message = nothingToApprove(goal);
+    else if (reaction.post_id === goal.mattermost.rootPostId) message = `To approve proposal ${goal.proposal!.id}, react :${APPROVE_EMOJI}: on Chick's proposal post rather than the goal post. Nothing changed.`;
+    else { await this.approveAndConfirm(id, metadata, key, reaction.create_at); return; }
+    metadata.pending = { inputPostId: key, since: reaction.create_at, message, ...(announcesProposal ? { proposal: true } : {}) };
     await this.store.saveRuntime(id, metadata);
     await this.deliver(goal, metadata);
+  }
+
+  /**
+   * The one approval path, used by the ✅ reaction and by `planning approve`: queues one assignment per outcome
+   * if the goal is still awaiting review (never twice), then posts the confirmation in the goal thread.
+   */
+  private async approveAndConfirm(id: string, metadata: RuntimeRecord, inputKey: string, since: number): Promise<PlanningGoal> {
+    let approved: PlanningGoal | undefined;
+    await this.store.update((state) => {
+      const found = state.planningGoals?.find((item) => item.id === id);
+      if (!found || !reviewing(found)) throw new Error(`Goal ${id} has no proposal awaiting review.`);
+      if (found.stage === "awaiting-review") {
+        const now = new Date().toISOString();
+        found.stage = "approved";
+        found.assignments = found.proposal!.outcomes.map((outcome) => ({ outcomeId: outcome.id, seatId: outcome.seatId, status: "queued", updatedAt: now }));
+        found.updatedAt = now;
+      }
+      approved = structuredClone(found);
+    }, () => `Approve goal ${id}: ${approved!.assignments?.length ?? 0} assignment${approved!.assignments?.length === 1 ? "" : "s"}`);
+    const goal = approved!;
+    metadata.pending = { inputPostId: inputKey, since, message: approvalMessage(goal, teamSeats(await this.store.read(), goal.teamId)) };
+    await this.store.saveRuntime(id, metadata);
+    await this.deliver(goal, metadata);
+    return goal;
+  }
+
+  /**
+   * The owner's approval from the terminal UI, through `planning approve`. It uses the same approval path as ✅,
+   * including the thread confirmation. Repeating it, or approving by both routes, never queues assignments twice.
+   */
+  async approve(id: string): Promise<{ goal: PlanningGoal; alreadyApproved: boolean }> {
+    const check = (goal: PlanningGoal | undefined): PlanningGoal => {
+      if (!goal) throw new Error(`No planning goal ${id} in state.`);
+      if (!reviewing(goal)) throw new Error(`Goal ${id} is at the ${goal.stage} stage; only a proposal awaiting review can be approved.`);
+      return goal;
+    };
+    check((await this.store.read()).planningGoals?.find((item) => item.id === id));
+    return await this.store.withGoalLock(id, async () => {
+      const goal = check((await this.store.read()).planningGoals?.find((item) => item.id === id));
+      const metadata = await this.store.runtime(id);
+      if (metadata.pending) await this.deliver(goal, metadata);
+      const key = ownerApprovalKey(id);
+      const alreadyApproved = goal.stage === "approved";
+      if (alreadyApproved && metadata.processedPostIds.includes(key)) return { goal, alreadyApproved };
+      return { goal: await this.approveAndConfirm(id, metadata, key, Date.now()), alreadyApproved };
+    });
   }
 
   /** A non-bot Mattermost user who is neither this bridge's account nor Chick's seat. */
-  private async human(state: PlanningDocument, goal: PlanningGoal, post: Post): Promise<boolean> {
+  private async human(state: PlanningDocument, goal: PlanningGoal, userId: string): Promise<boolean> {
     const team = (state.teams as { id: string; seats: { id: string; externalIdentities?: { mattermost?: { userId?: string } } }[] }[]).find((item) => item.id === goal.teamId);
     const chick = team?.seats.find((seat) => seat.id === goal.seatId)?.externalIdentities?.mattermost?.userId;
-    if (post.user_id === (await this.chat.ownUserId()) || post.user_id === chick) return false;
-    return !(await this.chat.isBot(post.user_id));
+    if (userId === (await this.chat.ownUserId()) || userId === chick) return false;
+    return !(await this.chat.isBot(userId));
   }
 
   private async deliver(goal: PlanningGoal, metadata: RuntimeRecord): Promise<void> {
     const pending = metadata.pending;
     if (!pending) return;
     const own = await this.chat.ownUserId();
-    const delivered = (await this.chat.since(goal.mattermost.channelId, Math.max(0, pending.since - 5000))).some((post) => post.user_id === own && post.root_id === goal.mattermost.rootPostId && post.props?.indra_delivery_id === pending.inputPostId);
-    if (!delivered) await this.chat.post(goal.mattermost.channelId, pending.message, goal.mattermost.rootPostId, pending.inputPostId);
+    const delivered = (await this.chat.since(goal.mattermost.channelId, Math.max(0, pending.since - 5000))).find((post) => post.user_id === own && post.root_id === goal.mattermost.rootPostId && post.props?.indra_delivery_id === pending.inputPostId);
+    const post = delivered ?? await this.chat.post(goal.mattermost.channelId, pending.message, goal.mattermost.rootPostId, pending.inputPostId);
+    // The proposal post is where people react ✅; it is found again after a restart by its delivery ID.
+    if (pending.proposal && !(metadata.proposalPostIds ?? []).includes(post.id)) metadata.proposalPostIds = [...(metadata.proposalPostIds ?? []), post.id];
     metadata.processedPostIds.push(pending.inputPostId);
     metadata.lastSeenAt = Math.max(metadata.lastSeenAt, pending.since);
     delete metadata.pending;

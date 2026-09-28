@@ -121,12 +121,24 @@ describe("local state checkout", () => {
     expect(() => parseOptions(["--mattermost", "--ui"])).toThrow("Usage:");
   });
 
-  it("accepts an optional nonempty team planning channel", () => {
-    const withChannel = fixture();
-    Object.assign(withChannel.teams[0].externalIdentities.mattermost, { planningChannelId: "channel-1" });
-    expect(() => parseState(withChannel)).not.toThrow();
-    Object.assign(withChannel.teams[0].externalIdentities.mattermost, { planningChannelId: " " });
-    expect(() => parseState(withChannel)).toThrow("teams[0].externalIdentities.mattermost.planningChannelId must be a nonempty string");
+  it("reads a team's optional home channel and GitHub project, naming the field when either is malformed", () => {
+    expect(parseState(fixture()).teams[0]).not.toHaveProperty("homeChannelId");
+    expect(parseState(fixture()).teams[0]).not.toHaveProperty("project");
+    const home = (mattermost: object, project?: unknown) => {
+      const value = fixture() as ReturnType<typeof fixture> & { teams: { project?: unknown }[] };
+      Object.assign(value.teams[0].externalIdentities.mattermost, mattermost);
+      if (project !== undefined) value.teams[0].project = project;
+      return value;
+    };
+    expect(parseState(home({ homeChannelId: "o9rogqxy7br1zkrcami681sray" }, { github: "satoramoto/indra" })).teams[0]).toMatchObject({ homeChannelId: "o9rogqxy7br1zkrcami681sray", project: { github: "satoramoto/indra" } });
+    expect(() => parseState(home({ homeChannelId: " " }))).toThrow("teams[0].externalIdentities.mattermost.homeChannelId must be a nonempty string");
+    expect(() => parseState(home({ planningChannelId: "channel-1" }))).toThrow("teams[0].externalIdentities.mattermost.planningChannelId is not part of state schema v1");
+    expect(() => parseState(home({}, "satoramoto/indra"))).toThrow("teams[0].project must be an object");
+    expect(() => parseState(home({}, {}))).toThrow("teams[0].project.github must be a nonempty string");
+    expect(() => parseState(home({}, { github: "satoramoto/indra", path: "/tmp" }))).toThrow("teams[0].project.path is not part of state schema v1");
+    for (const github of ["indra", "https://github.com/satoramoto/indra", "../indra", "satoramoto/..", "a/b/c", "satoramoto/in dra"]) {
+      expect(() => parseState(home({}, { github }))).toThrow("teams[0].project.github must be a GitHub repository as 'owner/repo'");
+    }
   });
 
   it("accepts only the Team Lead and Developer roles, one per seat", () => {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { git, stateCheckout } from "./state-checkout.js";
 import { PlanningStore } from "../src/planning.js";
@@ -11,7 +11,7 @@ import { parseOptions } from "../src/cli.js";
 const PR = "https://github.com/satoramoto/indra/pull/9";
 const seat = (id: string, name: string, roles: string[]) => ({ id, displayName: name, roles, externalIdentities: { mattermost: { userId: id, username: name.toLowerCase() } } });
 
-async function fixture(assignments: Assignment[], stage = "approved") {
+async function fixture(assignments: Assignment[], stage = "approved", project: { github: string } | null = { github: "satoramoto/indra" }) {
   const goal = {
     id: "goal-abc", teamId: "team-001", seatId: "seat-001", participantSeatIds: [], goal: "Build it", projectRefs: ["/proj"], stage,
     createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z", mattermost: { channelId: "channel", rootPostId: "root" },
@@ -23,7 +23,7 @@ async function fixture(assignments: Assignment[], stage = "approved") {
     ] },
     assignments,
   };
-  const state = { $schema: "./schema/v1/state.schema.json", schemaVersion: 1, sprints: [], planningGoals: [goal], teams: [{ id: "team-001", slug: "yahaha", displayName: "Yahaha", externalIdentities: { mattermost: { teamId: "team" } }, seats: [seat("seat-001", "Chick", ["Team Lead"]), seat("seat-002", "George", ["Developer"]), seat("seat-003", "Herbie", ["Developer"])] }] };
+  const state = { $schema: "./schema/v1/state.schema.json", schemaVersion: 1, sprints: [], planningGoals: [goal], teams: [{ id: "team-001", slug: "yahaha", displayName: "Yahaha", ...(project ? { project } : {}), externalIdentities: { mattermost: { teamId: "team" } }, seats: [seat("seat-001", "Chick", ["Team Lead"]), seat("seat-002", "George", ["Developer"]), seat("seat-003", "Herbie", ["Developer"])] }] };
   return new PlanningStore(await stateCheckout("indra-seat-", state));
 }
 const queued = (outcomeId: string, updatedAt: string, seatId = "seat-002"): Assignment => ({ outcomeId, seatId, status: "queued", updatedAt });
@@ -40,6 +40,8 @@ class FakeShell implements Shell {
     if (this.onFirst) { const hook = this.onFirst; this.onFirst = undefined; await hook(); }
     const line = `${command} ${args.join(" ")} @${cwd}`;
     this.calls.push(line);
+    // `gh repo clone` makes the checkout Indra then moves into place.
+    if (line.startsWith("gh repo clone")) await mkdir(join(args[3], ".git"), { recursive: true });
     if (line.startsWith("git rev-parse")) return { code: 0, stdout: "/proj/.git\n", stderr: "" };
     if (line.startsWith("gh pr view")) return { code: 0, stdout: "OPEN\n", stderr: "" };
     if (line.startsWith("gh pr checks")) return { code: this.checksCode, stdout: "", stderr: "" };
@@ -90,16 +92,19 @@ describe("developer seat", () => {
     expect((await assignment("outcome-2")).status).toBe("queued");
     expect((await assignment("outcome-3")).status).toBe("queued");
     const worktree = join(store.runtimeDir, "worktrees", "goal-abc-outcome-1");
-    expect(shell.calls).toEqual([
-      "git fetch origin main @/proj",
-      "git rev-parse --path-format=absolute --git-common-dir @/proj",
-      `git worktree add --no-track -b seat-002/goal-abc-outcome-1 ${worktree} origin/main @/proj`,
+    // Indra's own clone of the team's project, never a path from the owner or the goal.
+    const project = join(store.runtimeDir, "projects", "satoramoto", "indra");
+    expect(shell.calls[0]).toMatch(new RegExp(`^gh repo clone satoramoto/indra ${project}\\.[0-9a-f-]+\\.clone @${join(store.runtimeDir, "projects", "satoramoto")}$`));
+    expect(shell.calls.slice(1)).toEqual([
+      `git -c credential.helper= -c credential.helper=!gh auth git-credential fetch origin main @${project}`,
+      `git rev-parse --path-format=absolute --git-common-dir @${project}`,
+      `git worktree add --no-track -b seat-002/goal-abc-outcome-1 ${worktree} origin/main @${project}`,
       `gh pr comment ${PR} --body **Indra review:** Reviewed\n\nFindings:\n- Bug in foo @${worktree}`,
-      `gh pr view ${PR} --json state --jq .state @/proj`,
+      `gh pr view ${PR} --json state --jq .state @${project}`,
       `gh pr checks ${PR} --watch @${worktree}`,
       `git checkout --detach @${worktree}`,
       `gh pr merge ${PR} --squash --delete-branch @${worktree}`,
-      `git worktree remove --force ${worktree} @/proj`,
+      `git worktree remove --force ${worktree} @${project}`,
     ]);
     // Three new sessions: none resumes another. Build and fix write with network; the reviewer is read-only.
     const write = ["--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true", "--add-dir", "/proj/.git"];
@@ -115,6 +120,23 @@ describe("developer seat", () => {
       "Seat seat-002 marks goal-abc/outcome-1 in-review",
       "Seat seat-002 marks goal-abc/outcome-1 merged",
     ]);
+  });
+
+  it("fails an assignment whose team has no project, naming the state field", async () => {
+    const store = await fixture([queued("outcome-1", "2026-01-01T00:00:00Z")], "approved", null);
+    const shell = new FakeShell(); const codex = new FakeCodex();
+    await new DeveloperSeat(store, await loadDeveloperSeat(store, "seat-002"), new FakeChat(), shell, codex.factory).tick();
+    expect((await store.read()).planningGoals![0].assignments![0]).toMatchObject({ status: "failed", note: "worktree: Team team-001 has no project.github in state.json; record it in indra-state first." });
+    expect(shell.calls).toEqual([]);
+    expect(codex.runs).toHaveLength(0);
+  });
+
+  it("clones the project once and fetches it before each new worktree", async () => {
+    const { shell, seat } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z"), queued("outcome-2", "2026-01-02T00:00:00Z")]);
+    await seat.tick();
+    await seat.tick();
+    expect(shell.calls.filter((call) => call.startsWith("gh repo clone"))).toHaveLength(1);
+    expect(shell.calls.filter((call) => call.includes(" fetch origin main "))).toHaveLength(2);
   });
 
   it("skips the fix session when the reviewer has no findings", async () => {

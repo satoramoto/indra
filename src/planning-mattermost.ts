@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { PlanningChat, Post } from "./planning-bridge.js";
+import type { PlanningChat, Post, Reaction } from "./planning-bridge.js";
 
 const execFileAsync = promisify(execFile);
 const SERVER = "https://mattermost.newegypt.io";
@@ -47,6 +47,13 @@ export class MattermostPlanningChat implements PlanningChat {
   }
   async post(channelId: string, message: string, rootId?: string, deliveryId?: string): Promise<Post> {
     return await this.call("/posts", "POST", { channel_id: channelId, message, root_id: rootId ?? "", props: deliveryId ? { indra_delivery_id: deliveryId } : {} }) as Post;
+  }
+  /** GET only; Mattermost may answer `null` for a post without reactions. */
+  async reactions(postId: string): Promise<Reaction[]> {
+    const payload = await this.call(`/posts/${encodeURIComponent(postId)}/reactions`);
+    if (payload === null) return [];
+    if (!Array.isArray(payload)) throw new Error("Mattermost returned an invalid reaction list.");
+    return (payload as Partial<Reaction>[]).filter((item): item is Reaction => typeof item?.user_id === "string" && typeof item.post_id === "string" && typeof item.emoji_name === "string" && typeof item.create_at === "number");
   }
   async since(channelId: string, timestamp: number): Promise<Post[]> {
     const payload = await this.call(`/channels/${encodeURIComponent(channelId)}/posts?since=${timestamp}`) as { order: string[]; posts: Record<string, Post> };

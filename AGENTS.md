@@ -28,7 +28,8 @@ Reviewers flag only these, each with the file, the line and a one-line reason:
 - **Mattermost inventory:** the `--mattermost` mode sends only `GET` requests and refuses redirects. It never writes to Mattermost.
 - **State writes:** anything written to `state.json` stays valid against the v1 schema and Indra's reference checks. Runtime metadata (session IDs, delivery cursors, usage) stays in `<state-checkout>.runtime`, not in Git.
 - **tmux:** never kill, reuse or attach a tmux session or pane that Indra doesn't own and hasn't verified. A stale or missing ownership record is not grounds to act on another session.
-- **Approval:** nothing approves or starts proposal work without the human plan approval step.
+- **Approval:** nothing approves or starts proposal work without the human plan approval step: a person's ✅ reaction on Chick's proposal post, or the owner's `planning approve` from the terminal UI. Both go through the same approval code. Reactions are read with `GET` only, and reactions from bots, the bridge's own account or Chick's seat never count.
+- **Team home:** a team's channel and project come from `indra-state` (`externalIdentities.mattermost.homeChannelId`, `project.github`), never from prompts or options. Project checkouts stay under `<state-checkout>.runtime/projects/`.
 - **Bugs:** wrong logic, and tests that would pass without the code under test working.
 
 Don't comment on style or naming. Put small edge cases in a follow-up issue rather than blocking the PR.

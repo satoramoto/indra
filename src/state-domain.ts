@@ -16,6 +16,10 @@ export interface StateTeam {
   slug: string;
   displayName: string;
   mattermostTeamId: string;
+  /** `externalIdentities.mattermost.homeChannelId`: where Chick opens the team's planning threads. */
+  homeChannelId?: string;
+  /** The team's GitHub repository; Indra keeps its own clone of it. */
+  project?: { github: string };
   seats: StateSeat[];
 }
 
