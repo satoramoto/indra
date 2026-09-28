@@ -1,6 +1,7 @@
 import type { StateInventory, StateSeat, StateSnapshot, StateTeam } from "./state-domain.js";
 import type { GoalStarter, SeatLive, SeatProcessPort } from "./supervisor.js";
 import { missingTeamHome, missingTeamMessage } from "./planning.js";
+import type { StateSyncResult } from "./state-commit.js";
 
 /** Structural read port. A stable seat is never treated as a running agent without a runtime session. */
 export interface TerminalSession {
@@ -25,6 +26,11 @@ export interface SessionReadResult {
 
 export interface SessionReadPort {
   readSessions(): Promise<SessionReadResult>;
+}
+
+/** Syncs the state checkout with its remote; never throws for git or network problems. */
+export interface StateSyncPort {
+  sync(): Promise<StateSyncResult>;
 }
 
 export type UiPage = "teams" | "team" | "seat";
@@ -73,9 +79,40 @@ export class TerminalUiModel {
   /** Called after changes made outside a key press or refresh, so the screen redraws. */
   changed?: () => void;
 
-  constructor(private readonly state: StateInventory, private readonly sessions: SessionReadPort, private readonly processes?: SeatProcessPort, private readonly goals?: GoalStarter) {}
+  /** The last finished sync of the state checkout; undefined until the first one ends. */
+  syncResult?: StateSyncResult;
+  syncing = false;
+
+  constructor(private readonly state: StateInventory, private readonly sessions: SessionReadPort, private readonly processes?: SeatProcessPort, private readonly goals?: GoalStarter, private readonly stateSync?: StateSyncPort) {}
 
   private bump(): void { this.revision++; this.changed?.(); }
+
+  /** Syncs the state checkout first, then hosts the processes, so they start from the remote's state. */
+  async start(): Promise<void> {
+    await this.syncState();
+    await this.ensureProcesses();
+  }
+
+  /** Pulls the state checkout's remote changes and pushes Indra's; a changed state.json refreshes the screen. */
+  async syncState(): Promise<void> {
+    if (!this.stateSync || this.syncing) return;
+    this.syncing = true;
+    this.bump();
+    try { this.syncResult = await this.stateSync.sync(); }
+    catch (error) { this.syncResult = { outcome: "error", message: "State sync failed: " + (error instanceof Error ? error.message : String(error)), changed: false, at: new Date().toISOString() }; }
+    finally { this.syncing = false; }
+    if (this.syncResult.changed) await this.refresh().catch(() => false);
+    this.bump();
+  }
+
+  /** One line for the screen: when the state checkout last synced and how that went; undefined without sync. */
+  syncLine(): { text: string; ok: boolean } | undefined {
+    if (!this.stateSync) return undefined;
+    const last = this.syncResult;
+    if (!last) return { text: "State sync: syncing with the remote…", ok: true };
+    const ok = last.outcome === "synced" || last.outcome === "skipped";
+    return { text: "State sync " + last.at.slice(11, 19) + " UTC · " + (ok ? "" : last.outcome.toUpperCase() + " · ") + last.message + (this.syncing ? " · syncing…" : ""), ok };
+  }
 
   /** Hosts the bridge and seat runners that are not already running; problems become the notice. */
   async ensureProcesses(): Promise<void> {

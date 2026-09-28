@@ -2,7 +2,7 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { parseState } from "./local-state.js";
-import { StateCommitError, StateGit, withFileLock } from "./state-commit.js";
+import { StateCommitError, StateGit, withFileLock, type StateSyncResult } from "./state-commit.js";
 
 export interface PlanningGoal {
   id: string; teamId: string; seatId: string; participantSeatIds: string[]; goal: string; projectRefs: string[];
@@ -165,6 +165,21 @@ export class PlanningStore {
       return true;
     });
     if (changed) git.pushInBackground();
+  }
+  /**
+   * Syncs the checkout with its upstream under the same lock as writes, so it never interleaves with
+   * a write or its commit. An unfinished commit is completed first. Never throws; see `StateGit.sync`.
+   */
+  async sync(): Promise<StateSyncResult> {
+    const git = new StateGit(this.checkout);
+    try {
+      return await withFileLock(join(this.runtimeDir, "state.lock"), async () => {
+        await this.recoverCommit(git, join(this.checkout, "state.json"));
+        return await git.sync();
+      });
+    } catch (error) {
+      return { outcome: "error", message: `State sync failed: ${error instanceof Error ? error.message : String(error)}`, changed: false, at: new Date().toISOString() };
+    }
   }
   /** Finishes the commit of a write whose process stopped between writing state.json and committing it. */
   private async recoverCommit(git: StateGit, file: string): Promise<void> {
