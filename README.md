@@ -2,6 +2,27 @@
 
 Indra reads stable team seats and draft sprint records from an `indra-state` Git checkout. The planning commands connect Chick's durable seat to an authenticated Codex CLI session and a dedicated Mattermost thread.
 
+## Direction
+
+Indra is a startup simulator: a control plane where stable team seats in Mattermost are filled by coding-agent sessions. This section describes the proof of concept we are building toward. The rest of this README describes what runs today.
+
+**Roles.** There are exactly two permanent roles. The Team Lead is Chick Corea (`seat-001`). Every other seat is a Developer. There are no extra-role claims and no formal soft roles. A sprint proposal can describe soft responsibilities in prose.
+
+**Seats and tasks.** A seat limits concurrency by task ownership: each seat owns one logical workstream at a time. Inside that task it can start any number of subagents with the developer, reviewer and quick-fix profiles.
+
+**Rules inside a task.** Build, then review by a fresh agent, fix, merge. The reviewer is never the same agent reviewing its own work in the same context.
+
+**People and state.** The only human step is approving plans. Agents merge their own PRs once CI is green and the fresh reviewer has approved. Indra writes planning records to `indra-state`. Indra reads live Mattermost (the existing `--mattermost` mode) to confirm it matches `indra-state`; that read stays read-only.
+
+**POC milestone.** The full team loop runs on the Indra repository itself: a goal is set, Chick plans, a human approves, a Developer seat does the work in a worktree, opens a PR, starts a fresh reviewer, fixes, merges, then goes idle. Codex runs every seat first. The Claude Code adapter and handing a seat from one engine to another come later.
+
+**Planned PR order.**
+
+1. CI.
+2. The two roles, plus the check that live Mattermost matches `indra-state`.
+3. Plan approval, with assignment of approved work to seats.
+4. Developer seats running the task loop.
+
 ## Run
 
 Requires Node.js 26.4.0 or newer for the OpenTUI Solid terminal screen. The launcher passes Node's `--experimental-ffi` flag; it does not change the system Node installation. Keep the separate `indra-state` checkout beside this project, or pass its directory explicitly:
