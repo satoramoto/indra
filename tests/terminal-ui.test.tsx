@@ -2,7 +2,8 @@ import { testRender } from "@opentui/solid";
 import { createSignal } from "solid-js";
 import { describe, expect, it } from "vitest";
 import { StateInventory, type StateSnapshot } from "../src/state-domain.js";
-import { TerminalUiModel, type SessionReadResult } from "../src/terminal-ui.js";
+import { TerminalUiModel, type SessionReadResult, type StateSyncPort } from "../src/terminal-ui.js";
+import type { StateSyncResult } from "../src/state-commit.js";
 import { TerminalApp } from "../src/terminal-ui-solid.js";
 import { attachTmux, parseOwnedTmuxTarget } from "../src/tmux-attach.js";
 import type { GoalStarter, SeatLive, SeatProcessPort } from "../src/supervisor.js";
@@ -237,6 +238,40 @@ describe("terminal UI", () => {
       expect(frame).toContain("Process: running (seat runner)");
       expect(frame).toContain("Assignment: Second · in-review");
     } finally { detail.renderer.destroy(); }
+  });
+
+  it("syncs the state checkout before hosting processes, refreshes when state changed, and shows the last result", async () => {
+    const calls: string[] = [];
+    let state = snapshot;
+    const results: StateSyncResult[] = [
+      { outcome: "synced", changed: true, message: "Pulled 1 commit from origin/main.", at: "2026-09-28T10:00:05.000Z" },
+      { outcome: "conflict", changed: false, message: "Local state commits conflict with origin/main; the checkout is unchanged.", at: "2026-09-28T10:01:05.000Z" },
+    ];
+    const sync: StateSyncPort = { sync: async () => {
+      calls.push("sync");
+      const next = results.shift()!;
+      if (next.changed) state = { ...snapshot, teams: [{ ...snapshot.teams[0], displayName: "Yahaha Merged" }] };
+      return next;
+    } };
+    const processes: SeatProcessPort = { ensureAll: async () => { calls.push("ensureAll"); return []; }, read: async () => ({}), stop: async () => {}, restart: async () => {} };
+    const model = new TerminalUiModel(new StateInventory({ read: async () => state }), { readSessions: async () => ({ connection: "connected", sessions: [] }) }, processes, undefined, sync);
+    await model.refresh();
+    expect(model.syncLine()?.text).toContain("syncing with the remote");
+    await model.start();
+    expect(calls).toEqual(["sync", "ensureAll"]);
+    expect(model.team?.displayName).toBe("Yahaha Merged");
+    expect(model.syncLine()).toEqual({ ok: true, text: "State sync 10:00:05 UTC · Pulled 1 commit from origin/main." });
+    await model.syncState();
+    expect(model.syncLine()?.ok).toBe(false);
+    const [revision] = createSignal(model.revision);
+    const setup = await testRender(() => <TerminalApp model={model} revision={revision} onKey={() => {}} />, { width: 120, height: 30 });
+    try {
+      await setup.renderOnce();
+      expect(setup.captureCharFrame()).toContain("State sync 10:01:05 UTC · CONFLICT · Local state commits conflict with origin/main");
+    } finally { setup.renderer.destroy(); }
+    const failing = new TerminalUiModel(new StateInventory({ read: async () => state }), { readSessions: async () => ({ connection: "connected", sessions: [] }) }, undefined, undefined, { sync: async () => { throw new Error("lock timeout"); } });
+    await failing.syncState();
+    expect(failing.syncLine()?.text).toContain("ERROR · State sync failed: lock timeout");
   });
 
   it("starts a new planning goal from a typed line alone, with the team's home channel and project from state", async () => {

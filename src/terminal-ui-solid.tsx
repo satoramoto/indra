@@ -3,7 +3,7 @@ import { render, useKeyboard, useTerminalDimensions } from "@opentui/solid";
 import { createMemo, createSignal, For, Show, type Accessor } from "solid-js";
 import type { StateInventory, StateSeat } from "./state-domain.js";
 import { attachTmux } from "./tmux-attach.js";
-import { currentSession, displayText, newestPlanningRecord, TerminalUiModel, type SessionReadPort, type TerminalSession } from "./terminal-ui.js";
+import { currentSession, displayText, newestPlanningRecord, TerminalUiModel, type SessionReadPort, type StateSyncPort, type TerminalSession } from "./terminal-ui.js";
 import type { GoalStarter, SeatLive, SeatProcessPort } from "./supervisor.js";
 
 const theme = {
@@ -72,6 +72,7 @@ export function TerminalApp(props: TerminalAppProps) {
       : "State loaded " + (displayText(props.model.refreshedAt) || "pending");
   });
   const notice = createMemo(() => { props.revision(); return props.model.notice; });
+  const sync = createMemo(() => { props.revision(); return props.model.syncLine(); });
 
   const input = createMemo(() => { props.revision(); return props.model.input ? { ...props.model.input } : undefined; });
   const confirm = createMemo(() => { props.revision(); return props.model.confirm ? { ...props.model.confirm } : undefined; });
@@ -128,11 +129,12 @@ export function TerminalApp(props: TerminalAppProps) {
 
   return (
     <box width="100%" height="100%" flexDirection="column" backgroundColor={theme.background} padding={1} gap={1}>
-      <box height={2} flexDirection="column">
+      <box height={sync() ? 3 : 2} flexDirection="column">
         <text fg={theme.heading}>INDRA  /  {page() === "teams" ? "Teams" : displayText(team()?.displayName)}  /  {runtime()}</text>
         <text fg={props.model.stateError ? theme.error : theme.muted}>
           {stateSummary()}  ·  {displayText(props.model.sessionResult.message) || "Auto-updating"}
         </text>
+        <Show when={sync()}><text fg={sync()?.ok ? theme.muted : theme.error}>{displayText(sync()?.text, Math.max(20, dimensions().width - 4))}</text></Show>
       </box>
 
       <Show when={page() === "teams"}>
@@ -226,9 +228,12 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
   /** Hosts and controls the bridge and seat runners; they keep running after the UI quits. */
   processes?: SeatProcessPort;
   goals?: GoalStarter;
+  /** Syncs the state checkout with its remote before hosting processes, then every `syncMs`. */
+  sync?: StateSyncPort;
+  syncMs?: number;
 } = {}): Promise<number> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error("The terminal UI needs an interactive TTY. Use --once for redirected output.");
-  const model = new TerminalUiModel(state, sessions, options.processes, options.goals);
+  const model = new TerminalUiModel(state, sessions, options.processes, options.goals, options.sync);
   await model.refresh();
   const renderer = await createCliRenderer({ exitOnCtrlC: false, targetFps: 30 });
   const [revision, setRevision] = createSignal(model.revision);
@@ -237,6 +242,7 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
   let refreshing = false;
   let attaching = false;
   let timer: ReturnType<typeof setInterval> | undefined;
+  let syncTimer: ReturnType<typeof setInterval> | undefined;
   const refresh = async () => {
     if (!active || refreshing || attaching) return;
     refreshing = true;
@@ -255,6 +261,7 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
       if (!active) return false;
       active = false;
       if (timer) clearInterval(timer);
+      if (syncTimer) clearInterval(syncTimer);
       options.signal?.removeEventListener("abort", finish);
       renderer.destroy();
       return true;
@@ -292,7 +299,8 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
       .then(() => {
         if (!active) return;
         timer = setInterval(() => { void refresh(); }, Math.max(500, options.pollMs ?? 2000));
-        void model.ensureProcesses();
+        void model.start();
+        if (options.sync) syncTimer = setInterval(() => { if (active && !attaching) void model.syncState(); }, Math.max(5_000, options.syncMs ?? 60_000));
         options.signal?.addEventListener("abort", finish, { once: true });
         if (options.signal?.aborted) finish();
       })

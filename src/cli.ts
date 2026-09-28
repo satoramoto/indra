@@ -200,6 +200,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       return await runTerminalUi(new StateInventory(new LocalStateRepository(options.checkout)), new LocalSessionReader(options.checkout), {
         processes: new Supervisor(options.checkout, undefined, undefined, undefined, undefined, () => stageServiceToken(options.checkout)),
         goals: new CliGoalStarter(options.checkout),
+        sync: new PlanningStore(options.checkout),
       });
     }
     if (options.mode === "state") {
