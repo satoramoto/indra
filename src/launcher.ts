@@ -1,14 +1,14 @@
 import { spawn } from "node:child_process";
-import { dirname, join } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { join } from "node:path";
 
 /**
  * `npm start` runs this small launcher. It runs the CLI as a child with the terminal inherited and starts it
  * again, on whatever build is in `dist/` then, when the child exits with RELOAD_EXIT_CODE. Any other exit ends it.
- * It imports only the two constants it shares with the CLI, so it rarely needs to change. Nothing else may import
+ * It always starts `dist/cli.js`, so a reload follows the `dist` symlink to the newest build.
+ * It imports only the small helpers it shares with the CLI, so it rarely needs to change. Nothing else may import
  * this file: the build would move it into a shared chunk and the entry check below would never match.
  */
-import { LAUNCHER_ENV, RELOAD_EXIT_CODE } from "./reload.js";
+import { appRootOf, isEntry, LAUNCHER_ENV, RELOAD_EXIT_CODE } from "./reload.js";
 
 export { LAUNCHER_ENV, RELOAD_EXIT_CODE };
 
@@ -35,8 +35,8 @@ export function cliChild(cli: string, args: string[], nodeArgs = ["--experimenta
   });
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isEntry(import.meta.url)) {
   // Ctrl-C reaches the child directly from the terminal; the launcher waits for the child's exit instead.
   process.on("SIGINT", () => {});
-  process.exitCode = await launch(cliChild(join(dirname(fileURLToPath(import.meta.url)), "cli.js"), process.argv.slice(2)));
+  process.exitCode = await launch(cliChild(join(appRootOf(import.meta.url), "dist", "cli.js"), process.argv.slice(2)));
 }

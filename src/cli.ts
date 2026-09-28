@@ -1,6 +1,5 @@
 import { createInterface } from "node:readline/promises";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
 import { readToken } from "./credential.js";
 import { Inventory, InventoryError, type Seat, type Team } from "./domain.js";
 import { LocalStateRepository, StateDataError } from "./local-state.js";
@@ -17,7 +16,7 @@ import { defaultAppDir, signalReady, TmuxHost, turnLockFile } from "./tmux-host.
 import { withFileLock } from "./state-commit.js";
 import { readBuildStamp } from "./build-stamp.js";
 import { SelfUpdater } from "./self-update.js";
-import { LAUNCHER_ENV, RELOAD_EXIT_CODE } from "./reload.js";
+import { appRootOf, isEntry, LAUNCHER_ENV, RELOAD_EXIT_CODE } from "./reload.js";
 import { readFile, rm, writeFile, mkdir } from "node:fs/promises";
 import type { UiView } from "./terminal-ui.js";
 import { LocalSessionReader } from "./session-snapshot.js";
@@ -127,7 +126,7 @@ export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_
       else throw new StateDataError(usage);
     }
     if (!seatId) throw new StateDataError(usage);
-    const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+    const projectRoot = appRootOf(import.meta.url);
     return { mode: "seat", seatId, checkout: resolve(checkout || stateEnv || resolve(projectRoot, "..", "indra-state")), ...(readyNonce ? { readyNonce } : {}) };
   }
   if (args[0] === "planning") {
@@ -145,7 +144,7 @@ export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_
       else throw new StateDataError(usage);
     }
     if ((action === "start" || action === "approve") !== !!goal) throw new StateDataError(usage);
-    const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+    const projectRoot = appRootOf(import.meta.url);
     return { mode: "planning", action, checkout: resolve(checkout || stateEnv || resolve(projectRoot, "..", "indra-state")), goal, participants, ...(readyNonce ? { readyNonce } : {}) };
   }
   let mattermost = false;
@@ -171,7 +170,7 @@ export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_
     if (checkout || once) throw new StateDataError(usage);
     return { mode: "mattermost", slug };
   }
-  const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  const projectRoot = appRootOf(import.meta.url);
   const stateCheckout = resolve(checkout || stateEnv || resolve(projectRoot, "..", "indra-state"));
   if (mattermost) return { mode: "mattermost", checkout: stateCheckout, once };
   // The terminal UI is the default; --ui is kept as an alias.
@@ -317,6 +316,6 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isEntry(import.meta.url)) {
   process.exitCode = await main();
 }

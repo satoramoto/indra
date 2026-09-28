@@ -104,12 +104,24 @@ export class TerminalUiModel {
   reloadWanted = false;
   /** Actions in flight (goal start, approval, stop or restart, hosting); the UI never reloads under one. */
   private busy = 0;
+  /** Settles when the update in progress (install, build, switch and restarts) ends. */
+  private updateRun?: Promise<void>;
 
   constructor(private readonly state: StateInventory, private readonly sessions: SessionReadPort, private readonly processes?: SeatProcessPort, private readonly goals?: GoalStarter, private readonly stateSync?: StateSyncPort, private readonly update?: UpdatePort) {}
 
   private bump(): void { this.revision++; this.changed?.(); }
 
+  /**
+   * Every action that spawns Indra code (s, n, A, hosting) goes through here. It waits while an update may be
+   * changing node_modules or dist, and does not run at all after a failed dependency install.
+   */
   private async tracked(work: () => Promise<void>): Promise<void> {
+    while (this.updateRun) await this.updateRun;
+    if (this.updateResult?.installFailed) {
+      this.notice = "Not started: Indra is blocked because a dependency install failed; it retries on the next update check.";
+      this.bump();
+      return;
+    }
     this.busy++;
     try { await work(); } finally { this.busy--; }
   }
@@ -128,9 +140,13 @@ export class TerminalUiModel {
   async updateCode(): Promise<void> {
     if (!this.update || this.updating || this.busy) return;
     this.updating = true;
+    let release = () => {};
+    this.updateRun = new Promise((done) => { release = done; });
     this.bump();
     try {
       this.updateResult = await this.update.check();
+      // After a failed install node_modules may be half written: no reload and no restarts until one succeeds.
+      if (this.updateResult.installFailed) return;
       const reloading = await this.checkBuild() && this.update.canReload;
       if (!reloading && this.processes?.upgrade) {
         const { problems } = await this.processes.upgrade();
@@ -138,8 +154,12 @@ export class TerminalUiModel {
         await this.refresh();
       }
     } catch (error) { this.updateResult = { outcome: "blocked", message: "update check failed: " + (error instanceof Error ? error.message : String(error)), at: new Date().toISOString() }; }
-    finally { this.updating = false; }
-    this.bump();
+    finally {
+      this.updating = false;
+      this.updateRun = undefined;
+      release();
+      this.bump();
+    }
   }
 
   /** True once `dist/` holds a different build than this UI runs (a self-update or an `npm run dev` rebuild). */
@@ -152,7 +172,7 @@ export class TerminalUiModel {
 
   /** A reload is due and nothing is in flight: no typing, confirmation, state sync, update or action. */
   readyToReload(): boolean {
-    return this.reloadWanted && !!this.update?.canReload && !this.input && !this.confirm && !this.syncing && !this.updating && this.busy === 0;
+    return this.reloadWanted && !!this.update?.canReload && !this.updateResult?.installFailed && !this.input && !this.confirm && !this.syncing && !this.updating && this.busy === 0;
   }
 
   view(): UiView { return { page: this.page, ...(this.teamId ? { teamId: this.teamId } : {}), ...(this.seatId ? { seatId: this.seatId } : {}) }; }
@@ -171,6 +191,7 @@ export class TerminalUiModel {
     const version = "Indra " + (this.update.running?.sha.slice(0, 7) || "unknown build");
     const last = this.updateResult;
     const waiting = this.teams.flatMap((team) => team.seats).filter((seat) => this.live[seat.id]?.updatePending).map((seat) => seat.displayName);
+    if (last?.installFailed) return { text: version + " · blocked: " + last.message + " · retrying on the next check", ok: false };
     if (this.reloadWanted) return { text: version + " · update pending · " + (this.update.canReload ? "reloads when idle" : "new build ready; restart Indra to use it"), ok: true };
     if (this.updating) return { text: version + " · updating…", ok: true };
     if (last && (last.outcome === "blocked" || last.outcome === "failed")) return { text: version + " · blocked · " + last.message, ok: false };

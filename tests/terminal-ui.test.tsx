@@ -312,6 +312,42 @@ describe("terminal UI", () => {
     expect(model.view()).toEqual({ page: "seat", teamId: "team-001", seatId: "seat-003" });
   });
 
+  it("holds restarts, goals and reloads while an update runs, and refuses them after a failed dependency install", async () => {
+    const calls: string[] = [];
+    let finish: (result: UpdateResult) => void = () => {};
+    const update: UpdatePort = { running: { id: "build-1", sha: "abc1234def", builtAt: "now" }, canReload: true, check: () => new Promise((done) => { calls.push("check"); finish = done; }), current: async () => ({ id: "build-2", sha: "fed4321abc", builtAt: "now" }) };
+    const processes: SeatProcessPort = { ensureAll: async () => [], read: async () => ({}), stop: async () => {}, restart: async () => { calls.push("restart"); }, upgrade: async () => { calls.push("upgrade"); return { pending: [], problems: [] }; } };
+    const goals: GoalStarter = { start: async () => { calls.push("start"); return "ok"; }, approve: async () => { calls.push("approve"); return "ok"; } };
+    const model = new TerminalUiModel(new StateInventory({ read: async () => homed }), { readSessions: async () => ({ connection: "connected", sessions: [] }) }, processes, goals, undefined, update);
+    await model.refresh();
+    model.restore({ page: "seat", teamId: "team-001", seatId: "seat-002" });
+    await model.refresh();
+
+    const updating = model.updateCode();
+    const restart = model.control("restart");
+    model.input = { value: "a goal" };
+    const submit = model.submitInput();
+    await new Promise((done) => setTimeout(done, 20));
+    expect(calls).toEqual(["check"]);
+    expect(model.readyToReload()).toBe(false);
+    finish({ outcome: "blocked", message: "dependency install failed: npm ci failed: ENOSPC", at: "now", installFailed: true });
+    await Promise.all([updating, restart, submit]);
+    // The install failed: no reload, no restarts, and the held actions do not run on a half-installed node_modules.
+    expect(calls).toEqual(["check"]);
+    expect(model.reloadWanted).toBe(false);
+    expect(model.updateLine()).toEqual({ ok: false, text: "Indra abc1234 · blocked: dependency install failed: npm ci failed: ENOSPC · retrying on the next check" });
+
+    // The next check installs and builds: the new build is live, then held actions run again.
+    const retry = model.updateCode();
+    const again = model.control("restart");
+    await new Promise((done) => setTimeout(done, 20));
+    expect(calls).toEqual(["check", "check"]);
+    finish({ outcome: "built", message: "built fed4321", at: "now" });
+    await Promise.all([retry, again]);
+    expect(calls).toEqual(["check", "check", "restart"]);
+    expect(model.readyToReload()).toBe(true);
+  });
+
   it("starts a new planning goal from a typed line alone, with the team's home channel and project from state", async () => {
     const started: string[] = [];
     const goals: GoalStarter = {

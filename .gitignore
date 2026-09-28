@@ -5,5 +5,7 @@ __pycache__/
 .env.*
 !.env.example
 node_modules/
-dist/
+dist
+builds/
+.dist-*
 coverage/

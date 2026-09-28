@@ -3,8 +3,8 @@ import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
 import { access, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import { readBuildStamp } from "./build-stamp.js";
+import { appRootOf } from "./reload.js";
 
 const execFileAsync = promisify(execFile);
 export interface TmuxRunner { run(args: string[]): Promise<string> }
@@ -14,7 +14,7 @@ export type HostedProcess = { kind: "bridge" } | { kind: "seat"; seatId: string 
 export type Readiness = "ready" | "no-credential";
 
 /** The Indra checkout this code runs from (the parent of `dist/` or `src/`). */
-export const defaultAppDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+export const defaultAppDir = appRootOf(import.meta.url);
 
 /** The hosted process could not read its bot credential and exited. */
 export class NoCredentialError extends Error { override name = "NoCredentialError"; }
