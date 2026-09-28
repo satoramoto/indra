@@ -27,6 +27,8 @@ export interface Mismatch {
 export interface TeamReport {
   team: StateTeam;
   mismatches: Mismatch[];
+  /** Human accounts in the team that no seat claims. Informational only; never a mismatch. */
+  unclaimedHumans: LiveMember[];
 }
 
 /** Compares one state team with its live members. Pure: no reads, no writes. */
@@ -60,20 +62,27 @@ export function compareTeam(team: StateTeam, live: LiveMember[]): Mismatch[] {
     }
   }
   for (const member of live) {
-    if (claimed.has(member.userId)) continue;
+    if (claimed.has(member.userId) || !member.isBot) continue;
     mismatches.push({
       kind: "unexpected", teamId: team.id, field: "seats",
-      message: `${member.isBot ? "Bot" : "User"} @${member.username} (${member.userId}) is in the Mattermost team but no seat in state has that user.`,
+      message: `Bot @${member.username} (${member.userId}) is in the Mattermost team but no seat in state has that user.`,
     });
   }
   return mismatches;
+}
+
+/** Human accounts in the team that no seat claims. These are listed, not counted as mismatches. */
+export function unclaimedHumans(team: StateTeam, live: LiveMember[]): LiveMember[] {
+  const claimed = new Set(team.seats.map((seat) => seat.mattermostUserId));
+  return live.filter((member) => !member.isBot && !claimed.has(member.userId));
 }
 
 /** Reads every state team's live membership and compares it. Never writes to either side. */
 export async function checkConsistency(snapshot: StateSnapshot, reader: TeamMemberReader): Promise<TeamReport[]> {
   const reports: TeamReport[] = [];
   for (const team of snapshot.teams) {
-    reports.push({ team, mismatches: compareTeam(team, await reader.listTeamMembers(team.mattermostTeamId)) });
+    const live = await reader.listTeamMembers(team.mattermostTeamId);
+    reports.push({ team, mismatches: compareTeam(team, live), unclaimedHumans: unclaimedHumans(team, live) });
   }
   return reports;
 }
@@ -82,10 +91,11 @@ export function printConsistency(reports: TeamReport[], refreshed: string, write
   write(`Mattermost vs indra-state | checked ${refreshed}`);
   if (reports.length === 0) write("No teams are recorded in state.");
   let total = 0;
-  for (const { team, mismatches } of reports) {
+  for (const { team, mismatches, unclaimedHumans: humans } of reports) {
     total += mismatches.length;
     write(`${team.displayName} (${team.slug}) | ${mismatches.length === 0 ? "matches state" : `${mismatches.length} mismatch${mismatches.length === 1 ? "" : "es"}`}`);
     for (const mismatch of mismatches) write(`  ${mismatch.message}`);
+    for (const human of humans) write(`  Info: user @${human.username} (${human.userId}) is in the Mattermost team without a seat in state; humans are not checked.`);
   }
   return total;
 }

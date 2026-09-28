@@ -76,7 +76,9 @@ For every state team, the check reads the active members of its Mattermost team 
 - a seat whose Mattermost user (`externalIdentities.mattermost.userId`) is not an active member of the team;
 - a Mattermost username that differs from the seat's `externalIdentities.mattermost.username`;
 - a Mattermost profile **Position** that does not equal the seat's role (`Team Lead` or `Developer`, compared exactly after trimming spaces);
-- a bot or user account in the team that no seat in state claims.
+- a bot account in the team that no seat in state claims.
+
+Human accounts in the team that no seat claims (such as the owner's) are listed as `Info:` lines and do not count as mismatches.
 
 With `--once` it prints the report and exits 1 when there is any mismatch, 0 when everything matches. Without `--once` it prints the same report, then opens the interactive team and seat browser. `--team SLUG` prints one team's bot seats and their custom **Role** attribute without the state check. The check never writes to Mattermost or to `state.json`; fix a mismatch by editing the Mattermost profile or the state record yourself.
 

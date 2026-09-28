@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { runConsistencyCheck } from "../src/cli.js";
-import { compareTeam, type LiveMember } from "../src/consistency.js";
+import { compareTeam, unclaimedHumans, type LiveMember } from "../src/consistency.js";
 import { MattermostClient, MattermostInventory } from "../src/mattermost.js";
 import { StateInventory, type StateSnapshot, type StateTeam } from "../src/state-domain.js";
 
@@ -37,13 +37,12 @@ describe("Mattermost vs state comparison", () => {
       ["position", "seat-002", "roles"],
       ["missing", "seat-003", "externalIdentities.mattermost.userId"],
       ["unexpected", undefined, "seats"],
-      ["unexpected", undefined, "seats"],
     ]);
     expect(result[0].message).toBe("seat-001 (Chick Corea) externalIdentities.mattermost.username: state has 'chickcorea', Mattermost has 'chick'.");
     expect(result[1].message).toBe("seat-002 (George Duke) roles: state has 'Developer', Mattermost profile position is 'Product'.");
     expect(result[2].message).toContain("seat-003 (Aaron Magner) externalIdentities.mattermost.userId: user 'u3'");
     expect(result[3].message).toContain("Bot @stray (u9)");
-    expect(result[4].message).toContain("User @ryan (h1)");
+    expect(unclaimedHumans(team, live).map((member) => member.username)).toEqual(["ryan"]);
   });
 
   it("reports an empty position as a role mismatch", () => {
@@ -59,6 +58,10 @@ describe("Mattermost vs state comparison", () => {
     const lines: string[] = [];
     expect(await runConsistencyCheck(state, { listTeamMembers: async () => matching }, (line) => lines.push(line))).toBe(0);
     expect(lines.join("\n")).toContain("Yahaha (yahaha) | matches state");
+    lines.length = 0;
+    const withHuman = [...matching, { userId: "h1", username: "ryan", position: "", isBot: false }];
+    expect(await runConsistencyCheck(state, { listTeamMembers: async () => withHuman }, (line) => lines.push(line))).toBe(0);
+    expect(lines.join("\n")).toContain("Info: user @ryan (h1)");
     lines.length = 0;
     const reader = { listTeamMembers: vi.fn(async () => matching.slice(1)) };
     expect(await runConsistencyCheck(state, reader, (line) => lines.push(line))).toBe(1);
