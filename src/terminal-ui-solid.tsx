@@ -3,7 +3,7 @@ import { render, useKeyboard, useTerminalDimensions } from "@opentui/solid";
 import { createMemo, createSignal, For, Show, type Accessor } from "solid-js";
 import type { StateInventory, StateSeat } from "./state-domain.js";
 import { attachTmux } from "./tmux-attach.js";
-import { currentSession, displayText, newestPlanningRecord, TerminalUiModel, type SessionReadPort, type StateSyncPort, type TerminalSession, type UiApproval, type UiRetry, type UiRollback, type UiView, type UpdatePort } from "./terminal-ui.js";
+import { currentSession, displayText, GOAL_INPUT_LIMIT, newestPlanningRecord, TerminalUiModel, type SessionReadPort, type StateSyncPort, type TerminalSession, type UiApproval, type UiRetry, type UiRollback, type UiView, type UpdatePort } from "./terminal-ui.js";
 import type { GoalStarter, SeatLive, SeatProcessPort } from "./supervisor.js";
 
 const theme = {
@@ -24,6 +24,13 @@ function occupancy(model: TerminalUiModel, seat: StateSeat): { label: string; co
     color: session.status === "error" ? theme.error : session.status === "running" ? theme.running : theme.idle,
     session,
   };
+}
+
+/** The end of a long goal, as many characters as fit in six wrapped lines, so the cursor stays visible. */
+function goalInputTail(value: string, width: number): string {
+  const visible = Math.max(10, width - 2) * 6 - 20;
+  const clean = value.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ");
+  return clean.length > visible ? "…" + clean.slice(-(visible - 1)) : clean;
 }
 
 function activityLine(model: TerminalUiModel, seat: StateSeat, limit: number): string {
@@ -246,8 +253,11 @@ export function TerminalApp(props: TerminalAppProps) {
       <box flexShrink={0} flexDirection="column">
         <Show when={notice()}><text fg={theme.idle}>{displayText(notice())}</text></Show>
         <Show when={input()}>
-          <text fg={theme.heading}>
-            New planning goal: {(input()?.value ?? "").replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").slice(-Math.max(10, dimensions().width - 26))}▏
+          <text fg={theme.heading} wrapMode="char">
+            New planning goal: {goalInputTail(input()?.value ?? "", dimensions().width)}▏
+          </text>
+          <text fg={theme.muted}>
+            {(input()?.value.length ?? 0) >= GOAL_INPUT_LIMIT ? `Limit reached (${GOAL_INPUT_LIMIT} characters); extra characters are ignored.` : `${input()?.value.length ?? 0}/${GOAL_INPUT_LIMIT}`}
           </text>
         </Show>
         <Show when={confirm()}>

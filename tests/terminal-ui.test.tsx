@@ -2,7 +2,7 @@ import { testRender } from "@opentui/solid";
 import { createSignal } from "solid-js";
 import { describe, expect, it } from "vitest";
 import { StateInventory, type StateSnapshot } from "../src/state-domain.js";
-import { TerminalUiModel, type SessionReadResult, type StateSyncPort, type TerminalSession, type UpdatePort } from "../src/terminal-ui.js";
+import { GOAL_INPUT_LIMIT, TerminalUiModel, type SessionReadResult, type StateSyncPort, type TerminalSession, type UpdatePort } from "../src/terminal-ui.js";
 import type { UpdateResult } from "../src/self-update.js";
 import type { StateSyncResult } from "../src/state-commit.js";
 import { TerminalApp } from "../src/terminal-ui-solid.js";
@@ -611,6 +611,33 @@ describe("terminal UI", () => {
       await model.submitInput();
       expect(started).toEqual(["Fix tests", "Second goal"]);
       model.key("n");
+      model.key("escape");
+      expect(model.input).toBeUndefined();
+
+      // Long goals: typing past 1,000 characters keeps accepting input, and Escape still cancels.
+      model.key("n");
+      type("a".repeat(1500));
+      expect(model.input?.value.length).toBe(1500);
+      model.key("escape");
+      expect(model.input).toBeUndefined();
+      // Enter submits the full long text; the box wraps and shows the cursor.
+      model.key("n");
+      const long = "word ".repeat(600) + "end";
+      type(long);
+      setRevision(model.revision);
+      await setup.renderOnce();
+      expect(setup.captureCharFrame()).toContain("end▏");
+      expect(model.key("return")).toBe("submit");
+      await model.submitInput();
+      expect(started.at(-1)).toBe(long);
+      // At the limit, extra characters (typed or pasted) are dropped with a visible hint, and keys still work.
+      model.key("n");
+      model.key("x", "x".repeat(GOAL_INPUT_LIMIT - 1));
+      type("yz");
+      expect(model.input?.value).toBe("x".repeat(GOAL_INPUT_LIMIT - 1) + "y");
+      setRevision(model.revision);
+      await setup.renderOnce();
+      expect(setup.captureCharFrame()).toContain("Limit reached");
       model.key("escape");
       expect(model.input).toBeUndefined();
     } finally { setup.renderer.destroy(); }

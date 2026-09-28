@@ -61,7 +61,9 @@ export interface StateSyncPort {
 
 export type UiPage = "teams" | "team" | "seat";
 export type UiAction = "none" | "refresh" | "quit" | "attach" | "stop" | "restart" | "retry" | "submit" | "approve" | "propose" | "sprint" | "pause" | "ask-rollback" | "rollback";
-/** The one-line text input for a new planning goal. The channel and project come from the team in state. */
+/** Longest goal the new-goal input accepts; a Mattermost post (~16k) holds it with room to spare. */
+export const GOAL_INPUT_LIMIT = 8000;
+/** The multi-line text input for a new planning goal. The channel and project come from the team in state. */
 export interface UiInput { value: string }
 /**
  * A goal whose proposal the owner is requesting (`P`) or approving (`A`) from the terminal, or whose sprint the owner
@@ -512,7 +514,11 @@ export class TerminalUiModel {
       if (name === "escape") this.input = undefined;
       else if (name === "return" || name === "enter") { if (this.input.value.trim()) return "submit"; }
       else if (name === "backspace") this.input.value = this.input.value.slice(0, -1);
-      else if (text && text.length === 1 && text >= " " && text !== "\u007f" && this.input.value.length < 2000) this.input.value += text;
+      else if (text && !/^\u001b/.test(text)) {
+        // Printable characters only (a paste may arrive as one multi-character sequence); anything past the limit is dropped.
+        const printable = text.replace(/[\r\n\t]/g, " ").replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
+        this.input.value = (this.input.value + printable).slice(0, GOAL_INPUT_LIMIT);
+      }
       this.revision++;
       return "none";
     }
