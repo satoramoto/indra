@@ -490,6 +490,47 @@ describe("developer seat", () => {
     expect(await assignment("outcome-1")).toMatchObject({ status: "merged", prUrl: PR });
   });
 
+  it.each([undefined, SPRINT])("grants a fresh conflict budget when a failed assignment is explicitly re-queued (%j)", async (integration) => {
+    const { store, shell, codex, make, assignment } = await setup([reviewing()], integration);
+    await retainRecord(store, shell);
+    shell.mainStatus = [conflicting];
+    shell.mainMerges = [1, 1];
+    shell.resolved = [1, 1];
+    await make().tick();
+    expect((await assignment("outcome-1")).status).toBe("failed");
+    const saved = (await store.readRuntimeFile<SeatTaskRecord>(RECORD))!;
+    expect(saved.conflictRounds).toBe(2);
+    expect(codex.runs).toHaveLength(2);
+
+    await store.update((state) => { state.planningGoals![0].assignments![0].status = "queued"; }, "Re-queue failed assignment");
+    shell.mainStatus = [conflicting];
+    shell.mainMerges = [1, 1];
+    shell.resolved = [1, 0];
+    shell.onFirst = async () => { expect((await store.readRuntimeFile<SeatTaskRecord>(RECORD))?.conflictRounds).toBe(0); };
+    await make().tick();
+
+    const retried = (await store.readRuntimeFile<SeatTaskRecord>(RECORD))!;
+    expect(retried).toMatchObject({ branch: saved.branch, worktree: saved.worktree, prUrl: PR, conflictRounds: 2 });
+    expect(retried.sessions).toHaveLength(4);
+    expect(retried.sessions.slice(0, 2)).toEqual(saved.sessions);
+    expect(codex.runs).toHaveLength(4);
+    for (const run of codex.runs.slice(2)) expect(run.prompt).toContain(`Merging origin/${integration?.branch ?? "main"}`);
+    expect(shell.calls.some((call) => call.startsWith("git worktree add"))).toBe(false);
+    expect(await assignment("outcome-1")).toMatchObject({ status: "merged", prUrl: PR });
+  });
+
+  it.each(["running", "in-review"] as const)("preserves an exhausted conflict budget when a %s assignment restarts", async (status) => {
+    const { store, shell, codex, make, assignment } = await setup([{ ...reviewing(), status }], SPRINT);
+    await retainRecord(store, shell, { conflictRounds: 2 });
+    shell.mainStatus = [conflicting];
+    shell.mainMerges = [1];
+    await make().tick();
+    expect(codex.runs).toHaveLength(0);
+    expect((await store.readRuntimeFile<SeatTaskRecord>(RECORD))?.conflictRounds).toBe(2);
+    expect(await assignment("outcome-1")).toMatchObject({ status: "failed", note: "ci: merge conflict with sprint/goal-abc could not be resolved" });
+    expect(shell.calls.some((call) => call.includes(" push ") || call.startsWith("gh pr merge"))).toBe(false);
+  });
+
   it.each(["worktree", "build"] as const)("re-queues a saved %s step without colliding with its existing checkout", async (step) => {
     const { store, shell, codex, make, assignment } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
     const record = await retainRecord(store, shell, { step, prUrl: undefined });

@@ -22,7 +22,7 @@ export interface SeatTaskRecord {
   goalId: string; outcomeId: string; step: Step; branch: string; worktree: string; gitDir?: string; prUrl?: string; findings?: string[];
   /** A prior attempt's PR remains visible in state until this attempt opens its replacement. */
   retainedPrUrl?: string;
-  /** Conflict-resolution rounds used on merges of main into the branch; at most MAX_CONFLICT_ROUNDS. */
+  /** Conflict-resolution rounds used in this attempt; reset on explicit re-queue, preserved on restart. */
   conflictRounds?: number;
   sessions: { role: "developer" | "reviewer" | "fix"; sessionId: string; startedAt: string; finishedAt: string; usage?: unknown }[];
 }
@@ -83,6 +83,9 @@ export class DeveloperSeat {
     }, `Seat ${this.seat.id} claims ${goal.id}/${assignment.outcomeId}: running`);
     const saved = await this.store.readRuntimeFile<SeatTaskRecord>(this.recordName(goal.id, assignment.outcomeId));
     if (saved && this.ownsRecord(goal, assignment.outcomeId, saved)) {
+      // Claiming a queued retry grants a fresh budget; resuming active work above keeps its spent rounds.
+      saved.conflictRounds = 0;
+      await this.save(saved);
       await this.resume(goal, assignment, saved);
     } else {
       // Keep unrecognized metadata and retained checkouts intact. A new attempt must not collide with either.
@@ -279,7 +282,7 @@ export class DeveloperSeat {
   /**
    * When the PR is behind or conflicting with its base (the sprint branch, or main for a goal without one), merges
    * the fetched base into the seat's own branch in its own worktree (never a rebase or force-push) and pushes that
-   * branch. Conflicts get one Codex fix session per round, at most MAX_CONFLICT_ROUNDS per assignment. Returns true
+   * branch. Conflicts get one Codex fix session per round, at most MAX_CONFLICT_ROUNDS per attempt. Returns true
    * when it pushed, so CI must run again.
    */
   private async updateFromMain(goal: PlanningGoal, outcome: ApprovedOutcome, record: SeatTaskRecord, project: string): Promise<boolean> {
