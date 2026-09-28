@@ -9,8 +9,8 @@ import { attachTmux, parseOwnedTmuxTarget } from "../src/tmux-attach.js";
 const names = ["Chick Corea", "George Duke", "Aaron Magner", "Corey Henry", "Jordan Rudess"];
 const snapshot: StateSnapshot = {
   teams: [{
-    id: "team-001", slug: "yahaha", displayName: "Yahaha",
-    seats: names.map((displayName, index) => ({ id: "seat-00" + (index + 1), displayName, handle: displayName.toLowerCase().replace(" ", ""), roles: [index === 0 ? "Team Lead" : index === 1 ? "Product" : "Developer"] })),
+    id: "team-001", slug: "yahaha", displayName: "Yahaha", mattermostTeamId: "external-team",
+    seats: names.map((displayName, index) => ({ id: "seat-00" + (index + 1), displayName, handle: displayName.toLowerCase().replace(" ", ""), mattermostUserId: "user-" + (index + 1), roles: [index === 0 ? "Team Lead" : "Developer"] })),
   }],
   sprints: [{ id: "sprint-001", teamId: "team-001", status: "draft", phase: "planning", goal: "Review the first cycle", proposedWork: [], proposedAllocations: [] }],
 };

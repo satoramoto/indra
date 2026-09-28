@@ -15,6 +15,7 @@ import { CodexRuntime } from "./codex-runtime.js";
 import { TmuxHost } from "./tmux-host.js";
 import { LocalSessionReader } from "./session-snapshot.js";
 import { mkdir, writeFile } from "node:fs/promises";
+import { checkConsistency, printConsistency, type TeamMemberReader } from "./consistency.js";
 
 export const SERVER = "https://mattermost.newegypt.io";
 export type Write = (line: string) => void;
@@ -78,9 +79,15 @@ export async function interactive(inventory: Inventory, read: Read, write: Write
   }
 }
 
-type Options = { mode: "help" } | { mode: "seat"; seatId: string; checkout: string } | { mode: "state"; checkout: string; once: boolean } | { mode: "ui"; checkout: string } | { mode: "mattermost"; slug?: string } | { mode: "planning"; action: "start" | "serve" | "host" | "status"; checkout: string; channel?: string; goal?: string; projects: string[]; participants: string[]; readyNonce?: string };
+/** Prints the live Mattermost vs state report; returns the exit code (1 when anything differs). */
+export async function runConsistencyCheck(state: StateInventory, reader: TeamMemberReader, write: Write): Promise<number> {
+  const reports = await checkConsistency(await state.current(), reader);
+  return printConsistency(reports, timestamp(), write) > 0 ? 1 : 0;
+}
 
-const usage = "Usage: npm start -- [--state PATH] [--once] | --ui [--state PATH] | --mattermost [--team SLUG] | planning start --goal TEXT --channel CHANNEL_ID [--project PATH] [--participant SEAT_ID] [--state PATH] | planning serve|host|status [--state PATH] | seat run --seat SEAT_ID [--state PATH]\nPlanning serves only Chick's Yahaha thread. Reply in the thread to clarify; send /proposal there to request a draft.";
+type Options = { mode: "help" } | { mode: "seat"; seatId: string; checkout: string } | { mode: "state"; checkout: string; once: boolean } | { mode: "ui"; checkout: string } | { mode: "mattermost"; slug: string } | { mode: "mattermost"; checkout: string; once: boolean } | { mode: "planning"; action: "start" | "serve" | "host" | "status"; checkout: string; channel?: string; goal?: string; projects: string[]; participants: string[]; readyNonce?: string };
+
+const usage = "Usage: npm start -- [--state PATH] [--once] | --ui [--state PATH] | --mattermost [--state PATH] [--once] | --mattermost --team SLUG | planning start --goal TEXT --channel CHANNEL_ID [--project PATH] [--participant SEAT_ID] [--state PATH] | planning serve|host|status [--state PATH] | seat run --seat SEAT_ID [--state PATH]\nPlanning serves only Chick's Yahaha thread. Reply in the thread to clarify; send /proposal there to request a draft.";
 
 export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_REPO): Options {
   if (args.length === 1 && (args[0] === "--help" || args[0] === "-h")) return { mode: "help" };
@@ -136,14 +143,15 @@ export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_
       else throw new StateDataError(usage);
     } else throw new StateDataError(usage);
   }
-  if (mattermost) {
-    if (checkout || once || ui) throw new StateDataError(usage);
+  if (slug && !mattermost) throw new StateDataError("--team requires --mattermost.\n" + usage);
+  if (ui && (once || mattermost)) throw new StateDataError(usage);
+  if (slug) {
+    if (checkout || once) throw new StateDataError(usage);
     return { mode: "mattermost", slug };
   }
-  if (slug) throw new StateDataError("--team requires --mattermost.\n" + usage);
-  if (ui && once) throw new StateDataError(usage);
   const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
   const stateCheckout = resolve(checkout || stateEnv || resolve(projectRoot, "..", "indra-state"));
+  if (mattermost) return { mode: "mattermost", checkout: stateCheckout, once };
   return ui ? { mode: "ui", checkout: stateCheckout } : { mode: "state", checkout: stateCheckout, once };
 }
 
@@ -220,14 +228,25 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         await new Promise((resolve) => setTimeout(resolve, 3000));
       }
     }
-    const slug = options.slug;
     const adapter = new MattermostInventory(new MattermostClient(SERVER, await readToken()));
     const inventory = new Inventory(adapter, adapter);
-    if (slug) {
+    if ("slug" in options) {
+      const slug = options.slug;
       const team = (await inventory.teams()).find((item) => item.slug === slug);
       if (!team) throw new InventoryError(`Team '${slug}' is not visible to this credential.`);
       printSeats(team, await inventory.seats(team), timestamp(), console.log);
       return 0;
+    }
+    const state = new StateInventory(new LocalStateRepository(options.checkout));
+    console.log(`State checkout: ${options.checkout}`);
+    if (options.once) return await runConsistencyCheck(state, adapter, console.log);
+    try {
+      await runConsistencyCheck(state, adapter, console.log);
+    } catch (error) {
+      if (error instanceof StateDataError) console.log(`State error: ${error.message}`);
+      else if (error instanceof InventoryError) console.log(`Connection/error: ${error.message}`);
+      else throw error;
+      console.log("The Mattermost vs state check did not complete; no match can be concluded.");
     }
     const rl = createInterface({ input: process.stdin, output: process.stdout });
     try {

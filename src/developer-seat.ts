@@ -33,7 +33,7 @@ export async function loadDeveloperSeat(store: PlanningStore, seatId: string): P
   const teams = state.teams as { seats: { id: string; displayName: string; roles: string[]; externalIdentities: { mattermost: { username: string } } }[] }[];
   const seat = teams.flatMap((team) => team.seats).find((item) => item.id === seatId);
   if (!seat) throw new SeatError(`Seat '${seatId}' is not in state.`);
-  if (seat.roles.includes("Team Lead")) throw new SeatError(`Seat '${seatId}' is a Team Lead; seat run only runs Developer seats.`);
+  if (seat.roles[0] !== "Developer") throw new SeatError(`Seat '${seatId}' is a ${seat.roles[0] ?? "roleless seat"}; seat run only runs Developer seats.`);
   return { id: seat.id, displayName: seat.displayName, username: seat.externalIdentities.mattermost.username, roles: seat.roles };
 }
 

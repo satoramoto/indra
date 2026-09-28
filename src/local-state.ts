@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { SEAT_ROLES } from "./state-domain.js";
 import type { DraftSprint, ProposedAllocation, ProposedWork, StateRepository, StateSnapshot, StateTeam } from "./state-domain.js";
 
 export class StateDataError extends Error {
@@ -63,7 +64,6 @@ function team(value: unknown, index: number): StateTeam {
   fields(identities, `${path}.externalIdentities`, ["mattermost"]);
   const mattermost = record(identities.mattermost, `${path}.externalIdentities.mattermost`);
   fields(mattermost, `${path}.externalIdentities.mattermost`, ["teamId"]);
-  string(mattermost.teamId, `${path}.externalIdentities.mattermost.teamId`);
   const seats = array(data.seats, `${path}.seats`).map((value, index) => {
     const seatPath = `${path}.seats[${index}]`;
     const seat = record(value, seatPath);
@@ -72,21 +72,33 @@ function team(value: unknown, index: number): StateTeam {
     fields(identities, `${seatPath}.externalIdentities`, ["mattermost"]);
     const mattermost = record(identities.mattermost, `${seatPath}.externalIdentities.mattermost`);
     fields(mattermost, `${seatPath}.externalIdentities.mattermost`, ["userId", "username"]);
-    string(mattermost.userId, `${seatPath}.externalIdentities.mattermost.userId`);
+    const userId = string(mattermost.userId, `${seatPath}.externalIdentities.mattermost.userId`);
     const roles = strings(seat.roles, `${seatPath}.roles`);
     unique(roles, `${seatPath}.roles`, "role");
+    if (roles.length !== 1) {
+      throw new StateDataError(`${seatPath}.roles must contain exactly one role: ${SEAT_ROLES.map((role) => `'${role}'`).join(" or ")}.`);
+    }
+    if (!(SEAT_ROLES as readonly string[]).includes(roles[0])) {
+      throw new StateDataError(`${seatPath}.roles[0] '${roles[0]}' is not a seat role; expected ${SEAT_ROLES.map((role) => `'${role}'`).join(" or ")}.`);
+    }
     return {
       id: id(seat.id, `${seatPath}.id`),
       displayName: string(seat.displayName, `${seatPath}.displayName`),
       handle: string(mattermost.username, `${seatPath}.externalIdentities.mattermost.username`),
+      mattermostUserId: userId,
       roles,
     };
   });
   unique(seats.map((seat) => seat.id), `${path}.seats`);
+  const leads = seats.filter((seat) => seat.roles[0] === "Team Lead").length;
+  if (leads !== 1) {
+    throw new StateDataError(`${path}.seats must contain exactly one 'Team Lead' seat; found ${leads}.`);
+  }
   return {
     id: id(data.id, `${path}.id`),
     slug: id(data.slug, `${path}.slug`),
     displayName: string(data.displayName, `${path}.displayName`),
+    mattermostTeamId: string(mattermost.teamId, `${path}.externalIdentities.mattermost.teamId`),
     seats,
   };
 }

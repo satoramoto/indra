@@ -41,7 +41,7 @@ The default is the sibling `../indra-state` directory. `INDRA_STATE_REPO` also s
 npm start -- --state /path/to/indra-state --once
 ```
 
-The app validates the version 1 structure and references before showing a snapshot. Validation errors name the invalid field or reference. A failed refresh never presents malformed data as an empty roster. The `indra-state` repository contains [the formal JSON Schema](https://github.com/satoramoto/indra-state/blob/main/schema/v1/state.schema.json); `state.json` carries `$schema` and `schemaVersion`. The current sprint's work and allocations are **draft proposals**, not approved assignments or active execution.
+The app validates the version 1 structure and references before showing a snapshot. Each seat's `roles` holds exactly one of the two roles, `Team Lead` or `Developer`, and each team has exactly one Team Lead. Validation errors name the invalid field or reference. A failed refresh never presents malformed data as an empty roster. The `indra-state` repository contains [the formal JSON Schema](https://github.com/satoramoto/indra-state/blob/main/schema/v1/state.schema.json); `state.json` carries `$schema` and `schemaVersion`. The current sprint's work and allocations are **draft proposals**, not approved assignments or active execution.
 
 ## Chick planning
 
@@ -80,14 +80,27 @@ Any failure marks the assignment `failed` with a short `note` and the seat goes 
 
 Codex runs in the `workspace-write` sandbox with network access, so it can push and use `gh`; the builder and fix sessions may also write the project's shared Git directory, and the reviewer may not. They use the logged-in Codex CLI and `gh`. The seat posts short progress replies (claimed, PR opened, review done, merged or failed) in the goal thread as its own bot, using the 1Password item `Mattermost bot - USERNAME` (the seat's Mattermost username), as Chick's bridge does. A missing item stops the seat with an error naming it. Codex session IDs, usage and the task's step live in `<state-checkout>.runtime/seat-SEAT_ID-GOAL_ID-OUTCOME_ID.json`, not in `state.json`.
 
-## Existing live Mattermost inventory
+## Live Mattermost check and inventory
 
-The previous read-only live inventory remains available explicitly:
+`--mattermost` reads live Mattermost and compares it with the `indra-state` checkout (`--state`, `INDRA_STATE_REPO`, or the sibling default, as above). This report is where Mattermost vs state mismatches appear:
 
 ```sh
+npm start -- --mattermost --once
+npm start -- --mattermost --state /path/to/indra-state --once
 npm start -- --mattermost
 npm start -- --mattermost --team yahaha
 ```
+
+For every state team, the check reads the active members of its Mattermost team (`externalIdentities.mattermost.teamId`) and reports each mismatch on its own line, naming the seat and field:
+
+- a seat whose Mattermost user (`externalIdentities.mattermost.userId`) is not an active member of the team;
+- a Mattermost username that differs from the seat's `externalIdentities.mattermost.username`;
+- a Mattermost profile **Position** that does not equal the seat's role (`Team Lead` or `Developer`, compared exactly after trimming spaces);
+- a bot account in the team that no seat in state claims.
+
+Human accounts in the team that no seat claims (such as the owner's) are listed as `Info:` lines and do not count as mismatches.
+
+With `--once` it prints the report and exits 1 when there is any mismatch, 0 when everything matches. Without `--once` it prints the same report, then opens the interactive team and seat browser. `--team SLUG` prints one team's bot seats and their custom **Role** attribute without the state check. The check never writes to Mattermost or to `state.json`; fix a mismatch by editing the Mattermost profile or the state record yourself.
 
 This mode requires network access to `https://mattermost.newegypt.io` and an existing signed-in 1Password CLI session with access to `op://Agent Rig/Mattermost/access_token`. The launch commands use Node's system CA trust. No token belongs in environment variables, arguments, or the state repository. The adapter sends only `GET` requests, suppresses credential-bearing diagnostics, and refuses HTTP redirects. Mattermost visibility is limited to that credential's permissions. Its refresh time is the last successful read, and agent occupancy is labeled **not connected yet**.
 
