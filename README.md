@@ -88,7 +88,8 @@ It refuses a Team Lead seat or a seat that is not in `state.json`. Run one proce
 2. runs a new Codex session that implements the outcome under the project's AGENTS.md, runs the targeted tests once, commits, pushes and opens a PR; the assignment becomes `in-review` with its `prUrl`;
 3. runs a separate, new Codex session as the reviewer, read-only and without network, which returns its findings; the seat posts them on the PR as one comment with `gh pr comment`;
 4. if there are findings, runs one new Codex fix session;
-5. waits once with `gh pr checks --watch`, merges with `gh pr merge --squash --delete-branch` when CI is green, marks the assignment `merged`, removes the worktree and goes idle.
+5. before waiting on CI, and again when a merge fails, checks whether the PR is behind or conflicting with main; if so it merges the fetched `origin/main` into its own branch in its worktree (never a rebase or force-push), runs one Codex fix session to resolve any conflicts (at most 2 rounds per assignment, then it fails with "merge conflict with main could not be resolved"), and pushes before waiting on CI again;
+6. waits with `gh pr checks --watch`, merges with `gh pr merge --squash --delete-branch` when CI is green, marks the assignment `merged`, removes the worktree and goes idle.
 
 Any failure marks the assignment `failed` with a short `note` and the seat goes idle; a failed task's worktree is kept for inspection. On restart the seat resumes an `in-review` assignment from its recorded step; a `running` assignment that never opened a PR is marked `failed` rather than rebuilt. It never takes a second assignment while one is in flight. With nothing queued it checks again every 30 seconds.
 
