@@ -365,6 +365,87 @@ describe("terminal UI", () => {
     expect(model.readyToReload()).toBe(true);
   });
 
+  it("pauses and resumes auto-update with U, and rolls back with R after a y/n naming both versions", async () => {
+    const calls: string[] = [];
+    let paused = false;
+    let onDisk = { id: "build-2", sha: "fed4321abc", builtAt: "now" };
+    let previous: { build: string; from: typeof onDisk; to: typeof onDisk } | undefined;
+    let rolledBack: { sha: string; fromSha: string } | undefined;
+    const update: UpdatePort = {
+      running: onDisk, canReload: false, current: async () => onDisk,
+      check: async () => { calls.push(paused ? "check (paused)" : "check"); return paused ? { outcome: "paused", message: "2 new commits waiting on origin/main", at: "now" } : { outcome: "up-to-date", message: "", at: "now" }; },
+      paused: async () => paused,
+      setPaused: async (value) => { calls.push(value ? "pause" : "resume"); paused = value; },
+      rollbackPlan: async () => previous,
+      rollback: async () => {
+        calls.push("rollback");
+        if (!previous) return { rolledBack: false, message: "No previous build to roll back to; nothing changed." };
+        paused = true;
+        rolledBack = { sha: previous.to.sha, fromSha: previous.from.sha };
+        onDisk = previous.to;
+        return { rolledBack: true, message: "Rolled back to abc1234 from fed4321; updates paused (U resumes)." };
+      },
+      rolledBack: async () => rolledBack,
+    };
+    const processes: SeatProcessPort = { ensureAll: async () => [], read: async () => ({}), stop: async () => {}, restart: async () => {}, upgrade: async () => { calls.push("upgrade"); return { pending: [], problems: [] }; } };
+    const model = new TerminalUiModel(new StateInventory({ read: async () => snapshot }), { readSessions: async () => ({ connection: "connected", sessions: [] }) }, processes, undefined, undefined, update);
+    await model.refresh();
+
+    // U pauses; the setting is read back from the port, as a reloaded UI would.
+    expect(model.key("u", "U")).toBe("pause");
+    await model.togglePause();
+    expect(paused).toBe(true);
+    const reloaded = new TerminalUiModel(new StateInventory({ read: async () => snapshot }), { readSessions: async () => ({ connection: "connected", sessions: [] }) }, processes, undefined, undefined, update);
+    await reloaded.refresh();
+    await reloaded.updateCode();
+    expect(reloaded.paused).toBe(true);
+    expect(reloaded.updateLine()?.text).toBe("Indra fed4321 · updates paused · 2 new commits waiting on origin/main");
+    // r still checks once and says it is paused.
+    expect(reloaded.key("r")).toBe("refresh");
+    expect(reloaded.notice).toContain("Updates are paused");
+    // U again resumes and checks at once.
+    calls.length = 0;
+    await model.togglePause();
+    expect(calls).toEqual(["resume", "check", "upgrade"]);
+    expect(model.updateLine()?.text).toBe("Indra fed4321 · up to date");
+
+    // R without a previous build says so and changes nothing.
+    expect(model.key("r", "R")).toBe("ask-rollback");
+    await model.askRollback();
+    expect(model.confirm).toBeUndefined();
+    expect(model.notice).toBe("No previous build to roll back to; nothing changed.");
+
+    // R with a previous build asks, naming both versions; any other key cancels.
+    previous = { build: "abc1234def-1", from: onDisk, to: { id: "build-1", sha: "abc1234def", builtAt: "then" } };
+    await model.askRollback();
+    expect(model.confirm).toEqual({ action: "rollback", from: "fed4321", to: "abc1234" });
+    const [revision, setRevision] = createSignal(model.revision);
+    const setup = await testRender(() => <TerminalApp model={model} revision={revision} onKey={() => {}} />, { width: 120, height: 30 });
+    try {
+      await setup.renderOnce();
+      expect(setup.captureCharFrame()).toContain("Roll back from fed4321 to abc1234 and pause auto-update? y roll back");
+      expect(model.key("n", "n")).toBe("none");
+      expect(model.notice).toBe("Rollback cancelled; nothing changed.");
+      await model.askRollback();
+      calls.length = 0;
+      expect(model.key("y", "y")).toBe("rollback");
+      await model.rollbackConfirmed();
+      // Rolled back and paused; hosted processes restart at safe points as after an update.
+      expect(calls).toEqual(["rollback", "upgrade"]);
+      expect(model.paused).toBe(true);
+      expect(model.reloadWanted).toBe(true);
+      expect(model.notice).toContain("Rolled back to abc1234 from fed4321");
+      expect(model.updateLine()?.text).toBe("Indra fed4321 · rolled back to abc1234 from fed4321 · update pending · new build ready; restart Indra to use it");
+      // The UI started on the rolled-back build shows it with the pause.
+      const after = new TerminalUiModel(new StateInventory({ read: async () => snapshot }), { readSessions: async () => ({ connection: "connected", sessions: [] }) }, processes, undefined, undefined, { ...update, running: onDisk });
+      await after.updateCode();
+      expect(after.updateLine()?.text).toBe("Indra abc1234 · rolled back to abc1234 from fed4321 · updates paused · 2 new commits waiting on origin/main");
+      setRevision(model.revision);
+      await setup.renderOnce();
+      expect(setup.captureCharFrame()).toContain("Auto-update paused  ·  U resumes");
+    } finally { setup.renderer.destroy(); }
+  });
+
   it("starts a new planning goal from a typed line alone, with the team's home channel and project from state", async () => {
     const started: string[] = [];
     const goals: GoalStarter = {

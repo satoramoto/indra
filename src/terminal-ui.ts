@@ -3,7 +3,7 @@ import type { GoalStarter, SeatLive, SeatProcessPort } from "./supervisor.js";
 import { missingTeamHome, missingTeamMessage } from "./planning.js";
 import type { StateSyncResult } from "./state-commit.js";
 import type { BuildStamp } from "./build-stamp.js";
-import type { UpdateResult } from "./self-update.js";
+import type { RollbackPlan, UpdateResult } from "./self-update.js";
 
 /** Keeps Indra's own code current: pulls and builds new commits, and says when `dist/` holds a newer build. */
 export interface UpdatePort {
@@ -11,8 +11,18 @@ export interface UpdatePort {
   running?: BuildStamp;
   /** True under the `npm start` launcher, which restarts the UI when it exits for a reload. */
   canReload: boolean;
+  /** Pulls and builds unless auto-update is paused; while paused it only reports what waits on origin/main. */
   check(): Promise<UpdateResult>;
   current(): Promise<BuildStamp | undefined>;
+  /** The persisted pause setting (`U`). */
+  paused?(): Promise<boolean>;
+  setPaused?(paused: boolean): Promise<void>;
+  /** The previous build a rollback (`R`) would switch to; undefined when there is none. */
+  rollbackPlan?(): Promise<RollbackPlan | undefined>;
+  /** Switches `dist` back to the previous build and pauses auto-update. */
+  rollback?(): Promise<{ rolledBack: boolean; message: string }>;
+  /** The SHAs of the last rollback while `dist` still runs it. */
+  rolledBack?(): Promise<{ sha: string; fromSha: string } | undefined>;
 }
 /** What a reload restores. */
 export interface UiView { page: UiPage; teamId?: string; seatId?: string }
@@ -48,11 +58,15 @@ export interface StateSyncPort {
 }
 
 export type UiPage = "teams" | "team" | "seat";
-export type UiAction = "none" | "refresh" | "quit" | "attach" | "stop" | "restart" | "submit" | "approve" | "propose";
+export type UiAction = "none" | "refresh" | "quit" | "attach" | "stop" | "restart" | "submit" | "approve" | "propose" | "pause" | "ask-rollback" | "rollback";
 /** The one-line text input for a new planning goal. The channel and project come from the team in state. */
 export interface UiInput { value: string }
 /** A goal whose proposal the owner is requesting (`P`) or approving (`A`) from the terminal. */
 export interface UiApproval { action: "approve" | "propose"; goalId: string; goal: string }
+/** A rollback (`R`) from the running build's short SHA to the previous build's. */
+export interface UiRollback { action: "rollback"; from: string; to: string }
+
+const shortSha = (sha?: string) => sha?.slice(0, 7) || "unknown build";
 
 /** Remove terminal controls from state and runtime text before giving it to the renderer. */
 export function displayText(value: string | undefined, limit = 400): string {
@@ -86,8 +100,8 @@ export class TerminalUiModel {
   /** Live process, assignment and thread activity per seat ID; empty without a process supervisor. */
   live: Record<string, SeatLive> = {};
   input?: UiInput;
-  /** Set while the y/n question for requesting or approving a proposal is open. */
-  confirm?: UiApproval;
+  /** Set while the y/n question for requesting or approving a proposal, or for a rollback, is open. */
+  confirm?: UiApproval | UiRollback;
   /** The approval the owner confirmed, until `approveConfirmed` runs it. */
   private approving?: UiApproval;
   /** The proposal request the owner confirmed, until `proposeConfirmed` runs it. */
@@ -102,6 +116,10 @@ export class TerminalUiModel {
   /** The last finished check of Indra's own checkout; undefined until the first one ends. */
   updateResult?: UpdateResult;
   updating = false;
+  /** Auto-update is paused (`U`, or after a rollback); read from the persisted setting. */
+  paused = false;
+  /** Set while `dist` runs the build of the last rollback. */
+  rolledBack?: { sha: string; fromSha: string };
   /** Set once `dist/` holds a different build than this UI runs; the UI reloads at its next safe point. */
   reloadWanted = false;
   /** Actions in flight (goal start, proposal request, approval, stop or restart, hosting); the UI never reloads under one. */
@@ -140,28 +158,103 @@ export class TerminalUiModel {
    * older one, each at its own safe point; an older UI leaves that to the reloaded one.
    */
   async updateCode(): Promise<void> {
-    if (!this.update || this.updating || this.busy) return;
+    const update = this.update;
+    if (!update || this.updating || this.busy) return;
+    await this.exclusive(async () => {
+      try {
+        await this.loadUpdateSettings();
+        this.updateResult = await update.check();
+        // After a failed install node_modules may be half written: no reload and no restarts until one succeeds.
+        if (this.updateResult.installFailed) return;
+        await this.afterSwitch();
+      } catch (error) { this.updateResult = { outcome: "blocked", message: "update check failed: " + (error instanceof Error ? error.message : String(error)), at: new Date().toISOString() }; }
+    });
+  }
+
+  /** Runs an update or rollback; actions that spawn Indra code wait for it (see `tracked`). */
+  private async exclusive(work: () => Promise<void>): Promise<void> {
     this.updating = true;
     let release = () => {};
     this.updateRun = new Promise((done) => { release = done; });
     this.bump();
-    try {
-      this.updateResult = await this.update.check();
-      // After a failed install node_modules may be half written: no reload and no restarts until one succeeds.
-      if (this.updateResult.installFailed) return;
-      const reloading = await this.checkBuild() && this.update.canReload;
-      if (!reloading && this.processes?.upgrade) {
-        const { problems } = await this.processes.upgrade();
-        if (problems.length) this.notice = "Could not restart after an update: " + problems.join("; ");
-        await this.refresh();
-      }
-    } catch (error) { this.updateResult = { outcome: "blocked", message: "update check failed: " + (error instanceof Error ? error.message : String(error)), at: new Date().toISOString() }; }
+    try { await work(); }
     finally {
       this.updating = false;
       this.updateRun = undefined;
       release();
       this.bump();
     }
+  }
+
+  /** After `dist` may have changed: reload this UI, or else restart hosted processes on an older build at their safe points. */
+  private async afterSwitch(): Promise<void> {
+    const reloading = await this.checkBuild() && !!this.update?.canReload;
+    if (!reloading && this.processes?.upgrade) {
+      const { problems } = await this.processes.upgrade();
+      if (problems.length) this.notice = "Could not restart after an update: " + problems.join("; ");
+      await this.refresh();
+    }
+  }
+
+  /** Reads the persisted pause setting and whether `dist` runs a rollback; keeps the last values when unreadable. */
+  async loadUpdateSettings(): Promise<void> {
+    const update = this.update;
+    if (!update) return;
+    if (update.paused) this.paused = await update.paused().catch(() => this.paused);
+    if (update.rolledBack) this.rolledBack = await update.rolledBack().catch(() => this.rolledBack);
+  }
+
+  /** `U`: pauses or resumes auto-update. Resuming checks for new code at once. */
+  async togglePause(): Promise<void> {
+    const update = this.update;
+    if (!update?.setPaused) { this.notice = "Auto-update cannot be paused from this screen."; this.bump(); return; }
+    const paused = !this.paused;
+    try {
+      await update.setPaused(paused);
+      this.paused = paused;
+      this.notice = paused ? "Auto-update paused: Indra will not pull, build or switch builds until you press U again." : "Auto-update resumed.";
+    } catch (error) { this.notice = "Could not change auto-update: " + (error instanceof Error ? error.message : String(error)); }
+    this.bump();
+    if (!paused && !this.paused) await this.updateCode();
+  }
+
+  /** `R`: asks y/n naming both versions, or says there is no previous build. */
+  async askRollback(): Promise<void> {
+    const update = this.update;
+    if (!update?.rollbackPlan || !update.rollback) this.notice = "Rollback is not available from this screen.";
+    else if (this.updating) this.notice = "An update is running; press R again when it ends.";
+    else {
+      const plan = await update.rollbackPlan().catch(() => undefined);
+      if (!plan) this.notice = "No previous build to roll back to; nothing changed.";
+      else if (!this.input && !this.confirm) this.confirm = { action: "rollback", from: shortSha(plan.from?.sha), to: shortSha(plan.to?.sha) };
+    }
+    this.bump();
+  }
+
+  /**
+   * Runs the rollback the owner confirmed with y: `dist` goes back to the previous build and auto-update pauses; then,
+   * as after an update, the UI reloads and hosted processes restart at their safe points.
+   */
+  async rollbackConfirmed(): Promise<void> {
+    const update = this.update;
+    if (!update?.rollback) return;
+    if (this.updating || this.busy) {
+      this.notice = "Not rolled back: an update or action is still running. Press R again when it finishes.";
+      this.bump();
+      return;
+    }
+    const rollback = update.rollback;
+    await this.exclusive(async () => {
+      this.notice = "Rolling back…";
+      try {
+        const result = await rollback.call(update);
+        this.notice = result.message;
+        if (!result.rolledBack) return;
+        this.paused = true;
+        await this.loadUpdateSettings();
+        await this.afterSwitch();
+      } catch (error) { this.notice = "Could not roll back: " + (error instanceof Error ? error.message : String(error)); }
+    });
   }
 
   /** True once `dist/` holds a different build than this UI runs (a self-update or an `npm run dev` rebuild). */
@@ -193,12 +286,15 @@ export class TerminalUiModel {
     const version = "Indra " + (this.update.running?.sha.slice(0, 7) || "unknown build");
     const last = this.updateResult;
     const waiting = this.teams.flatMap((team) => team.seats).filter((seat) => this.live[seat.id]?.updatePending).map((seat) => seat.displayName);
+    const rolled = this.rolledBack ? " · rolled back to " + shortSha(this.rolledBack.sha) + " from " + shortSha(this.rolledBack.fromSha) : "";
+    const restarts = waiting.length ? " · " + waiting.join(", ") + " restart when idle" : "";
     if (last?.installFailed) return { text: version + " · blocked: " + last.message + " · retrying on the next check", ok: false };
-    if (this.reloadWanted) return { text: version + " · update pending · " + (this.update.canReload ? "reloads when idle" : "new build ready; restart Indra to use it"), ok: true };
-    if (this.updating) return { text: version + " · updating…", ok: true };
+    if (this.reloadWanted) return { text: version + rolled + " · update pending · " + (this.update.canReload ? "reloads when idle" : "new build ready; restart Indra to use it"), ok: true };
+    if (this.paused) return { text: version + rolled + " · updates paused" + (this.updating ? " · checking…" : last?.outcome === "paused" ? " · " + last.message : "") + restarts, ok: true };
+    if (this.updating) return { text: version + rolled + " · updating…", ok: true };
     if (last && (last.outcome === "blocked" || last.outcome === "failed")) return { text: version + " · blocked · " + last.message, ok: false };
-    if (waiting.length) return { text: version + " · update pending · " + waiting.join(", ") + " restart when idle", ok: true };
-    return { text: version + " · " + (last ? "up to date" : "checking for updates…"), ok: true };
+    if (waiting.length) return { text: version + rolled + " · update pending" + restarts, ok: true };
+    return { text: version + rolled + " · " + (last ? "up to date" : "checking for updates…"), ok: true };
   }
 
   /** Pulls the state checkout's remote changes and pushes Indra's; a changed state.json refreshes the screen. */
@@ -373,17 +469,25 @@ export class TerminalUiModel {
       this.confirm = undefined;
       this.revision++;
       if ((text ?? value).toLowerCase() === "y") {
+        if (target.action === "rollback") return "rollback";
         if (target.action === "propose") { this.proposing = target; return "propose"; }
         this.approving = target;
         return "approve";
       }
-      this.notice = (target.action === "propose" ? "Proposal request" : "Approval") + " cancelled; nothing changed.";
+      this.notice = (target.action === "rollback" ? "Rollback" : target.action === "propose" ? "Proposal request" : "Approval") + " cancelled; nothing changed.";
       return "none";
     }
     this.notice = undefined;
     const input = value.toLowerCase();
     if (input === "q") return "quit";
-    if (input === "r") return "refresh";
+    if (text === "U") return "pause";
+    if (text === "R") return "ask-rollback";
+    if (input === "r") {
+      // A manual one-off check; while paused it only looks at origin/main.
+      if (this.paused) this.notice = "Updates are paused: checking origin/main only, nothing is pulled or built. U resumes.";
+      this.revision++;
+      return "refresh";
+    }
     if (text === "A") {
       const target = this.reviewGoal();
       if (this.page !== "seat") this.notice = "Open Chick's seat to approve a proposal.";

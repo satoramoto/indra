@@ -3,7 +3,7 @@ import { render, useKeyboard, useTerminalDimensions } from "@opentui/solid";
 import { createMemo, createSignal, For, Show, type Accessor } from "solid-js";
 import type { StateInventory, StateSeat } from "./state-domain.js";
 import { attachTmux } from "./tmux-attach.js";
-import { currentSession, displayText, newestPlanningRecord, TerminalUiModel, type SessionReadPort, type StateSyncPort, type TerminalSession, type UiView, type UpdatePort } from "./terminal-ui.js";
+import { currentSession, displayText, newestPlanningRecord, TerminalUiModel, type SessionReadPort, type StateSyncPort, type TerminalSession, type UiApproval, type UiRollback, type UiView, type UpdatePort } from "./terminal-ui.js";
 import type { GoalStarter, SeatLive, SeatProcessPort } from "./supervisor.js";
 
 const theme = {
@@ -48,6 +48,11 @@ function threadActivity(live: SeatLive, limit: number): string {
   return live.activity ? "Latest: " + displayText(live.activity.message, limit) : "No thread activity yet.";
 }
 
+function confirmText(confirm: UiApproval | UiRollback, width: number): string {
+  if (confirm.action === "rollback") return `Roll back from ${displayText(confirm.from, 20)} to ${displayText(confirm.to, 20)} and pause auto-update? y roll back`;
+  return (confirm.action === "propose" ? "Request Chick's proposal for " : "Approve the proposal for ") + displayText(confirm.goalId, 40) + " (" + displayText(confirm.goal, Math.max(10, width - 80)) + ")? " + (confirm.action === "propose" ? "y request" : "y approve");
+}
+
 export interface TerminalAppProps {
   model: TerminalUiModel;
   revision: Accessor<number>;
@@ -77,6 +82,7 @@ export function TerminalApp(props: TerminalAppProps) {
 
   const input = createMemo(() => { props.revision(); return props.model.input ? { ...props.model.input } : undefined; });
   const confirm = createMemo(() => { props.revision(); return props.model.confirm ? { ...props.model.confirm } : undefined; });
+  const paused = createMemo(() => { props.revision(); return props.model.paused; });
 
   useKeyboard((key) => props.onKey(key.name, key.ctrl, key.sequence));
 
@@ -217,12 +223,12 @@ export function TerminalApp(props: TerminalAppProps) {
           </text>
         </Show>
         <Show when={confirm()}>
-          <text fg={theme.heading}>{confirm()?.action === "propose" ? "Request Chick's proposal for" : "Approve the proposal for"} {displayText(confirm()?.goalId, 40)} ({displayText(confirm()?.goal, Math.max(10, dimensions().width - 80))})? {confirm()?.action === "propose" ? "y request" : "y approve"} · any other key cancels</text>
+          <text fg={theme.heading}>{confirmText(confirm()!, dimensions().width)} · any other key cancels</text>
         </Show>
         <text fg={theme.accent}>
           {input() ? "Enter start  ·  Esc cancel  ·  " + displayText(team()?.project?.github, 80) + " · home channel" : page() === "teams" ? "↑↓ choose team  ·  Enter open  ·  n new goal  ·  q quit" : page() === "team" ? "↑↓ seat · Enter details · n new goal · s restart · x stop · b teams · q quit" : "a attach  ·  P propose  ·  A approve  ·  s restart  ·  x stop  ·  n new goal  ·  b team  ·  q quit"}
         </text>
-        <text fg={theme.muted}>Auto-update  ·  r checks now  ·  q leaves seat processes running</text>
+        <text fg={theme.muted}>{paused() ? "Auto-update paused  ·  U resumes" : "Auto-update  ·  U pauses"}  ·  r checks now  ·  R rolls back  ·  q leaves seat processes running</text>
       </box>
     </box>
   );
@@ -300,7 +306,10 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
       const action = model.key(name, text);
       setRevision(model.revision);
       if (action === "quit") finish();
-      else if (action === "refresh") void refresh();
+      else if (action === "refresh") { void refresh(); void model.updateCode(); }
+      else if (action === "pause") void model.togglePause();
+      else if (action === "ask-rollback") void model.askRollback();
+      else if (action === "rollback") void model.rollbackConfirmed();
       else if (action === "submit") void model.submitInput();
       else if (action === "approve") void model.approveConfirmed();
       else if (action === "propose") void model.proposeConfirmed();
