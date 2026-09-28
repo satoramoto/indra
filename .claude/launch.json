@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "indra-tui",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": ["-c", "exec ttyd -W -i 127.0.0.1 -p \"${PORT:-0}\" -t fontSize=13 tmux -L indra-ui new-session -A -s ui -x 160 -y 48 npm start"],
+      "port": 7681,
+      "autoPort": true
+    }
+  ]
+}
