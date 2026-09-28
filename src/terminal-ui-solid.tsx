@@ -1,9 +1,10 @@
-import { createCliRenderer } from "@opentui/core";
+import { createCliRenderer, type ScrollBoxRenderable } from "@opentui/core";
 import { render, useKeyboard, useTerminalDimensions } from "@opentui/solid";
 import { createMemo, createSignal, For, Show, type Accessor } from "solid-js";
 import type { StateInventory, StateSeat } from "./state-domain.js";
 import { attachTmux } from "./tmux-attach.js";
-import { currentSession, displayText, GOAL_INPUT_LIMIT, newestPlanningRecord, TerminalUiModel, type SessionReadPort, type StateSyncPort, type TerminalSession, type UiApproval, type UiRetry, type UiRollback, type UiView, type UpdatePort } from "./terminal-ui.js";
+import { currentSession, displayText, GOAL_INPUT_LIMIT, newestPlanningRecord, TerminalUiModel, type SessionReadPort, type StateSyncPort, type TerminalSession, type TerminalSprint, type UiApproval, type UiRetry, type UiRollback, type UiView, type UpdatePort } from "./terminal-ui.js";
+import { engineLabel, SPRINT_STAGES, type SprintBuild } from "./session-snapshot.js";
 import type { GoalStarter, SeatLive, SeatProcessPort } from "./supervisor.js";
 
 const theme = {
@@ -20,7 +21,7 @@ function occupancy(model: TerminalUiModel, seat: StateSeat): { label: string; co
   if (newest?.status === "error" && !newest.sessionId) return { label: records.some((record) => !!record.sessionId) ? "RUNTIME ERROR · SAVED SESSION" : "RUNTIME RECORD ERROR", color: theme.error, session: newest };
   if (!session?.sessionId) return { label: "NO ACTIVE SESSION", color: theme.idle, session };
   return {
-    label: session.status.toUpperCase() + " SESSION · " + session.engine,
+    label: session.status.toUpperCase() + " SESSION · " + engineLabel(session.engine),
     color: session.status === "error" ? theme.error : session.status === "running" ? theme.running : theme.idle,
     session,
   };
@@ -63,6 +64,41 @@ function sprintHint(sprint: NonNullable<TerminalSession["sprint"]>): string {
     "revert-open": "revert PR open · M merges it once CI is green, or react :white_check_mark: on its post",
     reverted: "rolled back",
   }[sprint];
+}
+
+const buildStatus: Record<SprintBuild["status"], string> = {
+  running: "Running build contains the integration commit.",
+  "reload-pending": "Pending reload: available build contains the integration; running build does not.",
+  "update-pending": "Update pending: running and available builds do not contain the integration.",
+  unavailable: "Build evidence unavailable; Updated is not confirmed.",
+  "revert-open": "Revert PR open; awaiting human merge confirmation.",
+  reverted: "Reverted on main; running revert build is unverified.",
+};
+
+function SprintCard(props: { sprint: TerminalSprint; model: TerminalUiModel }) {
+  const loop = () => props.sprint.loop;
+  return <box flexDirection="column" flexShrink={0} padding={1} border borderColor="#42536B" backgroundColor={theme.panel}>
+    <text fg={theme.heading} wrapMode="char">{props.sprint.draft ? "DRAFT SPRINT" : "SPRINT"} · {displayText(props.sprint.id)}</text>
+    <text fg={theme.accent}>Current stage: {loop().stage}</text>
+    <text wrapMode="word">
+      <For each={SPRINT_STAGES}>{(stage, index) => <span style={{ fg: stage === loop().stage ? theme.accent : theme.muted }}>
+        {(index() ? " → " : "") + (stage === loop().stage ? `[${stage}]` : stage)}
+      </span>}</For><span style={{ fg: theme.muted }}> → Goal</span>
+    </text>
+    <text fg={theme.regular} wrapMode="word">{displayText(props.sprint.goal, 160)}</text>
+    <text fg={theme.heading}>Build · tickets</text>
+    <Show when={loop().tickets.length} fallback={<text fg={theme.muted}>No tickets assigned yet.</text>}>
+      <For each={loop().tickets}>{(ticket) => <box flexDirection="column" flexShrink={0} paddingLeft={1}>
+        <text fg={ticket.status === "failed" ? theme.error : ticket.status === "merged" ? theme.running : theme.regular} wrapMode="word">{displayText(ticket.title, 8000)} · {ticket.status}</text>
+        <text fg={theme.muted} wrapMode="word">Seat: {displayText(props.model.team?.seats.find((seat) => seat.id === ticket.seatId)?.displayName ?? ticket.seatId)} ({displayText(ticket.seatId)})</text>
+        <text fg={theme.muted} wrapMode="char">PR: {displayText(ticket.prUrl, 2000) || "not opened"}</text>
+      </box>}</For>
+    </Show>
+    <text fg={theme.heading}>Integrate · integration PR</text>
+    <text fg={theme.regular} wrapMode="char">{displayText(loop().integration?.prUrl, 2000) || "Not opened"}</text>
+    <Show when={loop().integration?.revertPrUrl}><text fg={theme.idle} wrapMode="char">Revert PR: {displayText(loop().integration?.revertPrUrl, 2000)}</text></Show>
+    <Show when={loop().build}><text fg={loop().build?.status === "running" ? theme.running : theme.idle} wrapMode="word">{buildStatus[loop().build!.status]}</text></Show>
+  </box>;
 }
 
 function confirmText(confirm: UiApproval | UiRollback | UiRetry, width: number): string {
@@ -114,8 +150,18 @@ export function TerminalApp(props: TerminalAppProps) {
   const input = createMemo(() => { props.revision(); return props.model.input ? { ...props.model.input } : undefined; });
   const confirm = createMemo(() => { props.revision(); return props.model.confirm ? { ...props.model.confirm } : undefined; });
   const paused = createMemo(() => { props.revision(); return props.model.paused; });
+  const sprints = createMemo(() => { props.revision(); return props.model.sprintsForTeam(); });
+  const hasPlanningLoops = createMemo(() => sprints().some((sprint) => !sprint.draft));
 
-  useKeyboard((key) => props.onKey(key.name, key.ctrl, key.sequence));
+  let teamScroll: ScrollBoxRenderable | undefined;
+  let sprintScroll: ScrollBoxRenderable | undefined;
+  let detailScroll: ScrollBoxRenderable | undefined;
+  useKeyboard((key) => {
+    if (!props.model.input && !props.model.confirm && (key.name === "pageup" || key.name === "pagedown")) {
+      const target = page() === "seat" ? detailScroll : page() === "team" ? wide() ? sprintScroll : teamScroll : undefined;
+      target?.scrollBy(key.name === "pageup" ? -1 : 1, "viewport");
+    } else props.onKey(key.name, key.ctrl, key.sequence);
+  });
 
   const seatDetail = () => {
     props.revision();
@@ -146,7 +192,7 @@ export function TerminalApp(props: TerminalAppProps) {
         <For each={sessions}>{(session) => (
           <box flexDirection="column" gap={0}>
             <text fg={theme.accent}>Planning goal: {displayText(session.goal, 160)}</text>
-            <text fg={theme.regular}>Stage: {displayText(session.stage)}  ·  {props.model.sessionResult.connection === "connected" ? "Codex session" : "Last Codex session"}: {displayText(session.sessionId) || "not started"}</text>
+            <text fg={theme.regular}>Stage: {displayText(session.stage)}  ·  {props.model.sessionResult.connection === "connected" ? "" : "Last "}{engineLabel(session.engine)} session: {displayText(session.sessionId) || "not started"}</text>
             <text fg={theme.muted}>Updated: {displayText(session.updatedAt) || "not reported"}</text>
             <Show when={session.stage === "clarifying"}>
               <text fg={theme.idle}>Clarifying · {session.id === props.model.clarifyingGoal()?.id ? "P requests Chick's proposal here" : "P requests the newer goal's proposal first"}, or react :memo: on the goal post</text>
@@ -164,6 +210,7 @@ export function TerminalApp(props: TerminalAppProps) {
             <Show when={session.recentActivity.length} fallback={<text fg={theme.muted}>No runtime activity recorded.</text>}>
               <For each={session.recentActivity.slice(0, 5)}>{(activity) => <text fg={theme.regular}>• {displayText(activity, 160)}</text>}</For>
             </Show>
+            <Show when={session.loop}><SprintCard model={props.model} sprint={{ id: session.id, goal: session.goal, loop: session.loop! }} /></Show>
           </box>
         )}</For>
         <Show when={props.model.sessionResult.connection === "connected" && !sessions.some((session) => !!session.sessionId)}>
@@ -205,7 +252,7 @@ export function TerminalApp(props: TerminalAppProps) {
 
       <Show when={page() === "team" && !!team()}>
         <box flexGrow={1} flexDirection={wide() ? "row" : "column"} gap={1}>
-          <scrollbox flexGrow={1} width={wide() ? "62%" : "100%"} scrollY border borderColor="#42536B" title={(team()?.displayName ?? "Team") + " · " + (team()?.seats.length ?? 0) + " STABLE SEATS"} titleColor={theme.accent}>
+          <scrollbox id="team-scroll" ref={teamScroll} flexGrow={1} width={wide() ? "62%" : "100%"} scrollY border borderColor="#42536B" title={(team()?.displayName ?? "Team") + " · " + (team()?.seats.length ?? 0) + " STABLE SEATS"} titleColor={theme.accent}>
             <Show when={team()?.seats.length} fallback={<text fg={theme.idle}>No seats are recorded for this team.</text>}>
               <For each={team()?.seats ?? []}>{(item) => {
                 const status = () => { props.revision(); return occupancy(props.model, item); };
@@ -233,24 +280,21 @@ export function TerminalApp(props: TerminalAppProps) {
                 );
               }}</For>
             </Show>
+            <Show when={!wide()}><For each={sprints()}>{(sprint) => <SprintCard model={props.model} sprint={sprint} />}</For></Show>
           </scrollbox>
-          <Show when={wide()}><scrollbox width="38%" height="100%" scrollY>
-            {seatDetail()}
-            <For each={props.model.snapshot?.sprints.filter((sprint) => sprint.teamId === team()?.id) ?? []}>{(sprint) => (
-              <box flexDirection="column" padding={1}>
-                <text fg={theme.idle}>DRAFT SPRINT · {displayText(sprint.phase)}</text>
-                <text fg={theme.muted}>{displayText(sprint.goal, 150)}</text>
-              </box>
-            )}</For>
+          <Show when={wide()}><scrollbox id="sprint-scroll" ref={sprintScroll} width="38%" height="100%" scrollY>
+            <Show when={!hasPlanningLoops()}>{seatDetail()}</Show>
+            <For each={sprints()}>{(sprint) => <SprintCard model={props.model} sprint={sprint} />}</For>
           </scrollbox></Show>
         </box>
       </Show>
 
       <Show when={page() === "seat"}>
-        <scrollbox flexGrow={1} scrollY>{seatDetail()}</scrollbox>
+        <scrollbox id="detail-scroll" ref={detailScroll} flexGrow={1} scrollY>{seatDetail()}</scrollbox>
       </Show>
 
       <box flexShrink={0} flexDirection="column">
+        <Show when={hasPlanningLoops() && page() !== "teams"}><text fg={theme.muted}>PgUp/PgDn scroll sprint history</text></Show>
         <Show when={notice()}><text fg={theme.idle}>{displayText(notice())}</text></Show>
         <Show when={input()}>
           <text fg={theme.heading} wrapMode="char">

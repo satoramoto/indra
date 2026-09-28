@@ -4,6 +4,7 @@ import { missingTeamHome, missingTeamMessage } from "./planning.js";
 import type { StateSyncResult } from "./state-commit.js";
 import type { BuildStamp } from "./build-stamp.js";
 import type { RollbackPlan, UpdateResult } from "./self-update.js";
+import type { SessionSnapshot, SprintLoop } from "./session-snapshot.js";
 
 /** Keeps Indra's own code current: pulls and builds new commits, and says when `dist/` holds a newer build. */
 export interface UpdatePort {
@@ -28,21 +29,9 @@ export interface UpdatePort {
 export interface UiView { page: UiPage; teamId?: string; seatId?: string }
 
 /** Structural read port. A stable seat is never treated as a running agent without a runtime session. */
-export interface TerminalSession {
-  id: string;
-  teamId: string;
-  seatId: string;
-  status: "idle" | "running" | "error";
-  engine: "codex";
-  goal: string;
-  stage: string;
-  updatedAt?: string;
-  recentActivity: string[];
-  sessionId?: string;
-  attach?: { kind: "tmux"; target: string };
-  /** The sprint's integration status on an approved goal; see `sprintView`. */
-  sprint?: "collecting" | "pr-open" | "merged" | "revert-open" | "reverted";
-}
+export type TerminalSession = SessionSnapshot["sessions"][number];
+
+export interface TerminalSprint { id: string; goal: string; loop: SprintLoop; draft?: boolean }
 
 export interface SessionReadResult {
   connection: "connected" | "disconnected" | "error";
@@ -468,6 +457,19 @@ export class TerminalUiModel {
 
   sessionsFor(seatId: string): TerminalSession[] {
     return this.sessionResult.sessions.filter((session) => session.teamId === this.teamId && session.seatId === seatId);
+  }
+
+  /** Team history includes every planning sprint, independent of which seat currently holds work. */
+  sprintsForTeam(): TerminalSprint[] {
+    const sessions = this.sessionResult.sessions.filter((session) => session.teamId === this.teamId && session.loop);
+    return [
+      ...sessions.map((session) => ({ id: session.id, goal: session.goal, loop: session.loop! })),
+      ...(this.snapshot?.sprints ?? []).filter((sprint) => sprint.teamId === this.teamId && !sessions.some((session) => session.id === sprint.id)).map((sprint): TerminalSprint => ({
+        id: sprint.id, goal: sprint.goal, draft: true, loop: { stage: "Goal", tickets: sprint.proposedWork.map((work) => ({
+          id: work.id, title: work.title, seatId: sprint.proposedAllocations.find((item) => item.workIds.includes(work.id))?.seatId ?? "unassigned", status: "not assigned",
+        })) },
+      })),
+    ];
   }
 
   selectedSession(): TerminalSession | undefined { return currentSession(this.seat ? this.sessionsFor(this.seat.id) : []); }
