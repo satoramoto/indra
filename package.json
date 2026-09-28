@@ -15,6 +15,7 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
+    "@anthropic-ai/sandbox-runtime": "0.0.77",
     "@babel/core": "^7.29.6",
     "@babel/preset-typescript": "^7.27.1",
     "@types/babel__core": "^7.20.5",

@@ -64,9 +64,15 @@ describe("Claude runtime", () => {
     expect(flag("--permission-mode")).toBe("plan"); expect(flag("--permission-prompts")).toBe("none");
     expect(flag("--tools")).toBe("Bash,Read,Glob,Grep"); expect(flag("--disallowedTools")).toContain("Edit,Write");
     expect(flag("--setting-sources")).toBe(""); expect(args()).toContain("--strict-mcp-config");
-    expect(JSON.parse(flag("--settings"))).toMatchObject({ disableAllHooks: true, sandbox: { enabled: true, failIfUnavailable: true, autoAllowBashIfSandboxed: false, allowUnsandboxedCommands: false, excludedCommands: [], filesystem: { denyWrite: ["/"] }, network: { allowedDomains: [], strictAllowlist: true } } });
+    expect(JSON.parse(flag("--settings"))).toMatchObject({ disableAllHooks: true, sandbox: { enabled: true, failIfUnavailable: true, autoAllowBashIfSandboxed: false, allowUnsandboxedCommands: false, excludedCommands: [], filesystem: { denyWrite: expect.arrayContaining(["/", dir]) }, network: { allowedDomains: [], strictAllowlist: true } } });
     expect(args()).not.toContain("--add-dir");
     child.close(); await run;
+  });
+
+  it("fails closed if read-only filesystem boundaries cannot be determined", async () => {
+    await writeFile(join(dir, ".git"), "invalid gitdir pointer");
+    await expect(new ClaudeRuntime(dir).message("Review", schema)).rejects.toThrow("Could not determine Claude read-only filesystem boundaries");
+    expect(spawn).not.toHaveBeenCalled();
   });
 
   it("grants Developer edits only in the worktree and named extras with mandatory sandboxing", async () => {
