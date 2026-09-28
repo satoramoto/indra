@@ -25,6 +25,12 @@ jobs:
           cache: npm
 
       - run: npm ci
+      - name: Prepare the Linux sandbox tests
+        run: |
+          sudo apt-get update && sudo apt-get install -y bubblewrap socat ripgrep
+          # SRT needs capability-bearing user namespaces on the disposable runner.
+          # https://github.com/anthropics/sandbox-runtime#platform-specific-dependencies
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: npm run typecheck
       - run: npm test
       - run: npm run build

@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { readFile, realpath, stat } from "node:fs/promises";
+import { homedir } from "node:os";
+import { basename, dirname, join, resolve } from "node:path";
 import { CLARIFY_TIMEOUT_MS, type AgentResult, type AgentRuntime, type MessageOptions, type WriteAccess } from "./codex-runtime.js";
 
 /** Persisted handles are engine-qualified; bare legacy handles still belong to Codex. */
@@ -15,15 +16,56 @@ export function claudeSessionId(handle: string): string {
   return id;
 }
 
+async function gitWritePaths(cwd: string): Promise<string[]> {
+  let gitDir: string | undefined;
+  for (let dir = cwd; ; dir = dirname(dir)) {
+    const dotGit = join(dir, ".git");
+    try {
+      if ((await stat(dotGit)).isDirectory()) gitDir = dotGit;
+      else {
+        const pointer = /^gitdir: (.+)$/.exec((await readFile(dotGit, "utf8")).trim());
+        if (!pointer) throw new Error();
+        gitDir = resolve(dir, pointer[1]);
+      }
+      break;
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    if (dirname(dir) === dir) break;
+  }
+  if (!gitDir) return [];
+  // Claude grants this common directory from the worktree layout itself.
+  const paths = [gitDir, ...(basename(dirname(gitDir)) === "worktrees" ? [dirname(dirname(gitDir))] : [])];
+  try { return [...paths, resolve(gitDir, (await readFile(join(gitDir, "commondir"), "utf8")).trim())]; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  return paths;
+}
+
+async function readOnlyWritePaths(cwd: string): Promise<string[]> {
+  try {
+    const workingDir = await realpath(cwd);
+    const tempName = `claude-${process.getuid?.() ?? 0}`;
+    // Claude 2.1.283/SRT skip Linux denies outside an allowed write root. Deny
+    // each implicit root, including linked-worktree metadata and both temp paths.
+    // Keep / for macOS; allowing / just to deny it can undo managed read denies.
+    const paths = ["/", resolve(cwd), workingDir, ...await gitWritePaths(workingDir),
+      "/tmp/claude", "/private/tmp/claude", join(homedir(), ".npm", "_logs"), join(homedir(), ".claude", "debug"),
+      resolve(workingDir, process.env.CLAUDE_CODE_TMPDIR || "/tmp", tempName), join("/tmp", tempName)];
+    const resolved = await Promise.all(paths.map(async (path) => {
+      try { return await realpath(path); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; return path; }
+    }));
+    return [...new Set([...paths, ...resolved])];
+  } catch { throw new Error("Could not determine Claude read-only filesystem boundaries."); }
+}
+
 /** No inherited tool grants, hooks or MCP servers. Managed policy still applies. */
-export function claudePermissionArgs(write?: WriteAccess): string[] {
+export async function claudePermissionArgs(cwd: string, write?: WriteAccess): Promise<string[]> {
   const settings = {
     disableAllHooks: true,
     permissions: { disableBypassPermissionsMode: "disable", disableAutoMode: "disable" },
     sandbox: {
       enabled: true, failIfUnavailable: true, allowUnsandboxedCommands: false,
       autoAllowBashIfSandboxed: !!write, excludedCommands: [],
-      filesystem: { ...(write ? { allowWrite: write.extraDirs.map((dir) => resolve(dir)) } : { denyWrite: ["/"] }) },
+      filesystem: write ? { allowWrite: write.extraDirs.map((dir) => resolve(dir)) } : { denyWrite: await readOnlyWritePaths(cwd) },
       network: { allowedDomains: write ? ["*"] : [], strictAllowlist: true, allowLocalBinding: false },
     },
   };
@@ -48,7 +90,7 @@ export class ClaudeRuntime implements AgentRuntime {
     try { schema = JSON.parse(await readFile(schemaPath, "utf8")); }
     catch { throw new Error("Claude output schema could not be read as JSON."); }
     if (!schema || typeof schema !== "object" || Array.isArray(schema)) throw new Error("Claude output schema must be a JSON Schema object.");
-    const args = ["--print", "--output-format", "json", "--json-schema", JSON.stringify(schema), ...claudePermissionArgs(this.write), ...(resumeId ? ["--resume", resumeId] : [])];
+    const args = ["--print", "--output-format", "json", "--json-schema", JSON.stringify(schema), ...await claudePermissionArgs(this.cwd, this.write), ...(resumeId ? ["--resume", resumeId] : [])];
     const timeoutMs = options.timeoutMs ?? this.timeoutMs;
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("Claude timeout must be a positive number of milliseconds.");
     const output = await this.run(args, prompt, timeoutMs, options.signal);
