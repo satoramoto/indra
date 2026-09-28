@@ -401,13 +401,13 @@ ${outcome.description}`;
 }
 
 /** A short, single-line excerpt of command stderr with anything token-shaped removed. */
-export function stderrExcerpt(stderr: string): string {
+export function stderrExcerpt(stderr: string, max = 120): string {
   const text = stderr
     .replace(/\b(gh[opusr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b/g, "[redacted]")
     .replace(/(https?:\/\/)[^\s/@]+@/g, "$1[redacted]@")
     .replace(/\s+/g, " ")
     .trim();
-  return (text || "no output").slice(0, 120);
+  return (text || "no output").slice(0, max);
 }
 
 /** Runs commands without a shell; output is kept in memory only. */
