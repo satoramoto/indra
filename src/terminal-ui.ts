@@ -48,11 +48,11 @@ export interface StateSyncPort {
 }
 
 export type UiPage = "teams" | "team" | "seat";
-export type UiAction = "none" | "refresh" | "quit" | "attach" | "stop" | "restart" | "submit" | "approve";
+export type UiAction = "none" | "refresh" | "quit" | "attach" | "stop" | "restart" | "submit" | "approve" | "propose";
 /** The one-line text input for a new planning goal. The channel and project come from the team in state. */
 export interface UiInput { value: string }
-/** A goal whose proposal the owner is approving from the terminal. */
-export interface UiApproval { goalId: string; goal: string }
+/** A goal whose proposal the owner is requesting (`P`) or approving (`A`) from the terminal. */
+export interface UiApproval { action: "approve" | "propose"; goalId: string; goal: string }
 
 /** Remove terminal controls from state and runtime text before giving it to the renderer. */
 export function displayText(value: string | undefined, limit = 400): string {
@@ -86,10 +86,12 @@ export class TerminalUiModel {
   /** Live process, assignment and thread activity per seat ID; empty without a process supervisor. */
   live: Record<string, SeatLive> = {};
   input?: UiInput;
-  /** Set while the y/n question for approving a proposal is open. */
+  /** Set while the y/n question for requesting or approving a proposal is open. */
   confirm?: UiApproval;
   /** The approval the owner confirmed, until `approveConfirmed` runs it. */
   private approving?: UiApproval;
+  /** The proposal request the owner confirmed, until `proposeConfirmed` runs it. */
+  private proposing?: UiApproval;
   /** Called after changes made outside a key press or refresh, so the screen redraws. */
   changed?: () => void;
 
@@ -102,7 +104,7 @@ export class TerminalUiModel {
   updating = false;
   /** Set once `dist/` holds a different build than this UI runs; the UI reloads at its next safe point. */
   reloadWanted = false;
-  /** Actions in flight (goal start, approval, stop or restart, hosting); the UI never reloads under one. */
+  /** Actions in flight (goal start, proposal request, approval, stop or restart, hosting); the UI never reloads under one. */
   private busy = 0;
   /** Settles when the update in progress (install, build, switch and restarts) ends. */
   private updateRun?: Promise<void>;
@@ -112,7 +114,7 @@ export class TerminalUiModel {
   private bump(): void { this.revision++; this.changed?.(); }
 
   /**
-   * Every action that spawns Indra code (s, n, A, hosting) goes through here. It waits while an update may be
+   * Every action that spawns Indra code (s, n, P, A, hosting) goes through here. It waits while an update may be
    * changing node_modules or dist, and does not run at all after a failed dependency install.
    */
   private async tracked(work: () => Promise<void>): Promise<void> {
@@ -273,6 +275,27 @@ export class TerminalUiModel {
     return this.seat ? newestPlanningRecord(this.sessionsFor(this.seat.id).filter((session) => session.stage === "awaiting-review")) : undefined;
   }
 
+  /** The selected seat's newest goal still being clarified, whose proposal the owner may request. */
+  clarifyingGoal(): TerminalSession | undefined {
+    return this.seat ? newestPlanningRecord(this.sessionsFor(this.seat.id).filter((session) => session.stage === "clarifying")) : undefined;
+  }
+
+  /** Runs the proposal request the owner confirmed with y; the bridge drafts it through the same path as a 📝 reaction. */
+  async proposeConfirmed(): Promise<void> {
+    const target = this.proposing;
+    this.proposing = undefined;
+    if (!target || !this.goals) return;
+    this.notice = "Requesting a proposal for " + target.goalId + "…";
+    this.bump();
+    const goals = this.goals;
+    await this.tracked(async () => {
+      try { this.notice = await goals.propose(target.goalId); }
+      catch (error) { this.notice = "Could not request a proposal for " + target.goalId + ": " + (error instanceof Error ? error.message : String(error)); }
+    });
+    await this.refresh();
+    this.bump();
+  }
+
   /** Runs the approval the owner confirmed with y; the CLI posts the same thread confirmation as a ✅ reaction. */
   async approveConfirmed(): Promise<void> {
     const target = this.approving;
@@ -349,8 +372,12 @@ export class TerminalUiModel {
       const target = this.confirm;
       this.confirm = undefined;
       this.revision++;
-      if ((text ?? value).toLowerCase() === "y") { this.approving = target; return "approve"; }
-      this.notice = "Approval cancelled; nothing changed.";
+      if ((text ?? value).toLowerCase() === "y") {
+        if (target.action === "propose") { this.proposing = target; return "propose"; }
+        this.approving = target;
+        return "approve";
+      }
+      this.notice = (target.action === "propose" ? "Proposal request" : "Approval") + " cancelled; nothing changed.";
       return "none";
     }
     this.notice = undefined;
@@ -362,7 +389,13 @@ export class TerminalUiModel {
       if (this.page !== "seat") this.notice = "Open Chick's seat to approve a proposal.";
       else if (!this.goals) this.notice = "Proposals cannot be approved from this screen.";
       else if (!target) this.notice = "No proposal is awaiting review for this seat.";
-      else this.confirm = { goalId: target.id, goal: target.goal };
+      else this.confirm = { action: "approve", goalId: target.id, goal: target.goal };
+    } else if (text === "P") {
+      const target = this.clarifyingGoal();
+      if (this.page !== "seat") this.notice = "Open Chick's seat to request a proposal.";
+      else if (!this.goals) this.notice = "Proposals cannot be requested from this screen.";
+      else if (!target) this.notice = "No goal is being clarified for this seat.";
+      else this.confirm = { action: "propose", goalId: target.id, goal: target.goal };
     } else if (input === "n") {
       const missing = missingTeamHome(this.team);
       if (!this.goals || !this.team) this.notice = "Planning goals cannot be started from this screen.";

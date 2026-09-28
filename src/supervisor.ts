@@ -32,6 +32,8 @@ export interface GoalStarter {
   start(goal: string): Promise<string>;
   /** Approves a goal's proposal as the owner and returns a one-line result for the screen. */
   approve(goalId: string): Promise<string>;
+  /** Requests Chick's proposal for a clarifying goal as the owner and returns a one-line result for the screen. */
+  propose(goalId: string): Promise<string>;
 }
 
 /** Newest progress post a Developer seat made in its goal thread; kept in `<state-checkout>.runtime`. */
@@ -186,7 +188,7 @@ export class Supervisor implements SeatProcessPort {
 }
 
 /**
- * Starts and approves planning goals through the built CLI, so Chick's credential never enters the terminal UI process.
+ * Starts planning goals, requests their proposals and approves them through the built CLI, so Chick's credential never enters the terminal UI process.
  * `run` executes one CLI invocation; tests replace it.
  */
 export class CliGoalStarter implements GoalStarter {
@@ -202,6 +204,10 @@ export class CliGoalStarter implements GoalStarter {
 
   async approve(goalId: string): Promise<string> {
     return await this.run(["planning", "approve", "--state", resolve(this.checkout), "--goal", goalId], 5 * 60_000) || `Approved goal ${goalId}.`;
+  }
+
+  async propose(goalId: string): Promise<string> {
+    return await this.run(["planning", "propose", "--state", resolve(this.checkout), "--goal", goalId], 5 * 60_000) || `Requested a proposal for goal ${goalId}.`;
   }
 }
 

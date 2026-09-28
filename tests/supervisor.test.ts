@@ -224,12 +224,14 @@ describe("seat process supervisor", () => {
 describe("CLI goal starter", () => {
   it("starts goals with only the goal text and approves through planning approve", async () => {
     const calls: string[][] = [];
-    const starter = new CliGoalStarter("/state", "/app", async (args) => { calls.push(args); return args[1] === "start" ? "Planning goal goal-1: link" : "Approved goal goal-1: 2 outcome(s) queued for Developer seats."; });
+    const starter = new CliGoalStarter("/state", "/app", async (args) => { calls.push(args); return args[1] === "start" ? "Planning goal goal-1: link" : args[1] === "propose" ? "Requested a proposal for goal goal-2." : "Approved goal goal-1: 2 outcome(s) queued for Developer seats."; });
     expect(await starter.start("Fix tests")).toBe("Planning goal goal-1: link");
     expect(await starter.approve("goal-1")).toContain("Approved goal goal-1");
+    expect(await starter.propose("goal-2")).toBe("Requested a proposal for goal goal-2.");
     expect(calls).toEqual([
       ["planning", "start", "--state", "/state", "--goal", "Fix tests"],
       ["planning", "approve", "--state", "/state", "--goal", "goal-1"],
+      ["planning", "propose", "--state", "/state", "--goal", "goal-2"],
     ]);
   });
 });

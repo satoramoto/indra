@@ -110,6 +110,9 @@ export function TerminalApp(props: TerminalAppProps) {
             <text fg={theme.accent}>Planning goal: {displayText(session.goal, 160)}</text>
             <text fg={theme.regular}>Stage: {displayText(session.stage)}  ·  {props.model.sessionResult.connection === "connected" ? "Codex session" : "Last Codex session"}: {displayText(session.sessionId) || "not started"}</text>
             <text fg={theme.muted}>Updated: {displayText(session.updatedAt) || "not reported"}</text>
+            <Show when={session.stage === "clarifying"}>
+              <text fg={theme.idle}>Clarifying · {session.id === props.model.clarifyingGoal()?.id ? "P requests Chick's proposal here" : "P requests the newer goal's proposal first"}, or react :memo: on the goal post</text>
+            </Show>
             <Show when={session.stage === "awaiting-review"}>
               <text fg={theme.idle}>Proposal awaiting review · {session.id === props.model.reviewGoal()?.id ? "A approves it here" : "A approves the newer goal first"}, or react :white_check_mark: on its proposal post</text>
             </Show>
@@ -214,10 +217,10 @@ export function TerminalApp(props: TerminalAppProps) {
           </text>
         </Show>
         <Show when={confirm()}>
-          <text fg={theme.heading}>Approve the proposal for {displayText(confirm()?.goalId, 40)} ({displayText(confirm()?.goal, Math.max(10, dimensions().width - 70))})? y approve · any other key cancels</text>
+          <text fg={theme.heading}>{confirm()?.action === "propose" ? "Request Chick's proposal for" : "Approve the proposal for"} {displayText(confirm()?.goalId, 40)} ({displayText(confirm()?.goal, Math.max(10, dimensions().width - 80))})? {confirm()?.action === "propose" ? "y request" : "y approve"} · any other key cancels</text>
         </Show>
         <text fg={theme.accent}>
-          {input() ? "Enter start  ·  Esc cancel  ·  " + displayText(team()?.project?.github, 80) + " · home channel" : page() === "teams" ? "↑↓ choose team  ·  Enter open  ·  n new goal  ·  q quit" : page() === "team" ? "↑↓ seat · Enter details · n new goal · s restart · x stop · b teams · q quit" : "a attach  ·  A approve  ·  s restart  ·  x stop  ·  n new goal  ·  b team  ·  q quit"}
+          {input() ? "Enter start  ·  Esc cancel  ·  " + displayText(team()?.project?.github, 80) + " · home channel" : page() === "teams" ? "↑↓ choose team  ·  Enter open  ·  n new goal  ·  q quit" : page() === "team" ? "↑↓ seat · Enter details · n new goal · s restart · x stop · b teams · q quit" : "a attach  ·  P propose  ·  A approve  ·  s restart  ·  x stop  ·  n new goal  ·  b team  ·  q quit"}
         </text>
         <text fg={theme.muted}>Auto-update  ·  r checks now  ·  q leaves seat processes running</text>
       </box>
@@ -300,6 +303,7 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
       else if (action === "refresh") void refresh();
       else if (action === "submit") void model.submitInput();
       else if (action === "approve") void model.approveConfirmed();
+      else if (action === "propose") void model.proposeConfirmed();
       else if (action === "stop" || action === "restart") void model.control(action);
       else if (action === "attach") {
         const target = model.attachTarget();

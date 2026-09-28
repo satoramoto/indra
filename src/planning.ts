@@ -41,7 +41,7 @@ export function validateOutcomeSeats(outcomes: PlanningOutcome[], developerSeatI
  * and reaction keys. `pending.proposal` marks a reply that announces the proposal; once delivered, its post ID joins
  * `proposalPostIds`, the posts a ✅ reaction approves.
  */
-export interface RuntimeRecord { sessionId?: string; lastSeenAt: number; processedPostIds: string[]; proposalPostIds?: string[]; pending?: { inputPostId: string; message: string; since: number; proposal?: boolean }; runs: { startedAt: string; finishedAt: string; usage?: unknown }[] }
+export interface RuntimeRecord { sessionId?: string; lastSeenAt: number; processedPostIds: string[]; proposalPostIds?: string[]; pending?: { inputPostId: string; message: string; since: number; proposal?: boolean }; /** The owner's `planning propose`, waiting for the bridge's next poll. */ proposalRequest?: { requestedAt: number }; runs: { startedAt: string; finishedAt: string; usage?: unknown }[] }
 export interface PlanningDocument { $schema: string; schemaVersion: number; teams: unknown[]; sprints: unknown[]; planningGoals?: PlanningGoal[] }
 
 export function validatePlanningGoal(goal: PlanningGoal): void {
