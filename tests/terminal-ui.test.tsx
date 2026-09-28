@@ -2,7 +2,7 @@ import { testRender } from "@opentui/solid";
 import { createSignal } from "solid-js";
 import { describe, expect, it } from "vitest";
 import { StateInventory, type StateSnapshot } from "../src/state-domain.js";
-import { TerminalUiModel, type SessionReadResult, type StateSyncPort, type UpdatePort } from "../src/terminal-ui.js";
+import { TerminalUiModel, type SessionReadResult, type StateSyncPort, type TerminalSession, type UpdatePort } from "../src/terminal-ui.js";
 import type { UpdateResult } from "../src/self-update.js";
 import type { StateSyncResult } from "../src/state-commit.js";
 import { TerminalApp } from "../src/terminal-ui-solid.js";
@@ -552,6 +552,56 @@ describe("terminal UI", () => {
       // Lowercase a still attaches rather than approving.
       expect(model.key("a", "a")).not.toBe("approve");
     } finally { setup.renderer.destroy(); }
+  });
+
+  it("opens, merges and rolls back a sprint with I, M and V, each after a y/n confirmation", async () => {
+    const calls: string[] = [];
+    let sprint: TerminalSession["sprint"] = "collecting";
+    const goals: GoalStarter = { start: async () => "unused", approve: async () => "unused", propose: async () => "unused", sprint: async (action, goalId) => { calls.push(`${action} ${goalId}`); return `ran ${action}`; } };
+    const session = (): TerminalSession => ({ id: "goal-1", teamId: "team-001", seatId: "seat-001", status: "idle", engine: "codex", sessionId: "codex-1", goal: "Plan the next cycle", stage: "approved", updatedAt: "2026-01-02T00:00:00Z", recentActivity: [], sprint });
+    const model = new TerminalUiModel(new StateInventory({ read: async () => homed }), { readSessions: async () => ({ connection: "connected", sessions: [session()] }) }, undefined, goals);
+    await model.refresh();
+    model.key("down");
+    model.key("return");
+    expect(model.key("m", "M")).toBe("none");
+    expect(model.notice).toContain("No sprint has an integration or revert PR open");
+    model.key("i", "I");
+    expect(model.confirm).toEqual({ action: "integrate", goalId: "goal-1", goal: "Plan the next cycle" });
+    const [revision] = createSignal(model.revision);
+    const setup = await testRender(() => <TerminalApp model={model} revision={revision} onKey={() => {}} />, { width: 160, height: 30 });
+    try {
+      await setup.renderOnce();
+      expect(setup.captureCharFrame()).toContain("Open the integration PR into main");
+      expect(setup.captureCharFrame()).toContain("I opens it for what merged");
+    } finally { setup.renderer.destroy(); }
+    expect(model.key("n", "n")).toBe("none");
+    expect(model.notice).toContain("cancelled");
+    await model.sprintConfirmed();
+    expect(calls).toEqual([]);
+    model.key("i", "I");
+    expect(model.key("y", "y")).toBe("sprint");
+    await model.sprintConfirmed();
+    sprint = "pr-open";
+    await model.refresh();
+    model.key("m", "M");
+    expect(model.confirm).toEqual({ action: "merge", goalId: "goal-1", goal: "Plan the next cycle" });
+    expect(model.key("y", "y")).toBe("sprint");
+    await model.sprintConfirmed();
+    sprint = "merged";
+    await model.refresh();
+    // R stays the self-update rollback; V rolls the sprint back.
+    model.key("v", "V");
+    expect(model.confirm).toEqual({ action: "revert", goalId: "goal-1", goal: "Plan the next cycle" });
+    expect(model.key("y", "y")).toBe("sprint");
+    await model.sprintConfirmed();
+    sprint = "revert-open";
+    await model.refresh();
+    model.key("m", "M");
+    expect(model.confirm).toMatchObject({ action: "merge", revert: true });
+    expect(model.key("y", "y")).toBe("sprint");
+    await model.sprintConfirmed();
+    expect(calls).toEqual(["integrate goal-1", "merge goal-1", "rollback goal-1", "merge goal-1"]);
+    expect(model.notice).toBe("ran merge");
   });
 
   it("requests Chick's proposal for the newest clarifying goal with P and a y/n confirmation", async () => {

@@ -12,7 +12,14 @@ export interface PlanningGoal {
   proposal?: { id: string; createdAt: string; summary: string; outcomes: PlanningOutcome[]; risks: string[]; openQuestions: string[] };
   /** Present only once a human approved the proposal; one entry per outcome. */
   assignments?: PlanningAssignment[];
+  /** The sprint's integration branch, created on approval; seats' PRs target it, and one PR takes it into main. */
+  integration?: SprintIntegration;
 }
+export const INTEGRATION_STATUSES = ["collecting", "pr-open", "merged", "reverted"] as const;
+/** `revertPrUrl` is the open or merged PR on main that reverts `mergedSha` (`planning rollback`). */
+export interface SprintIntegration { branch: string; baseSha: string; status: typeof INTEGRATION_STATUSES[number]; prUrl?: string; mergedSha?: string; revertPrUrl?: string }
+/** Which PR a merge post gates: the sprint's integration PR into main, or the PR on main that reverts it. */
+export type MergeKind = "integration" | "revert";
 export interface PlanningOutcome { id: string; title: string; description: string; seatId: string }
 export const ASSIGNMENT_STATUSES = ["queued", "running", "in-review", "merged", "failed"] as const;
 export interface PlanningAssignment { outcomeId: string; seatId: string; status: typeof ASSIGNMENT_STATUSES[number]; updatedAt: string; prUrl?: string; note?: string }
@@ -41,7 +48,10 @@ export function validateOutcomeSeats(outcomes: PlanningOutcome[], developerSeatI
  * and reaction keys. `pending.proposal` marks a reply that announces the proposal; once delivered, its post ID joins
  * `proposalPostIds`, the posts a ✅ reaction approves.
  */
-export interface RuntimeRecord { sessionId?: string; lastSeenAt: number; processedPostIds: string[]; proposalPostIds?: string[]; pending?: { inputPostId: string; message: string; since: number; proposal?: boolean }; /** The owner's `planning propose`, waiting for the bridge's next poll. */ proposalRequest?: { requestedAt: number }; runs: { startedAt: string; finishedAt: string; usage?: unknown }[] }
+export interface RuntimeRecord { sessionId?: string; lastSeenAt: number; processedPostIds: string[]; proposalPostIds?: string[];
+  /** Posts announcing the sprint's integration PR or its revert PR; a person's ✅ on one merges that PR. */
+  mergePosts?: { id: string; kind: MergeKind }[];
+  pending?: { inputPostId: string; message: string; since: number; proposal?: boolean; mergePost?: MergeKind }; /** The owner's `planning propose`, waiting for the bridge's next poll. */ proposalRequest?: { requestedAt: number }; runs: { startedAt: string; finishedAt: string; usage?: unknown }[] }
 export interface PlanningDocument { $schema: string; schemaVersion: number; teams: unknown[]; sprints: unknown[]; planningGoals?: PlanningGoal[] }
 
 export function validatePlanningGoal(goal: PlanningGoal): void {
@@ -53,9 +63,16 @@ export function validatePlanningGoal(goal: PlanningGoal): void {
   if (goal.proposal && (!goal.proposal.summary.trim() || !Array.isArray(goal.proposal.outcomes) || !goal.proposal.outcomes.length || goal.proposal.outcomes.some((item) => !/^[a-z][a-z0-9-]+$/.test(item.id) || typeof item.title !== "string" || !item.title.trim() || typeof item.description !== "string" || !item.description.trim() || typeof item.seatId !== "string" || !/^[a-z][a-z0-9-]+$/.test(item.seatId)) || new Set(goal.proposal.outcomes.map((item) => item.id)).size !== goal.proposal.outcomes.length || !Array.isArray(goal.proposal.risks) || goal.proposal.risks.some((item) => typeof item !== "string" || !item.trim()) || !Array.isArray(goal.proposal.openQuestions) || goal.proposal.openQuestions.some((item) => typeof item !== "string" || !item.trim()))) throw new Error("Invalid proposal.");
   if (!Array.isArray(goal.projectRefs) || goal.projectRefs.some((item) => typeof item !== "string" || !item.trim())) throw new Error("Invalid project references.");
   if (!Array.isArray(goal.participantSeatIds) || new Set(goal.participantSeatIds).size !== goal.participantSeatIds.length) throw new Error("Invalid participants.");
+  const text = (value: unknown) => value === undefined || (typeof value === "string" && !!value.trim());
+  if (goal.integration !== undefined) {
+    const item = goal.integration as unknown as Record<string, unknown>;
+    const sha = (value: unknown) => typeof value === "string" && /^[0-9a-f]{40}$/.test(value);
+    if (goal.stage !== "approved") throw new Error("A sprint integration is allowed only at approved stage.");
+    if (!item || typeof item !== "object" || Object.keys(item).some((key) => !["branch", "baseSha", "status", "prUrl", "mergedSha", "revertPrUrl"].includes(key)) || item.branch !== `sprint/${goal.id}` || !sha(item.baseSha) || !INTEGRATION_STATUSES.includes(item.status as SprintIntegration["status"]) || !text(item.prUrl) || (item.mergedSha !== undefined && !sha(item.mergedSha)) || !text(item.revertPrUrl)) throw new Error("Invalid sprint integration.");
+    if ((item.status !== "collecting" && !item.prUrl) || ((item.status === "merged" || item.status === "reverted") && !item.mergedSha) || (item.status === "reverted" && !item.revertPrUrl)) throw new Error(`Sprint integration at ${String(item.status)} is missing its PR or merge commit.`);
+  }
   if (goal.assignments !== undefined) {
     const outcomeIds = new Set(goal.proposal!.outcomes.map((item) => item.id));
-    const text = (value: unknown) => value === undefined || (typeof value === "string" && !!value.trim());
     if (!Array.isArray(goal.assignments) || goal.assignments.some((item) => !item || typeof item !== "object" || Object.keys(item).some((key) => !["outcomeId", "seatId", "status", "updatedAt", "prUrl", "note"].includes(key)) || typeof item.seatId !== "string" || !/^[a-z][a-z0-9-]+$/.test(item.seatId) || !ASSIGNMENT_STATUSES.includes(item.status) || typeof item.updatedAt !== "string" || Number.isNaN(Date.parse(item.updatedAt)) || !text(item.prUrl) || !text(item.note))) throw new Error("Invalid assignment.");
     const unknown = goal.assignments.find((item) => !outcomeIds.has(item.outcomeId));
     if (unknown) throw new Error(`Assignment references unknown outcome ${String(unknown.outcomeId)}.`);

@@ -1,5 +1,5 @@
 import type { StateInventory, StateSeat, StateSnapshot, StateTeam } from "./state-domain.js";
-import type { GoalStarter, SeatLive, SeatProcessPort } from "./supervisor.js";
+import type { GoalStarter, SeatLive, SeatProcessPort, SprintAction } from "./supervisor.js";
 import { missingTeamHome, missingTeamMessage } from "./planning.js";
 import type { StateSyncResult } from "./state-commit.js";
 import type { BuildStamp } from "./build-stamp.js";
@@ -40,6 +40,8 @@ export interface TerminalSession {
   recentActivity: string[];
   sessionId?: string;
   attach?: { kind: "tmux"; target: string };
+  /** The sprint's integration status on an approved goal; see `sprintView`. */
+  sprint?: "collecting" | "pr-open" | "merged" | "revert-open" | "reverted";
 }
 
 export interface SessionReadResult {
@@ -58,11 +60,16 @@ export interface StateSyncPort {
 }
 
 export type UiPage = "teams" | "team" | "seat";
-export type UiAction = "none" | "refresh" | "quit" | "attach" | "stop" | "restart" | "submit" | "approve" | "propose" | "pause" | "ask-rollback" | "rollback";
+export type UiAction = "none" | "refresh" | "quit" | "attach" | "stop" | "restart" | "submit" | "approve" | "propose" | "sprint" | "pause" | "ask-rollback" | "rollback";
 /** The one-line text input for a new planning goal. The channel and project come from the team in state. */
 export interface UiInput { value: string }
-/** A goal whose proposal the owner is requesting (`P`) or approving (`A`) from the terminal. */
-export interface UiApproval { action: "approve" | "propose"; goalId: string; goal: string }
+/**
+ * A goal whose proposal the owner is requesting (`P`) or approving (`A`) from the terminal, or whose sprint the owner
+ * integrates (`I`), merges (`M`: the integration PR, or the revert PR when `revert`) or rolls back (`V`).
+ */
+export interface UiApproval { action: "approve" | "propose" | "integrate" | "merge" | "revert"; goalId: string; goal: string; revert?: boolean }
+/** `revert` in the UI (V) is `planning rollback`; `rollback` alone is the self-update rollback (R). */
+const sprintActions: Record<string, SprintAction> = { integrate: "integrate", merge: "merge", revert: "rollback" };
 /** A rollback (`R`) from the running build's short SHA to the previous build's. */
 export interface UiRollback { action: "rollback"; from: string; to: string }
 
@@ -106,6 +113,8 @@ export class TerminalUiModel {
   private approving?: UiApproval;
   /** The proposal request the owner confirmed, until `proposeConfirmed` runs it. */
   private proposing?: UiApproval;
+  /** The sprint action (`I`, `M` or `V`) the owner confirmed, until `sprintConfirmed` runs it. */
+  private sprinting?: UiApproval;
   /** Called after changes made outside a key press or refresh, so the screen redraws. */
   changed?: () => void;
 
@@ -392,6 +401,28 @@ export class TerminalUiModel {
     this.bump();
   }
 
+  /** The selected seat's newest goal whose sprint is at one of `views`. */
+  sprintGoal(...views: NonNullable<TerminalSession["sprint"]>[]): TerminalSession | undefined {
+    return this.seat ? newestPlanningRecord(this.sessionsFor(this.seat.id).filter((session) => !!session.sprint && views.includes(session.sprint))) : undefined;
+  }
+
+  /** Runs the sprint action the owner confirmed with y; merges go through the same path as a ✅ on the merge post. */
+  async sprintConfirmed(): Promise<void> {
+    const target = this.sprinting;
+    this.sprinting = undefined;
+    const goals = this.goals;
+    const action = target && sprintActions[target.action];
+    if (!target || !goals?.sprint || !action) return;
+    this.notice = "Running " + action + " for sprint " + target.goalId + "…";
+    this.bump();
+    await this.tracked(async () => {
+      try { this.notice = await goals.sprint!(action, target.goalId); }
+      catch (error) { this.notice = "Could not " + action + " sprint " + target.goalId + ": " + (error instanceof Error ? error.message : String(error)); }
+    });
+    await this.refresh();
+    this.bump();
+  }
+
   /** Runs the approval the owner confirmed with y; the CLI posts the same thread confirmation as a ✅ reaction. */
   async approveConfirmed(): Promise<void> {
     const target = this.approving;
@@ -471,10 +502,11 @@ export class TerminalUiModel {
       if ((text ?? value).toLowerCase() === "y") {
         if (target.action === "rollback") return "rollback";
         if (target.action === "propose") { this.proposing = target; return "propose"; }
-        this.approving = target;
-        return "approve";
+        if (target.action === "approve") { this.approving = target; return "approve"; }
+        this.sprinting = target;
+        return "sprint";
       }
-      this.notice = (target.action === "rollback" ? "Rollback" : target.action === "propose" ? "Proposal request" : "Approval") + " cancelled; nothing changed.";
+      this.notice = (target.action === "rollback" ? "Rollback" : target.action === "propose" ? "Proposal request" : target.action === "approve" ? "Approval" : "Sprint " + target.action) + " cancelled; nothing changed.";
       return "none";
     }
     this.notice = undefined;
@@ -500,6 +532,13 @@ export class TerminalUiModel {
       else if (!this.goals) this.notice = "Proposals cannot be requested from this screen.";
       else if (!target) this.notice = "No goal is being clarified for this seat.";
       else this.confirm = { action: "propose", goalId: target.id, goal: target.goal };
+    } else if (text === "I" || text === "M" || text === "V") {
+      const action = text === "I" ? "integrate" : text === "M" ? "merge" : "revert";
+      const target = text === "I" ? this.sprintGoal("collecting") : text === "M" ? this.sprintGoal("pr-open", "revert-open") : this.sprintGoal("merged");
+      if (this.page !== "seat") this.notice = "Open Chick's seat to " + action + " a sprint.";
+      else if (!this.goals?.sprint) this.notice = "Sprints cannot be managed from this screen.";
+      else if (!target) this.notice = text === "I" ? "No sprint is collecting merges for this seat." : text === "M" ? "No sprint has an integration or revert PR open for this seat." : "No merged sprint to roll back for this seat.";
+      else this.confirm = { action, goalId: target.id, goal: target.goal, ...(target.sprint === "revert-open" ? { revert: true } : {}) };
     } else if (input === "n") {
       const missing = missingTeamHome(this.team);
       if (!this.goals || !this.team) this.notice = "Planning goals cannot be started from this screen.";

@@ -22,7 +22,9 @@ const exists = (path: string) => stat(path).then(() => true, () => false);
  * A missing clone is made with `gh repo clone` into a temporary directory and moved into place, so an
  * interrupted clone never leaves a half-made checkout. One lock per project covers every Indra process.
  */
-export async function ensureProjectCheckout(shell: Shell, runtimeDir: string, github: string): Promise<string> {
+export async function ensureProjectCheckout(shell: Shell, runtimeDir: string, github: string, base = "main"): Promise<string> {
+  // A sprint's branch is fetched alongside main, so `origin/<base>` is current too.
+  const branches = base === "main" ? ["main"] : ["main", base];
   const dir = projectCheckoutPath(runtimeDir, github);
   return await withFileLock(`${dir}.lock`, async () => {
     if (!(await exists(join(dir, ".git")))) {
@@ -37,8 +39,8 @@ export async function ensureProjectCheckout(shell: Shell, runtimeDir: string, gi
       await rename(temp, dir);
     }
     // gh supplies the credential for this one command; Git's configuration is never changed.
-    const fetched = await shell.run("git", ["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential", "fetch", "origin", "main"], dir);
-    if (fetched.code !== 0) throw new ProjectCheckoutError(`git fetch origin main failed in the ${github} checkout (exit ${fetched.code}).`);
+    const fetched = await shell.run("git", ["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential", "fetch", "origin", ...branches], dir);
+    if (fetched.code !== 0) throw new ProjectCheckoutError(`git fetch origin ${branches.join(" ")} failed in the ${github} checkout (exit ${fetched.code}).`);
     return dir;
   }, 30 * 60_000); // Another seat may be cloning a large project.
 }
