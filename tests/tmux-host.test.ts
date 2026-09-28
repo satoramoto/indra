@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { TmuxHost, type TmuxRunner } from "../src/tmux-host.js";
 import { LocalSessionReader } from "../src/session-snapshot.js";
 import { PlanningStore } from "../src/planning.js";
+import { git } from "./state-checkout.js";
 
 class FakeTmux implements TmuxRunner {
   calls: string[][] = [];
@@ -64,7 +65,8 @@ describe("tmux host", () => {
     fake.onStart = async (nonce) => { await writeFile(host.readyFile(nonce), JSON.stringify({ nonce })); };
     await host.start();
     const store = new PlanningStore(dir);
-    await store.update((state) => { state.planningGoals = [{ id: "goal-1", teamId: "team-001", seatId: "seat-001", participantSeatIds: [], goal: "Plan", projectRefs: [], stage: "clarifying", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), mattermost: { channelId: "channel", rootPostId: "root" }, brief: { summary: "Plan", decisions: [], openQuestions: [] } }]; });
+    git(dir, "init", "--quiet"); git(dir, "add", "state.json"); git(dir, "commit", "--quiet", "-m", "Initial state");
+    await store.update((state) => { state.planningGoals = [{ id: "goal-1", teamId: "team-001", seatId: "seat-001", participantSeatIds: [], goal: "Plan", projectRefs: [], stage: "clarifying", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), mattermost: { channelId: "channel", rootPostId: "root" }, brief: { summary: "Plan", decisions: [], openQuestions: [] } }]; }, "Start planning goal goal-1");
     const snapshot = await new LocalSessionReader(dir, store, host).readSessions();
     expect(snapshot.connection).toBe("connected");
     expect(snapshot.sessions[0]).toMatchObject({ id: "goal-1", status: "idle", engine: "codex", attach: { kind: "tmux", target: host.attachTarget((await host.readRecord())!) } });

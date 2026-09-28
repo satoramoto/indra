@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { git, stateCheckout } from "./state-checkout.js";
 import { PlanningStore } from "../src/planning.js";
 import { DeveloperSeat, loadDeveloperSeat, type SeatChat, type SeatTaskRecord, type Shell, type ShellResult } from "../src/developer-seat.js";
 import { sandboxArgs, type AgentResult, type AgentRuntime, type WriteAccess } from "../src/codex-runtime.js";
@@ -12,7 +12,6 @@ const PR = "https://github.com/satoramoto/indra/pull/9";
 const seat = (id: string, name: string, roles: string[]) => ({ id, displayName: name, roles, externalIdentities: { mattermost: { userId: id, username: name.toLowerCase() } } });
 
 async function fixture(assignments: Assignment[], stage = "approved") {
-  const dir = await mkdtemp(join(tmpdir(), "indra-seat-"));
   const goal = {
     id: "goal-abc", teamId: "team-001", seatId: "seat-001", participantSeatIds: [], goal: "Build it", projectRefs: ["/proj"], stage,
     createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z", mattermost: { channelId: "channel", rootPostId: "root" },
@@ -25,8 +24,7 @@ async function fixture(assignments: Assignment[], stage = "approved") {
     assignments,
   };
   const state = { $schema: "./schema/v1/state.schema.json", schemaVersion: 1, sprints: [], planningGoals: [goal], teams: [{ id: "team-001", slug: "yahaha", displayName: "Yahaha", externalIdentities: { mattermost: { teamId: "team" } }, seats: [seat("seat-001", "Chick", ["Team Lead"]), seat("seat-002", "George", ["Developer"]), seat("seat-003", "Herbie", ["Developer"])] }] };
-  await writeFile(join(dir, "state.json"), JSON.stringify(state));
-  return new PlanningStore(dir);
+  return new PlanningStore(await stateCheckout("indra-seat-", state));
 }
 const queued = (outcomeId: string, updatedAt: string, seatId = "seat-002"): Assignment => ({ outcomeId, seatId, status: "queued", updatedAt });
 
@@ -111,6 +109,12 @@ describe("developer seat", () => {
     expect(record.sessions.map((item) => [item.role, item.sessionId])).toEqual([["developer", "session-1"], ["reviewer", "session-2"], ["fix", "session-3"]]);
     expect(await readFile(join(store.checkout, "state.json"), "utf8")).not.toContain("session-");
     expect(chat.messages.map((message) => message.split(" ")[0])).toEqual(["Claimed", "Opened", "Review", "Merged"]);
+    expect(git(store.checkout, "log", "--format=%s").trim().split("\n").reverse()).toEqual([
+      "Initial state",
+      "Seat seat-002 claims goal-abc/outcome-1: running",
+      "Seat seat-002 marks goal-abc/outcome-1 in-review",
+      "Seat seat-002 marks goal-abc/outcome-1 merged",
+    ]);
   });
 
   it("skips the fix session when the reviewer has no findings", async () => {

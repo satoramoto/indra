@@ -120,6 +120,14 @@ describe("local state checkout", () => {
     expect(() => parseOptions(["--mattermost", "--ui"])).toThrow("Usage:");
   });
 
+  it("accepts an optional nonempty team planning channel", () => {
+    const withChannel = fixture();
+    Object.assign(withChannel.teams[0].externalIdentities.mattermost, { planningChannelId: "channel-1" });
+    expect(() => parseState(withChannel)).not.toThrow();
+    Object.assign(withChannel.teams[0].externalIdentities.mattermost, { planningChannelId: " " });
+    expect(() => parseState(withChannel)).toThrow("teams[0].externalIdentities.mattermost.planningChannelId must be a nonempty string");
+  });
+
   it("accepts only the Team Lead and Developer roles, one per seat", () => {
     const product = fixture();
     product.teams[0].seats[1].roles = ["Product"];

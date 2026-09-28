@@ -3,7 +3,7 @@ import { dirname, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { AgentRuntime } from "./codex-runtime.js";
 import { planningId } from "./codex-runtime.js";
-import { PlanningStore, developerSeats, validateOutcomeSeats, type PlanningDocument, type PlanningGoal, type RuntimeRecord } from "./planning.js";
+import { PlanningStore, developerSeats, planningChannelId, validateOutcomeSeats, type PlanningDocument, type PlanningGoal, type RuntimeRecord } from "./planning.js";
 
 export interface Post { id: string; user_id: string; channel_id: string; root_id: string; message: string; create_at: number; props?: { indra_delivery_id?: string } }
 export interface PlanningChat {
@@ -58,18 +58,21 @@ export class PlanningBridge {
   private readonly busy = new Map<string, Promise<void>>();
   constructor(private readonly store: PlanningStore, private readonly chat: PlanningChat, private readonly runtime: AgentRuntime, private readonly maxQueue = 20) {}
 
-  async start(goalText: string, channelId: string, projectRefs: string[], participantSeatIds: string[] = []): Promise<PlanningGoal> {
+  /** Without an explicit channel, the thread goes to the team's recorded planning channel. */
+  async start(goalText: string, explicitChannelId: string | undefined, projectRefs: string[], participantSeatIds: string[] = []): Promise<PlanningGoal> {
     const state = await this.store.read();
     const team = (state.teams as { id: string; slug: string; seats: { id: string; externalIdentities: { mattermost: { username: string } } }[] }[]).find((item) => item.slug === "yahaha");
     const seat = team?.seats.find((item) => item.externalIdentities.mattermost.username === "chickcorea");
     if (!team || !seat) throw new Error("Chick's Yahaha seat is missing from state.");
-    if (!goalText.trim() || !channelId.trim()) throw new Error("Goal and channel ID are required.");
+    const channelId = explicitChannelId ?? planningChannelId(state, team.id);
+    if (!channelId?.trim()) throw new Error("No planning channel: pass --channel, or record the team's externalIdentities.mattermost.planningChannelId in state.json.");
+    if (!goalText.trim()) throw new Error("A goal is required.");
     if (participantSeatIds.some((id) => !team.seats.some((seat) => seat.id === id))) throw new Error("A participant seat is not in Yahaha.");
     const id = planningId();
     const root = await this.chat.post(channelId, `**Planning goal ${id} — Chick**\n${goalText}\n\nReply here to clarify. Send /proposal in this thread to request a draft for review.`);
     const now = new Date().toISOString();
     const goal: PlanningGoal = { id, teamId: team.id, seatId: seat.id, participantSeatIds, goal: goalText, projectRefs, stage: "clarifying", createdAt: now, updatedAt: now, mattermost: { channelId, rootPostId: root.id }, brief: { summary: goalText, decisions: [], openQuestions: [] } };
-    try { await this.store.update((state) => { state.planningGoals = [...(state.planningGoals ?? []), goal]; }); }
+    try { await this.store.update((state) => { state.planningGoals = [...(state.planningGoals ?? []), goal]; }, `Start planning goal ${id}`); }
     catch (error) { throw new Error(`Planning root post ${root.id} was created, but state persistence failed; inspect that post and retry after repair.`, { cause: error }); }
     const metadata: RuntimeRecord = { lastSeenAt: Math.max(0, root.create_at - 5000), processedPostIds: [root.id], runs: [] };
     await this.store.saveRuntime(id, metadata);
@@ -78,7 +81,7 @@ export class PlanningBridge {
     metadata.runs.push({ startedAt: run.startedAt, finishedAt: run.finishedAt, usage: run.usage });
     await this.store.saveRuntime(id, metadata);
     const update = brief(run.response);
-    await this.store.update((state) => { const found = state.planningGoals!.find((item) => item.id === id)!; found.brief = { summary: update.summary, decisions: update.decisions, openQuestions: update.openQuestions }; found.updatedAt = new Date().toISOString(); });
+    await this.store.update((state) => { const found = state.planningGoals!.find((item) => item.id === id)!; found.brief = { summary: update.summary, decisions: update.decisions, openQuestions: update.openQuestions }; found.updatedAt = new Date().toISOString(); }, `Update brief for goal ${id}`);
     metadata.pending = { inputPostId: root.id, since: root.create_at, message: update.reply };
     await this.store.saveRuntime(id, metadata);
     await this.deliver(goal, metadata);
@@ -124,7 +127,7 @@ export class PlanningBridge {
       return;
     }
     const drafting = post.message.trim() === "/proposal";
-    if (drafting) await this.store.update((state) => { const found = state.planningGoals!.find((item) => item.id === id)!; found.stage = "drafting"; found.updatedAt = new Date().toISOString(); });
+    if (drafting) await this.store.update((state) => { const found = state.planningGoals!.find((item) => item.id === id)!; found.stage = "drafting"; found.updatedAt = new Date().toISOString(); }, `Start drafting a proposal for goal ${id}`);
     const developers = drafting ? developerSeats(await this.store.read(), goal.teamId).map((seat) => ({ id: seat.id, displayName: seat.displayName ?? seat.id })) : [];
     const run = await this.runtime.message(prompt(goal, post.message, drafting, developers), drafting ? proposalSchema : briefSchema, metadata.sessionId);
     metadata.sessionId = run.sessionId;
@@ -132,11 +135,11 @@ export class PlanningBridge {
     await this.store.saveRuntime(id, metadata);
     if (drafting) {
       const draft = proposal(run.response, developers);
-      await this.store.update((state) => { const found = state.planningGoals!.find((item) => item.id === id)!; found.proposal = draft; found.stage = "awaiting-review"; found.updatedAt = new Date().toISOString(); });
+      await this.store.update((state) => { const found = state.planningGoals!.find((item) => item.id === id)!; found.proposal = draft; found.stage = "awaiting-review"; found.updatedAt = new Date().toISOString(); }, `Draft proposal for goal ${id}: ${draft.outcomes.length} outcome${draft.outcomes.length === 1 ? "" : "s"}`);
       metadata.pending = { inputPostId: post.id, since: post.create_at, message: proposalMessage({ ...goal, proposal: draft }, teamSeats(await this.store.read(), goal.teamId)) };
     } else {
       const update = brief(run.response);
-      await this.store.update((state) => { const found = state.planningGoals!.find((item) => item.id === id)!; found.brief = { summary: update.summary, decisions: update.decisions, openQuestions: update.openQuestions }; found.updatedAt = new Date().toISOString(); });
+      await this.store.update((state) => { const found = state.planningGoals!.find((item) => item.id === id)!; found.brief = { summary: update.summary, decisions: update.decisions, openQuestions: update.openQuestions }; found.updatedAt = new Date().toISOString(); }, `Update brief for goal ${id}`);
       metadata.pending = { inputPostId: post.id, since: post.create_at, message: update.reply };
     }
     await this.store.saveRuntime(id, metadata);
@@ -167,7 +170,7 @@ export class PlanningBridge {
           found.updatedAt = now;
         }
         approved = structuredClone(found);
-      });
+      }, () => `Approve goal ${id}: ${approved.assignments?.length ?? 0} assignment${approved.assignments?.length === 1 ? "" : "s"}`);
       message = approvalMessage(approved, seats);
     }
     metadata.pending = { inputPostId: post.id, since: post.create_at, message };
