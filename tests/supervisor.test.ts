@@ -241,9 +241,10 @@ async function retryFixture(goals = [failedGoal()]) {
 }
 
 describe("failed assignment retries", () => {
-  it("offers the newest eligible failure for each Developer, skipping other statuses and closed sprints", async () => {
+  it("offers the newest eligible failure for each Developer, skipping other statuses and missing or closed sprints", async () => {
     const old = failedGoal("goal-old", "2026-01-01T00:00:00Z");
-    delete old.integration; // Goals approved before sprint branches also remain retryable.
+    const legacy = failedGoal("goal-legacy", "2026-01-07T00:00:00Z");
+    delete legacy.integration; // A legacy goal would target main, so it cannot be retried.
     const newest = failedGoal();
     newest.proposal!.outcomes.push({ id: "outcome-2", title: "Newer failure", description: "Fix it", seatId: "seat-002" });
     newest.assignments!.push({ outcomeId: "outcome-2", seatId: "seat-002", status: "failed", updatedAt: "2026-01-03T00:00:00Z" });
@@ -258,7 +259,7 @@ describe("failed assignment retries", () => {
       goal.assignments![0].status = status;
       return goal;
     });
-    const { supervisor } = await retryFixture([old, newest, closed, other, lead, ...active]);
+    const { supervisor } = await retryFixture([old, newest, closed, other, lead, legacy, ...active]);
     const live = await supervisor.read();
     expect(live["seat-002"].retry).toEqual({ seatId: "seat-002", goalId: "goal-retry", goal: "Fix the terminal", outcomeId: "outcome-2", title: "Newer failure", updatedAt: "2026-01-03T00:00:00Z" });
     expect(live["seat-003"].retry?.goalId).toBe("goal-other");
@@ -300,6 +301,16 @@ describe("failed assignment retries", () => {
     await expect(supervisor.retry(target)).rejects.toThrow("changed since confirmation");
     expect((await store.read()).planningGoals![0].assignments![0].status).toBe("failed");
     await expect(supervisor.retry((await supervisor.read())["seat-002"].retry!)).resolves.toContain("Re-queued");
+  });
+
+  it("refuses a confirmation whose sprint integration was removed instead of queuing work on main", async () => {
+    const { store, supervisor, target, dir } = await retryFixture();
+    await store.update((state) => { delete state.planningGoals![0].integration; }, "Remove sprint integration");
+    const head = git(dir, "rev-parse", "HEAD");
+    await expect(supervisor.retry(target)).rejects.toThrow("no sprint integration branch");
+    expect(git(dir, "rev-parse", "HEAD")).toBe(head);
+    expect((await supervisor.read())["seat-002"].retry).toBeUndefined();
+    expect((await store.read()).planningGoals![0].assignments![0].status).toBe("failed");
   });
 
   it.each(["pr-open", "merged", "reverted"] as const)("refuses retries once sprint integration is %s", async (status) => {

@@ -67,7 +67,7 @@ function holdsWork(state: PlanningDocument, seatId: string): boolean {
 
 function newestFailedAssignment(state: PlanningDocument, seatId: string): AssignmentRetry | undefined {
   return (state.planningGoals ?? [])
-    .filter((goal) => goal.stage === "approved" && (goal.integration?.status ?? "collecting") === "collecting" && developerSeats(state, goal.teamId).some((seat) => seat.id === seatId))
+    .filter((goal) => goal.stage === "approved" && goal.integration?.status === "collecting" && developerSeats(state, goal.teamId).some((seat) => seat.id === seatId))
     .flatMap((goal) => (goal.assignments ?? []).filter((item) => item.seatId === seatId && item.status === "failed").map((assignment) => ({
       seatId, goalId: goal.id, goal: goal.goal, outcomeId: assignment.outcomeId,
       title: goal.proposal!.outcomes.find((item) => item.id === assignment.outcomeId)!.title, updatedAt: assignment.updatedAt,
@@ -169,7 +169,8 @@ export class Supervisor implements SeatProcessPort {
         const goal = state.planningGoals?.find((item) => item.id === target.goalId);
         if (!goal || goal.stage !== "approved") throw new Error(`Goal ${target.goalId} is no longer approved or available.`);
         if (!developerSeats(state, goal.teamId).some((seat) => seat.id === target.seatId)) throw new Error(`Seat ${target.seatId} is not a Developer on this goal's team.`);
-        if (goal.integration && goal.integration.status !== "collecting") throw new Error(`Sprint ${goal.id} is ${goal.integration.status}; it no longer accepts retries.`);
+        if (!goal.integration) throw new Error(`Goal ${goal.id} has no sprint integration branch; it cannot be retried.`);
+        if (goal.integration.status !== "collecting") throw new Error(`Sprint ${goal.id} is ${goal.integration.status}; it no longer accepts retries.`);
         const assignment = goal.assignments?.find((item) => item.outcomeId === target.outcomeId);
         if (!assignment || assignment.seatId !== target.seatId) throw new Error(`Assignment ${goal.id}/${target.outcomeId} is no longer assigned to ${target.seatId}.`);
         if (assignment.status !== "failed") throw new Error(`Assignment ${goal.id}/${target.outcomeId} is ${assignment.status}, not failed; nothing re-queued.`);
