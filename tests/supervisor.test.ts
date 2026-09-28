@@ -102,6 +102,29 @@ describe("seat process supervisor", () => {
     expect(tmux.launches()).toHaveLength(4);
   });
 
+  it("stages the service account credential once before hosting, and retries it on restart after a failure", async () => {
+    const { dir, tmux } = await fixture();
+    const order: string[] = [];
+    tmux.onStart = async (session, nonce) => { order.push(session.split("-")[0]); await signalReady(dir, nonce); };
+    let staged = 0;
+    const ok = new Supervisor(dir, tmux, dir, 1000, undefined, async () => { staged++; order.push("stage"); });
+    expect(await ok.ensureAll()).toEqual([]);
+    await ok.ensureAll();
+    await ok.restart("seat-002");
+    expect(staged).toBe(1);
+    expect(order[0]).toBe("stage");
+
+    const fresh = await fixture();
+    let attempts = 0;
+    const failing = new Supervisor(fresh.dir, fresh.tmux, fresh.dir, 1000, undefined, async () => { if (++attempts === 1) throw new Error("1Password could not supply the service account token"); });
+    expect(await failing.ensureAll()).toEqual(["1Password could not supply the service account token"]);
+    expect(fresh.tmux.launches()).toHaveLength(3);
+    await failing.restart("seat-002");
+    expect(attempts).toBe(2);
+    await failing.restart("seat-002");
+    expect(attempts).toBe(2);
+  });
+
   it("shows a seat without a bot credential as no credential and keeps the others running", async () => {
     const { dir, tmux, supervisor } = await fixture();
     tmux.onStart = async (session, nonce) => { await signalReady(dir, nonce, session.startsWith("dev-seat-003") ? "no-credential" : undefined); };
