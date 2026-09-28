@@ -28,7 +28,9 @@ const ACTIVE = new Set<Assignment["status"]>(["running", "in-review"]);
 const MAX_CONFLICT_ROUNDS = 2;
 /** Clean or conflicting merges of main per CI step, so a fast-moving main cannot keep a seat busy forever. */
 const MAX_MAIN_UPDATES = 4;
-const CONFLICT_NOTE = "merge conflict with main could not be resolved";
+const conflictNote = (base: string) => `merge conflict with ${base} could not be resolved`;
+/** A sprint's PRs target its integration branch; a goal approved before sprints existed targets main. */
+export const baseBranch = (goal: PlanningGoal) => goal.integration?.branch ?? "main";
 // gh supplies the credential for one command; Git's configuration is never changed.
 const GH_CREDENTIAL = ["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential"];
 
@@ -62,7 +64,8 @@ export class DeveloperSeat {
     const mine = goals.flatMap((goal) => (goal.assignments ?? []).filter((item) => item.seatId === this.seat.id).map((assignment) => ({ goal, assignment })));
     const active = mine.find((item) => ACTIVE.has(item.assignment.status));
     if (active) { await this.resume(active.goal, active.assignment); return "worked"; }
-    const next = mine.filter((item) => item.assignment.status === "queued").sort((a, b) => a.assignment.updatedAt.localeCompare(b.assignment.updatedAt) || a.goal.createdAt.localeCompare(b.goal.createdAt))[0];
+    // Once a sprint's integration PR is open, its queued outcomes are skipped: nothing more lands in its branch.
+    const next = mine.filter((item) => item.assignment.status === "queued" && (item.goal.integration?.status ?? "collecting") === "collecting").sort((a, b) => a.assignment.updatedAt.localeCompare(b.assignment.updatedAt) || a.goal.createdAt.localeCompare(b.goal.createdAt))[0];
     if (!next) return "idle";
     const { goal, assignment } = next;
     await this.store.update((state) => {
@@ -91,16 +94,19 @@ export class DeveloperSeat {
 
   private async work(goal: PlanningGoal, record: SeatTaskRecord): Promise<void> {
     const outcome = this.outcome(goal, record.outcomeId);
+    const base = baseBranch(goal);
     try {
       if (record.step === "worktree") {
-        const project = await ensureProjectCheckout(this.shell, this.store.runtimeDir, await this.github(goal));
+        const project = await ensureProjectCheckout(this.shell, this.store.runtimeDir, await this.github(goal), base);
         record.gitDir = (await this.sh("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], project)).stdout.trim();
-        await this.sh("git", ["worktree", "add", "--no-track", "-b", record.branch, record.worktree, "origin/main"], project);
+        await this.sh("git", ["worktree", "add", "--no-track", "-b", record.branch, record.worktree, `origin/${base}`], project);
         await this.advance(record, "build");
       }
       if (record.step === "build") {
-        const run = await this.codex("developer", record, { extraDirs: [record.gitDir!] }, buildPrompt(this.seat, goal, outcome, record.branch), developerSchema);
+        const run = await this.codex("developer", record, { extraDirs: [record.gitDir!] }, buildPrompt(this.seat, goal, outcome, record.branch, base), developerSchema);
         const prUrl = prUrlFrom(run.response);
+        // The seat's PR merges into its sprint branch whatever base the session chose, never into main.
+        if (base !== "main") await this.sh("gh", ["pr", "edit", prUrl, "--base", base], record.worktree);
         record.prUrl = prUrl;
         await this.advance(record, "review");
         await this.setStatus(goal.id, record.outcomeId, { status: "in-review", prUrl });
@@ -122,7 +128,7 @@ export class DeveloperSeat {
         const project = projectCheckoutPath(this.store.runtimeDir, await this.github(goal));
         const state = (await this.sh("gh", ["pr", "view", record.prUrl!, "--json", "state", "--jq", ".state"], project)).stdout.trim();
         if (state !== "MERGED") {
-          // Another seat's PR may have merged first: bring main in before CI, and again when a merge fails.
+          // Another seat's PR may have merged first: bring the base branch in before CI, and again when a merge fails.
           let updates = await this.updateFromMain(goal, outcome, record, project) ? 1 : 0;
           for (;;) {
             const checks = await this.shell.run("gh", ["pr", "checks", record.prUrl!, "--watch"], record.worktree);
@@ -198,31 +204,32 @@ export class DeveloperSeat {
   }
 
   /**
-   * When the PR is behind or conflicting with main, merges the fetched origin/main into the seat's own
-   * branch in its own worktree (never a rebase or force-push) and pushes that branch. Conflicts get one
-   * Codex fix session per round, at most MAX_CONFLICT_ROUNDS per assignment. Returns true when it pushed,
-   * so CI must run again.
+   * When the PR is behind or conflicting with its base (the sprint branch, or main for a goal without one), merges
+   * the fetched base into the seat's own branch in its own worktree (never a rebase or force-push) and pushes that
+   * branch. Conflicts get one Codex fix session per round, at most MAX_CONFLICT_ROUNDS per assignment. Returns true
+   * when it pushed, so CI must run again.
    */
   private async updateFromMain(goal: PlanningGoal, outcome: ApprovedOutcome, record: SeatTaskRecord, project: string): Promise<boolean> {
     if (await this.mainStatus(record.prUrl!, project) === "current") return false;
+    const base = baseBranch(goal);
     for (;;) {
-      await ensureProjectCheckout(this.shell, this.store.runtimeDir, await this.github(goal));
-      const merged = await this.shell.run("git", ["merge", "--no-edit", "origin/main"], record.worktree);
+      await ensureProjectCheckout(this.shell, this.store.runtimeDir, await this.github(goal), base);
+      const merged = await this.shell.run("git", ["merge", "--no-edit", `origin/${base}`], record.worktree);
       if (merged.code === 0) break;
       const rounds = record.conflictRounds ?? 0;
       if (rounds >= MAX_CONFLICT_ROUNDS) {
         await this.shell.run("git", ["merge", "--abort"], record.worktree);
-        throw new SeatError(CONFLICT_NOTE);
+        throw new SeatError(conflictNote(base));
       }
       record.conflictRounds = rounds + 1;
       await this.save(record);
-      await this.say(goal, `${record.prUrl} conflicts with main; resolving (round ${record.conflictRounds} of ${MAX_CONFLICT_ROUNDS}).`);
-      await this.codex("fix", record, { extraDirs: [record.gitDir!] }, conflictPrompt(outcome, record.prUrl!, record.branch), developerSchema);
-      // Resolved means the merge is committed: origin/main is now an ancestor of HEAD.
-      const resolved = await this.shell.run("git", ["merge-base", "--is-ancestor", "origin/main", "HEAD"], record.worktree);
+      await this.say(goal, `${record.prUrl} conflicts with ${base}; resolving (round ${record.conflictRounds} of ${MAX_CONFLICT_ROUNDS}).`);
+      await this.codex("fix", record, { extraDirs: [record.gitDir!] }, conflictPrompt(outcome, record.prUrl!, record.branch, base), developerSchema);
+      // Resolved means the merge is committed: the base is now an ancestor of HEAD.
+      const resolved = await this.shell.run("git", ["merge-base", "--is-ancestor", `origin/${base}`, "HEAD"], record.worktree);
       if (resolved.code === 0) break;
       await this.shell.run("git", ["merge", "--abort"], record.worktree);
-      if (record.conflictRounds >= MAX_CONFLICT_ROUNDS) throw new SeatError(CONFLICT_NOTE);
+      if (record.conflictRounds >= MAX_CONFLICT_ROUNDS) throw new SeatError(conflictNote(base));
     }
     await this.sh("git", [...GH_CREDENTIAL, "push", "origin", `HEAD:refs/heads/${record.branch}`], record.worktree);
     return true;
@@ -285,10 +292,10 @@ function findingsFrom(response: unknown): string[] {
   return (findings as string[]).filter((item) => item.trim());
 }
 
-function buildPrompt(seat: SeatIdentity, goal: PlanningGoal, outcome: ApprovedOutcome, branch: string): string {
-  return `You are ${seat.displayName}, a Developer seat in Indra, working one approved outcome in this git worktree (branch ${branch}, created from origin/main).
+function buildPrompt(seat: SeatIdentity, goal: PlanningGoal, outcome: ApprovedOutcome, branch: string, base: string): string {
+  return `You are ${seat.displayName}, a Developer seat in Indra, working one approved outcome in this git worktree (branch ${branch}, created from origin/${base}).
 Follow the repository's AGENTS.md: use its feedback loop, run the targeted tests and checks it lists once each, and keep the change to this outcome only.
-When done: commit, push with \`git push -u origin HEAD:refs/heads/${branch}\`, and open a pull request against main with \`gh pr create\`. Do not merge. Never put credentials in commands, files or output.
+When done: commit, push with \`git push -u origin HEAD:refs/heads/${branch}\`, and open a pull request against ${base} with \`gh pr create --base ${base}\`. Do not merge. Never put credentials in commands, files or output.
 Return only JSON: prUrl (the PR's https://github.com/... URL) and summary (one or two sentences).
 Goal: ${goal.goal}
 Outcome ${outcome.id}: ${outcome.title}
@@ -318,9 +325,9 @@ Findings:
 ${findings.map((item) => `- ${item}`).join("\n")}`;
 }
 
-function conflictPrompt(outcome: ApprovedOutcome, prUrl: string, branch: string): string {
-  return `You are a Developer seat in Indra. Merging origin/main into this worktree (branch ${branch}, PR ${prUrl}) stopped with conflicts; the merge is in progress.
-Resolve every conflict keeping the intent of both sides: main's changes and this PR's outcome. Do not rebase, reset, force-push or abort the merge.
+function conflictPrompt(outcome: ApprovedOutcome, prUrl: string, branch: string, base: string): string {
+  return `You are a Developer seat in Indra. Merging origin/${base} into this worktree (branch ${branch}, PR ${prUrl}) stopped with conflicts; the merge is in progress.
+Resolve every conflict keeping the intent of both sides: ${base}'s changes and this PR's outcome. Do not rebase, reset, force-push or abort the merge.
 Run the same targeted tests and checks from AGENTS.md that cover this PR's change, once each, then commit the merge with \`git commit --no-edit\`. Do not push or merge; Indra pushes the branch.
 Return only JSON: prUrl (${prUrl}) and summary.
 Outcome ${outcome.id}: ${outcome.title}

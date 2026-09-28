@@ -34,7 +34,10 @@ export interface GoalStarter {
   approve(goalId: string): Promise<string>;
   /** Requests Chick's proposal for a clarifying goal as the owner and returns a one-line result for the screen. */
   propose(goalId: string): Promise<string>;
+  /** The owner's sprint actions on an approved goal: open its integration PR, merge its open integration or revert PR, or roll it back. */
+  sprint?(action: SprintAction, goalId: string): Promise<string>;
 }
+export type SprintAction = "integrate" | "merge" | "rollback";
 
 /** Newest progress post a Developer seat made in its goal thread; kept in `<state-checkout>.runtime`. */
 export const activityRecordName = (seatId: string) => `activity-${seatId}`;
@@ -208,6 +211,11 @@ export class CliGoalStarter implements GoalStarter {
 
   async propose(goalId: string): Promise<string> {
     return await this.run(["planning", "propose", "--state", resolve(this.checkout), "--goal", goalId], 5 * 60_000) || `Requested a proposal for goal ${goalId}.`;
+  }
+
+  async sprint(action: SprintAction, goalId: string): Promise<string> {
+    // A rollback may clone the project first.
+    return await this.run(["planning", action, "--state", resolve(this.checkout), "--goal", goalId], action === "rollback" ? 30 * 60_000 : 5 * 60_000) || `Ran planning ${action} for goal ${goalId}.`;
   }
 }
 

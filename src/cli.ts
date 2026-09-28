@@ -127,9 +127,14 @@ export async function runConsistencyCheck(state: StateInventory, reader: TeamMem
   return printConsistency(reports, timestamp(), write) > 0 ? 1 : 0;
 }
 
-type Options = { mode: "help" } | { mode: "seat"; seatId: string; checkout: string; readyNonce?: string } | { mode: "state"; checkout: string; once: boolean } | { mode: "ui"; checkout: string } | { mode: "mattermost"; slug: string } | { mode: "mattermost"; checkout: string; once: boolean } | { mode: "planning"; action: "start" | "serve" | "host" | "status" | "approve" | "propose"; checkout: string; goal?: string; participants: string[]; readyNonce?: string };
+/** Planning actions on one existing goal, each taking `--goal GOAL_ID`. */
+const GOAL_ACTIONS = ["approve", "propose", "integrate", "merge", "rollback"] as const;
+type GoalAction = typeof GOAL_ACTIONS[number];
+const isGoalAction = (action: string | undefined): action is GoalAction => (GOAL_ACTIONS as readonly (string | undefined)[]).includes(action);
 
-const usage = "Usage: npm start -- [--state PATH] [--once] | --ui [--state PATH] | --mattermost [--state PATH] [--once] | --mattermost --team SLUG | planning start --goal TEXT [--participant SEAT_ID] [--state PATH] | planning propose|approve --goal GOAL_ID [--state PATH] | planning serve|host|status [--state PATH] | seat run --seat SEAT_ID [--state PATH]\nPlanning serves only Chick's Yahaha thread, in the team's home channel and project from state. Reply in the thread to clarify; react :memo: on Chick's goal post to request a draft, and :white_check_mark: on the proposal post to approve it.";
+type Options = { mode: "help" } | { mode: "seat"; seatId: string; checkout: string; readyNonce?: string } | { mode: "state"; checkout: string; once: boolean } | { mode: "ui"; checkout: string } | { mode: "mattermost"; slug: string } | { mode: "mattermost"; checkout: string; once: boolean } | { mode: "planning"; action: "start" | "serve" | "host" | "status" | GoalAction; checkout: string; goal?: string; participants: string[]; readyNonce?: string };
+
+const usage = "Usage: npm start -- [--state PATH] [--once] | --ui [--state PATH] | --mattermost [--state PATH] [--once] | --mattermost --team SLUG | planning start --goal TEXT [--participant SEAT_ID] [--state PATH] | planning propose|approve|integrate|merge|rollback --goal GOAL_ID [--state PATH] | planning serve|host|status [--state PATH] | seat run --seat SEAT_ID [--state PATH]\nPlanning serves only Chick's Yahaha thread, in the team's home channel and project from state. Reply in the thread to clarify; react :memo: on Chick's goal post to request a draft, and :white_check_mark: on the proposal post to approve it.\nEach approved goal is a sprint on branch sprint/GOAL_ID; its seats' PRs target that branch, and one integration PR takes it into main. integrate opens that PR for what merged, merge merges the open integration or revert PR once CI is green, and rollback opens a PR on main reverting the merged sprint.";
 
 export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_REPO): Options {
   if (args.length === 1 && (args[0] === "--help" || args[0] === "-h")) return { mode: "help" };
@@ -150,7 +155,7 @@ export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_
   }
   if (args[0] === "planning") {
     const action = args[1];
-    if (action !== "start" && action !== "serve" && action !== "host" && action !== "status" && action !== "approve" && action !== "propose") throw new StateDataError(usage);
+    if (action !== "start" && action !== "serve" && action !== "host" && action !== "status" && !isGoalAction(action)) throw new StateDataError(usage);
     let checkout: string | undefined; let goal: string | undefined; let readyNonce: string | undefined;
     const participants: string[] = [];
     for (let index = 2; index < args.length; index++) {
@@ -162,7 +167,7 @@ export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_
       else if (key === "--ready-nonce" && !readyNonce && action === "serve" && /^[a-f0-9-]{36}$/.test(value)) readyNonce = value;
       else throw new StateDataError(usage);
     }
-    if ((action === "start" || action === "approve" || action === "propose") !== !!goal) throw new StateDataError(usage);
+    if ((action === "start" || isGoalAction(action)) !== !!goal) throw new StateDataError(usage);
     const projectRoot = appRootOf(import.meta.url);
     return { mode: "planning", action, checkout: resolve(checkout || stateEnv || resolve(projectRoot, "..", "indra-state")), goal, participants, ...(readyNonce ? { readyNonce } : {}) };
   }
@@ -290,6 +295,19 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
           await joinTeamHome(options.checkout, undefined, store, chat, CHICK_USERNAME);
           const { goal, alreadyApproved } = await new PlanningBridge(store, chat, new CodexRuntime(process.cwd())).approve(options.goal!);
           console.log(alreadyApproved ? `Goal ${goal.id} was already approved; no new assignments.` : `Approved goal ${goal.id}: ${goal.assignments?.length ?? 0} outcome(s) queued for Developer seats.`);
+          return 0;
+        } catch (error) {
+          console.error(`Planning error: ${error instanceof Error ? error.message : String(error)}`);
+          return 1;
+        }
+      }
+      if (options.action === "integrate" || options.action === "merge" || options.action === "rollback") {
+        // Run by the terminal UI, like approve: Chick's token only with the staged service account token.
+        try {
+          const chat = new MattermostPlanningChat(await readChickToken({ serviceToken: await readServiceToken(options.checkout), headless: true }), CHICK_USERNAME);
+          await joinTeamHome(options.checkout, undefined, store, chat, CHICK_USERNAME);
+          const bridge = new PlanningBridge(store, chat, new CodexRuntime(process.cwd()));
+          console.log(await (options.action === "integrate" ? bridge.integrate(options.goal!) : options.action === "merge" ? bridge.merge(options.goal!) : bridge.rollback(options.goal!)));
           return 0;
         } catch (error) {
           console.error(`Planning error: ${error instanceof Error ? error.message : String(error)}`);

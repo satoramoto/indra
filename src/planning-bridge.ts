@@ -2,7 +2,9 @@ import { randomUUID } from "node:crypto";
 import type { AgentRuntime } from "./codex-runtime.js";
 import { schemaPathOf } from "./reload.js";
 import { planningId } from "./codex-runtime.js";
-import { PlanningStore, developerSeats, requireTeamHome, validateOutcomeSeats, type PlanningDocument, type PlanningGoal, type RuntimeRecord } from "./planning.js";
+import { PlanningStore, developerSeats, missingTeamMessage, requireTeamHome, teamProject, validateOutcomeSeats, type MergeKind, type PlanningDocument, type PlanningGoal, type RuntimeRecord, type SprintIntegration } from "./planning.js";
+import { processShell, type Shell } from "./developer-seat.js";
+import { SprintGitHub, sprintBranch } from "./sprint.js";
 
 export interface Post { id: string; user_id: string; channel_id: string; root_id: string; message: string; create_at: number; props?: { indra_delivery_id?: string } }
 export interface Reaction { user_id: string; post_id: string; emoji_name: string; create_at: number }
@@ -54,7 +56,28 @@ function proposalMessage(goal: PlanningGoal, seats: Map<string, string>): string
 }
 function approvalMessage(goal: PlanningGoal, seats: Map<string, string>): string {
   const titles = new Map(goal.proposal!.outcomes.map((item) => [item.id, item.title]));
-  return `**Proposal ${goal.proposal!.id} approved**\n${(goal.assignments ?? []).map((item) => `- ${titles.get(item.outcomeId) ?? item.outcomeId} → ${seatLabel(seats, item.seatId)}`).join("\n")}\n\nRecorded in indra-state as ${goal.id}. Each outcome is queued for its Developer seat.`;
+  return `**Proposal ${goal.proposal!.id} approved**\n${(goal.assignments ?? []).map((item) => `- ${titles.get(item.outcomeId) ?? item.outcomeId} → ${seatLabel(seats, item.seatId)}`).join("\n")}\n\nRecorded in indra-state as ${goal.id}. Each outcome is queued for its Developer seat.${goal.integration ? ` Their PRs target \`${goal.integration.branch}\`; once every outcome merges, Chick opens one PR from it into main.` : ""}`;
+}
+function outcomeLines(goal: PlanningGoal, seats: Map<string, string>): { merged: string[]; missed: string[] } {
+  const titles = new Map(goal.proposal!.outcomes.map((item) => [item.id, item.title]));
+  const merged: string[] = []; const missed: string[] = [];
+  for (const item of goal.assignments ?? []) {
+    const head = `**${titles.get(item.outcomeId) ?? item.outcomeId}** → ${seatLabel(seats, item.seatId)}`;
+    if (item.status === "merged") merged.push(`- ${head}: ${item.prUrl ?? "merged"}`);
+    else missed.push(`- ${head}: ${item.status === "failed" ? `failed${item.note ? ` (${item.note})` : ""}` : `skipped (${item.status})`}${item.prUrl ? ` ${item.prUrl}` : ""}`);
+  }
+  return { merged, missed };
+}
+/** The integration PR's body: the goal, each outcome with its seat and PR, and what failed or was skipped. */
+function sprintSummary(goal: PlanningGoal, seats: Map<string, string>): string {
+  const { merged, missed } = outcomeLines(goal, seats);
+  return `Sprint integration for planning goal ${goal.id}.\n\n**Goal:** ${goal.goal}\n\n**Outcomes**\n${merged.join("\n") || "- none"}${missed.length ? `\n\n**Failed or skipped**\n${missed.join("\n")}` : ""}\n\nMerging this PR lands the whole sprint on main; \`planning rollback --goal ${goal.id}\` reverts it as a unit.`;
+}
+function integrationMessage(goal: PlanningGoal, prUrl: string): string {
+  return `**Sprint ${goal.id} is ready: ${prUrl}**\nThis PR takes \`${sprintBranch(goal.id)}\` into main. To merge the sprint once its CI is green, a person reacts :${APPROVE_EMOJI}: on this post (or the owner presses M in Chick's detail).`;
+}
+function revertMessage(goal: PlanningGoal, prUrl: string): string {
+  return `**Rollback of sprint ${goal.id}: ${prUrl}**\nThis PR on main reverts the sprint's merge commit ${goal.integration!.mergedSha!.slice(0, 7)}. To merge the revert once its CI is green, a person reacts :${APPROVE_EMOJI}: on this post (or the owner presses M in Chick's detail).`;
 }
 function nothingToApprove(goal: PlanningGoal): string {
   return `Nothing to approve: goal ${goal.id} is at the ${goal.stage} stage. :${APPROVE_EMOJI}: approves only Chick's proposal post while it awaits review${goal.stage === "clarifying" ? `; react :${PROPOSE_EMOJI}: on the goal post to request one` : ""}.`;
@@ -76,7 +99,11 @@ function prompt(goal: PlanningGoal, input: string, drafting: boolean, developers
 /** One process serializes each seat. Poll cursors, handled posts and handled reactions survive restart. */
 export class PlanningBridge {
   private readonly busy = new Map<string, Promise<void>>();
-  constructor(private readonly store: PlanningStore, private readonly chat: PlanningChat, private readonly runtime: AgentRuntime, private readonly maxQueue = 20) {}
+  private readonly github: SprintGitHub;
+  /** `shell` runs gh and git for the sprint's integration branch, PR, merge and rollback. */
+  constructor(private readonly store: PlanningStore, private readonly chat: PlanningChat, private readonly runtime: AgentRuntime, private readonly maxQueue = 20, shell: Shell = processShell) {
+    this.github = new SprintGitHub(shell, store.runtimeDir);
+  }
 
   /** Opens the thread in the team's home channel and records the team's project on the goal; both come from state. */
   async start(goalText: string, participantSeatIds: string[] = []): Promise<PlanningGoal> {
@@ -132,6 +159,143 @@ export class PlanningBridge {
     for (const { reaction, key } of reactions) await this.enqueue(goal.seatId, () => this.react(goal.id, reaction, key));
     // After the reactions, so a 📝 and a `planning propose` seen in the same poll draft once.
     if (budget > 0 && (await this.store.runtime(goal.id)).proposalRequest) await this.enqueue(goal.seatId, () => this.ownerProposal(goal.id));
+    // A GitHub problem is logged and retried on the next poll; it never stops the bridge.
+    if (current?.stage === "approved" && current.integration?.status === "collecting") {
+      try { await this.enqueue(goal.seatId, () => this.sprintProgress(goal.id)); }
+      catch (error) { console.error(`Sprint ${goal.id}: ${error instanceof Error ? error.message : String(error)}`); }
+    }
+  }
+
+  /**
+   * Opens the integration PR once every assignment merged, or, once each has either merged or failed, posts once
+   * that the owner can still open it for what merged (`planning integrate`, I in the terminal UI).
+   */
+  private async sprintProgress(id: string): Promise<void> {
+    const state = await this.store.read();
+    const goal = state.planningGoals?.find((item) => item.id === id);
+    if (!goal?.integration || goal.integration.status !== "collecting" || !goal.assignments?.length) return;
+    const metadata = await this.store.runtime(id);
+    if (metadata.pending) await this.deliver(goal, metadata);
+    const statuses = goal.assignments.map((item) => item.status);
+    if (statuses.every((status) => status === "merged")) { await this.openIntegration(goal, metadata); return; }
+    const key = `sprint-incomplete:${id}`;
+    if (!statuses.every((status) => status === "merged" || status === "failed") || metadata.processedPostIds.includes(key)) return;
+    const { merged, missed } = outcomeLines(goal, teamSeats(state, goal.teamId));
+    metadata.pending = { inputPostId: key, since: Date.now(), message: `**Sprint ${id} is not complete**\n${missed.join("\n")}\n\n${merged.length ? `${merged.length} outcome(s) merged into \`${goal.integration.branch}\`. The owner can still open the integration PR for what merged: press I in Chick's detail (\`planning integrate --goal ${id}\`).` : "Nothing merged, so there is no integration PR to open."}` };
+    await this.store.saveRuntime(id, metadata);
+    await this.deliver(goal, metadata);
+  }
+
+  /** Opens (or finds) the one PR from the sprint branch into main, records it and posts it in the thread as the merge post. */
+  private async openIntegration(goal: PlanningGoal, metadata: RuntimeRecord): Promise<string> {
+    const state = await this.store.read();
+    const github = this.project(state, goal);
+    const prUrl = await this.github.openPr(github, goal.integration!.branch, `Sprint ${goal.id}: ${goal.goal}`.slice(0, 200), sprintSummary(goal, teamSeats(state, goal.teamId)));
+    await this.store.update((doc) => {
+      const found = doc.planningGoals!.find((item) => item.id === goal.id)!;
+      if (found.integration?.status === "collecting") { found.integration = { ...found.integration, status: "pr-open", prUrl }; found.updatedAt = new Date().toISOString(); }
+    }, `Open integration PR for goal ${goal.id}`);
+    metadata.pending = { inputPostId: `integration-pr:${goal.id}`, since: Date.now(), message: integrationMessage(goal, prUrl), mergePost: "integration" };
+    await this.store.saveRuntime(goal.id, metadata);
+    await this.deliver(goal, metadata);
+    return prUrl;
+  }
+
+  private project(state: PlanningDocument, goal: PlanningGoal): string {
+    const github = teamProject(state, goal.teamId);
+    if (!github) throw new Error(missingTeamMessage(goal.teamId, ["project.github"]));
+    return github;
+  }
+
+  /**
+   * The owner's `planning integrate` (I in the terminal UI): opens the integration PR for what merged when some
+   * outcomes failed or are still queued. Refused while a seat is still running or reviewing one. Repeating it finds the same PR.
+   */
+  async integrate(id: string): Promise<string> {
+    return await this.store.withGoalLock(id, async () => {
+      const goal = this.approvedGoal((await this.store.read()).planningGoals?.find((item) => item.id === id), id);
+      const integration = goal.integration!;
+      if (integration.status !== "collecting") return `Sprint ${id} is ${integration.status}${integration.prUrl ? `: ${integration.prUrl}` : ""}; nothing to open.`;
+      const assignments = goal.assignments ?? [];
+      if (assignments.some((item) => item.status === "running" || item.status === "in-review")) throw new Error(`A seat is still working on goal ${id}; open the integration PR once no outcome is running or in review.`);
+      if (!assignments.some((item) => item.status === "merged")) throw new Error(`Nothing merged into ${integration.branch}; there is no sprint to integrate.`);
+      const metadata = await this.store.runtime(id);
+      if (metadata.pending) await this.deliver(goal, metadata);
+      return `Opened the integration PR for sprint ${id}: ${await this.openIntegration(goal, metadata)}`;
+    });
+  }
+
+  private approvedGoal(goal: PlanningGoal | undefined, id: string): PlanningGoal {
+    if (!goal) throw new Error(`No planning goal ${id} in state.`);
+    if (goal.stage !== "approved" || !goal.integration) throw new Error(`Goal ${id} has no sprint integration branch; only goals approved with one have a sprint.`);
+    return goal;
+  }
+
+  /**
+   * The one merge path for the sprint's integration PR and its revert PR, used by a person's ✅ on the merge post
+   * and by the owner's `planning merge`. It merges only once CI is green, records the result, and posts it.
+   * Merging a PR that already merged changes nothing. Returns what happened, and whether it was merged.
+   */
+  private async mergeGate(id: string, kind: MergeKind | undefined): Promise<{ message: string; merged: boolean; post: boolean }> {
+    const goal = this.approvedGoal((await this.store.read()).planningGoals?.find((item) => item.id === id), id);
+    const integration = goal.integration!;
+    const target: MergeKind | undefined = kind ?? (integration.status === "pr-open" ? "integration" : integration.status === "merged" && integration.revertPrUrl ? "revert" : undefined);
+    if (target === "integration" && (integration.status === "merged" || integration.status === "reverted")) return { message: `Sprint ${id} is already merged into main as ${integration.mergedSha!.slice(0, 7)} (${integration.prUrl}).`, merged: false, post: true };
+    if (target === "revert" && integration.status === "reverted") return { message: `Sprint ${id} is already rolled back (${integration.revertPrUrl}).`, merged: false, post: true };
+    const prUrl = target === "integration" && integration.status === "pr-open" ? integration.prUrl : target === "revert" && integration.status === "merged" ? integration.revertPrUrl : undefined;
+    if (!target || !prUrl) return { message: `Nothing to merge for sprint ${id}: it is ${integration.status}${integration.status === "collecting" ? " and has no integration PR yet" : ""}.`, merged: false, post: false };
+    const result = await this.github.merge(prUrl);
+    if (!result.merged) return { message: `Not merged: ${result.reason}. Nothing changed; merge again once CI is green.`, merged: false, post: true };
+    await this.store.update((state) => {
+      const found = state.planningGoals!.find((item) => item.id === id)!;
+      const current = found.integration!;
+      if (target === "integration" && current.status === "pr-open") found.integration = { ...current, status: "merged", mergedSha: result.sha };
+      else if (target === "revert" && current.status === "merged") found.integration = { ...current, status: "reverted" };
+      else return;
+      found.updatedAt = new Date().toISOString();
+    }, target === "integration" ? `Merge sprint ${id} into main` : `Revert sprint ${id} on main`);
+    return { message: target === "integration" ? `**Sprint ${id} merged into main** as ${result.sha.slice(0, 7)} (${prUrl}). To roll the whole sprint back: \`planning rollback --goal ${id}\`, or V in Chick's detail.` : `**Sprint ${id} rolled back** on main by ${prUrl} (${result.sha.slice(0, 7)}).`, merged: true, post: true };
+  }
+
+  /** The owner's `planning merge` (M in the terminal UI): merges the open integration or revert PR through the same path as ✅. */
+  async merge(id: string): Promise<string> {
+    return await this.store.withGoalLock(id, async () => {
+      const goal = this.approvedGoal((await this.store.read()).planningGoals?.find((item) => item.id === id), id);
+      const metadata = await this.store.runtime(id);
+      if (metadata.pending) await this.deliver(goal, metadata);
+      const result = await this.mergeGate(id, undefined);
+      if (!result.merged) throw new Error(result.message);
+      metadata.pending = { inputPostId: `owner-merge:${id}:${Date.now()}`, since: Date.now(), message: result.message };
+      await this.store.saveRuntime(id, metadata);
+      await this.deliver(goal, metadata);
+      return result.message.replace(/\*\*/g, "");
+    });
+  }
+
+  /**
+   * The owner's `planning rollback` (V in the terminal UI): opens a PR on main that reverts the sprint's merge commit
+   * and posts it as a merge post; merging it goes through the same ✅ or M gate. Repeating it returns the same PR.
+   */
+  async rollback(id: string): Promise<string> {
+    return await this.store.withGoalLock(id, async () => {
+      const state = await this.store.read();
+      const goal = this.approvedGoal(state.planningGoals?.find((item) => item.id === id), id);
+      const integration = goal.integration!;
+      if (integration.status === "reverted") return `Sprint ${id} is already rolled back (${integration.revertPrUrl}).`;
+      if (integration.status !== "merged") throw new Error(`Sprint ${id} is ${integration.status}; only a sprint merged into main can be rolled back.`);
+      if (integration.revertPrUrl) return `The revert PR for sprint ${id} is already open: ${integration.revertPrUrl}`;
+      const metadata = await this.store.runtime(id);
+      if (metadata.pending) await this.deliver(goal, metadata);
+      const prUrl = await this.github.revertPr(this.project(state, goal), id, integration.mergedSha!, `Revert sprint ${id}: ${goal.goal}`.slice(0, 200), `Reverts sprint ${id} (${integration.prUrl}), merge commit ${integration.mergedSha}, as a unit.\n\n**Goal:** ${goal.goal}`);
+      await this.store.update((doc) => {
+        const found = doc.planningGoals!.find((item) => item.id === id)!;
+        if (found.integration?.status === "merged" && !found.integration.revertPrUrl) { found.integration = { ...found.integration, revertPrUrl: prUrl }; found.updatedAt = new Date().toISOString(); }
+      }, `Open revert PR for sprint ${id}`);
+      metadata.pending = { inputPostId: `revert-pr:${id}`, since: Date.now(), message: revertMessage(goal, prUrl), mergePost: "revert" };
+      await this.store.saveRuntime(id, metadata);
+      await this.deliver(goal, metadata);
+      return `Opened the revert PR for sprint ${id}: ${prUrl}`;
+    });
   }
 
   /** Unhandled 📝 on the goal post and ✅ on the goal or proposal posts, oldest first; the bridge's own reactions never count. */
@@ -139,7 +303,7 @@ export class PlanningBridge {
     const metadata = await this.store.runtime(goal.id);
     const root = goal.mattermost.rootPostId;
     const found: Reaction[] = [];
-    for (const postId of [root, ...(metadata.proposalPostIds ?? [])]) {
+    for (const postId of [root, ...(metadata.proposalPostIds ?? []), ...(metadata.mergePosts ?? []).map((item) => item.id)]) {
       found.push(...(await this.chat.reactions(postId)).filter((reaction) => reaction.post_id === postId && reaction.user_id !== own && (reaction.emoji_name === APPROVE_EMOJI || (reaction.emoji_name === PROPOSE_EMOJI && postId === root))));
     }
     return found.map((reaction) => ({ reaction, key: reactionKey(reaction) })).filter((item) => !metadata.processedPostIds.includes(item.key)).sort((a, b) => a.reaction.create_at - b.reaction.create_at);
@@ -215,14 +379,32 @@ export class PlanningBridge {
     if (metadata.processedPostIds.includes(key)) return;
     const seats = teamSeats(state, goal.teamId);
     const approving = reaction.emoji_name === APPROVE_EMOJI;
+    const gate = approving ? metadata.mergePosts?.find((item) => item.id === reaction.post_id) : undefined;
     let message: string; let announcesProposal = false;
-    if (!(await this.human(state, goal, reaction.user_id))) message = `Only a person can ${approving ? "approve a proposal" : "request a proposal"}; reactions from bots and Chick don't count. Nothing changed.`;
+    if (!(await this.human(state, goal, reaction.user_id))) message = `Only a person can ${gate ? "merge a sprint" : approving ? "approve a proposal" : "request a proposal"}; reactions from bots and Chick don't count. Nothing changed.`;
+    else if (gate) {
+      try { message = (await this.mergeGate(id, gate.kind)).message; }
+      catch (error) { console.error(`Sprint ${id} merge failed: ${error instanceof Error ? error.message : String(error)}`); message = `Could not merge the sprint's PR right now; nothing changed. React :${APPROVE_EMOJI}: again (remove and re-add it) to retry.`; }
+    }
     else if (goal.stage === "approved") message = approvalMessage(goal, seats);
     else if (!approving && goal.stage === "awaiting-review") { message = proposalMessage(goal, seats); announcesProposal = true; }
     else if (!approving) { await this.draft(goal, metadata, key, reaction.create_at); return; }
     else if (goal.stage !== "awaiting-review") message = nothingToApprove(goal);
     else if (reaction.post_id === goal.mattermost.rootPostId) message = `To approve proposal ${goal.proposal!.id}, react :${APPROVE_EMOJI}: on Chick's proposal post rather than the goal post. Nothing changed.`;
-    else { await this.approveAndConfirm(id, metadata, key, reaction.create_at); return; }
+    else {
+      let integration: SprintIntegration;
+      try { integration = await this.createSprint(state, goal); }
+      catch (error) {
+        console.error(`Sprint branch for goal ${id} failed: ${error instanceof Error ? error.message : String(error)}`);
+        message = `Could not create the sprint branch \`${sprintBranch(id)}\` on GitHub, so nothing was approved. React :${APPROVE_EMOJI}: again (remove and re-add it) or press A in Chick's detail to retry.`;
+        metadata.pending = { inputPostId: key, since: reaction.create_at, message };
+        await this.store.saveRuntime(id, metadata);
+        await this.deliver(goal, metadata);
+        return;
+      }
+      await this.approveAndConfirm(id, metadata, key, reaction.create_at, integration);
+      return;
+    }
     metadata.pending = { inputPostId: key, since: reaction.create_at, message, ...(announcesProposal ? { proposal: true } : {}) };
     await this.store.saveRuntime(id, metadata);
     await this.deliver(goal, metadata);
@@ -255,15 +437,27 @@ export class PlanningBridge {
    * The one approval path, used by the ✅ reaction and by `planning approve`: queues one assignment per outcome
    * if the goal is still awaiting review (never twice), then posts the confirmation in the goal thread.
    */
-  private async approveAndConfirm(id: string, metadata: RuntimeRecord, inputKey: string, since: number): Promise<PlanningGoal> {
+  /** Creates the sprint's integration branch on GitHub from main (or finds it) before a goal is approved. */
+  private async createSprint(state: PlanningDocument, goal: PlanningGoal): Promise<SprintIntegration> {
+    const baseSha = await this.github.ensureBranch(this.project(state, goal), goal.id);
+    return { branch: sprintBranch(goal.id), baseSha, status: "collecting" };
+  }
+
+  /**
+   * `integration` is the sprint branch made just before; it is recorded in the same commit as the assignments, so no
+   * seat ever sees an approved goal without the branch its PRs target.
+   */
+  private async approveAndConfirm(id: string, metadata: RuntimeRecord, inputKey: string, since: number, integration?: SprintIntegration): Promise<PlanningGoal> {
     let approved: PlanningGoal | undefined;
     await this.store.update((state) => {
       const found = state.planningGoals?.find((item) => item.id === id);
       if (!found || !reviewing(found)) throw new Error(`Goal ${id} has no proposal awaiting review.`);
       if (found.stage === "awaiting-review") {
+        if (!integration) throw new Error(`Goal ${id} has no sprint branch yet.`);
         const now = new Date().toISOString();
         found.stage = "approved";
         found.assignments = found.proposal!.outcomes.map((outcome) => ({ outcomeId: outcome.id, seatId: outcome.seatId, status: "queued", updatedAt: now }));
+        found.integration = integration;
         found.updatedAt = now;
       }
       approved = structuredClone(found);
@@ -293,7 +487,8 @@ export class PlanningBridge {
       const key = ownerApprovalKey(id);
       const alreadyApproved = goal.stage === "approved";
       if (alreadyApproved && metadata.processedPostIds.includes(key)) return { goal, alreadyApproved };
-      return { goal: await this.approveAndConfirm(id, metadata, key, Date.now()), alreadyApproved };
+      const integration = alreadyApproved ? undefined : await this.createSprint(await this.store.read(), goal);
+      return { goal: await this.approveAndConfirm(id, metadata, key, Date.now(), integration), alreadyApproved };
     });
   }
 
@@ -335,6 +530,7 @@ export class PlanningBridge {
     const post = delivered ?? await this.chat.post(goal.mattermost.channelId, pending.message, goal.mattermost.rootPostId, pending.inputPostId);
     // The proposal post is where people react ✅; it is found again after a restart by its delivery ID.
     if (pending.proposal && !(metadata.proposalPostIds ?? []).includes(post.id)) metadata.proposalPostIds = [...(metadata.proposalPostIds ?? []), post.id];
+    if (pending.mergePost && !(metadata.mergePosts ?? []).some((item) => item.id === post.id)) metadata.mergePosts = [...(metadata.mergePosts ?? []), { id: post.id, kind: pending.mergePost }];
     metadata.processedPostIds.push(pending.inputPostId);
     metadata.lastSeenAt = Math.max(metadata.lastSeenAt, pending.since);
     delete metadata.pending;

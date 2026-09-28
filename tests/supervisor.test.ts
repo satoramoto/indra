@@ -228,10 +228,14 @@ describe("CLI goal starter", () => {
     expect(await starter.start("Fix tests")).toBe("Planning goal goal-1: link");
     expect(await starter.approve("goal-1")).toContain("Approved goal goal-1");
     expect(await starter.propose("goal-2")).toBe("Requested a proposal for goal goal-2.");
+    for (const action of ["integrate", "merge", "rollback"] as const) await starter.sprint(action, "goal-1");
     expect(calls).toEqual([
       ["planning", "start", "--state", "/state", "--goal", "Fix tests"],
       ["planning", "approve", "--state", "/state", "--goal", "goal-1"],
       ["planning", "propose", "--state", "/state", "--goal", "goal-2"],
+      ["planning", "integrate", "--state", "/state", "--goal", "goal-1"],
+      ["planning", "merge", "--state", "/state", "--goal", "goal-1"],
+      ["planning", "rollback", "--state", "/state", "--goal", "goal-1"],
     ]);
   });
 });

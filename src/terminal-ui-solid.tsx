@@ -48,9 +48,26 @@ function threadActivity(live: SeatLive, limit: number): string {
   return live.activity ? "Latest: " + displayText(live.activity.message, limit) : "No thread activity yet.";
 }
 
+function sprintHint(sprint: NonNullable<TerminalSession["sprint"]>): string {
+  return {
+    collecting: "collecting seat PRs · the integration PR opens when all merge; I opens it for what merged",
+    "pr-open": "integration PR open · M merges it once CI is green, or react :white_check_mark: on its post",
+    merged: "merged into main · V rolls the sprint back",
+    "revert-open": "revert PR open · M merges it once CI is green, or react :white_check_mark: on its post",
+    reverted: "rolled back",
+  }[sprint];
+}
+
 function confirmText(confirm: UiApproval | UiRollback, width: number): string {
   if (confirm.action === "rollback") return `Roll back from ${displayText(confirm.from, 20)} to ${displayText(confirm.to, 20)} and pause auto-update? y roll back`;
-  return (confirm.action === "propose" ? "Request Chick's proposal for " : "Approve the proposal for ") + displayText(confirm.goalId, 40) + " (" + displayText(confirm.goal, Math.max(10, width - 80)) + ")? " + (confirm.action === "propose" ? "y request" : "y approve");
+  const [question, yes] = {
+    propose: ["Request Chick's proposal for ", "y request"],
+    approve: ["Approve the proposal for ", "y approve"],
+    integrate: ["Open the integration PR into main, for what merged, for sprint ", "y open"],
+    merge: [confirm.revert ? "Merge the revert PR on main for sprint " : "Merge the integration PR into main for sprint ", "y merge"],
+    revert: ["Roll back sprint ", "y open a revert PR"],
+  }[confirm.action];
+  return question + displayText(confirm.goalId, 40) + " (" + displayText(confirm.goal, Math.max(10, width - 80)) + ")? " + yes;
 }
 
 export interface TerminalAppProps {
@@ -121,6 +138,9 @@ export function TerminalApp(props: TerminalAppProps) {
             </Show>
             <Show when={session.stage === "awaiting-review"}>
               <text fg={theme.idle}>Proposal awaiting review · {session.id === props.model.reviewGoal()?.id ? "A approves it here" : "A approves the newer goal first"}, or react :white_check_mark: on its proposal post</text>
+            </Show>
+            <Show when={session.sprint}>
+              <text fg={theme.idle}>Sprint sprint/{displayText(session.id)}: {sprintHint(session.sprint!)}</text>
             </Show>
             <text fg={props.model.sessionResult.connection === "connected" && session.attach ? theme.running : theme.muted}>
               Bridge view: {props.model.sessionResult.connection === "connected" && session.attach ? displayText(session.attach.target) : "no verified tmux target"}
@@ -226,7 +246,7 @@ export function TerminalApp(props: TerminalAppProps) {
           <text fg={theme.heading}>{confirmText(confirm()!, dimensions().width)} · any other key cancels</text>
         </Show>
         <text fg={theme.accent}>
-          {input() ? "Enter start  ·  Esc cancel  ·  " + displayText(team()?.project?.github, 80) + " · home channel" : page() === "teams" ? "↑↓ choose team  ·  Enter open  ·  n new goal  ·  q quit" : page() === "team" ? "↑↓ seat · Enter details · n new goal · s restart · x stop · b teams · q quit" : "a attach  ·  P propose  ·  A approve  ·  s restart  ·  x stop  ·  n new goal  ·  b team  ·  q quit"}
+          {input() ? "Enter start  ·  Esc cancel  ·  " + displayText(team()?.project?.github, 80) + " · home channel" : page() === "teams" ? "↑↓ choose team  ·  Enter open  ·  n new goal  ·  q quit" : page() === "team" ? "↑↓ seat · Enter details · n new goal · s restart · x stop · b teams · q quit" : "a attach  ·  P propose  ·  A approve · I/M/V sprint · s restart  ·  x stop  ·  n new goal  ·  b team  ·  q quit"}
         </text>
         <text fg={theme.muted}>{paused() ? "Auto-update paused  ·  U resumes" : "Auto-update  ·  U pauses"}  ·  r checks now  ·  R rolls back  ·  q leaves seat processes running</text>
       </box>
@@ -313,6 +333,7 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
       else if (action === "submit") void model.submitInput();
       else if (action === "approve") void model.approveConfirmed();
       else if (action === "propose") void model.proposeConfirmed();
+      else if (action === "sprint") void model.sprintConfirmed();
       else if (action === "stop" || action === "restart") void model.control(action);
       else if (action === "attach") {
         const target = model.attachTarget();

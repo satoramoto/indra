@@ -11,7 +11,8 @@ import { parseOptions } from "../src/cli.js";
 const PR = "https://github.com/satoramoto/indra/pull/9";
 const seat = (id: string, name: string, roles: string[]) => ({ id, displayName: name, roles, externalIdentities: { mattermost: { userId: id, username: name.toLowerCase() } } });
 
-async function fixture(assignments: Assignment[], stage = "approved", project: { github: string } | null = { github: "satoramoto/indra" }) {
+const SPRINT = { branch: "sprint/goal-abc", baseSha: "a".repeat(40), status: "collecting" };
+async function fixture(assignments: Assignment[], stage = "approved", project: { github: string } | null = { github: "satoramoto/indra" }, integration?: object) {
   const goal = {
     id: "goal-abc", teamId: "team-001", seatId: "seat-001", participantSeatIds: [], goal: "Build it", projectRefs: ["/proj"], stage,
     createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z", mattermost: { channelId: "channel", rootPostId: "root" },
@@ -22,6 +23,7 @@ async function fixture(assignments: Assignment[], stage = "approved", project: {
       { id: "outcome-3", title: "Third", description: "Someone else's", seatId: "seat-003" },
     ] },
     assignments,
+    ...(integration ? { integration } : {}),
   };
   const state = { $schema: "./schema/v1/state.schema.json", schemaVersion: 1, sprints: [], planningGoals: [goal], teams: [{ id: "team-001", slug: "yahaha", displayName: "Yahaha", ...(project ? { project } : {}), externalIdentities: { mattermost: { teamId: "team" } }, seats: [seat("seat-001", "Chick", ["Team Lead"]), seat("seat-002", "George", ["Developer"]), seat("seat-003", "Herbie", ["Developer"])] }] };
   return new PlanningStore(await stateCheckout("indra-seat-", state));
@@ -58,7 +60,7 @@ class FakeShell implements Shell {
       return { code: outcome.code, stdout: "", stderr: outcome.stderr };
     }
     if (line.startsWith("gh pr view") && args.includes("mergeable,mergeStateStatus")) return { code: 0, stdout: JSON.stringify(this.mainStatus.shift() ?? { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" }), stderr: "" };
-    if (line.startsWith("git merge --no-edit origin/main")) return { code: this.mainMerges.shift() ?? 0, stdout: "", stderr: "" };
+    if (line.startsWith("git merge --no-edit origin/")) return { code: this.mainMerges.shift() ?? 0, stdout: "", stderr: "" };
     if (line.startsWith("git merge-base --is-ancestor")) return { code: this.resolved.shift() ?? 0, stdout: "", stderr: "" };
     if (line.startsWith("gh pr view")) return { code: 0, stdout: this.merged ? "MERGED\n" : "OPEN\n", stderr: "" };
     if (line.startsWith("gh pr checks")) return { code: this.checksCode, stdout: "", stderr: "" };
@@ -80,8 +82,8 @@ class FakeCodex {
   });
 }
 
-async function setup(assignments: Assignment[]) {
-  const store = await fixture(assignments);
+async function setup(assignments: Assignment[], integration?: object) {
+  const store = await fixture(assignments, "approved", { github: "satoramoto/indra" }, integration);
   const chat = new FakeChat(); const shell = new FakeShell(); const codex = new FakeCodex();
   const identity = await loadDeveloperSeat(store, "seat-002");
   const make = () => Object.assign(new DeveloperSeat(store, identity, chat, shell, codex.factory), { mergeRetryMs: 0 });
@@ -221,6 +223,34 @@ describe("developer seat", () => {
     expect((await assignment("outcome-1")).status).toBe("merged");
     const record = JSON.parse(await readFile(join(store.runtimeDir, "seat-seat-002-goal-abc-outcome-1.json"), "utf8")) as SeatTaskRecord;
     expect(record.conflictRounds).toBe(1);
+  });
+
+  it("in a sprint, starts from the sprint branch, targets it with its PR, and merges the sprint branch in when behind or conflicting", async () => {
+    const { store, chat, shell, codex, seat, assignment } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")], SPRINT);
+    codex.findings = [];
+    shell.mainStatus = [conflicting];
+    shell.mainMerges = [1];
+    await seat.tick();
+    const worktree = join(store.runtimeDir, "worktrees", "goal-abc-outcome-1");
+    const project = join(store.runtimeDir, "projects", "satoramoto", "indra");
+    const fetch = `git -c credential.helper= -c credential.helper=!gh auth git-credential fetch origin main sprint/goal-abc @${project}`;
+    expect(shell.calls.slice(1, 4)).toEqual([fetch, `git rev-parse --path-format=absolute --git-common-dir @${project}`, `git worktree add --no-track -b seat-002/goal-abc-outcome-1 ${worktree} origin/sprint/goal-abc @${project}`]);
+    expect(codex.runs[0].prompt).toContain("gh pr create --base sprint/goal-abc");
+    expect(shell.calls).toContain(`gh pr edit ${PR} --base sprint/goal-abc @${worktree}`);
+    const conflictAt = shell.calls.indexOf(`git merge --no-edit origin/sprint/goal-abc @${worktree}`);
+    expect(shell.calls[conflictAt - 1]).toBe(fetch);
+    expect(shell.calls.slice(conflictAt + 1, conflictAt + 3)).toEqual([`git merge-base --is-ancestor origin/sprint/goal-abc HEAD @${worktree}`, ownPush(worktree)]);
+    expect(codex.runs[2].prompt).toContain("Merging origin/sprint/goal-abc into this worktree");
+    expect(chat.messages.some((message) => message.includes("conflicts with sprint/goal-abc; resolving"))).toBe(true);
+    expect(shell.calls.some((line) => line.includes("origin/main") || line.includes("refs/heads/main"))).toBe(false);
+    onlyOwnPushes(shell.calls, worktree);
+    expect((await assignment("outcome-1")).status).toBe("merged");
+  });
+
+  it("does not claim a sprint's queued outcome once its integration PR is open", async () => {
+    const { seat, assignment } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")], { ...SPRINT, status: "pr-open", prUrl: "https://github.com/satoramoto/indra/pull/50" });
+    expect(await seat.tick()).toBe("idle");
+    expect((await assignment("outcome-1")).status).toBe("queued");
   });
 
   it("fails with a clear note when main still conflicts after two resolution rounds", async () => {
