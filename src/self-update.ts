@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { access, lstat, readdir, readlink, rename, rm, symlink } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { access, lstat, readdir, readFile, readlink, realpath, rename, rm, stat, symlink } from "node:fs/promises";
+import { basename, join, resolve } from "node:path";
 import { readBuildStamp } from "./build-stamp.js";
 
 /**
@@ -21,7 +22,7 @@ export class SelfUpdater {
   /** The HEAD whose build failed; not retried until HEAD moves. */
   private failed?: { sha: string; message: string };
 
-  constructor(readonly appDir: string, private readonly npm = "npm", private readonly timeoutMs = 15 * 60_000) {}
+  constructor(readonly appDir: string, private readonly npm = "npm", private readonly timeoutMs = 15 * 60_000, private readonly runtimeDir = defaultRuntimeDir(appDir)) {}
 
   private exec(command: string, args: string[]): Promise<string> {
     return new Promise((resolve, reject) => {
@@ -72,7 +73,7 @@ export class SelfUpdater {
         this.failed = { sha: head, message: `build of ${head.slice(0, 7)} failed; still running the previous build: ${reason(error)}` };
         return result("failed", this.failed.message);
       }
-      await switchDist(this.appDir, name);
+      await switchDist(this.appDir, name, { runtimeDir: this.runtimeDir });
       this.failed = undefined;
       return result("built", `built ${head.slice(0, 7)}`);
     } catch (error) { return result("blocked", `update check failed: ${reason(error)}`); }
@@ -82,12 +83,71 @@ export class SelfUpdater {
 /** Self-update builds live in `builds/<sha>-<time>/`; `dist` is a symlink to the live one. */
 export const BUILDS = "builds";
 
+/** Builds younger than this are never pruned, so a process that just resolved one can still load from it. */
+export const PRUNE_GRACE_MS = 10 * 60_000;
+
+/** `<state-checkout>.runtime` for the default state checkout of the Indra checkout at `appDir`. */
+export function defaultRuntimeDir(appDir: string, stateEnv = process.env.INDRA_STATE_REPO): string {
+  return `${resolve(stateEnv || resolve(appDir, "..", "indra-state"))}.runtime`;
+}
+
+const IN_USE = "builds-in-use";
+
+/**
+ * Records in `<runtimeDir>/builds-in-use/<pid>.json` the real build directory this process runs from, so pruning
+ * keeps it while the process lives. The record is removed on a clean exit; one left by a dead pid is ignored.
+ */
+export function recordRunningBuild(runtimeDir: string, moduleUrl: string): void {
+  try {
+    const build = realpathSync(new URL(".", moduleUrl));
+    const file = join(runtimeDir, IN_USE, `${process.pid}.json`);
+    mkdirSync(join(runtimeDir, IN_USE), { recursive: true, mode: 0o700 });
+    writeFileSync(file, JSON.stringify({ pid: process.pid, build }), { mode: 0o600 });
+    process.once("exit", () => { try { rmSync(file, { force: true }); } catch { /* best effort */ } });
+  } catch { /* best effort: pruning still keeps current, previous and recent builds */ }
+}
+
+function alive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
+}
+
+async function buildsInUse(runtimeDir: string): Promise<Set<string>> {
+  const used = new Set<string>();
+  for (const entry of await readdir(join(runtimeDir, IN_USE)).catch(() => [] as string[])) {
+    try {
+      const record = JSON.parse(await readFile(join(runtimeDir, IN_USE, entry), "utf8")) as { pid: number; build: string };
+      if (Number.isInteger(record.pid) && alive(record.pid)) used.add(await realpath(record.build).catch(() => record.build));
+    } catch { /* unreadable record */ }
+  }
+  return used;
+}
+
+export interface PruneOptions { runtimeDir?: string; graceMs?: number; now?: number }
+
+/**
+ * Removes builds that are not `keep`, not recorded as in use by a live process, and older than the grace period.
+ */
+export async function pruneBuilds(appDir: string, keep: string[], options: PruneOptions = {}): Promise<void> {
+  const builds = join(appDir, BUILDS);
+  const used = await buildsInUse(options.runtimeDir ?? defaultRuntimeDir(appDir));
+  const cutoff = (options.now ?? Date.now()) - (options.graceMs ?? PRUNE_GRACE_MS);
+  for (const entry of await readdir(builds)) {
+    if (keep.includes(entry)) continue;
+    const dir = join(builds, entry);
+    const real = await realpath(dir).catch(() => dir);
+    if (used.has(real)) continue;
+    const info = await stat(dir).catch(() => undefined);
+    if (!info || info.mtimeMs > cutoff) continue;
+    await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
 /**
  * Makes `builds/<name>` the live build in one step: a new symlink is renamed over `dist`, so a reader sees either
  * the old build or the new one, never a missing `dist/cli.js`. Keeps the previous build for rollback and removes
- * older ones. A real `dist/` directory from a local `npm run build` is first moved into `builds/`.
+ * older ones that no live process runs from (see `pruneBuilds`). A real `dist/` directory from a local `npm run build` is first moved into `builds/`.
  */
-export async function switchDist(appDir: string, name: string): Promise<void> {
+export async function switchDist(appDir: string, name: string, options: PruneOptions = {}): Promise<void> {
   const dist = join(appDir, "dist");
   const builds = join(appDir, BUILDS);
   let previous: string | undefined;
@@ -101,7 +161,5 @@ export async function switchDist(appDir: string, name: string): Promise<void> {
   const temporary = join(appDir, `.dist-${randomUUID()}`);
   await symlink(join(BUILDS, name), temporary);
   await rename(temporary, dist);
-  for (const entry of await readdir(builds)) {
-    if (entry !== name && entry !== previous) await rm(join(builds, entry), { recursive: true, force: true }).catch(() => undefined);
-  }
+  await pruneBuilds(appDir, previous ? [name, previous] : [name], options);
 }

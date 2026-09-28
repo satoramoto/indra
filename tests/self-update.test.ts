@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { execFileSync, spawn } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readBuildStamp } from "../src/build-stamp.js";
-import { SelfUpdater } from "../src/self-update.js";
+import { pruneBuilds, SelfUpdater } from "../src/self-update.js";
 import { git } from "./state-checkout.js";
 
 const head = (dir: string, ref = "HEAD") => git(dir, "rev-parse", ref).trim();
@@ -61,7 +61,7 @@ fi
     git(upstream, "commit", "--quiet", "-am", `Change ${file}`);
     git(upstream, "push", "--quiet");
   };
-  return { app, remote, updater: new SelfUpdater(app, npm), npmCalls, merge };
+  return { app, remote, updater: new SelfUpdater(app, npm, undefined, join(root, "state.runtime")), npmCalls, merge };
 }
 
 describe("self-update", () => {
@@ -131,7 +131,7 @@ describe("self-update", () => {
     expect(await npmCalls()).toEqual(["run build"]);
   });
 
-  it("switches dist to the new build atomically, keeps the previous build and prunes older ones", async () => {
+  it("switches dist to the new build atomically, and keeps builds inside the grace period while a reader runs", async () => {
     const { app, updater, merge } = await fixture();
     // The first update moves the local real dist/ aside (spawns are held meanwhile); from then on dist is a symlink.
     await merge("code.ts", "export const version = 1.5;\n");
@@ -161,8 +161,24 @@ console.log(JSON.stringify({ reads, misses }));
     expect(misses).toBe(0);
     expect((await lstat(join(app, "dist"))).isSymbolicLink()).toBe(true);
     expect(await readBuildStamp(app)).toMatchObject({ sha: head(app) });
-    expect(await readdir(join(app, "builds"))).toHaveLength(2);
+    // Every build is inside the grace period, so none was pruned while the reader ran.
+    expect(await readdir(join(app, "builds"))).toHaveLength(5);
     expect(await readdir(app)).not.toContain(expect.stringMatching(/^\.dist-/));
+  });
+
+  it("prunes only old builds that are not current, previous, or recorded by a live process", async () => {
+    const app = await mkdtemp(join(tmpdir(), "indra-prune-"));
+    const runtime = join(app, "state.runtime");
+    for (const name of ["old", "used", "stale-record", "fresh", "previous", "current"]) await mkdir(join(app, "builds", name), { recursive: true });
+    const hour = 60 * 60_000;
+    for (const name of ["old", "used", "stale-record", "previous", "current"]) await utimes(join(app, "builds", name), new Date(Date.now() - hour), new Date(Date.now() - hour));
+    await mkdir(join(runtime, "builds-in-use"), { recursive: true });
+    await writeFile(join(runtime, "builds-in-use", "1.json"), JSON.stringify({ pid: process.pid, build: join(app, "builds", "used") }));
+    const dead = spawn(process.execPath, ["-e", ""]);
+    await new Promise((done) => dead.on("exit", done));
+    await writeFile(join(runtime, "builds-in-use", "2.json"), JSON.stringify({ pid: dead.pid, build: join(app, "builds", "stale-record") }));
+    await pruneBuilds(app, ["current", "previous"], { runtimeDir: runtime });
+    expect((await readdir(join(app, "builds"))).sort()).toEqual(["current", "fresh", "previous", "used"]);
   });
 
   it("blocks without remembering the commit when npm ci fails, keeps the running build, and retries the install next time", async () => {

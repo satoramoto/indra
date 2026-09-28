@@ -15,7 +15,7 @@ import { CodexRuntime } from "./codex-runtime.js";
 import { defaultAppDir, signalReady, TmuxHost, turnLockFile } from "./tmux-host.js";
 import { withFileLock } from "./state-commit.js";
 import { readBuildStamp } from "./build-stamp.js";
-import { SelfUpdater } from "./self-update.js";
+import { recordRunningBuild, SelfUpdater } from "./self-update.js";
 import { appRootOf, isEntry, LAUNCHER_ENV, RELOAD_EXIT_CODE } from "./reload.js";
 import { readFile, rm, writeFile, mkdir } from "node:fs/promises";
 import type { UiView } from "./terminal-ui.js";
@@ -185,6 +185,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       return 0;
     }
     if (options.mode === "seat") {
+      recordRunningBuild(`${options.checkout}.runtime`, import.meta.url);
       try {
         const store = new PlanningStore(options.checkout);
         const seat = await loadDeveloperSeat(store, options.seatId);
@@ -207,7 +208,8 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       const viewFile = join(`${options.checkout}.runtime`, "ui-view.json");
       const view = await readFile(viewFile, "utf8").then((text) => JSON.parse(text) as UiView, () => undefined);
       await rm(viewFile, { force: true });
-      const updater = new SelfUpdater(defaultAppDir);
+      recordRunningBuild(`${options.checkout}.runtime`, import.meta.url);
+      const updater = new SelfUpdater(defaultAppDir, undefined, undefined, `${resolve(options.checkout)}.runtime`);
       return await runTerminalUi(new StateInventory(new LocalStateRepository(options.checkout)), new LocalSessionReader(options.checkout), {
         processes: new Supervisor(options.checkout, undefined, undefined, undefined, undefined, () => stageServiceToken(options.checkout)),
         goals: new CliGoalStarter(options.checkout),
@@ -268,6 +270,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
           return 1;
         }
       }
+      recordRunningBuild(`${options.checkout}.runtime`, import.meta.url);
       const chat = new MattermostPlanningChat(await hostedToken(options.checkout, options.readyNonce, readChickToken));
       const bridge = new PlanningBridge(store, chat, new CodexRuntime(process.cwd()));
       console.log("Chick planning bridge running. Stop with Ctrl-C.");
