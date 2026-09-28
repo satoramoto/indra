@@ -1,12 +1,16 @@
 import { execFile } from "node:child_process";
 import { join, resolve } from "node:path";
-import { PlanningStore, type PlanningDocument } from "./planning.js";
+import { developerSeats, PlanningStore, type PlanningDocument } from "./planning.js";
 import { defaultAppDir, NoChannelError, NoCredentialError, SystemTmux, TmuxHost, turnLockFile, type HostRecord, type TmuxRunner } from "./tmux-host.js";
 import { readBuildStamp } from "./build-stamp.js";
 import { withFileLock } from "./state-commit.js";
 
 /** `no channel`: the seat's bot could not join its team's Mattermost team or home channel. */
 export type ProcessState = "running" | "stopped" | "no credential" | "no channel";
+/** The exact failed attempt shown in a retry confirmation; updatedAt prevents a stale confirmation retrying a later failure. */
+export interface AssignmentRetry {
+  seatId: string; goalId: string; goal: string; outcomeId: string; title: string; updatedAt: string;
+}
 /** What the team view shows for a seat beyond its stable state record. */
 export interface SeatLive {
   process: ProcessState;
@@ -15,6 +19,8 @@ export interface SeatLive {
   /** Running an older build than `dist/`; it is restarted at its next safe point. */
   updatePending?: boolean;
   assignment?: { title: string; status: string; prUrl?: string };
+  /** Newest failed assignment still eligible to be queued for this Developer seat. */
+  retry?: AssignmentRetry;
   activity?: { message: string; at: string };
   attach?: { kind: "tmux"; target: string };
 }
@@ -24,6 +30,8 @@ export interface SeatProcessPort {
   read(): Promise<Record<string, SeatLive>>;
   stop(seatId: string): Promise<void>;
   restart(seatId: string): Promise<void>;
+  /** Rechecks the confirmed failure under the state lock, then queues it for the same seat. */
+  retry?(target: AssignmentRetry): Promise<string>;
   /** Restarts processes running an older build, each only at a safe point; see Supervisor.upgrade. */
   upgrade?(): Promise<{ pending: string[]; problems: string[] }>;
 }
@@ -57,9 +65,19 @@ function holdsWork(state: PlanningDocument, seatId: string): boolean {
   return (state.planningGoals ?? []).some((goal) => goal.stage === "approved" && (goal.assignments ?? []).some((item) => item.seatId === seatId && ACTIVE.includes(item.status)));
 }
 
+function newestFailedAssignment(state: PlanningDocument, seatId: string): AssignmentRetry | undefined {
+  return (state.planningGoals ?? [])
+    .filter((goal) => goal.stage === "approved" && (goal.integration?.status ?? "collecting") === "collecting" && developerSeats(state, goal.teamId).some((seat) => seat.id === seatId))
+    .flatMap((goal) => (goal.assignments ?? []).filter((item) => item.seatId === seatId && item.status === "failed").map((assignment) => ({
+      seatId, goalId: goal.id, goal: goal.goal, outcomeId: assignment.outcomeId,
+      title: goal.proposal!.outcomes.find((item) => item.id === assignment.outcomeId)!.title, updatedAt: assignment.updatedAt,
+    })))
+    .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt) || b.goalId.localeCompare(a.goalId) || b.outcomeId.localeCompare(a.outcomeId))[0];
+}
+
 /**
  * Keeps Chick's planning bridge (for Team Lead seats) and one runner per Developer seat hosted in Indra-owned tmux sessions.
- * Every action goes through TmuxHost, which only reuses or stops a session it owns and has verified.
+ * Process controls go through TmuxHost, which only reuses or stops a session it owns and has verified.
  */
 export class Supervisor implements SeatProcessPort {
   constructor(
@@ -130,16 +148,38 @@ export class Supervisor implements SeatProcessPort {
       const current = held.find((item) => ACTIVE.includes(item.assignment.status))
         ?? held.filter((item) => item.assignment.status === "queued").sort((a, b) => a.assignment.updatedAt.localeCompare(b.assignment.updatedAt))[0];
       const activity = await this.store.readRuntimeFile<{ message?: unknown; at?: unknown }>(activityRecordName(seat.id)).catch(() => undefined);
+      const retry = newestFailedAssignment(state, seat.id);
       live[seat.id] = {
         process,
         ...(problem ? { problem } : {}),
         ...(record && stamp && record.build !== stamp.id ? { updatePending: true } : {}),
         ...(current ? { assignment: { title: current.goal.proposal?.outcomes.find((item) => item.id === current.assignment.outcomeId)?.title ?? current.assignment.outcomeId, status: current.assignment.status, prUrl: current.assignment.prUrl } } : {}),
+        ...(retry ? { retry } : {}),
         ...(typeof activity?.message === "string" && typeof activity.at === "string" ? { activity: { message: activity.message, at: activity.at } } : {}),
         ...(target ? { attach: { kind: "tmux" as const, target } } : {}),
       };
     }
     return live;
+  }
+
+  /** A retry never changes approval or ownership, and shares the goal lock with opening the sprint's integration PR. */
+  async retry(target: AssignmentRetry): Promise<string> {
+    return await this.store.withGoalLock(target.goalId, async () => {
+      await this.store.update((state) => {
+        const goal = state.planningGoals?.find((item) => item.id === target.goalId);
+        if (!goal || goal.stage !== "approved") throw new Error(`Goal ${target.goalId} is no longer approved or available.`);
+        if (!developerSeats(state, goal.teamId).some((seat) => seat.id === target.seatId)) throw new Error(`Seat ${target.seatId} is not a Developer on this goal's team.`);
+        if (goal.integration && goal.integration.status !== "collecting") throw new Error(`Sprint ${goal.id} is ${goal.integration.status}; it no longer accepts retries.`);
+        const assignment = goal.assignments?.find((item) => item.outcomeId === target.outcomeId);
+        if (!assignment || assignment.seatId !== target.seatId) throw new Error(`Assignment ${goal.id}/${target.outcomeId} is no longer assigned to ${target.seatId}.`);
+        if (assignment.status !== "failed") throw new Error(`Assignment ${goal.id}/${target.outcomeId} is ${assignment.status}, not failed; nothing re-queued.`);
+        if (assignment.updatedAt !== target.updatedAt) throw new Error(`Assignment ${goal.id}/${target.outcomeId} changed since confirmation; press T again to review it.`);
+        assignment.status = "queued";
+        assignment.updatedAt = goal.updatedAt = new Date().toISOString();
+        delete assignment.note;
+      }, `Re-queue ${target.goalId}/${target.outcomeId} for ${target.seatId}`);
+      return `Re-queued ${target.goalId}/${target.outcomeId} for ${target.seatId}.`;
+    });
   }
 
   /**

@@ -3,7 +3,7 @@ import { render, useKeyboard, useTerminalDimensions } from "@opentui/solid";
 import { createMemo, createSignal, For, Show, type Accessor } from "solid-js";
 import type { StateInventory, StateSeat } from "./state-domain.js";
 import { attachTmux } from "./tmux-attach.js";
-import { currentSession, displayText, newestPlanningRecord, TerminalUiModel, type SessionReadPort, type StateSyncPort, type TerminalSession, type UiApproval, type UiRollback, type UiView, type UpdatePort } from "./terminal-ui.js";
+import { currentSession, displayText, newestPlanningRecord, TerminalUiModel, type SessionReadPort, type StateSyncPort, type TerminalSession, type UiApproval, type UiRetry, type UiRollback, type UiView, type UpdatePort } from "./terminal-ui.js";
 import type { GoalStarter, SeatLive, SeatProcessPort } from "./supervisor.js";
 
 const theme = {
@@ -40,7 +40,7 @@ const processLabel = (live: SeatLive) => live.process.toUpperCase() + (live.upda
 
 function assignmentLine(live: SeatLive, limit: number): string {
   const held = live.assignment;
-  if (!held) return "No assignment";
+  if (!held) return live.retry ? displayText(live.retry.title, limit) + " · failed · T retry" : "No assignment";
   return displayText(held.title, limit) + " · " + displayText(held.status, 20) + (held.prUrl ? " · " + displayText(held.prUrl, 120) : "");
 }
 
@@ -58,8 +58,15 @@ function sprintHint(sprint: NonNullable<TerminalSession["sprint"]>): string {
   }[sprint];
 }
 
-function confirmText(confirm: UiApproval | UiRollback, width: number): string {
+function confirmText(confirm: UiApproval | UiRollback | UiRetry, width: number): string {
   if (confirm.action === "rollback") return `Roll back from ${displayText(confirm.from, 20)} to ${displayText(confirm.to, 20)} and pause auto-update? y roll back`;
+  if (confirm.action === "retry") {
+    const goal = "Retry goal " + displayText(confirm.goalId, 40) + ": ";
+    const outcome = "Outcome " + displayText(confirm.outcomeId, 40) + ": ";
+    return goal + displayText(confirm.goal, Math.max(10, width - goal.length - 4)) + "\n"
+      + outcome + displayText(confirm.title, Math.max(10, width - outcome.length - 5)) + "?\n"
+      + "y re-queue for " + displayText(confirm.seatId, 40);
+  }
   const [question, yes] = {
     propose: ["Request Chick's proposal for ", "y request"],
     approve: ["Approve the proposal for ", "y approve"],
@@ -120,6 +127,7 @@ export function TerminalApp(props: TerminalAppProps) {
             <Show when={live.problem}><text fg={theme.error}>{displayText(live.problem, 300)}</text></Show>
             <Show when={isDeveloper(selected)}>
               <text fg={theme.regular}>Assignment: {assignmentLine(live, 160)}</text>
+              <Show when={live.retry}><text fg={theme.idle}>T retries {displayText(live.retry?.goalId, 40)}/{displayText(live.retry?.outcomeId, 40)}: {displayText(live.retry?.title, 120)} (confirm first)</text></Show>
               <text fg={theme.muted}>{threadActivity(live, 300)}{live.activity ? "  (" + displayText(live.activity.at) + ")" : ""}</text>
             </Show>
           </box>
@@ -212,7 +220,7 @@ export function TerminalApp(props: TerminalAppProps) {
                     <text fg={selected() ? theme.accent : theme.regular}>{headline()}</text>
                     <Show when={wide()}><text fg={second().color}>  {second().text}</text></Show>
                     <text fg={!wide() && problem() ? theme.error : theme.muted}>
-                      {"  "}{!wide() && problem() ? problem() : !wide() && dev()?.assignment ? assignmentLine(dev()!, 60) : activity()}
+                      {"  "}{!wide() && problem() ? problem() : !wide() && (dev()?.assignment || dev()?.retry) ? assignmentLine(dev()!, 60) : activity()}
                     </text>
                   </box>
                 );
@@ -235,7 +243,7 @@ export function TerminalApp(props: TerminalAppProps) {
         <scrollbox flexGrow={1} scrollY>{seatDetail()}</scrollbox>
       </Show>
 
-      <box height={(notice() ? 3 : 2) + (input() || confirm() ? 1 : 0)} flexDirection="column">
+      <box flexShrink={0} flexDirection="column">
         <Show when={notice()}><text fg={theme.idle}>{displayText(notice())}</text></Show>
         <Show when={input()}>
           <text fg={theme.heading}>
@@ -243,10 +251,10 @@ export function TerminalApp(props: TerminalAppProps) {
           </text>
         </Show>
         <Show when={confirm()}>
-          <text fg={theme.heading}>{confirmText(confirm()!, dimensions().width)} · any other key cancels</text>
+          <text fg={theme.heading}>{confirmText(confirm()!, dimensions().width)}{confirm()?.action === "retry" ? " · n/Esc cancel" : " · any other key cancels"}</text>
         </Show>
         <text fg={theme.accent}>
-          {input() ? "Enter start  ·  Esc cancel  ·  " + displayText(team()?.project?.github, 80) + " · home channel" : page() === "teams" ? "↑↓ choose team  ·  Enter open  ·  n new goal  ·  q quit" : page() === "team" ? "↑↓ seat · Enter details · n new goal · s restart · x stop · b teams · q quit" : "a attach  ·  P propose  ·  A approve · I/M/V sprint · s restart  ·  x stop  ·  n new goal  ·  b team  ·  q quit"}
+          {input() ? "Enter start  ·  Esc cancel  ·  " + displayText(team()?.project?.github, 80) + " · home channel" : page() === "teams" ? "↑↓ choose team  ·  Enter open  ·  n new goal  ·  q quit" : page() === "team" ? "↑↓ seat · Enter details · T retry · n new goal · s restart · x stop · b teams · q quit" : "a attach · T retry · P propose · A approve · I/M/V sprint · s restart · x stop · n new goal · b team · q quit"}
         </text>
         <text fg={theme.muted}>{paused() ? "Auto-update paused  ·  U resumes" : "Auto-update  ·  U pauses"}  ·  r checks now  ·  R rolls back  ·  q leaves seat processes running</text>
       </box>
@@ -334,6 +342,7 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
       else if (action === "approve") void model.approveConfirmed();
       else if (action === "propose") void model.proposeConfirmed();
       else if (action === "sprint") void model.sprintConfirmed();
+      else if (action === "retry") void model.retryConfirmed();
       else if (action === "stop" || action === "restart") void model.control(action);
       else if (action === "attach") {
         const target = model.attachTarget();

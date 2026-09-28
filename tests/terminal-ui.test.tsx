@@ -7,7 +7,7 @@ import type { UpdateResult } from "../src/self-update.js";
 import type { StateSyncResult } from "../src/state-commit.js";
 import { TerminalApp } from "../src/terminal-ui-solid.js";
 import { attachTmux, parseOwnedTmuxTarget } from "../src/tmux-attach.js";
-import type { GoalStarter, SeatLive, SeatProcessPort } from "../src/supervisor.js";
+import type { AssignmentRetry, GoalStarter, SeatLive, SeatProcessPort } from "../src/supervisor.js";
 
 const names = ["Chick Corea", "George Duke", "Aaron Magner", "Corey Henry", "Jordan Rudess"];
 const snapshot: StateSnapshot = {
@@ -27,7 +27,132 @@ function harness() {
   return { model, state: (next: StateSnapshot) => { state = next; }, sessions: (next: SessionReadResult) => { sessions = next; } };
 }
 
+async function retryHarness(retry?: (target: AssignmentRetry) => Promise<string>) {
+  const target: AssignmentRetry = { seatId: "seat-002", goalId: "goal-retry", goal: "Fix the terminal", outcomeId: "outcome-1", title: "Retry failed work", updatedAt: "2026-01-02T00:00:00Z" };
+  const live: Record<string, SeatLive> = { "seat-002": { process: "running", retry: { ...target } } };
+  const calls: AssignmentRetry[] = [];
+  const processes: SeatProcessPort = {
+    ensureAll: async () => [], read: async () => live, stop: async () => {}, restart: async () => {},
+    retry: async (selected) => {
+      calls.push(selected);
+      if (retry) return await retry(selected);
+      delete live["seat-002"].retry;
+      live["seat-002"].assignment = { title: selected.title, status: "queued" };
+      return "Re-queued goal-retry/outcome-1 for seat-002.";
+    },
+  };
+  const model = new TerminalUiModel(new StateInventory({ read: async () => snapshot }), { readSessions: async () => ({ connection: "connected", sessions: [] }) }, processes);
+  await model.refresh();
+  model.seatId = "seat-002";
+  return { model, target, live, calls, processes };
+}
+
 describe("terminal UI", () => {
+  it("names the failed goal and outcome in T's confirmation and queues it only after y", async () => {
+    const { model, target, calls } = await retryHarness();
+    expect(model.key("t", "T")).toBe("none");
+    expect(model.confirm).toEqual({ ...target, action: "retry" });
+    await model.retryConfirmed();
+    expect(calls).toEqual([]);
+    const [revision, setRevision] = createSignal(model.revision);
+    for (const size of [{ width: 120, height: 30 }, { width: 80, height: 24 }]) {
+      const setup = await testRender(() => <TerminalApp model={model} revision={revision} onKey={() => {}} />, size);
+      try {
+        await setup.renderOnce();
+        const frame = setup.captureCharFrame();
+        expect(frame).toContain("Retry failed work · failed · T retry");
+        expect(frame).toContain("Retry goal goal-retry: Fix the terminal");
+        expect(frame).toContain("Outcome outcome-1: Retry failed work?");
+        expect(frame).toContain("y re-queue for seat-002 · n/Esc cancel");
+      } finally { setup.renderer.destroy(); }
+    }
+    expect(model.key("y", "y")).toBe("retry");
+    expect(model.confirm).toBeUndefined();
+    // Changing the selected seat cannot redirect the confirmed request.
+    model.seatId = "seat-003";
+    await model.retryConfirmed();
+    await model.retryConfirmed();
+    expect(calls).toEqual([{ ...target, action: "retry" }]);
+    expect(model.notice).toBe("Re-queued goal-retry/outcome-1 for seat-002.");
+    model.seatId = "seat-002";
+    model.page = "seat";
+    setRevision(model.revision);
+    const setup = await testRender(() => <TerminalApp model={model} revision={revision} onKey={() => {}} />, { width: 80, height: 24 });
+    try {
+      await setup.renderOnce();
+      expect(setup.captureCharFrame()).toContain("Re-queued goal-retry/outcome-1 for seat-002.");
+      expect(setup.captureCharFrame()).toContain("Assignment: Retry failed work · queued");
+    } finally { setup.renderer.destroy(); }
+    model.key("t", "T");
+    expect(model.confirm).toBeUndefined();
+    expect(model.notice).toBe("No eligible failed assignment for this seat.");
+  });
+
+  it.each(["n", "escape", "return", "t"])("cancels a retry with %s without re-queuing it", async (key) => {
+    const { model, calls } = await retryHarness();
+    model.page = "seat";
+    model.key("t", "T");
+    expect(model.key(key, key === "t" ? "T" : undefined)).toBe("none");
+    expect(model.confirm).toBeUndefined();
+    expect(model.notice).toBe("Retry cancelled; nothing changed.");
+    await model.retryConfirmed();
+    expect(model.key("y", "y")).toBe("none");
+    expect(calls).toEqual([]);
+  });
+
+  it("binds a confirmation to its original failure and shows a stale-state refusal from the supervisor", async () => {
+    const { model, target, live, calls } = await retryHarness(async () => { throw new Error("Sprint goal-retry is pr-open; it no longer accepts retries."); });
+    model.key("t", "T");
+    live["seat-002"].retry = { ...target, goalId: "goal-newer", outcomeId: "outcome-newer", updatedAt: "2026-01-03T00:00:00Z" };
+    await model.refresh();
+    expect(model.confirm).toEqual({ ...target, action: "retry" });
+    expect(model.key("y", "y")).toBe("retry");
+    await model.retryConfirmed();
+    expect(calls).toEqual([{ ...target, action: "retry" }]);
+    expect(model.notice).toBe("Could not retry: Sprint goal-retry is pr-open; it no longer accepts retries.");
+    const setup = await testRender(() => <TerminalApp model={model} revision={() => model.revision} onKey={() => {}} />, { width: 120, height: 30 });
+    try {
+      await setup.renderOnce();
+      expect(setup.captureCharFrame()).toContain(model.notice);
+    } finally { setup.renderer.destroy(); }
+  });
+
+  it("blocks repeated retry requests while the confirmed request is still running", async () => {
+    let finish = (_message: string) => {};
+    const { model, calls } = await retryHarness(() => new Promise<string>((done) => { finish = done; }));
+    model.key("t", "T");
+    model.key("y", "y");
+    const pending = model.retryConfirmed();
+    model.key("t", "T");
+    expect(model.confirm).toBeUndefined();
+    expect(model.notice).toBe("A retry is already in progress.");
+    expect(model.key("y", "y")).toBe("none");
+    await model.retryConfirmed();
+    expect(calls).toHaveLength(1);
+    finish("Re-queued once.");
+    await pending;
+    expect(model.notice).toBe("Re-queued once.");
+  });
+
+  it("requires a Developer seat, an eligible failure, and a supervisor that supports retry", async () => {
+    const { model, processes } = await retryHarness();
+    model.seatId = "seat-001";
+    model.key("t", "T");
+    expect(model.confirm).toBeUndefined();
+    expect(model.notice).toContain("Choose a Developer seat");
+    model.seatId = "seat-002";
+    model.key("t", "t");
+    expect(model.confirm).toBeUndefined();
+    model.page = "teams";
+    model.key("t", "T");
+    expect(model.confirm).toBeUndefined();
+    model.page = "seat";
+    delete processes.retry;
+    model.key("t", "T");
+    expect(model.confirm).toBeUndefined();
+    expect(model.notice).toBe("Assignments cannot be retried from this screen.");
+  });
+
   it("shows five stable seats without inventing occupancy, then keeps selection during automatic updates", async () => {
     const fixture = harness();
     await fixture.model.refresh();
