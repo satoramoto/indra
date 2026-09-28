@@ -97,7 +97,12 @@ export class PlanningStore {
     try { return JSON.parse(await readFile(join(this.runtimeDir, `${id}.json`), "utf8")) as RuntimeRecord; }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; return { lastSeenAt: Date.now(), processedPostIds: [], runs: [] }; }
   }
-  async saveRuntime(id: string, runtime: RuntimeRecord): Promise<void> {
+  /** Reads a runtime file other than a planning goal's record; undefined when absent. */
+  async readRuntimeFile<T>(name: string): Promise<T | undefined> {
+    try { return JSON.parse(await readFile(join(this.runtimeDir, `${name}.json`), "utf8")) as T; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; return undefined; }
+  }
+  async saveRuntime(id: string, runtime: object): Promise<void> {
     await mkdir(this.runtimeDir, { recursive: true, mode: 0o700 });
     const file = join(this.runtimeDir, `${id}.json`);
     const temp = `${file}.${randomUUID()}.tmp`;

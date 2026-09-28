@@ -9,7 +9,8 @@ import { interactiveState, printState } from "./state-cli.js";
 import { StateInventory } from "./state-domain.js";
 import { PlanningStore } from "./planning.js";
 import { PlanningBridge } from "./planning-bridge.js";
-import { MattermostPlanningChat, readChickToken } from "./planning-mattermost.js";
+import { MattermostPlanningChat, readBotToken, readChickToken } from "./planning-mattermost.js";
+import { DeveloperSeat, loadDeveloperSeat, processShell } from "./developer-seat.js";
 import { CodexRuntime } from "./codex-runtime.js";
 import { TmuxHost } from "./tmux-host.js";
 import { LocalSessionReader } from "./session-snapshot.js";
@@ -84,12 +85,26 @@ export async function runConsistencyCheck(state: StateInventory, reader: TeamMem
   return printConsistency(reports, timestamp(), write) > 0 ? 1 : 0;
 }
 
-type Options = { mode: "help" } | { mode: "state"; checkout: string; once: boolean } | { mode: "ui"; checkout: string } | { mode: "mattermost"; slug: string } | { mode: "mattermost"; checkout: string; once: boolean } | { mode: "planning"; action: "start" | "serve" | "host" | "status"; checkout: string; channel?: string; goal?: string; projects: string[]; participants: string[]; readyNonce?: string };
+type Options = { mode: "help" } | { mode: "seat"; seatId: string; checkout: string } | { mode: "state"; checkout: string; once: boolean } | { mode: "ui"; checkout: string } | { mode: "mattermost"; slug: string } | { mode: "mattermost"; checkout: string; once: boolean } | { mode: "planning"; action: "start" | "serve" | "host" | "status"; checkout: string; channel?: string; goal?: string; projects: string[]; participants: string[]; readyNonce?: string };
 
-const usage = "Usage: npm start -- [--state PATH] [--once] | --ui [--state PATH] | --mattermost [--state PATH] [--once] | --mattermost --team SLUG | planning start --goal TEXT --channel CHANNEL_ID [--project PATH] [--participant SEAT_ID] [--state PATH] | planning serve|host|status [--state PATH]\nPlanning serves only Chick's Yahaha thread. Reply in the thread to clarify; send /proposal there to request a draft.";
+const usage = "Usage: npm start -- [--state PATH] [--once] | --ui [--state PATH] | --mattermost [--state PATH] [--once] | --mattermost --team SLUG | planning start --goal TEXT --channel CHANNEL_ID [--project PATH] [--participant SEAT_ID] [--state PATH] | planning serve|host|status [--state PATH] | seat run --seat SEAT_ID [--state PATH]\nPlanning serves only Chick's Yahaha thread. Reply in the thread to clarify; send /proposal there to request a draft.";
 
 export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_REPO): Options {
   if (args.length === 1 && (args[0] === "--help" || args[0] === "-h")) return { mode: "help" };
+  if (args[0] === "seat") {
+    if (args[1] !== "run") throw new StateDataError(usage);
+    let checkout: string | undefined; let seatId: string | undefined;
+    for (let index = 2; index < args.length; index++) {
+      const key = args[index]; const value = args[++index];
+      if (!value || value.startsWith("--")) throw new StateDataError(usage);
+      if (key === "--state" && !checkout) checkout = value;
+      else if (key === "--seat" && !seatId) seatId = value;
+      else throw new StateDataError(usage);
+    }
+    if (!seatId) throw new StateDataError(usage);
+    const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+    return { mode: "seat", seatId, checkout: resolve(checkout || stateEnv || resolve(projectRoot, "..", "indra-state")) };
+  }
   if (args[0] === "planning") {
     const action = args[1];
     if (action !== "start" && action !== "serve" && action !== "host" && action !== "status") throw new StateDataError(usage);
@@ -146,6 +161,21 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
     if (options.mode === "help") {
       console.log(usage);
       return 0;
+    }
+    if (options.mode === "seat") {
+      try {
+        const store = new PlanningStore(options.checkout);
+        const seat = await loadDeveloperSeat(store, options.seatId);
+        const chat = new MattermostPlanningChat(await readBotToken(seat.username));
+        const runner = new DeveloperSeat(store, seat, chat, processShell, (cwd, write) => new CodexRuntime(cwd, 60 * 60_000, write), (line) => console.log(`[${new Date().toISOString()}] ${line}`));
+        console.log(`Developer seat ${seat.id} (@${seat.username}) running. Stop with Ctrl-C.`);
+        while (true) {
+          if (await runner.tick() === "idle") await new Promise((resolve) => setTimeout(resolve, 30_000));
+        }
+      } catch (error) {
+        console.error(`Seat error: ${error instanceof Error ? error.message : String(error)}`);
+        return 1;
+      }
     }
     if (options.mode === "ui") {
       const { runTerminalUi } = await import("./terminal-ui-solid.js");
