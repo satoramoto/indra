@@ -41,7 +41,8 @@ describe("local state checkout", () => {
     const inventory = new StateInventory(new LocalStateRepository(await checkout(fixture())));
     const snapshot = await inventory.current();
     expect(snapshot.teams[0].seats.map((seat) => seat.id)).toEqual(["seat-001", "seat-002"]);
-    expect(snapshot.teams[0].seats[1]).toEqual({ id: "seat-002", displayName: "Corey Henry", handle: "coreyhenry", roles: ["Developer"] });
+    expect(snapshot.teams[0].seats[1]).toEqual({ id: "seat-002", displayName: "Corey Henry", handle: "coreyhenry", mattermostUserId: "external-user-2", roles: ["Developer"] });
+    expect(snapshot.teams[0].mattermostTeamId).toBe("external-team");
     const output: string[] = [];
     printState(snapshot, "now", (line) => output.push(line));
     expect(output.join("\n")).toContain("Yahaha (yahaha) | 2 seats");
@@ -59,7 +60,8 @@ describe("local state checkout", () => {
     await interactiveState(inventory, async () => {
       if (prompts++ === 0) {
         const edited = JSON.parse(await readFile(join(dir, "state.json"), "utf8")) as ReturnType<typeof fixture>;
-        edited.teams[0].seats[1].roles = ["Developer", "Team Lead"];
+        edited.teams[0].seats[0].roles = ["Developer"];
+        edited.teams[0].seats[1].roles = ["Team Lead"];
         edited.sprints[0].phase = "review";
         await writeFile(join(dir, "state.json"), JSON.stringify(edited));
         return "r";
@@ -68,7 +70,7 @@ describe("local state checkout", () => {
     }, (line) => output.push(line));
     const text = output.join("\n");
     expect(text).toContain("Corey Henry (@coreyhenry) | Role: Developer\n");
-    expect(text).toContain("Corey Henry (@coreyhenry) | Role: Developer, Team Lead");
+    expect(text).toContain("Corey Henry (@coreyhenry) | Role: Team Lead");
     expect(text).toContain("phase: planning");
     expect(text).toContain("phase: review");
   });
@@ -107,11 +109,53 @@ describe("local state checkout", () => {
     expect(String(error)).toContain("Set --state PATH or INDRA_STATE_REPO");
   });
 
-  it("selects state by default and keeps Mattermost opt-in", () => {
-    expect(parseOptions([], "/tmp/fixture")).toEqual({ mode: "state", checkout: "/tmp/fixture", once: false });
+  it("opens the terminal UI by default and keeps Mattermost opt-in", () => {
+    expect(parseOptions([], "/tmp/fixture")).toEqual({ mode: "ui", checkout: "/tmp/fixture" });
+    expect(parseOptions(["--ui"], "/tmp/fixture")).toEqual({ mode: "ui", checkout: "/tmp/fixture" });
     expect(parseOptions(["--state", "/tmp/explicit", "--once"], "/tmp/fixture")).toEqual({ mode: "state", checkout: "/tmp/explicit", once: true });
     expect(parseOptions(["--mattermost", "--team", "yahaha"])).toEqual({ mode: "mattermost", slug: "yahaha" });
     expect(() => parseOptions(["--team", "yahaha"])).toThrow("requires --mattermost");
-    expect(() => parseOptions(["--mattermost", "--once"])).toThrow("Usage:");
+    expect(parseOptions(["--mattermost", "--once"], "/tmp/fixture")).toEqual({ mode: "mattermost", checkout: "/tmp/fixture", once: true });
+    expect(parseOptions(["--mattermost", "--state", "/tmp/explicit"], "/tmp/fixture")).toEqual({ mode: "mattermost", checkout: "/tmp/explicit", once: false });
+    expect(() => parseOptions(["--mattermost", "--team", "yahaha", "--once"])).toThrow("Usage:");
+    expect(() => parseOptions(["--mattermost", "--ui"])).toThrow("Usage:");
+  });
+
+  it("reads a team's optional home channel and GitHub project, naming the field when either is malformed", () => {
+    expect(parseState(fixture()).teams[0]).not.toHaveProperty("homeChannelId");
+    expect(parseState(fixture()).teams[0]).not.toHaveProperty("project");
+    const home = (mattermost: object, project?: unknown) => {
+      const value = fixture() as ReturnType<typeof fixture> & { teams: { project?: unknown }[] };
+      Object.assign(value.teams[0].externalIdentities.mattermost, mattermost);
+      if (project !== undefined) value.teams[0].project = project;
+      return value;
+    };
+    expect(parseState(home({ homeChannelId: "o9rogqxy7br1zkrcami681sray" }, { github: "satoramoto/indra" })).teams[0]).toMatchObject({ homeChannelId: "o9rogqxy7br1zkrcami681sray", project: { github: "satoramoto/indra" } });
+    expect(() => parseState(home({ homeChannelId: " " }))).toThrow("teams[0].externalIdentities.mattermost.homeChannelId must be a nonempty string");
+    expect(() => parseState(home({ planningChannelId: "channel-1" }))).toThrow("teams[0].externalIdentities.mattermost.planningChannelId is not part of state schema v1");
+    expect(() => parseState(home({}, "satoramoto/indra"))).toThrow("teams[0].project must be an object");
+    expect(() => parseState(home({}, {}))).toThrow("teams[0].project.github must be a nonempty string");
+    expect(() => parseState(home({}, { github: "satoramoto/indra", path: "/tmp" }))).toThrow("teams[0].project.path is not part of state schema v1");
+    for (const github of ["indra", "https://github.com/satoramoto/indra", "../indra", "satoramoto/..", "a/b/c", "satoramoto/in dra"]) {
+      expect(() => parseState(home({}, { github }))).toThrow("teams[0].project.github must be a GitHub repository as 'owner/repo'");
+    }
+  });
+
+  it("accepts only the Team Lead and Developer roles, one per seat", () => {
+    const product = fixture();
+    product.teams[0].seats[1].roles = ["Product"];
+    expect(() => parseState(product)).toThrow("teams[0].seats[1].roles[0] 'Product' is not a seat role; expected 'Team Lead' or 'Developer'");
+    const two = fixture();
+    two.teams[0].seats[1].roles = ["Developer", "Team Lead"];
+    expect(() => parseState(two)).toThrow("teams[0].seats[1].roles must contain exactly one role");
+    const none = fixture();
+    none.teams[0].seats[1].roles = [];
+    expect(() => parseState(none)).toThrow("teams[0].seats[1].roles must contain exactly one role");
+    const noLead = fixture();
+    noLead.teams[0].seats[0].roles = ["Developer"];
+    expect(() => parseState(noLead)).toThrow("teams[0].seats must contain exactly one 'Team Lead' seat; found 0");
+    const twoLeads = fixture();
+    twoLeads.teams[0].seats[1].roles = ["Team Lead"];
+    expect(() => parseState(twoLeads)).toThrow("teams[0].seats must contain exactly one 'Team Lead' seat; found 2");
   });
 });

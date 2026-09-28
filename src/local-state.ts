@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { SEAT_ROLES } from "./state-domain.js";
 import type { DraftSprint, ProposedAllocation, ProposedWork, StateRepository, StateSnapshot, StateTeam } from "./state-domain.js";
 
 export class StateDataError extends Error {
@@ -58,12 +59,13 @@ function unique(ids: string[], path: string, label = "ID"): void {
 function team(value: unknown, index: number): StateTeam {
   const path = `teams[${index}]`;
   const data = record(value, path);
-  fields(data, path, ["id", "slug", "displayName", "externalIdentities", "seats"]);
+  fields(data, path, ["id", "slug", "displayName", "project", "externalIdentities", "seats"]);
+  const project = data.project === undefined ? undefined : teamProject(data.project, `${path}.project`);
   const identities = record(data.externalIdentities, `${path}.externalIdentities`);
   fields(identities, `${path}.externalIdentities`, ["mattermost"]);
   const mattermost = record(identities.mattermost, `${path}.externalIdentities.mattermost`);
-  fields(mattermost, `${path}.externalIdentities.mattermost`, ["teamId"]);
-  string(mattermost.teamId, `${path}.externalIdentities.mattermost.teamId`);
+  fields(mattermost, `${path}.externalIdentities.mattermost`, ["teamId", "homeChannelId"]);
+  const homeChannelId = mattermost.homeChannelId === undefined ? undefined : string(mattermost.homeChannelId, `${path}.externalIdentities.mattermost.homeChannelId`);
   const seats = array(data.seats, `${path}.seats`).map((value, index) => {
     const seatPath = `${path}.seats[${index}]`;
     const seat = record(value, seatPath);
@@ -72,23 +74,48 @@ function team(value: unknown, index: number): StateTeam {
     fields(identities, `${seatPath}.externalIdentities`, ["mattermost"]);
     const mattermost = record(identities.mattermost, `${seatPath}.externalIdentities.mattermost`);
     fields(mattermost, `${seatPath}.externalIdentities.mattermost`, ["userId", "username"]);
-    string(mattermost.userId, `${seatPath}.externalIdentities.mattermost.userId`);
+    const userId = string(mattermost.userId, `${seatPath}.externalIdentities.mattermost.userId`);
     const roles = strings(seat.roles, `${seatPath}.roles`);
     unique(roles, `${seatPath}.roles`, "role");
+    if (roles.length !== 1) {
+      throw new StateDataError(`${seatPath}.roles must contain exactly one role: ${SEAT_ROLES.map((role) => `'${role}'`).join(" or ")}.`);
+    }
+    if (!(SEAT_ROLES as readonly string[]).includes(roles[0])) {
+      throw new StateDataError(`${seatPath}.roles[0] '${roles[0]}' is not a seat role; expected ${SEAT_ROLES.map((role) => `'${role}'`).join(" or ")}.`);
+    }
     return {
       id: id(seat.id, `${seatPath}.id`),
       displayName: string(seat.displayName, `${seatPath}.displayName`),
       handle: string(mattermost.username, `${seatPath}.externalIdentities.mattermost.username`),
+      mattermostUserId: userId,
       roles,
     };
   });
   unique(seats.map((seat) => seat.id), `${path}.seats`);
+  const leads = seats.filter((seat) => seat.roles[0] === "Team Lead").length;
+  if (leads !== 1) {
+    throw new StateDataError(`${path}.seats must contain exactly one 'Team Lead' seat; found ${leads}.`);
+  }
   return {
     id: id(data.id, `${path}.id`),
     slug: id(data.slug, `${path}.slug`),
     displayName: string(data.displayName, `${path}.displayName`),
+    mattermostTeamId: string(mattermost.teamId, `${path}.externalIdentities.mattermost.teamId`),
+    ...(homeChannelId ? { homeChannelId } : {}),
+    ...(project ? { project } : {}),
     seats,
   };
+}
+
+/** GitHub `owner/repo`: letters, digits, `-`, `_` and `.`, never a `.` or `..` segment (it becomes a local path). */
+export const GITHUB_REPO = /^(?!\.\.?\/)[A-Za-z0-9_.-]+\/(?!\.\.?$)[A-Za-z0-9_.-]+$/;
+
+function teamProject(value: unknown, path: string): { github: string } {
+  const data = record(value, path);
+  fields(data, path, ["github"]);
+  const github = string(data.github, `${path}.github`);
+  if (!GITHUB_REPO.test(github)) throw new StateDataError(`${path}.github must be a GitHub repository as 'owner/repo'.`);
+  return { github };
 }
 
 function sprint(value: unknown, index: number): DraftSprint {

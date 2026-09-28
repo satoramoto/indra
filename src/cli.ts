@@ -1,19 +1,27 @@
 import { createInterface } from "node:readline/promises";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { dirname, join, resolve } from "node:path";
 import { readToken } from "./credential.js";
 import { Inventory, InventoryError, type Seat, type Team } from "./domain.js";
 import { LocalStateRepository, StateDataError } from "./local-state.js";
 import { MattermostClient, MattermostInventory } from "./mattermost.js";
-import { interactiveState, printState } from "./state-cli.js";
+import { printState } from "./state-cli.js";
 import { StateInventory } from "./state-domain.js";
 import { PlanningStore } from "./planning.js";
 import { PlanningBridge } from "./planning-bridge.js";
-import { MattermostPlanningChat, readChickToken } from "./planning-mattermost.js";
+import { MattermostPlanningChat, readBotToken, readChickToken, type BotTokenOptions } from "./planning-mattermost.js";
+import { readServiceToken, stageServiceToken } from "./service-account.js";
+import { DeveloperSeat, loadDeveloperSeat, processShell } from "./developer-seat.js";
 import { CodexRuntime } from "./codex-runtime.js";
-import { TmuxHost } from "./tmux-host.js";
+import { defaultAppDir, signalReady, TmuxHost, turnLockFile } from "./tmux-host.js";
+import { withFileLock } from "./state-commit.js";
+import { readBuildStamp } from "./build-stamp.js";
+import { recordRunningBuild, SelfUpdater } from "./self-update.js";
+import { appRootOf, isEntry, LAUNCHER_ENV, RELOAD_EXIT_CODE } from "./reload.js";
+import { readFile, rm, writeFile, mkdir } from "node:fs/promises";
+import type { UiView } from "./terminal-ui.js";
 import { LocalSessionReader } from "./session-snapshot.js";
-import { mkdir, writeFile } from "node:fs/promises";
+import { CliGoalStarter, Supervisor } from "./supervisor.js";
+import { checkConsistency, printConsistency, type TeamMemberReader } from "./consistency.js";
 
 export const SERVER = "https://mattermost.newegypt.io";
 export type Write = (line: string) => void;
@@ -77,32 +85,67 @@ export async function interactive(inventory: Inventory, read: Read, write: Write
   }
 }
 
-type Options = { mode: "help" } | { mode: "state"; checkout: string; once: boolean } | { mode: "ui"; checkout: string } | { mode: "mattermost"; slug?: string } | { mode: "planning"; action: "start" | "serve" | "host" | "status"; checkout: string; channel?: string; goal?: string; projects: string[]; participants: string[]; readyNonce?: string };
+/**
+ * Reads a process's bot token with the service account token the control plane staged, if any.
+ * A hosted process (one with a ready nonce) never falls back to a desktop prompt; when its token is missing,
+ * it tells the tmux host "no credential" before failing.
+ */
+export async function hostedToken(checkout: string, readyNonce: string | undefined, read: (options: BotTokenOptions) => Promise<string>, lingerMs = 5000): Promise<string> {
+  try { return await read({ serviceToken: await readServiceToken(checkout), headless: !!readyNonce }); }
+  catch (error) {
+    if (readyNonce) {
+      await signalReady(checkout, readyNonce, "no-credential").catch(() => {});
+      // Stay alive briefly so the host sees the signal from a verified pane rather than a vanished one.
+      await new Promise((done) => setTimeout(done, lingerMs));
+    }
+    throw error;
+  }
+}
 
-const usage = "Usage: npm start -- [--state PATH] [--once] | --ui [--state PATH] | --mattermost [--team SLUG] | planning start --goal TEXT --channel CHANNEL_ID [--project PATH] [--participant SEAT_ID] [--state PATH] | planning serve|host|status [--state PATH]\nPlanning serves only Chick's Yahaha thread. Reply in the thread to clarify; send /proposal there to request a draft.";
+/** Prints the live Mattermost vs state report; returns the exit code (1 when anything differs). */
+export async function runConsistencyCheck(state: StateInventory, reader: TeamMemberReader, write: Write): Promise<number> {
+  const reports = await checkConsistency(await state.current(), reader);
+  return printConsistency(reports, timestamp(), write) > 0 ? 1 : 0;
+}
+
+type Options = { mode: "help" } | { mode: "seat"; seatId: string; checkout: string; readyNonce?: string } | { mode: "state"; checkout: string; once: boolean } | { mode: "ui"; checkout: string } | { mode: "mattermost"; slug: string } | { mode: "mattermost"; checkout: string; once: boolean } | { mode: "planning"; action: "start" | "serve" | "host" | "status" | "approve"; checkout: string; goal?: string; participants: string[]; readyNonce?: string };
+
+const usage = "Usage: npm start -- [--state PATH] [--once] | --ui [--state PATH] | --mattermost [--state PATH] [--once] | --mattermost --team SLUG | planning start --goal TEXT [--participant SEAT_ID] [--state PATH] | planning approve --goal GOAL_ID [--state PATH] | planning serve|host|status [--state PATH] | seat run --seat SEAT_ID [--state PATH]\nPlanning serves only Chick's Yahaha thread, in the team's home channel and project from state. Reply in the thread to clarify; react :memo: on Chick's goal post to request a draft, and :white_check_mark: on the proposal post to approve it.";
 
 export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_REPO): Options {
   if (args.length === 1 && (args[0] === "--help" || args[0] === "-h")) return { mode: "help" };
-  if (args[0] === "planning") {
-    const action = args[1];
-    if (action !== "start" && action !== "serve" && action !== "host" && action !== "status") throw new StateDataError(usage);
-    let checkout: string | undefined; let channel: string | undefined; let goal: string | undefined; let readyNonce: string | undefined;
-    const projects: string[] = []; const participants: string[] = [];
+  if (args[0] === "seat") {
+    if (args[1] !== "run") throw new StateDataError(usage);
+    let checkout: string | undefined; let seatId: string | undefined; let readyNonce: string | undefined;
     for (let index = 2; index < args.length; index++) {
       const key = args[index]; const value = args[++index];
       if (!value || value.startsWith("--")) throw new StateDataError(usage);
       if (key === "--state" && !checkout) checkout = value;
-      else if (key === "--channel" && !channel) channel = value;
+      else if (key === "--seat" && !seatId) seatId = value;
+      else if (key === "--ready-nonce" && !readyNonce && /^[a-f0-9-]{36}$/.test(value)) readyNonce = value;
+      else throw new StateDataError(usage);
+    }
+    if (!seatId) throw new StateDataError(usage);
+    const projectRoot = appRootOf(import.meta.url);
+    return { mode: "seat", seatId, checkout: resolve(checkout || stateEnv || resolve(projectRoot, "..", "indra-state")), ...(readyNonce ? { readyNonce } : {}) };
+  }
+  if (args[0] === "planning") {
+    const action = args[1];
+    if (action !== "start" && action !== "serve" && action !== "host" && action !== "status" && action !== "approve") throw new StateDataError(usage);
+    let checkout: string | undefined; let goal: string | undefined; let readyNonce: string | undefined;
+    const participants: string[] = [];
+    for (let index = 2; index < args.length; index++) {
+      const key = args[index]; const value = args[++index];
+      if (!value || value.startsWith("--")) throw new StateDataError(usage);
+      if (key === "--state" && !checkout) checkout = value;
       else if (key === "--goal" && !goal) goal = value;
-      else if (key === "--project") projects.push(value);
-      else if (key === "--participant") participants.push(value);
+      else if (key === "--participant" && action === "start") participants.push(value);
       else if (key === "--ready-nonce" && !readyNonce && action === "serve" && /^[a-f0-9-]{36}$/.test(value)) readyNonce = value;
       else throw new StateDataError(usage);
     }
-    if (action === "start" && (!goal || !channel)) throw new StateDataError(usage);
-    if (action !== "start" && (goal || channel || projects.length || participants.length)) throw new StateDataError(usage);
-    const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-    return { mode: "planning", action, checkout: resolve(checkout || stateEnv || resolve(projectRoot, "..", "indra-state")), goal, channel, projects, participants, readyNonce };
+    if ((action === "start" || action === "approve") !== !!goal) throw new StateDataError(usage);
+    const projectRoot = appRootOf(import.meta.url);
+    return { mode: "planning", action, checkout: resolve(checkout || stateEnv || resolve(projectRoot, "..", "indra-state")), goal, participants, ...(readyNonce ? { readyNonce } : {}) };
   }
   let mattermost = false;
   let checkout: string | undefined;
@@ -121,15 +164,17 @@ export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_
       else throw new StateDataError(usage);
     } else throw new StateDataError(usage);
   }
-  if (mattermost) {
-    if (checkout || once || ui) throw new StateDataError(usage);
+  if (slug && !mattermost) throw new StateDataError("--team requires --mattermost.\n" + usage);
+  if (ui && (once || mattermost)) throw new StateDataError(usage);
+  if (slug) {
+    if (checkout || once) throw new StateDataError(usage);
     return { mode: "mattermost", slug };
   }
-  if (slug) throw new StateDataError("--team requires --mattermost.\n" + usage);
-  if (ui && once) throw new StateDataError(usage);
-  const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  const projectRoot = appRootOf(import.meta.url);
   const stateCheckout = resolve(checkout || stateEnv || resolve(projectRoot, "..", "indra-state"));
-  return ui ? { mode: "ui", checkout: stateCheckout } : { mode: "state", checkout: stateCheckout, once };
+  if (mattermost) return { mode: "mattermost", checkout: stateCheckout, once };
+  // The terminal UI is the default; --ui is kept as an alias.
+  return once ? { mode: "state", checkout: stateCheckout, once } : { mode: "ui", checkout: stateCheckout };
 }
 
 export async function main(args: string[] = process.argv.slice(2)): Promise<number> {
@@ -139,26 +184,59 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       console.log(usage);
       return 0;
     }
+    if (options.mode === "seat") {
+      recordRunningBuild(`${options.checkout}.runtime`, import.meta.url);
+      try {
+        const store = new PlanningStore(options.checkout);
+        const seat = await loadDeveloperSeat(store, options.seatId);
+        const chat = new MattermostPlanningChat(await hostedToken(options.checkout, options.readyNonce, (tokenOptions) => readBotToken(seat.username, tokenOptions)));
+        if (options.readyNonce) await signalReady(options.checkout, options.readyNonce);
+        const runner = new DeveloperSeat(store, seat, chat, processShell, (cwd, write) => new CodexRuntime(cwd, 60 * 60_000, write), (line) => console.log(`[${new Date().toISOString()}] ${line}`));
+        console.log(`Developer seat ${seat.id} (@${seat.username}) running. Stop with Ctrl-C.`);
+        while (true) {
+          // Each step holds the turn lock, so the supervisor only restarts this runner for an update between steps.
+          if (await withFileLock(turnLockFile(options.checkout, { kind: "seat", seatId: seat.id }), () => runner.tick(), 24 * 60 * 60_000) === "idle") await new Promise((resolve) => setTimeout(resolve, 30_000));
+        }
+      } catch (error) {
+        console.error(`Seat error: ${error instanceof Error ? error.message : String(error)}`);
+        return 1;
+      }
+    }
     if (options.mode === "ui") {
       const { runTerminalUi } = await import("./terminal-ui-solid.js");
-      return await runTerminalUi(new StateInventory(new LocalStateRepository(options.checkout)), new LocalSessionReader(options.checkout));
+      // The view to restore after a reload for new code; read once, then removed.
+      const viewFile = join(`${options.checkout}.runtime`, "ui-view.json");
+      const view = await readFile(viewFile, "utf8").then((text) => JSON.parse(text) as UiView, () => undefined);
+      await rm(viewFile, { force: true });
+      recordRunningBuild(`${options.checkout}.runtime`, import.meta.url);
+      const updater = new SelfUpdater(defaultAppDir, undefined, undefined, `${resolve(options.checkout)}.runtime`);
+      return await runTerminalUi(new StateInventory(new LocalStateRepository(options.checkout)), new LocalSessionReader(options.checkout), {
+        processes: new Supervisor(options.checkout, undefined, undefined, undefined, undefined, () => stageServiceToken(options.checkout)),
+        goals: new CliGoalStarter(options.checkout),
+        sync: new PlanningStore(options.checkout),
+        update: {
+          running: await readBuildStamp(defaultAppDir),
+          canReload: process.env[LAUNCHER_ENV] === "1",
+          check: () => updater.check(),
+          current: () => readBuildStamp(defaultAppDir),
+        },
+        view,
+        reload: async (current) => {
+          // Best effort: without the saved view the reloaded UI opens on its default page.
+          await mkdir(dirname(viewFile), { recursive: true, mode: 0o700 }).then(() => writeFile(viewFile, JSON.stringify(current), { mode: 0o600 })).catch(() => undefined);
+          return RELOAD_EXIT_CODE;
+        },
+      });
     }
     if (options.mode === "state") {
       const inventory = new StateInventory(new LocalStateRepository(options.checkout));
       console.log(`State checkout: ${options.checkout}`);
-      if (options.once) {
-        printState(await inventory.current(), timestamp(), console.log);
-        return 0;
-      }
-      const rl = createInterface({ input: process.stdin, output: process.stdout });
-      try {
-        return await interactiveState(inventory, (prompt) => rl.question(prompt), console.log);
-      } finally {
-        rl.close();
-      }
+      printState(await inventory.current(), timestamp(), console.log);
+      return 0;
     }
     if (options.mode === "planning") {
       if (options.action === "host") {
+        await stageServiceToken(options.checkout);
         const host = new TmuxHost(options.checkout);
         const record = await host.start();
         console.log(`Chick bridge hosted in tmux. Attach target: ${host.attachTarget(record)}`);
@@ -169,35 +247,63 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         return 0;
       }
       const store = new PlanningStore(options.checkout);
-      const chat = new MattermostPlanningChat(await readChickToken());
-      const runtime = new CodexRuntime(process.cwd());
-      const bridge = new PlanningBridge(store, chat, runtime);
-      if (options.action === "start") {
-        const goal = await bridge.start(options.goal!, options.channel!, options.projects, options.participants);
-        console.log(`Planning goal ${goal.id}: ${SERVER}/yahaha/pl/${goal.mattermost.rootPostId}`);
-        return 0;
+      if (options.action === "approve") {
+        // Run by the terminal UI: like a hosted process, it reads Chick's token only with the staged service account token.
+        try {
+          const chat = new MattermostPlanningChat(await readChickToken({ serviceToken: await readServiceToken(options.checkout), headless: true }));
+          const { goal, alreadyApproved } = await new PlanningBridge(store, chat, new CodexRuntime(process.cwd())).approve(options.goal!);
+          console.log(alreadyApproved ? `Goal ${goal.id} was already approved; no new assignments.` : `Approved goal ${goal.id}: ${goal.assignments?.length ?? 0} outcome(s) queued for Developer seats.`);
+          return 0;
+        } catch (error) {
+          console.error(`Planning error: ${error instanceof Error ? error.message : String(error)}`);
+          return 1;
+        }
       }
+      if (options.action === "start") {
+        try {
+          const chat = new MattermostPlanningChat(await hostedToken(options.checkout, options.readyNonce, readChickToken));
+          const goal = await new PlanningBridge(store, chat, new CodexRuntime(process.cwd())).start(options.goal!, options.participants);
+          console.log(`Planning goal ${goal.id}: ${SERVER}/yahaha/pl/${goal.mattermost.rootPostId}`);
+          return 0;
+        } catch (error) {
+          console.error(`Planning error: ${error instanceof Error ? error.message : String(error)}`);
+          return 1;
+        }
+      }
+      recordRunningBuild(`${options.checkout}.runtime`, import.meta.url);
+      const chat = new MattermostPlanningChat(await hostedToken(options.checkout, options.readyNonce, readChickToken));
+      const bridge = new PlanningBridge(store, chat, new CodexRuntime(process.cwd()));
       console.log("Chick planning bridge running. Stop with Ctrl-C.");
       let ready = false;
       while (true) {
-        await bridge.poll();
+        // A poll finishes its Codex turns and saves pending deliveries before it releases the turn lock.
+        await withFileLock(turnLockFile(options.checkout, { kind: "bridge" }), () => bridge.poll(), 24 * 60 * 60_000);
         if (!ready && options.readyNonce) {
-          const host = new TmuxHost(options.checkout);
-          await mkdir(host.runtimeDir, { recursive: true, mode: 0o700 });
-          await writeFile(host.readyFile(options.readyNonce), JSON.stringify({ nonce: options.readyNonce, pid: process.pid, readyAt: new Date().toISOString() }), { flag: "wx", mode: 0o600 });
+          await signalReady(options.checkout, options.readyNonce);
           ready = true;
         }
         await new Promise((resolve) => setTimeout(resolve, 3000));
       }
     }
-    const slug = options.slug;
     const adapter = new MattermostInventory(new MattermostClient(SERVER, await readToken()));
     const inventory = new Inventory(adapter, adapter);
-    if (slug) {
+    if ("slug" in options) {
+      const slug = options.slug;
       const team = (await inventory.teams()).find((item) => item.slug === slug);
       if (!team) throw new InventoryError(`Team '${slug}' is not visible to this credential.`);
       printSeats(team, await inventory.seats(team), timestamp(), console.log);
       return 0;
+    }
+    const state = new StateInventory(new LocalStateRepository(options.checkout));
+    console.log(`State checkout: ${options.checkout}`);
+    if (options.once) return await runConsistencyCheck(state, adapter, console.log);
+    try {
+      await runConsistencyCheck(state, adapter, console.log);
+    } catch (error) {
+      if (error instanceof StateDataError) console.log(`State error: ${error.message}`);
+      else if (error instanceof InventoryError) console.log(`Connection/error: ${error.message}`);
+      else throw error;
+      console.log("The Mattermost vs state check did not complete; no match can be concluded.");
     }
     const rl = createInterface({ input: process.stdin, output: process.stdout });
     try {
@@ -213,6 +319,6 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isEntry(import.meta.url)) {
   process.exitCode = await main();
 }

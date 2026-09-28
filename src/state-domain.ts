@@ -1,8 +1,13 @@
+/** The only permanent seat roles. A team has exactly one Team Lead; every other seat is a Developer. */
+export const SEAT_ROLES = ["Team Lead", "Developer"] as const;
+
 /** Business records used by the terminal, independent of their storage or source. */
 export interface StateSeat {
   id: string;
   displayName: string;
   handle: string;
+  mattermostUserId: string;
+  /** Exactly one entry from SEAT_ROLES once validated. */
   roles: string[];
 }
 
@@ -10,6 +15,11 @@ export interface StateTeam {
   id: string;
   slug: string;
   displayName: string;
+  mattermostTeamId: string;
+  /** `externalIdentities.mattermost.homeChannelId`: where Chick opens the team's planning threads. */
+  homeChannelId?: string;
+  /** The team's GitHub repository; Indra keeps its own clone of it. */
+  project?: { github: string };
   seats: StateSeat[];
 }
 

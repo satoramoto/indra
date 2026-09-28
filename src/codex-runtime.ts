@@ -4,12 +4,24 @@ import { randomUUID } from "node:crypto";
 export interface AgentResult { sessionId: string; response: unknown; usage?: unknown; startedAt: string; finishedAt: string }
 export interface AgentRuntime { message(prompt: string, schemaPath: string, sessionId?: string, signal?: AbortSignal): Promise<AgentResult> }
 
-/** Uses the logged-in Codex CLI and an explicit session id; never uses --last. */
+/**
+ * Write access for a new session: workspace-write sandbox with network (for git push and gh),
+ * plus extra writable directories such as a worktree's shared Git directory.
+ */
+export interface WriteAccess { extraDirs: string[] }
+
+/** Sandbox arguments for a new session: read-only without write access. */
+export function sandboxArgs(write?: WriteAccess): string[] {
+  return write ? ["--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true", ...write.extraDirs.flatMap((dir) => ["--add-dir", dir])] : ["--sandbox", "read-only"];
+}
+
+/** Uses the logged-in Codex CLI and an explicit session id; never uses --last. Read-only unless given write access. */
 export class CodexRuntime implements AgentRuntime {
-  constructor(private readonly cwd: string, private readonly timeoutMs = 300_000) {}
+  constructor(private readonly cwd: string, private readonly timeoutMs = 300_000, private readonly write?: WriteAccess) {}
   async message(prompt: string, schemaPath: string, sessionId?: string, signal?: AbortSignal): Promise<AgentResult> {
     const startedAt = new Date().toISOString();
-    const args = sessionId ? ["exec", "resume", sessionId, "--json", "-c", "sandbox_mode=\"read-only\"", "-"] : ["exec", "--json", "--sandbox", "read-only", "--output-schema", schemaPath, "-"];
+    const sandbox = sandboxArgs(this.write);
+    const args = sessionId ? ["exec", "resume", sessionId, "--json", "-c", "sandbox_mode=\"read-only\"", "-"] : ["exec", "--json", ...sandbox, "--output-schema", schemaPath, "-"];
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     signal?.addEventListener("abort", () => controller.abort(), { once: true });

@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":false,"required":["findings","summary"],"properties":{"findings":{"type":"array","items":{"type":"string"}},"summary":{"type":"string"}}}

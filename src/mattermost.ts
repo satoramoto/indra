@@ -1,3 +1,4 @@
+import type { LiveMember, TeamMemberReader } from "./consistency.js";
 import { InventoryError, type Seat, type SeatReader, type Team, type TeamReader } from "./domain.js";
 
 const PAGE_SIZE = 100;
@@ -177,9 +178,25 @@ export class MattermostClient {
   }
 }
 
-/** One service adapter satisfies both narrow domain ports. */
-export class MattermostInventory implements TeamReader, SeatReader {
+/** One service adapter satisfies the narrow domain ports. */
+export class MattermostInventory implements TeamReader, SeatReader, TeamMemberReader {
   constructor(private readonly api: MattermostClient) {}
+
+  /** Active team members, bots and people alike; deactivated accounts count as absent. */
+  async listTeamMembers(teamId: string): Promise<LiveMember[]> {
+    const members = await this.api.pages(`/teams/${encodeURIComponent(teamId)}/members`);
+    const ids = [...new Set(members.filter((member) => !member.delete_at).map((member) => text(member.user_id)).filter((id): id is string => !!id))];
+    const result: LiveMember[] = [];
+    for (const id of ids) {
+      const user = await this.api.get(`/users/${encodeURIComponent(id)}`);
+      if (!object(user)) throw new InventoryError("Mattermost returned an unexpected user record.");
+      if (user.delete_at) continue;
+      const username = text(user.username);
+      if (!username) throw new InventoryError("Mattermost returned an unexpected user record.");
+      result.push({ userId: id, username, position: typeof user.position === "string" ? user.position : "", isBot: user.is_bot === true });
+    }
+    return result;
+  }
 
   async listTeams(): Promise<Team[]> {
     return (await this.api.pages("/teams")).map((item) => {
