@@ -47,7 +47,18 @@ export class Supervisor implements SeatProcessPort {
     private readonly appDir = defaultAppDir,
     private readonly readinessTimeoutMs = 15_000,
     private readonly store = new PlanningStore(checkout),
+    /** Hands the 1Password service account token to hosted processes; runs once, before the first process starts. */
+    private readonly stageCredential?: () => Promise<void>,
   ) {}
+
+  private staged = false;
+
+  /** Stages the credential until it succeeds once; a failure is reported and the processes show "no credential". */
+  private async credential(): Promise<string | undefined> {
+    if (this.staged || !this.stageCredential) return undefined;
+    try { await this.stageCredential(); this.staged = true; return undefined; }
+    catch (error) { return error instanceof Error ? error.message : String(error); }
+  }
 
   private host(seat: SeatRow): TmuxHost {
     const hosted = seat.roles.includes("Team Lead") ? { kind: "bridge" as const } : { kind: "seat" as const, seatId: seat.id };
@@ -62,6 +73,8 @@ export class Supervisor implements SeatProcessPort {
 
   async ensureAll(): Promise<string[]> {
     const problems: string[] = [];
+    const credentialProblem = await this.credential();
+    if (credentialProblem) problems.push(credentialProblem);
     const started = new Set<string>();
     // Sequential: tmux starts one owned server for the socket, and each host waits for its own readiness.
     for (const seat of seatsOf(await this.store.read())) {
@@ -109,9 +122,11 @@ export class Supervisor implements SeatProcessPort {
 
   async restart(seatId: string): Promise<void> {
     const host = this.host(await this.seat(seatId));
+    const credentialProblem = await this.credential();
     await host.stop();
     try { await host.start(); }
     catch (error) { if (!(error instanceof NoCredentialError)) throw error; }
+    if (credentialProblem) throw new Error(credentialProblem);
   }
 }
 

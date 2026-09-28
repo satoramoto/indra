@@ -5,18 +5,29 @@ import type { PlanningChat, Post } from "./planning-bridge.js";
 const execFileAsync = promisify(execFile);
 const SERVER = "https://mattermost.newegypt.io";
 /** 1Password reference for a seat's Mattermost bot token, named after the bot's username. */
-export const botTokenRef = (username: string) => `op://Agent Rig/Mattermost bot - ${username}/access_token`;
+export const botTokenRef = (username: string) => `op://Agent Rig/Mattermost bot - ${username}/token`;
 
-export async function readBotToken(username: string, ref = botTokenRef(username)): Promise<string> {
-  try {
-    const { stdout } = await execFileAsync("op", ["read", ref], { timeout: 30_000, encoding: "utf8" });
-    if (stdout.trim()) return stdout.trim();
-  } catch { /* hide secret manager details */ }
-  throw new Error(`1Password could not supply the bot token for @${username}. Expected item '${ref}'; check it exists and desktop authorization.`);
+export interface BotTokenOptions {
+  ref?: string;
+  /** 1Password service account token; set only in the environment of the `op read` subprocess. */
+  serviceToken?: string;
+  /** A hosted process has no desktop to prompt: without a service token it fails instead of calling `op`. */
+  headless?: boolean;
 }
 
-export async function readChickToken(): Promise<string> {
-  return await readBotToken("chickcorea", process.env.INDRA_CHICK_TOKEN_REF ?? botTokenRef("chickcorea"));
+export async function readBotToken(username: string, options: BotTokenOptions = {}): Promise<string> {
+  const ref = options.ref ?? botTokenRef(username);
+  if (options.headless && !options.serviceToken) throw new Error(`No 1Password service account token is staged for @${username}; start the terminal UI to stage it, then restart this process.`);
+  try {
+    const env = options.serviceToken ? { ...process.env, OP_SERVICE_ACCOUNT_TOKEN: options.serviceToken } : process.env;
+    const { stdout } = await execFileAsync("op", ["read", ref], { timeout: 30_000, encoding: "utf8", env });
+    if (stdout.trim()) return stdout.trim();
+  } catch { /* hide secret manager details */ }
+  throw new Error(`1Password could not supply the bot token for @${username}. Expected item '${ref}'; check it exists and ${options.serviceToken ? "the service account's vault access" : "desktop authorization"}.`);
+}
+
+export async function readChickToken(options: Omit<BotTokenOptions, "ref"> = {}): Promise<string> {
+  return await readBotToken("chickcorea", { ...options, ref: process.env.INDRA_CHICK_TOKEN_REF ?? botTokenRef("chickcorea") });
 }
 
 export class MattermostPlanningChat implements PlanningChat {

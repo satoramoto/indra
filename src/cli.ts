@@ -9,7 +9,8 @@ import { printState } from "./state-cli.js";
 import { StateInventory } from "./state-domain.js";
 import { PlanningStore } from "./planning.js";
 import { PlanningBridge } from "./planning-bridge.js";
-import { MattermostPlanningChat, readBotToken, readChickToken } from "./planning-mattermost.js";
+import { MattermostPlanningChat, readBotToken, readChickToken, type BotTokenOptions } from "./planning-mattermost.js";
+import { readServiceToken, stageServiceToken } from "./service-account.js";
 import { DeveloperSeat, loadDeveloperSeat, processShell } from "./developer-seat.js";
 import { CodexRuntime } from "./codex-runtime.js";
 import { signalReady, TmuxHost } from "./tmux-host.js";
@@ -79,14 +80,18 @@ export async function interactive(inventory: Inventory, read: Read, write: Write
   }
 }
 
-/** Reads a hosted process's bot token; when it is missing, tells the tmux host "no credential" before failing. */
-async function hostedToken(checkout: string, readyNonce: string | undefined, read: () => Promise<string>): Promise<string> {
-  try { return await read(); }
+/**
+ * Reads a process's bot token with the service account token the control plane staged, if any.
+ * A hosted process (one with a ready nonce) never falls back to a desktop prompt; when its token is missing,
+ * it tells the tmux host "no credential" before failing.
+ */
+export async function hostedToken(checkout: string, readyNonce: string | undefined, read: (options: BotTokenOptions) => Promise<string>, lingerMs = 5000): Promise<string> {
+  try { return await read({ serviceToken: await readServiceToken(checkout), headless: !!readyNonce }); }
   catch (error) {
     if (readyNonce) {
       await signalReady(checkout, readyNonce, "no-credential").catch(() => {});
       // Stay alive briefly so the host sees the signal from a verified pane rather than a vanished one.
-      await new Promise((done) => setTimeout(done, 5000));
+      await new Promise((done) => setTimeout(done, lingerMs));
     }
     throw error;
   }
@@ -181,7 +186,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       try {
         const store = new PlanningStore(options.checkout);
         const seat = await loadDeveloperSeat(store, options.seatId);
-        const chat = new MattermostPlanningChat(await hostedToken(options.checkout, options.readyNonce, () => readBotToken(seat.username)));
+        const chat = new MattermostPlanningChat(await hostedToken(options.checkout, options.readyNonce, (tokenOptions) => readBotToken(seat.username, tokenOptions)));
         if (options.readyNonce) await signalReady(options.checkout, options.readyNonce);
         const runner = new DeveloperSeat(store, seat, chat, processShell, (cwd, write) => new CodexRuntime(cwd, 60 * 60_000, write), (line) => console.log(`[${new Date().toISOString()}] ${line}`));
         console.log(`Developer seat ${seat.id} (@${seat.username}) running. Stop with Ctrl-C.`);
@@ -196,7 +201,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
     if (options.mode === "ui") {
       const { runTerminalUi } = await import("./terminal-ui-solid.js");
       return await runTerminalUi(new StateInventory(new LocalStateRepository(options.checkout)), new LocalSessionReader(options.checkout), {
-        processes: new Supervisor(options.checkout),
+        processes: new Supervisor(options.checkout, undefined, undefined, undefined, undefined, () => stageServiceToken(options.checkout)),
         goals: new CliGoalStarter(options.checkout),
       });
     }
@@ -208,6 +213,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
     }
     if (options.mode === "planning") {
       if (options.action === "host") {
+        await stageServiceToken(options.checkout);
         const host = new TmuxHost(options.checkout);
         const record = await host.start();
         console.log(`Chick bridge hosted in tmux. Attach target: ${host.attachTarget(record)}`);
