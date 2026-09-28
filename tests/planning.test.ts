@@ -8,6 +8,7 @@ import type { Shell, ShellResult } from "../src/developer-seat.js";
 import { MattermostPlanningChat } from "../src/planning-mattermost.js";
 import { parseOptions } from "../src/cli.js";
 import type { AgentRuntime, AgentResult } from "../src/codex-runtime.js";
+import { CLARIFY_TIMEOUT_MS, DRAFT_TIMEOUT_MS } from "../src/codex-runtime.js";
 
 const MEMO = "memo";
 const CHECK = "white_check_mark";
@@ -74,7 +75,9 @@ class FakeRuntime implements AgentRuntime {
   sessions: (string | undefined)[] = [];
   prompts: string[] = [];
   outcomes = [{ title: "Learn project", description: "Inspect it and report findings", seatId: "seat-003" }, { title: "Write tests", description: "Cover the planning flow", seatId: "seat-004" }];
-  async message(prompt: string, schemaPath: string, sessionId?: string): Promise<AgentResult> {
+  timeouts: { schema: string; timeoutMs?: number }[] = [];
+  async message(prompt: string, schemaPath: string, sessionId?: string, options?: { timeoutMs?: number }): Promise<AgentResult> {
+    this.timeouts.push({ schema: schemaPath, timeoutMs: options?.timeoutMs });
     this.sessions.push(sessionId);
     this.prompts.push(prompt);
     const response = schemaPath.endsWith("proposal.json") ? { summary: "Roadmap", outcomes: this.outcomes, risks: [], openQuestions: [] } : { reply: "What matters most?", summary: "Explore project", decisions: [], openQuestions: ["Priority?"] };
@@ -106,6 +109,11 @@ describe("planning bridge", () => {
     const saved = (await store.read()).planningGoals![0];
     expect(saved.stage).toBe("awaiting-review");
     expect(saved.proposal?.outcomes[0].title).toBe("Learn project");
+    expect(runtime.timeouts.filter((call) => call.schema.endsWith("proposal.json")).map((call) => call.timeoutMs)).toEqual([DRAFT_TIMEOUT_MS]);
+    const clarifying = runtime.timeouts.filter((call) => !call.schema.endsWith("proposal.json"));
+    expect(clarifying.length).toBeGreaterThan(0);
+    expect(clarifying.every((call) => call.timeoutMs === CLARIFY_TIMEOUT_MS)).toBe(true);
+    expect(DRAFT_TIMEOUT_MS).toBeGreaterThan(CLARIFY_TIMEOUT_MS);
     const announcement = chat.posts.at(-1)!;
     expect(announcement.message).toContain("awaiting review");
     expect(announcement.message).toContain(`:${CHECK}:`);
