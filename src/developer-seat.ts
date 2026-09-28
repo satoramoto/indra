@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { lstat, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import type { AgentResult, AgentRuntime, WriteAccess } from "./codex-runtime.js";
+import { maintainDeveloperSeat, ownsSeatRecord, retainSeatRecord, seatRecordName } from "./developer-maintenance.js";
 import { postReviewOnce } from "./developer-review.js";
 import { missingTeamMessage, teamProject, type PlanningAssignment as Assignment, type PlanningGoal, type PlanningOutcome as ApprovedOutcome, type PlanningStore } from "./planning.js";
 import { ensureProjectCheckout, ProjectCheckoutError, projectCheckoutPath } from "./project-checkout.js";
@@ -13,7 +14,7 @@ import { activityRecordName } from "./supervisor.js";
 export interface ShellResult { code: number; stdout: string; stderr: string }
 export interface Shell { run(command: string, args: string[], cwd: string): Promise<ShellResult> }
 export interface SeatChat { post(channelId: string, message: string, rootId?: string): Promise<unknown> }
-/** Creates a Codex runtime in `cwd`: read-only without `write`, otherwise workspace-write plus the given extra dirs (the shared Git dir). */
+/** Creates an agent runtime in `cwd`: read-only without `write`, otherwise workspace-write plus the given extra dirs (the shared Git dir). */
 export type RuntimeFactory = (cwd: string, write?: WriteAccess) => AgentRuntime;
 
 export interface SeatIdentity { id: string; displayName: string; username: string; roles: string[] }
@@ -66,6 +67,7 @@ export class DeveloperSeat {
 
   /** Resumes the seat's in-flight assignment, or claims the oldest queued one. Returns "idle" when there was nothing to do. */
   async tick(): Promise<"idle" | "worked"> {
+    if (await maintainDeveloperSeat(this.store, this.seat.id, this.shell, this.log)) return "worked";
     const goals = ((await this.store.read()).planningGoals ?? []).filter((goal) => goal.stage === "approved");
     const mine = goals.flatMap((goal) => (goal.assignments ?? []).filter((item) => item.seatId === this.seat.id).map((assignment) => ({ goal, assignment })));
     const active = mine.find((item) => ACTIVE.has(item.assignment.status));
@@ -90,7 +92,7 @@ export class DeveloperSeat {
       await this.resume(goal, assignment, saved);
     } else {
       // Keep unrecognized metadata and retained checkouts intact. A new attempt must not collide with either.
-      if (saved) await this.store.saveRuntime(`${this.recordName(goal.id, assignment.outcomeId)}-retained-${randomUUID()}`, saved);
+      if (saved) await retainSeatRecord(this.store, this.recordName(goal.id, assignment.outcomeId), saved);
       const record = this.newRecord(goal.id, assignment.outcomeId);
       if (assignment.prUrl) record.retainedPrUrl = assignment.prUrl;
       await this.save(record);
@@ -118,11 +120,7 @@ export class DeveloperSeat {
   }
 
   private ownsRecord(goal: PlanningGoal, outcomeId: string, record: SeatTaskRecord): boolean {
-    const branch = `${this.seat.id}/${goal.id}-${outcomeId}`;
-    if (record.goalId !== goal.id || record.outcomeId !== outcomeId || !record.branch?.startsWith(branch)) return false;
-    const suffix = record.branch.slice(branch.length);
-    return (!suffix || /^-attempt-[0-9a-f-]{36}$/.test(suffix)) && record.worktree === this.newRecord(goal.id, outcomeId, suffix).worktree
-      && ["worktree", "build", "review", "fix", "ci", "done"].includes(record.step) && Array.isArray(record.sessions);
+    return ownsSeatRecord(this.store.runtimeDir, this.seat.id, goal.id, outcomeId, record);
   }
 
   /** Verify both the assignment identity and Git's actual checkout before any recovery command or session. */
@@ -151,6 +149,7 @@ export class DeveloperSeat {
   private async work(goal: PlanningGoal, record: SeatTaskRecord, resuming = false): Promise<void> {
     const outcome = this.outcome(goal, record.outcomeId);
     const base = baseBranch(goal);
+    let finalized = false;
     try {
       if (resuming && (record.step !== "worktree" || await pathExists(record.worktree))) {
         await this.verifyWorktree(goal, record);
@@ -209,6 +208,7 @@ export class DeveloperSeat {
           }
         }
         await this.setStatus(goal.id, record.outcomeId, { status: "merged", prUrl: record.prUrl });
+        finalized = true;
         await this.advance(record, "done");
         await this.say(goal, `Merged ${record.prUrl} for **${outcome.title}**. Going idle.`);
         // Cleanup is best-effort: none of it can fail a merged assignment.
@@ -221,6 +221,7 @@ export class DeveloperSeat {
         if (branchGone.code !== 0) this.log(`Could not delete local branch ${record.branch}.`);
       }
     } catch (error) {
+      if (finalized) { this.log(`Merged ${goal.id}/${record.outcomeId}; could not finish post-merge housekeeping.`); return; }
       const reason = error instanceof SeatError || error instanceof ProjectCheckoutError ? error.message : "unexpected error";
       this.log(`Assignment ${goal.id}/${record.outcomeId} failed at ${record.step}: ${error instanceof Error ? error.message : String(error)}`);
       await this.fail(goal, record.outcomeId, `${record.step}: ${reason}`.slice(0, 200));
@@ -237,15 +238,16 @@ export class DeveloperSeat {
   }
 
   private async fail(goal: PlanningGoal, outcomeId: string, note: string): Promise<void> {
-    await this.setStatus(goal.id, outcomeId, { status: "failed", note });
-    await this.say(goal, `Failed **${this.outcome(goal, outcomeId).title}** (${outcomeId}): ${note} Going idle.`);
+    if (await this.setStatus(goal.id, outcomeId, { status: "failed", note })) {
+      await this.say(goal, `Failed **${this.outcome(goal, outcomeId).title}** (${outcomeId}): ${note} Going idle.`);
+    }
   }
 
   private async codex(role: SeatTaskRecord["sessions"][number]["role"], record: SeatTaskRecord, write: WriteAccess | undefined, prompt: string, schema: string): Promise<AgentResult> {
     let run: AgentResult;
     // Every session is new: no session id is ever passed, so the reviewer never shares the builder's context.
     try { run = await this.runtimeFor(record.worktree, write).message(prompt, schema); }
-    catch (error) { this.log(`Codex ${role} session error: ${error instanceof Error ? error.message : String(error)}`); throw new SeatError(`Codex ${role} session failed.`); }
+    catch { this.log(`Agent ${role} session error.`); throw new SeatError(`Agent ${role} session failed.`); }
     record.sessions.push({ role, sessionId: run.sessionId, startedAt: run.startedAt, finishedAt: run.finishedAt, usage: run.usage });
     await this.save(record);
     return run;
@@ -318,8 +320,17 @@ export class DeveloperSeat {
     return result;
   }
 
-  private async setStatus(goalId: string, outcomeId: string, change: Partial<Assignment>): Promise<void> {
-    await this.store.update((state) => { Object.assign(this.find(state.planningGoals, goalId, outcomeId), change, { updatedAt: new Date().toISOString() }); }, `Seat ${this.seat.id} marks ${goalId}/${outcomeId} ${change.status ?? "updated"}`);
+  private async setStatus(goalId: string, outcomeId: string, change: Partial<Assignment>): Promise<boolean> {
+    let changed = false;
+    await this.store.update((state) => {
+      const target = this.find(state.planningGoals, goalId, outcomeId);
+      // update's lock and commit recovery also protect a merge whose commit succeeded before update threw.
+      if (target.status === "merged") return;
+      Object.assign(target, change, { updatedAt: new Date().toISOString() });
+      if (change.status === "merged") delete target.note;
+      changed = true;
+    }, `Seat ${this.seat.id} marks ${goalId}/${outcomeId} ${change.status ?? "updated"}`);
+    return changed;
   }
 
   private find(goals: PlanningGoal[] | undefined, goalId: string, outcomeId: string): Assignment {
@@ -339,7 +350,7 @@ export class DeveloperSeat {
     return github;
   }
 
-  private recordName(goalId: string, outcomeId: string): string { return `seat-${this.seat.id}-${goalId}-${outcomeId}`; }
+  private recordName(goalId: string, outcomeId: string): string { return seatRecordName(this.seat.id, goalId, outcomeId); }
   private async save(record: SeatTaskRecord): Promise<void> { await this.store.saveRuntime(this.recordName(record.goalId, record.outcomeId), record); }
   private async advance(record: SeatTaskRecord, step: Step): Promise<void> { record.step = step; await this.save(record); }
 
