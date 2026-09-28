@@ -35,6 +35,8 @@ class FakeChat implements SeatChat {
 class FakeShell implements Shell {
   calls: string[] = [];
   checksCode = 0;
+  merges: { code: number; stderr: string; merged: boolean }[] = [];
+  merged = false;
   onFirst?: () => Promise<void>;
   async run(command: string, args: string[], cwd: string): Promise<ShellResult> {
     if (this.onFirst) { const hook = this.onFirst; this.onFirst = undefined; await hook(); }
@@ -43,7 +45,13 @@ class FakeShell implements Shell {
     // `gh repo clone` makes the checkout Indra then moves into place.
     if (line.startsWith("gh repo clone")) await mkdir(join(args[3], ".git"), { recursive: true });
     if (line.startsWith("git rev-parse")) return { code: 0, stdout: "/proj/.git\n", stderr: "" };
-    if (line.startsWith("gh pr view")) return { code: 0, stdout: "OPEN\n", stderr: "" };
+    if (line.startsWith("gh pr merge")) {
+      // Each merge attempt takes the next outcome; by default gh succeeds and the PR merges.
+      const outcome = this.merges.shift() ?? { code: 0, stderr: "", merged: true };
+      this.merged = outcome.merged;
+      return { code: outcome.code, stdout: "", stderr: outcome.stderr };
+    }
+    if (line.startsWith("gh pr view")) return { code: 0, stdout: this.merged ? "MERGED\n" : "OPEN\n", stderr: "" };
     if (line.startsWith("gh pr checks")) return { code: this.checksCode, stdout: "", stderr: "" };
     return { code: 0, stdout: "", stderr: "" };
   }
@@ -67,7 +75,7 @@ async function setup(assignments: Assignment[]) {
   const store = await fixture(assignments);
   const chat = new FakeChat(); const shell = new FakeShell(); const codex = new FakeCodex();
   const identity = await loadDeveloperSeat(store, "seat-002");
-  const make = () => new DeveloperSeat(store, identity, chat, shell, codex.factory);
+  const make = () => Object.assign(new DeveloperSeat(store, identity, chat, shell, codex.factory), { mergeRetryMs: 0 });
   const assignment = async (id: string) => (await store.read()).planningGoals![0].assignments!.find((item) => item.outcomeId === id)!;
   return { store, chat, shell, codex, seat: make(), make, assignment };
 }
@@ -102,9 +110,11 @@ describe("developer seat", () => {
       `gh pr comment ${PR} --body **Indra review:** Reviewed\n\nFindings:\n- Bug in foo @${worktree}`,
       `gh pr view ${PR} --json state --jq .state @${project}`,
       `gh pr checks ${PR} --watch @${worktree}`,
-      `git checkout --detach @${worktree}`,
-      `gh pr merge ${PR} --squash --delete-branch @${worktree}`,
+      `gh pr merge ${PR} --squash @${project}`,
+      `gh pr view ${PR} --json state --jq .state @${project}`,
+      `gh api -X DELETE repos/satoramoto/indra/git/refs/heads/seat-002/goal-abc-outcome-1 @${project}`,
       `git worktree remove --force ${worktree} @${project}`,
+      `git branch -D seat-002/goal-abc-outcome-1 @${project}`,
     ]);
     // Three new sessions: none resumes another. Build and fix write with network; the reviewer is read-only.
     const write = ["--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true", "--add-dir", "/proj/.git"];
@@ -120,6 +130,32 @@ describe("developer seat", () => {
       "Seat seat-002 marks goal-abc/outcome-1 in-review",
       "Seat seat-002 marks goal-abc/outcome-1 merged",
     ]);
+  });
+
+  it("counts a merge as done when gh exits 1 but the PR is MERGED", async () => {
+    const { shell, seat, assignment } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
+    shell.merges = [{ code: 1, stderr: "failed to delete local branch", merged: true }];
+    await seat.tick();
+    expect((await assignment("outcome-1")).status).toBe("merged");
+    expect(shell.calls.filter((call) => call.startsWith("gh pr merge"))).toHaveLength(1);
+  });
+
+  it("retries a merge GitHub briefly refused", async () => {
+    const { shell, seat, assignment } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
+    shell.merges = [{ code: 1, stderr: "Pull request is not mergeable", merged: false }, { code: 0, stderr: "", merged: true }];
+    await seat.tick();
+    expect((await assignment("outcome-1")).status).toBe("merged");
+    expect(shell.calls.filter((call) => call.startsWith("gh pr merge"))).toHaveLength(2);
+  });
+
+  it("fails a merge that never lands with a secret-free stderr excerpt", async () => {
+    const { shell, seat, assignment } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
+    const refused = { code: 1, stderr: "GraphQL: Pull request is not mergeable\n(token ghp_abc123SECRET)", merged: false };
+    shell.merges = [refused, refused];
+    await seat.tick();
+    const failed = await assignment("outcome-1");
+    expect(failed).toMatchObject({ status: "failed", note: "ci: gh pr merge failed: GraphQL: Pull request is not mergeable (token [redacted])" });
+    expect(shell.calls.some((call) => call.startsWith("git worktree remove"))).toBe(false);
   });
 
   it("fails an assignment whose team has no project, naming the state field", async () => {
