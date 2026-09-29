@@ -6,6 +6,8 @@ import { parseOptions } from "../src/cli.js";
 import { LocalStateRepository, parseState, StateDataError } from "../src/local-state.js";
 import { interactiveState, printState } from "../src/state-cli.js";
 import { StateInventory } from "../src/state-domain.js";
+import { advanceCeremony, startCeremony } from "../src/ceremony.js";
+import type { PlanningGoal } from "../src/planning.js";
 
 const fixture = () => ({
   $schema: "./schema/v1/state.schema.json",
@@ -37,6 +39,49 @@ async function checkout(value: unknown): Promise<string> {
 }
 
 describe("local state checkout", () => {
+  it("validates planning goals and their references for readers as well as writers", () => {
+    const now = "2026-09-01T00:00:00Z";
+    const goal: PlanningGoal = { id: "goal-one", teamId: "team-001", seatId: "seat-001", participantSeatIds: ["seat-002"], goal: "Goal", projectRefs: ["owner/project"], stage: "clarifying", createdAt: now, updatedAt: now, mattermost: { channelId: "home", rootPostId: "root" }, brief: { summary: "Goal", decisions: [], openQuestions: [] } };
+    const value = { ...fixture(), planningGoals: [goal] };
+    expect(() => parseState(value)).not.toThrow();
+    for (const [patch, message] of [
+      [{ teamId: "team-absent" }, "Unknown planning team"],
+      [{ seatId: "seat-absent" }, "outside the team"],
+      [{ participantSeatIds: ["seat-absent"] }, "outside the team"],
+      [{ sessionId: "runtime-only" }, "runtime metadata"],
+    ] as const) expect(() => parseState({ ...value, planningGoals: [{ ...goal, ...patch }] })).toThrow(message);
+    expect(() => parseState({ ...value, planningGoals: [goal, goal] })).toThrow("Duplicate planning goal");
+    expect(() => parseState({ ...value, planningGoals: {} })).toThrow("must be an array");
+  });
+
+  it("binds ceremony evidence to team seats, the team home, proposal outcomes and the state project", () => {
+    const now = "2026-09-01T00:00:00Z";
+    const goal: PlanningGoal = { id: "goal-one", teamId: "team-001", seatId: "seat-001", participantSeatIds: ["seat-002"], goal: "Goal", projectRefs: ["owner/project"], stage: "awaiting-review", createdAt: now, updatedAt: now, mattermost: { channelId: "home", rootPostId: "root" }, brief: { summary: "Goal", decisions: [], openQuestions: [] },
+      proposal: { id: "proposal-one", createdAt: now, summary: "Proposal", outcomes: [{ id: "outcome-one", seatId: "seat-002", title: "Title", description: "Description" }], risks: [], openQuestions: [] }, ceremony: startCeremony(now) };
+    goal.ceremony = advanceCeremony(goal, { to: "proposal", at: now });
+    goal.stage = "approved"; goal.assignments = [{ outcomeId: "outcome-one", seatId: "seat-002", status: "queued", updatedAt: now }];
+    goal.integration = { branch: "sprint/goal-one", baseSha: "a".repeat(40), status: "collecting" };
+    goal.ceremony = advanceCeremony(goal, { to: "implement", at: now, evidence: { kind: "approval", proposalId: "proposal-one", proposalPostId: "proposal-post", approval: { source: "reaction", userId: "person", postId: "proposal-post", emoji: "white_check_mark", verifiedHuman: true, at: now } } });
+    const value = { ...fixture(), planningGoals: [goal] };
+    Object.assign(value.teams[0], { project: { github: "owner/project" } });
+    Object.assign(value.teams[0].externalIdentities.mattermost, { homeChannelId: "home" });
+    expect(() => parseState(value)).not.toThrow();
+    const entry = goal.ceremony.history[2];
+    if (entry.stage !== "implement" || entry.evidence.approval.source !== "reaction") throw new Error("Expected approval");
+    entry.evidence.approval.userId = "external-user-1";
+    expect(() => parseState(value)).toThrow("cannot supply human approval");
+    entry.evidence.approval.userId = "person";
+    goal.mattermost.channelId = "elsewhere";
+    expect(() => parseState(value)).toThrow("home channel");
+    goal.mattermost.channelId = "home";
+    goal.assignments![0].seatId = "seat-001";
+    expect(() => parseState(value)).toThrow("proposed seat");
+    goal.assignments![0].seatId = "seat-002";
+    goal.assignments![0].status = "merged"; goal.assignments![0].prUrl = "https://github.com/another/project/pull/1";
+    goal.ceremony = advanceCeremony(goal, { to: "release", at: now, evidence: { kind: "implementation", outcomes: [{ outcomeId: "outcome-one", seatId: "seat-002", prUrl: goal.assignments![0].prUrl, baseBranch: "sprint/goal-one", mergedSha: "b".repeat(40), checksPassed: true, reviewApproved: true }] } });
+    expect(() => parseState(value)).toThrow("team's project");
+  });
+
   it("reads the seed shape into neutral records and clearly labels draft work", async () => {
     const inventory = new StateInventory(new LocalStateRepository(await checkout(fixture())));
     const snapshot = await inventory.current();
