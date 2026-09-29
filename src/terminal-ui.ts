@@ -342,7 +342,8 @@ export class TerminalUiModel {
     if (this.updating) return { text: version + rolled + " · updating…", ok: true };
     if (last && (last.outcome === "blocked" || last.outcome === "failed")) return { text: version + " · blocked · " + last.message, ok: false };
     if (waiting.length) return { text: version + rolled + " · update pending" + restarts, ok: true };
-    return { text: version + rolled + " · " + (last ? "up to date" : "checking for updates…"), ok: true };
+    const live = last?.branch && last.sha ? " · Live from local " + last.branch + " @ " + last.sha.slice(0, 7) : "";
+    return { text: version + rolled + " · " + (last ? "up to date" : "checking for updates…") + live, ok: true };
   }
 
   /** Pulls the state checkout's remote changes and pushes Indra's; a changed state.json refreshes the screen. */
