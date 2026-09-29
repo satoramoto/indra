@@ -156,10 +156,15 @@ function validateApproval(goal: PlanningGoal, evidence: ApprovalEvidence): void 
   requireThat(goal.proposal?.id === evidence.proposalId, "Approval evidence must reference this goal's proposal.");
   validateHuman(evidence.approval, "planning approve", evidence.proposalPostId, goal);
   notBefore(evidence.approval.at, goal.proposal.createdAt);
-  const outcomes = goal.proposal.outcomes;
-  requireThat(goal.assignments?.length === outcomes.length && outcomes.every((outcome) => goal.assignments?.some((assignment) => assignment.outcomeId === outcome.id && assignment.seatId === outcome.seatId)), "Approval requires one assignment per proposed outcome, on its proposed seat.");
+  // Seats match the proposal when approval is recorded (see advanceCeremony and validateCeremonyMutation); an idle seat may take over a queued outcome later.
+  requireThat(oneAssignmentPerOutcome(goal), "Approval requires one assignment per proposed outcome.");
   requireThat(goal.integration?.branch === `sprint/${goal.id}`, "Approval requires this goal's sprint branch.");
 }
+function oneAssignmentPerOutcome(goal: PlanningGoal): boolean {
+  const outcomes = goal.proposal?.outcomes ?? [];
+  return outcomes.length > 0 && goal.assignments?.length === outcomes.length && outcomes.every((outcome) => goal.assignments?.some((assignment) => assignment.outcomeId === outcome.id));
+}
+const PROPOSED_SEATS = "Approval requires one assignment per proposed outcome, on its proposed seat.";
 function validateImplementation(goal: PlanningGoal, evidence: ImplementationEvidence): void {
   const outcomes = goal.proposal?.outcomes ?? [];
   const accounted = [...evidence.outcomes, ...(evidence.omissions ?? [])];
@@ -167,12 +172,12 @@ function validateImplementation(goal: PlanningGoal, evidence: ImplementationEvid
   for (const item of evidence.outcomes) {
     const outcome = outcomes.find((outcome) => outcome.id === item.outcomeId);
     const assignment = goal.assignments?.find((assignment) => assignment.outcomeId === item.outcomeId);
-    requireThat(outcome?.seatId === item.seatId && assignment?.seatId === item.seatId && assignment.status === "merged" && assignment.prUrl === item.prUrl && item.baseBranch === `sprint/${goal.id}`, "Implementation requires every assigned PR merged into this goal's sprint branch.");
+    requireThat(!!outcome && assignment?.seatId === item.seatId && assignment.status === "merged" && assignment.prUrl === item.prUrl && item.baseBranch === `sprint/${goal.id}`, "Implementation requires every assigned PR merged into this goal's sprint branch.");
   }
   for (const item of evidence.omissions ?? []) {
     const outcome = outcomes.find((outcome) => outcome.id === item.outcomeId);
     const assignment = goal.assignments?.find((assignment) => assignment.outcomeId === item.outcomeId);
-    requireThat(outcome?.seatId === item.seatId && assignment?.seatId === item.seatId && assignment.status === "failed", "Only terminal, unmerged outcomes may be explicitly omitted by the owner.");
+    requireThat(!!outcome && assignment?.seatId === item.seatId && assignment.status === "failed", "Only terminal, unmerged outcomes may be explicitly omitted by the owner.");
   }
 }
 function assignmentsMatchOutcomes(goal: PlanningGoal): boolean {
@@ -180,7 +185,8 @@ function assignmentsMatchOutcomes(goal: PlanningGoal): boolean {
   return outcomes.length > 0 && goal.assignments?.length === outcomes.length && outcomes.every((outcome) => goal.assignments?.some((assignment) => assignment.outcomeId === outcome.id && assignment.seatId === outcome.seatId));
 }
 function validateLegacyApproval(goal: PlanningGoal, evidence: LegacyApprovalEvidence): void {
-  requireThat(goal.stage === "approved" && goal.proposal?.id === evidence.proposalId && assignmentsMatchOutcomes(goal), "Legacy approval requires the approved proposal with one assignment per outcome, on its proposed seat.");
+  // Migration itself requires proposed seats (migrateLegacyCeremony); later takeovers keep the evidence valid.
+  requireThat(goal.stage === "approved" && goal.proposal?.id === evidence.proposalId && oneAssignmentPerOutcome(goal), "Legacy approval requires the approved proposal with one assignment per outcome, on its proposed seat.");
 }
 function validateLegacyImplementation(goal: PlanningGoal, evidence: LegacyImplementationEvidence): void {
   const outcomes = goal.proposal?.outcomes ?? [];
@@ -285,7 +291,8 @@ export function advanceCeremony(goal: PlanningGoal, transition: CeremonyTransiti
   notBefore(transition.at, current.migratedAt);
   requireThat(CEREMONY_STAGES.indexOf(transition.to) === CEREMONY_STAGES.indexOf(current.stage) + 1, "Ceremony transitions must advance exactly one stage.");
   if (transition.to === "retro") requireThat(goal.integration?.status === "merged", "A running release requires a merged integration PR that has not been reverted.");
-  const entry = { stage: transition.to, enteredAt: transition.at, ...("evidence" in transition ? { evidence: structuredClone(transition.evidence) } : {}) } as CeremonyEntry;
+  if (transition.to === "implement") requireThat(assignmentsMatchOutcomes(goal), PROPOSED_SEATS);
+  const entry ={ stage: transition.to, enteredAt: transition.at, ...("evidence" in transition ? { evidence: structuredClone(transition.evidence) } : {}) } as CeremonyEntry;
   const next = { ...structuredClone(current), stage: transition.to, history: [...structuredClone(current.history), entry] };
   validateCeremony(goal, next);
   return next;
@@ -339,6 +346,7 @@ export function validateCeremonyMutation(before: PlanningGoal, after: PlanningGo
   // Legacy evidence exists only in a whole-ceremony migration; a live transition must bring native proof.
   const appended = next.history[old.history.length];
   if (appended && "evidence" in appended) requireThat(appended.evidence.kind !== "legacy-approval" && appended.evidence.kind !== "legacy-implementation", "Only legacy migration records legacy evidence.");
+  if (appended?.stage === "implement") requireThat(assignmentsMatchOutcomes(after), PROPOSED_SEATS);
   if (old.closure) requireThat(same(old, next), "A closed ceremony is immutable.");
   if (old.stage === "release" && next.stage === "retro") requireThat(after.integration?.status === "merged", "A running release requires a merged integration PR that has not been reverted.");
   if (next.closure && !old.closure) {
