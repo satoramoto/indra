@@ -1,12 +1,30 @@
-import { describe, expect, it } from "vitest";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { describe, expect, it, vi } from "vitest";
+import { copyFile, mkdir, mkdtemp, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PlanningStore, type PlanningGoal } from "../src/planning.js";
 import { signalReady, TmuxHost, turnLockFile, type TmuxRunner } from "../src/tmux-host.js";
 import { withFileLock } from "../src/state-commit.js";
 import { activityRecordName, CliGoalStarter, Supervisor } from "../src/supervisor.js";
+import { ImplementationRecorder } from "../src/implementation-facts.js";
+import { main } from "../src/cli.js";
+import { runTerminalUi } from "../src/terminal-ui-solid.js";
 import { git, stateCheckout } from "./state-checkout.js";
+
+const rollout = vi.hoisted(() => ({ ready: true }));
+vi.mock("../src/release-activation.js", async (original) => ({
+  ...await original<typeof import("../src/release-activation.js")>(),
+  get ceremonyReadiness() {
+    return rollout.ready ? { version: 1, consumers: { planning: 1, developer: 1, release: 1, retro: 1, tui: 1 } } : undefined;
+  },
+}));
+vi.mock("../src/retro-publication.js", async (original) => ({
+  ...await original<typeof import("../src/retro-publication.js")>(),
+  get ceremonyReadiness() {
+    return rollout.ready ? { version: 1, consumers: { planning: 1, developer: 1, release: 1, retro: 1, tui: 1 } } : undefined;
+  },
+}));
+vi.mock("../src/terminal-ui-solid.js", () => ({ runTerminalUi: vi.fn(async () => 0) }));
 
 /** A tmux server with several sessions. `onStart` decides how a new hosted process behaves. */
 class FakeTmux implements TmuxRunner {
@@ -38,14 +56,17 @@ class FakeTmux implements TmuxRunner {
 
 const seat = (id: string, name: string, roles: string[]) => ({ id, displayName: name, roles, externalIdentities: { mattermost: { userId: id, username: name.toLowerCase() } } });
 
-async function fixture() {
-  const state = { $schema: "./schema/v1/state.schema.json", schemaVersion: 1, sprints: [], planningGoals: [], teams: [{ id: "team-001", slug: "yahaha", displayName: "Yahaha", externalIdentities: { mattermost: { teamId: "team" } }, seats: [seat("seat-001", "Chick", ["Team Lead"]), seat("seat-002", "George", ["Developer"]), seat("seat-003", "Herbie", ["Developer"])] }] };
+const READY = { version: 1 as const, consumers: { planning: 1 as const, developer: 1 as const, release: 1 as const, retro: 1 as const, tui: 1 as const } };
+async function fixture(goals: PlanningGoal[] = []) {
+  const state = { $schema: "./schema/v1/state.schema.json", schemaVersion: 1, sprints: [], planningGoals: goals, teams: [{ id: "team-001", slug: "yahaha", displayName: "Yahaha", project: { github: "o/r" }, externalIdentities: { mattermost: { teamId: "team", homeChannelId: "channel" } }, seats: [seat("seat-001", "Chick", ["Team Lead"]), seat("seat-002", "George", ["Developer"]), seat("seat-003", "Herbie", ["Developer"])] }] };
   const dir = await stateCheckout("indra-supervisor-", state);
   await mkdir(join(dir, "dist"));
   await writeFile(join(dir, "dist", "cli.js"), "");
+  await mkdir(join(dir, "schema/v1"), { recursive: true });
+  await copyFile("schema/v1/state.schema.json", join(dir, "schema/v1/state.schema.json"));
   const tmux = new FakeTmux();
   tmux.onStart = async (_session, nonce) => { await signalReady(dir, nonce); };
-  return { dir, tmux, supervisor: new Supervisor(dir, tmux, dir, 1000) };
+  return { dir, tmux, supervisor: new Supervisor(dir, tmux, dir, 1000, new PlanningStore(dir, undefined, READY)) };
 }
 
 describe("seat process supervisor", () => {
@@ -232,7 +253,7 @@ describe("seat process supervisor", () => {
 
 function failedGoal(id = "goal-retry", updatedAt = "2026-01-02T00:00:00Z"): PlanningGoal {
   return {
-    id, teamId: "team-001", seatId: "seat-001", participantSeatIds: [], goal: "Fix the terminal", projectRefs: [], stage: "approved",
+    id, teamId: "team-001", seatId: "seat-001", participantSeatIds: [], goal: "Fix the terminal", projectRefs: ["o/r"], stage: "approved",
     createdAt: "2026-01-01T00:00:00Z", updatedAt, mattermost: { channelId: "channel", rootPostId: "root" },
     brief: { summary: "Fix it", decisions: [], openQuestions: [] },
     proposal: { id: "proposal-1", createdAt: updatedAt, summary: "Plan", risks: [], openQuestions: [], outcomes: [{ id: "outcome-1", title: "Retry failed work", description: "Add T", seatId: "seat-002" }] },
@@ -242,14 +263,41 @@ function failedGoal(id = "goal-retry", updatedAt = "2026-01-02T00:00:00Z"): Plan
 }
 
 async function retryFixture(goals = [failedGoal()]) {
-  const fixtureValue = await fixture();
-  const store = new PlanningStore(fixtureValue.dir);
-  await store.update((state) => { state.planningGoals = goals; }, "Add failed assignments");
+  for (const goal of goals) {
+    if (!goal.integration || goal.assignments?.some((item) => item.seatId === "seat-001")) continue;
+    goal.ceremony = { version: 1, stage: "implement", history: [
+      { stage: "planning", enteredAt: goal.createdAt }, { stage: "proposal", enteredAt: goal.proposal!.createdAt },
+      { stage: "implement", enteredAt: goal.proposal!.createdAt, evidence: { kind: "approval", proposalId: goal.proposal!.id, proposalPostId: "proposal-post", approval: { source: "owner-command", command: "planning approve", at: goal.proposal!.createdAt } } },
+    ] };
+  }
+  const fixtureValue = await fixture(goals);
+  const store = new PlanningStore(fixtureValue.dir, undefined, READY);
   const target = (await fixtureValue.supervisor.read())["seat-002"].retry!;
   return { ...fixtureValue, store, target };
 }
 
 describe("failed assignment retries", () => {
+  it.each([true, false])("passes rollout readiness through the production UI supervisor (ready: %s)", async (ready) => {
+    const { dir, store, target } = await retryFixture();
+    const before = git(dir, "rev-list", "--count", "HEAD");
+    rollout.ready = ready;
+    vi.mocked(runTerminalUi).mockClear();
+    try {
+      expect(await main(["--ui", "--state", dir])).toBe(0);
+      expect(runTerminalUi).toHaveBeenCalledOnce();
+      const processes = vi.mocked(runTerminalUi).mock.calls[0][2]!.processes!;
+      // Exercise the real Supervisor and Git transaction supplied by main, without starting tmux or a renderer.
+      expect(processes).toBeInstanceOf(Supervisor);
+      if (ready) await expect(processes.retry!(target)).resolves.toBe("Re-queued goal-retry/outcome-1 for seat-002.");
+      else await expect(processes.retry!(target)).rejects.toThrow("Ceremony writes are disabled");
+      const goal = (await store.read()).planningGoals![0];
+      expect(goal.assignments![0]).toMatchObject({ seatId: target.seatId, status: ready ? "queued" : "failed", prUrl: "https://github.com/o/r/pull/1" });
+      expect(goal.assignments![0].note).toBe(ready ? undefined : "Interrupted");
+      expect(goal.integration!.branch).toBe(`sprint/${target.goalId}`);
+      expect(Number(git(dir, "rev-list", "--count", "HEAD")) - Number(before)).toBe(ready ? 1 : 0);
+    } finally { rollout.ready = true; }
+  });
+
   it("offers the newest eligible failure for each Developer, skipping other statuses and missing or closed sprints", async () => {
     const old = failedGoal("goal-old", "2026-01-01T00:00:00Z");
     const legacy = failedGoal("goal-legacy", "2026-01-07T00:00:00Z");
@@ -273,6 +321,36 @@ describe("failed assignment retries", () => {
     expect(live["seat-002"].retry).toEqual({ seatId: "seat-002", goalId: "goal-retry", goal: "Fix the terminal", outcomeId: "outcome-2", title: "Newer failure", updatedAt: "2026-01-03T00:00:00Z" });
     expect(live["seat-003"].retry?.goalId).toBe("goal-other");
     expect(live["seat-001"].retry).toBeUndefined();
+  });
+
+  it.each(["planning", "proposal", "release", "retro", "legacy"])("does not offer or accept retries outside implement: %s", async (stage) => {
+    const { store, supervisor, target } = await retryFixture();
+    const snapshot = await store.read();
+    if (stage === "legacy") delete snapshot.planningGoals![0].ceremony;
+    else snapshot.planningGoals![0].ceremony!.stage = stage as "planning" | "proposal" | "release" | "retro";
+    const read = vi.spyOn(PlanningStore.prototype, "read").mockResolvedValue(snapshot);
+    try {
+      expect((await supervisor.read())["seat-002"].retry).toBeUndefined();
+      await expect(supervisor.retry(target)).rejects.toThrow("not in implement");
+      expect((await new ImplementationRecorder(store, target.seatId, target.goalId, target.outcomeId).read()).attempts).toEqual([]);
+    } finally { read.mockRestore(); }
+  });
+
+  it("records the failed note and retry before deleting the note or queuing work", async () => {
+    const { store, supervisor, target } = await retryFixture();
+    const facts = new ImplementationRecorder(store, target.seatId, target.goalId, target.outcomeId);
+    // Observe durable facts at the state-write boundary, without intercepting Git persistence.
+    // Supervisor uses a separate store instance for the same checkout.
+    const method = PlanningStore.prototype.update;
+    vi.spyOn(PlanningStore.prototype, "update").mockImplementation(async function (this: PlanningStore, ...args) {
+      const attempt = (await facts.read()).attempts[0];
+      expect(attempt.events).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "failure", message: "Interrupted" }), expect.objectContaining({ kind: "retry", result: "started" })]));
+      return method.apply(this, args);
+    });
+    try { await supervisor.retry(target); }
+    finally { vi.restoreAllMocks(); }
+    expect((await store.read()).planningGoals![0].assignments![0].note).toBeUndefined();
+    expect((await facts.read()).attempts[0].claimedAt).toBeNull();
   });
 
   it("commits one re-queue to the same seat, preserving the prior PR and runner metadata, even for simultaneous requests", async () => {
@@ -314,12 +392,14 @@ describe("failed assignment retries", () => {
 
   it("refuses a confirmation whose sprint integration was removed instead of queuing work on main", async () => {
     const { store, supervisor, target, dir } = await retryFixture();
-    await store.update((state) => { delete state.planningGoals![0].integration; }, "Remove sprint integration");
+    const snapshot = await store.read(); delete snapshot.planningGoals![0].integration;
+    vi.spyOn(PlanningStore.prototype, "read").mockResolvedValue(snapshot);
     const head = git(dir, "rev-parse", "HEAD");
     await expect(supervisor.retry(target)).rejects.toThrow("no sprint integration branch");
     expect(git(dir, "rev-parse", "HEAD")).toBe(head);
     expect((await supervisor.read())["seat-002"].retry).toBeUndefined();
     expect((await store.read()).planningGoals![0].assignments![0].status).toBe("failed");
+    vi.restoreAllMocks();
   });
 
   it.each(["pr-open", "merged", "reverted"] as const)("refuses retries once sprint integration is %s", async (status) => {
@@ -339,18 +419,17 @@ describe("failed assignment retries", () => {
 
   it("rechecks ownership, Developer role and approval without picking a different failure", async () => {
     const { store, supervisor, target } = await retryFixture([failedGoal(), failedGoal("goal-older", "2026-01-01T00:00:00Z")]);
-    await store.update((state) => { state.planningGoals![0].assignments![0].seatId = "seat-003"; }, "Reassign outcome");
+    const snapshot = await store.read();
+    snapshot.planningGoals![0].assignments![0].seatId = "seat-003";
+    vi.spyOn(PlanningStore.prototype, "read").mockImplementation(async () => structuredClone(snapshot));
     await expect(supervisor.retry(target)).rejects.toThrow("no longer assigned to seat-002");
     await expect(supervisor.retry({ ...target, seatId: "seat-001" })).rejects.toThrow("not a Developer");
-    await store.update((state) => {
-      const goal = state.planningGoals![0];
-      goal.stage = "awaiting-review";
-      delete goal.assignments; delete goal.integration;
-    }, "Remove approval");
+    snapshot.planningGoals![0].stage = "awaiting-review";
     await expect(supervisor.retry(target)).rejects.toThrow("no longer approved");
-    await store.update((state) => { state.planningGoals!.shift(); }, "Remove goal");
+    snapshot.planningGoals!.shift();
     await expect(supervisor.retry(target)).rejects.toThrow("no longer approved or available");
-    expect((await store.read()).planningGoals![0].assignments![0].status).toBe("failed");
+    expect(snapshot.planningGoals![0].assignments![0].status).toBe("failed");
+    vi.restoreAllMocks();
   });
 });
 

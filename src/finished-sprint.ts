@@ -1,13 +1,18 @@
 /**
- * Whether a sprint is done and can leave the team's sprint list.
- * - With an integration record: finished once it is reverted, or merged with no revert PR open (`revert-open` still needs the owner).
- * - Without one: every approved sprint gets its integration at approval (since #27), so this is a legacy goal whose PRs merged
- *   straight into main and `I` never applies. It is finished only when every ticket merged; a failed ticket keeps it visible so
- *   its retry stays reachable.
+ * Whether a sprint is done and can leave the team's sprint list. It is the same rule that decides whether a goal
+ * still holds its team's lock (`TerminalUiModel.openGoals`), so the owner is never blocked by a goal they can't see.
+ * - With a persisted ceremony: finished only once the ceremony is closed (retro published, release reverted before it
+ *   ran, or a finished legacy goal closed by migration). A merged integration still in release or retro stays visible.
+ * - Without a ceremony: a legacy goal that start-up migration has not closed (its evidence conflicts, or it has not
+ *   run yet). It stays visible and open, whatever its integration says, until migration records its ceremony.
  */
-export function isFinishedSprint(loop: { integration?: { status: string; revertPrUrl?: string }; tickets: { status: string }[] } | undefined): boolean {
+export function isFinishedSprint(loop: {
+  ceremony?: { closure?: unknown };
+  closedAt?: string;
+  integration?: { status: string; revertPrUrl?: string };
+  tickets: { status: string }[];
+} | undefined): boolean {
   if (!loop) return false;
-  const integration = loop.integration;
-  if (integration) return integration.status === "reverted" || (integration.status === "merged" && !integration.revertPrUrl);
-  return loop.tickets.length > 0 && loop.tickets.every((ticket) => ticket.status === "merged");
+  if (loop.ceremony) return Boolean(loop.ceremony.closure);
+  return Boolean(loop.closedAt);
 }

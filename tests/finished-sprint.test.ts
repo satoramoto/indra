@@ -16,19 +16,23 @@ const goal = (statuses: Status[], integration?: Partial<SprintIntegration>) => (
 const finished = (statuses: Status[], integration?: Partial<SprintIntegration>) => isFinishedSprint(projectSprint(goal(statuses, integration)));
 
 describe("isFinishedSprint", () => {
-  it("finishes a legacy goal only when every assignment merged", () => {
-    expect(finished(["merged", "merged", "merged", "merged"])).toBe(true);
+  it("keeps every goal without a ceremony visible until migration closes it, whatever its integration says", () => {
+    expect(finished(["merged", "merged", "merged", "merged"])).toBe(false);
     expect(finished(["merged", "failed"])).toBe(false);
-    expect(finished(["merged", "running"])).toBe(false);
-  });
-  it("finishes merged and reverted integrations", () => {
-    expect(finished(["merged"], { status: "merged" })).toBe(true);
-    expect(finished(["merged"], { status: "reverted" })).toBe(true);
+    expect(finished(["merged"], { status: "merged" })).toBe(false);
+    expect(finished(["merged"], { status: "reverted" })).toBe(false);
   });
   it("keeps collecting, pr-open and revert-open sprints visible", () => {
     expect(finished(["merged"], { status: "collecting" })).toBe(false);
     expect(finished(["merged"], { status: "pr-open" })).toBe(false);
     expect(finished(["merged"], { status: "merged", revertPrUrl: "https://github.com/o/r/pull/2" })).toBe(false);
+  });
+  it("finishes a ceremony goal only once it is closed, whatever its integration says", () => {
+    const tickets = [{ status: "merged" }];
+    const merged = { status: "merged" };
+    expect(isFinishedSprint({ ceremony: { }, integration: merged, tickets })).toBe(false);
+    expect(isFinishedSprint({ ceremony: { }, integration: { status: "reverted" }, tickets })).toBe(false);
+    expect(isFinishedSprint({ ceremony: { closure: { closedAt: "2026-01-01T00:00:00Z" } }, closedAt: "2026-01-01T00:00:00Z", integration: merged, tickets })).toBe(true);
   });
 });
 
@@ -37,15 +41,19 @@ describe("team sprint list", () => {
     const snapshot = { teams: [{ id: "t", slug: "t", displayName: "T", mattermostTeamId: "m", seats: [{ id: "s", displayName: "S", handle: "s", mattermostUserId: "u", roles: ["Developer"] }] }], sprints: [] };
     const session = (id: string, g: PlanningGoal, sprint?: "merged" | "collecting") => ({ id, teamId: "t", seatId: "s", status: "idle" as const, engine: "codex" as const,
       goal: id, stage: "approved", recentActivity: [], loop: projectSprint(g), ...(sprint ? { sprint } : {}) });
+    const closed = goal(["merged"], { status: "merged", prUrl: "https://github.com/o/r/pull/1", mergedSha: "a".repeat(40) });
+    closed.ceremony = { version: 1, stage: "release", history: [], migratedAt: "2026-01-01T00:00:00Z", closure: { closedAt: "2026-01-01T00:00:00Z", evidence: { kind: "legacy-migration", integration: "merged" } } };
     const sessions: SessionSnapshot["sessions"] = [
-      session("done", goal(["merged"], { status: "merged" }), "merged"),
+      session("done", closed, "merged"),
       session("legacy", goal(["merged", "merged"])),
       session("live", goal(["running"], { status: "collecting" }), "collecting"),
     ];
     const model = new TerminalUiModel(new StateInventory({ read: async () => snapshot as never }), { readSessions: async () => ({ connection: "connected", sessions }) });
     await model.refresh();
     model.teamId = "t";
-    expect(model.sprintsForTeam().map((sprint) => sprint.id)).toEqual(["live"]);
+    // Hidden and open agree: the unmigrated legacy goal shows and blocks; the migrated, closed one does neither.
+    expect(model.sprintsForTeam().map((sprint) => sprint.id)).toEqual(["legacy", "live"]);
+    expect(model.openGoals().map((item) => item.id)).toEqual(["legacy", "live"]);
     expect(model.sessionsFor("s").map((item) => item.id)).toEqual(["done", "legacy", "live"]);
   });
 });

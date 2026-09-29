@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { execFileSync, spawn } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, utimes, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { readBuildStamp } from "../src/build-stamp.js";
-import { pruneBuilds, SelfUpdater, switchDist } from "../src/self-update.js";
+import { IN_USE, processStart, pruneBuilds, readUpdateStatus, recordRunningBuild, SelfUpdater, switchDist } from "../src/self-update.js";
 import { git } from "./state-checkout.js";
 
 const head = (dir: string, ref = "HEAD") => git(dir, "rev-parse", ref).trim();
@@ -66,6 +67,53 @@ fi
 }
 
 describe("self-update", () => {
+  it("captures the loaded application at startup, confirms readiness on its check, and never changes that evidence when dist switches", async () => {
+    const { app, runtime, updater, merge } = await fixture();
+    const args = process.argv;
+    try {
+      process.argv = [process.execPath, join(app, "dist", "cli.js"), "--state", join(runtime, "..", "state")];
+      recordRunningBuild(runtime, pathToFileURL(join(app, "dist", "cli.js")).href, () => "application birth");
+    } finally { process.argv = args; }
+    const receipt = async () => JSON.parse(await readFile(join(runtime, IN_USE, `${process.pid}.json`), "utf8"));
+    const original = head(app);
+    expect(await receipt()).toMatchObject({ role: "application", stamp: { id: "running", sha: original }, processStart: "application birth" });
+    expect((await receipt()).readyAt).toBeUndefined();
+    await updater.check();
+    const ready = await receipt();
+    expect(Date.parse(ready.readyAt)).toBeGreaterThanOrEqual(Date.parse(ready.startedAt));
+    await merge("code.ts", "export const version = 2;\n");
+    await updater.check();
+    expect(await receipt()).toEqual(ready);
+    expect((await readBuildStamp(app))?.sha).not.toBe(original);
+    expect(await readUpdateStatus(runtime)).toMatchObject({ outcome: "built" });
+  });
+
+  it("records the loaded bridge and its host nonce without claiming readiness before a successful poll", async () => {
+    const { app, runtime, updater } = await fixture();
+    const args = process.argv;
+    try {
+      process.argv = [process.execPath, join(app, "dist", "cli.js"), "planning", "serve", "--ready-nonce", "11111111-2222-3333-4444-555555555555"];
+      recordRunningBuild(runtime, pathToFileURL(join(app, "dist", "cli.js")).href, () => "bridge birth");
+    } finally { process.argv = args; }
+    await updater.check();
+    const receipt = JSON.parse(await readFile(join(runtime, IN_USE, `${process.pid}.json`), "utf8"));
+    expect(receipt).toMatchObject({ role: "bridge", readyNonce: "11111111-2222-3333-4444-555555555555", stamp: { sha: head(app) } });
+    expect(receipt.readyAt).toBeUndefined();
+  });
+
+  it("keeps a pruning-only record when process identity is unavailable", async () => {
+    const { app, runtime, updater } = await fixture();
+    const args = process.argv;
+    try {
+      process.argv = [process.execPath, join(app, "dist", "cli.js")];
+      recordRunningBuild(runtime, pathToFileURL(join(app, "dist", "cli.js")).href, () => undefined);
+    } finally { process.argv = args; }
+    await updater.check();
+    expect(JSON.parse(await readFile(join(runtime, IN_USE, `${process.pid}.json`), "utf8"))).toEqual({ pid: process.pid, build: await realpath(join(app, "dist")) });
+    expect(await processStart(-1)).toBeUndefined();
+    await expect(processStart(Number.MAX_SAFE_INTEGER)).resolves.toBeUndefined();
+  });
+
   it("fast-forwards a clean main and builds, without npm ci when package-lock.json is unchanged", async () => {
     const { app, remote, updater, npmCalls, merge } = await fixture();
     expect(await updater.check()).toMatchObject({ outcome: "up-to-date" });
@@ -119,13 +167,15 @@ describe("self-update", () => {
   });
 
   it("keeps the old build when the new one fails, shows the error, and does not rebuild the same commit", async () => {
-    const { app, updater, npmCalls, merge } = await fixture();
+    const { app, runtime, updater, npmCalls, merge } = await fixture();
     await writeFile(join(app, "fail-build"), "");
     await merge("code.ts", "export const version = 2\n");
     const failed = await updater.check();
     expect(failed.outcome).toBe("failed");
     expect(failed.message).toContain("still running the previous build");
     expect(failed.message).toContain("error TS1005");
+    expect(await readUpdateStatus(runtime)).toMatchObject({ outcome: "failed" });
+    expect(await readUpdateStatus(runtime)).not.toHaveProperty("message");
     expect(await readBuildStamp(app)).toMatchObject({ id: "running" });
     expect(execFileSync(process.execPath, [join(app, "dist", "cli.js")], { encoding: "utf8" })).toBe("running build\n");
     expect(await updater.check()).toMatchObject({ outcome: "failed" });
@@ -137,16 +187,18 @@ describe("self-update", () => {
     // The first update moves the local real dist/ aside (spawns are held meanwhile); from then on dist is a symlink.
     await merge("code.ts", "export const version = 1.5;\n");
     expect(await updater.check()).toMatchObject({ outcome: "built" });
-    // A separate process reads dist/cli.js in a tight loop through three updates and counts misses.
+    // Resolve the current dist link, then read that immutable build. Count every lookup/read failure.
     const stop = join(app, "..", "stop");
     const reader = spawn(process.execPath, ["-e", `
-const { readFileSync, existsSync } = require("node:fs");
+const { readFileSync, readlinkSync, existsSync } = require("node:fs");
+const { join } = require("node:path");
 let reads = 0, misses = 0;
+const errors = [];
 while (!existsSync(${JSON.stringify(stop)})) {
   reads++;
-  try { if (!/build/.test(readFileSync(${JSON.stringify(join(app, "dist", "cli.js"))}, "utf8"))) misses++; } catch { misses++; }
+  try { if (!/build/.test(readFileSync(join(${JSON.stringify(app)}, readlinkSync(${JSON.stringify(join(app, "dist"))}), "cli.js"), "utf8"))) { misses++; if (errors.length < 5) errors.push("incomplete build"); } } catch (error) { misses++; if (errors.length < 5) errors.push(error.code + ":" + error.syscall); }
 }
-console.log(JSON.stringify({ reads, misses }));
+console.log(JSON.stringify({ reads, misses, errors }));
 `], { stdio: ["ignore", "pipe", "inherit"] });
     let output = "";
     reader.stdout.on("data", (chunk) => { output += chunk; });
@@ -157,9 +209,9 @@ console.log(JSON.stringify({ reads, misses }));
     }
     await writeFile(stop, "");
     await exited;
-    const { reads, misses } = JSON.parse(output) as { reads: number; misses: number };
+    const { reads, misses, errors } = JSON.parse(output) as { reads: number; misses: number; errors: string[] };
     expect(reads).toBeGreaterThan(100);
-    expect(misses).toBe(0);
+    expect(misses, JSON.stringify(errors)).toBe(0);
     expect((await lstat(join(app, "dist"))).isSymbolicLink()).toBe(true);
     expect(await readBuildStamp(app)).toMatchObject({ sha: head(app) });
     // Every build is inside the grace period, so none was pruned while the reader ran.
@@ -191,6 +243,7 @@ console.log(JSON.stringify({ reads, misses }));
     expect(await restarted.paused()).toBe(true);
     await merge("code.ts", "export const version = 2;\n");
     expect(await restarted.check()).toMatchObject({ outcome: "paused", message: "1 new commit waiting on origin/main" });
+    expect(await readUpdateStatus(runtime)).toMatchObject({ outcome: "paused" });
     expect(head(app)).toBe(before);
     expect(await npmCalls()).toEqual([]);
     expect(await readBuildStamp(app)).toMatchObject({ id: "running" });
@@ -253,15 +306,19 @@ console.log(JSON.stringify({ reads, misses }));
   });
 
   it("blocks without remembering the commit when npm ci fails, keeps the running build, and retries the install next time", async () => {
-    const { app, updater, npmCalls, merge } = await fixture();
+    const { app, runtime, updater, npmCalls, merge } = await fixture();
     await writeFile(join(app, "fail-ci"), "");
     await merge("package-lock.json", "{\"lockfileVersion\": 3, \"packages\": {}}\n");
     const blocked = await updater.check();
     expect(blocked).toMatchObject({ outcome: "blocked", installFailed: true });
     expect(blocked.message).toMatch(/^dependency install failed: .*ENOSPC/);
+    expect(await readUpdateStatus(runtime)).toMatchObject({ outcome: "blocked", installFailed: true });
+    expect(await readUpdateStatus(runtime)).not.toHaveProperty("message");
     expect(await readBuildStamp(app)).toMatchObject({ id: "running" });
     await rm(join(app, "fail-ci"));
     expect(await updater.check()).toMatchObject({ outcome: "built" });
+    expect(await readUpdateStatus(runtime)).toMatchObject({ outcome: "built" });
+    expect(await readUpdateStatus(runtime)).not.toHaveProperty("installFailed");
     expect(await npmCalls()).toEqual(["ci", "ci", "run build"]);
   });
 });

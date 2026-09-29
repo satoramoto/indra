@@ -4,6 +4,9 @@ import { developerSeats, PlanningStore, type PlanningDocument } from "./planning
 import { defaultAppDir, hostedProcessFor, NoChannelError, NoCredentialError, SystemTmux, TmuxHost, turnLockFile, type HostRecord, type TmuxRunner } from "./tmux-host.js";
 import { readBuildStamp } from "./build-stamp.js";
 import { withFileLock } from "./state-commit.js";
+import { ImplementationRecorder, implementationEligible } from "./implementation-facts.js";
+import { ownsSeatRecord, seatRecordName } from "./developer-maintenance.js";
+import { redactSecrets } from "./redact.js";
 import { childEnv } from "./op-env.js";
 
 /** `no channel`: the seat's bot could not join its team's Mattermost team or home channel. */
@@ -61,14 +64,14 @@ function seatsOf(state: PlanningDocument): SeatRow[] {
   return (state.teams as { seats: SeatRow[] }[]).flatMap((team) => team.seats);
 }
 
-/** True when the seat holds a running or in-review assignment on an approved goal. */
+/** Active assignments keep a process busy, including legacy work awaiting migration. */
 function holdsWork(state: PlanningDocument, seatId: string): boolean {
-  return (state.planningGoals ?? []).some((goal) => goal.stage === "approved" && (goal.assignments ?? []).some((item) => item.seatId === seatId && ACTIVE.includes(item.status)));
+  return (state.planningGoals ?? []).some((goal) => (goal.assignments ?? []).some((item) => item.seatId === seatId && ACTIVE.includes(item.status)));
 }
 
 function newestFailedAssignment(state: PlanningDocument, seatId: string): AssignmentRetry | undefined {
   return (state.planningGoals ?? [])
-    .filter((goal) => goal.stage === "approved" && goal.integration?.status === "collecting" && developerSeats(state, goal.teamId).some((seat) => seat.id === seatId))
+    .filter((goal) => implementationEligible(goal) && developerSeats(state, goal.teamId).some((seat) => seat.id === seatId))
     .flatMap((goal) => (goal.assignments ?? []).filter((item) => item.seatId === seatId && item.status === "failed").map((assignment) => ({
       seatId, goalId: goal.id, goal: goal.goal, outcomeId: assignment.outcomeId,
       title: goal.proposal!.outcomes.find((item) => item.id === assignment.outcomeId)!.title, updatedAt: assignment.updatedAt,
@@ -152,7 +155,7 @@ export class Supervisor implements SeatProcessPort {
       const { process, problem, target, record } = await this.processState(this.host(seat));
       const held = (state.planningGoals ?? []).filter((goal) => goal.stage === "approved").flatMap((goal) => (goal.assignments ?? []).filter((item) => item.seatId === seat.id).map((assignment) => ({ goal, assignment })));
       const current = held.find((item) => ACTIVE.includes(item.assignment.status))
-        ?? held.filter((item) => item.assignment.status === "queued").sort((a, b) => a.assignment.updatedAt.localeCompare(b.assignment.updatedAt))[0];
+        ?? held.filter((item) => item.assignment.status === "queued" && implementationEligible(item.goal)).sort((a, b) => a.assignment.updatedAt.localeCompare(b.assignment.updatedAt))[0];
       const activity = await this.store.readRuntimeFile<{ message?: unknown; at?: unknown }>(activityRecordName(seat.id)).catch(() => undefined);
       const retry = newestFailedAssignment(state, seat.id);
       live[seat.id] = {
@@ -171,16 +174,31 @@ export class Supervisor implements SeatProcessPort {
   /** A retry never changes approval or ownership, and shares the goal lock with opening the sprint's integration PR. */
   async retry(target: AssignmentRetry): Promise<string> {
     return await this.store.withGoalLock(target.goalId, async () => {
-      await this.store.update((state) => {
+      const validate = (state: PlanningDocument) => {
         const goal = state.planningGoals?.find((item) => item.id === target.goalId);
         if (!goal || goal.stage !== "approved") throw new Error(`Goal ${target.goalId} is no longer approved or available.`);
         if (!developerSeats(state, goal.teamId).some((seat) => seat.id === target.seatId)) throw new Error(`Seat ${target.seatId} is not a Developer on this goal's team.`);
         if (!goal.integration) throw new Error(`Goal ${goal.id} has no sprint integration branch; it cannot be retried.`);
+        if (goal.ceremony?.stage !== "implement" || goal.ceremony.closure) throw new Error(`Goal ${goal.id} is not in implement; it cannot be retried.`);
+        if (goal.integration.branch !== `sprint/${goal.id}`) throw new Error("Retry requires this goal's sprint branch.");
         if (goal.integration.status !== "collecting") throw new Error(`Sprint ${goal.id} is ${goal.integration.status}; it no longer accepts retries.`);
         const assignment = goal.assignments?.find((item) => item.outcomeId === target.outcomeId);
         if (!assignment || assignment.seatId !== target.seatId) throw new Error(`Assignment ${goal.id}/${target.outcomeId} is no longer assigned to ${target.seatId}.`);
         if (assignment.status !== "failed") throw new Error(`Assignment ${goal.id}/${target.outcomeId} is ${assignment.status}, not failed; nothing re-queued.`);
         if (assignment.updatedAt !== target.updatedAt) throw new Error(`Assignment ${goal.id}/${target.outcomeId} changed since confirmation; press T again to review it.`);
+        return assignment;
+      };
+      const assignment = validate(await this.store.read());
+      const facts = new ImplementationRecorder(this.store, target.seatId, target.goalId, target.outcomeId);
+      const saved = await this.store.readRuntimeFile(seatRecordName(target.seatId, target.goalId, target.outcomeId));
+      const record = ownsSeatRecord(this.store.runtimeDir, target.seatId, target.goalId, target.outcomeId, saved) ? saved : undefined;
+      const id = record ? await facts.retain(record) : await facts.recover();
+      await facts.event(id, { kind: "failure", message: redactSecrets(assignment.note ?? "Assignment failed."), prUrl: assignment.prUrl }, `failure:${target.updatedAt}`, target.updatedAt);
+      await facts.finish(id, "failed", target.updatedAt);
+      await facts.event(id, { kind: "retry", result: "started", message: "Owner requested an explicit retry." }, `retry:${target.updatedAt}`);
+      await this.store.update((state) => {
+        const assignment = validate(state);
+        const goal = state.planningGoals!.find((item) => item.id === target.goalId)!;
         assignment.status = "queued";
         assignment.updatedAt = goal.updatedAt = new Date().toISOString();
         delete assignment.note;

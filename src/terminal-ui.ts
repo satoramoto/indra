@@ -32,7 +32,19 @@ export interface UiView { page: UiPage; teamId?: string; seatId?: string }
 /** Structural read port. A stable seat is never treated as a running agent without a runtime session. */
 export type TerminalSession = SessionSnapshot["sessions"][number];
 
-export interface TerminalSprint { id: string; goal: string; loop: SprintLoop; draft?: boolean }
+export interface TerminalSprint { id: string; goal: string; loop: SprintLoop; planningStage?: string; draft?: boolean }
+
+/** Use the persisted ceremony even when an older reader also supplies a legacy loop stage. */
+export function sessionSprint(session: TerminalSession): TerminalSprint {
+  const ceremony = session.ceremony ?? session.loop?.ceremony;
+  return { id: session.id, goal: session.goal, planningStage: session.stage, loop: {
+    ...session.loop, stage: ceremony?.stage ?? session.loop?.stage ?? "Goal", tickets: session.loop?.tickets ?? [],
+    ...(ceremony ? { ceremony } : {}),
+    closedAt: ceremony ? ceremony.closure?.closedAt : session.closedAt ?? session.loop?.closedAt,
+    release: session.release ?? session.loop?.release,
+    retro: session.retro ?? session.loop?.retro,
+  } };
+}
 
 export interface SessionReadResult {
   connection: "connected" | "disconnected" | "error";
@@ -57,9 +69,16 @@ export const GOAL_INPUT_LIMIT = 8000;
 export interface UiInput { value: string }
 /**
  * A goal whose proposal the owner is requesting (`P`) or approving (`A`) from the terminal, or whose sprint the owner
- * integrates (`I`), merges (`M`: the integration PR, or the revert PR when `revert`) or rolls back (`V`).
+ * integrates (`I`), merges (`M`: release, revert or retro) or rolls back (`V`).
  */
-export interface UiApproval { action: "approve" | "propose" | "integrate" | "merge" | "revert"; goalId: string; goal: string; revert?: boolean }
+export interface UiApproval {
+  action: "approve" | "propose" | "integrate" | "merge" | "revert";
+  goalId: string; goal: string;
+  mergeKind?: "release" | "revert" | "retro";
+  prUrl?: string;
+  /** An approval cannot silently approve a replaced proposal. */
+  updatedAt?: string;
+}
 /** `revert` in the UI (V) is `planning rollback`; `rollback` alone is the self-update rollback (R). */
 const sprintActions: Record<string, SprintAction> = { integrate: "integrate", merge: "merge", revert: "rollback" };
 /** A rollback (`R`) from the running build's short SHA to the previous build's. */
@@ -110,6 +129,9 @@ export class TerminalUiModel {
   private proposing?: UiApproval;
   /** The sprint action (`I`, `M` or `V`) the owner confirmed, until `sprintConfirmed` runs it. */
   private sprinting?: UiApproval;
+  private ceremonyPending = false;
+  private starting = false;
+  private sessionsReadable = false;
   /** Called after changes made outside a key press or refresh, so the screen redraws. */
   changed?: () => void;
 
@@ -374,82 +396,140 @@ export class TerminalUiModel {
   /** Enter in the input: start the goal in the team's home channel, for the team's project. */
   async submitInput(): Promise<void> {
     const input = this.input;
-    if (!input || !this.goals || !this.teamId) return;
+    if (!input || !this.goals || !this.teamId || this.starting) return;
     const goal = input.value.trim();
     if (!goal) return;
-    this.input = undefined;
-    this.notice = "Starting planning goal… Chick will post in the team's home channel.";
-    this.bump();
+    const teamId = this.teamId;
     const goals = this.goals;
-    await this.tracked(async () => {
-      try { this.notice = await goals.start(goal); }
-      catch (error) { this.notice = "Could not start the planning goal: " + (error instanceof Error ? error.message : String(error)); }
-    });
-    this.bump();
+    this.starting = true;
+    try {
+      await this.tracked(async () => {
+        await this.refresh();
+        // Escape can cancel this input while an update or refresh is in flight.
+        if (this.input !== input) return;
+        const blocked = this.newGoalBlocked(true);
+        if (blocked || teamId !== this.teamId) {
+          this.notice = blocked ?? "The selected team changed; review the goal before starting it.";
+          return;
+        }
+        this.input = undefined;
+        this.notice = "Starting planning goal… Chick will post in the team's home channel.";
+        this.bump();
+        try { this.notice = await goals.start(goal); }
+        catch (error) {
+          this.input = input;
+          this.notice = "Could not start the planning goal: " + (error instanceof Error ? error.message : String(error));
+        }
+        await this.refresh();
+      });
+    } finally { this.starting = false; this.bump(); }
   }
 
-  /** The selected seat's newest goal whose proposal awaits review. */
-  reviewGoal(): TerminalSession | undefined {
-    return this.seat ? newestPlanningRecord(this.sessionsFor(this.seat.id).filter((session) => session.stage === "awaiting-review")) : undefined;
+  /** Every goal the team list shows holds the team's lock, and only those: an integration merge alone never closes one. */
+  openGoals(): TerminalSession[] {
+    return this.sessionResult.sessions.filter((session) => session.teamId === this.teamId && !isFinishedSprint(sessionSprint(session).loop));
   }
 
-  /** The selected seat's newest goal still being clarified, whose proposal the owner may request. */
-  clarifyingGoal(): TerminalSession | undefined {
-    return this.seat ? newestPlanningRecord(this.sessionsFor(this.seat.id).filter((session) => session.stage === "clarifying")) : undefined;
+  newGoalBlocked(submitting = false): string | undefined {
+    if (!this.goals || !this.team) return "Planning goals cannot be started from this screen.";
+    if (this.stateError || !this.sessionsReadable) return "Cannot start a planning goal: current goal state is unavailable; refresh first.";
+    const missing = missingTeamHome(this.team);
+    if (missing.length) return "Cannot start a planning goal: " + missingTeamMessage(this.team.displayName, missing);
+    const open = this.openGoals();
+    if (open.length) return "New goal blocked by open goal " + open.map((session) => `${session.id} (${sessionSprint(session).loop.ceremony?.stage ?? `ceremony not recorded${session.migration ? `; legacy goal ${displayText(session.migration, 200)}` : ""}`}): ${displayText(session.goal, 80)}`).join("; ") + ". Close it after retro publication.";
+    if (this.starting && !submitting) return "A planning goal is starting; wait for it to finish.";
+    if (this.ceremonyPending) return "A ceremony action is in progress; wait for it to finish.";
+    return undefined;
   }
 
-  /** Runs the proposal request the owner confirmed with y; the bridge drafts it through the same path as a 📝 reaction. */
+  /** Only operations supported by both the durable stage and its recorded work are offered. */
+  private operation(session: TerminalSession, action: UiApproval["action"]): UiApproval | undefined {
+    if (!this.goals || this.stateError || !this.sessionsReadable) return undefined;
+    const owner = this.teams.find((team) => team.id === session.teamId)?.seats.find((seat) => seat.id === session.seatId);
+    if (!owner?.roles.includes("Team Lead")) return undefined;
+    const loop = sessionSprint(session).loop;
+    const stage = loop.ceremony?.stage;
+    if (!stage) return undefined;
+    const integration = loop.integration;
+    const target: UiApproval = { action, goalId: session.id, goal: session.goal };
+    // Reverting a released sprint remains possible in history, independently of closure.
+    if (action === "revert") return this.goals.sprint && integration?.status === "merged" && !integration.revertPrUrl
+      && (stage === "release" || stage === "retro") ? { ...target, prUrl: integration.prUrl } : undefined;
+    if (action === "merge" && this.goals.sprint && integration?.status === "merged" && integration.revertPrUrl
+      && (stage === "release" || stage === "retro")) return { ...target, mergeKind: "revert", prUrl: integration.revertPrUrl };
+    if (loop.closedAt) return undefined;
+    if (action === "propose") return (stage === "planning" || stage === "proposal") && session.stage === "clarifying" ? target : undefined;
+    if (action === "approve") return stage === "proposal" && session.stage === "awaiting-review" ? { ...target, updatedAt: session.updatedAt } : undefined;
+    if (!this.goals.sprint || session.stage !== "approved") return undefined;
+    if (action === "integrate") return (stage === "implement" || stage === "release") && integration?.status === "collecting"
+      && loop.tickets.some((ticket) => ticket.status === "merged")
+      && !loop.tickets.some((ticket) => ticket.status === "building" || ticket.status === "in review") ? target : undefined;
+    if (action === "merge") {
+      if (stage === "release" && integration?.status === "pr-open" && integration.prUrl) return { ...target, mergeKind: "release", prUrl: integration.prUrl };
+      if (stage === "retro" && loop.retro?.status === "pending" && loop.retro.prUrl) return { ...target, mergeKind: "retro", prUrl: loop.retro.prUrl };
+    }
+    return undefined;
+  }
+
+  actionGoal(action: UiApproval["action"]): TerminalSession | undefined {
+    return this.seat?.roles.includes("Team Lead") && !this.ceremonyPending && !this.starting
+      ? newestPlanningRecord(this.sessionsFor(this.seat.id).filter((session) => this.operation(session, action))) : undefined;
+  }
+
+  reviewGoal(): TerminalSession | undefined { return this.actionGoal("approve"); }
+  clarifyingGoal(): TerminalSession | undefined { return this.actionGoal("propose"); }
+
+  ceremonyKeys(): string[] {
+    if (this.page !== "seat") return [];
+    const keys: string[] = [];
+    for (const [action, label] of [["propose", "P propose"], ["approve", "A approve"], ["integrate", "I integrate"], ["merge", "M merge"], ["revert", "V revert"]] as const) {
+      const session = this.actionGoal(action);
+      const target = session && this.operation(session, action);
+      if (target) keys.push(label + (target.mergeKind ? " " + target.mergeKind : ""));
+    }
+    return keys;
+  }
+
+  private confirmationCurrent(target: UiApproval): boolean {
+    const session = this.sessionResult.sessions.find((item) => item.id === target.goalId);
+    const current = session && this.operation(session, target.action);
+    return !!current && JSON.stringify(current) === JSON.stringify(target);
+  }
+
+  /** Re-read after waiting for updates; never redirect an owner's confirmation to a different PR or proposal. */
+  private async runConfirmed(target: UiApproval | undefined, run: () => Promise<string>, failure: string): Promise<void> {
+    if (!target || this.ceremonyPending) return;
+    this.ceremonyPending = true;
+    try {
+      await this.tracked(async () => {
+        await this.refresh();
+        if (!this.confirmationCurrent(target)) {
+          this.notice = `Not run: ${target.action} for ${target.goalId} changed or is no longer available. Review the refreshed ceremony and confirm again.`;
+          return;
+        }
+        this.notice = `Running ${target.action}${target.mergeKind ? " " + target.mergeKind : ""} for ${target.goalId}…`;
+        this.bump();
+        try { this.notice = await run(); }
+        catch (error) { this.notice = failure + (error instanceof Error ? error.message : String(error)); }
+        await this.refresh();
+      });
+    } finally { this.ceremonyPending = false; this.bump(); }
+  }
+
   async proposeConfirmed(): Promise<void> {
-    const target = this.proposing;
-    this.proposing = undefined;
-    if (!target || !this.goals) return;
-    this.notice = "Requesting a proposal for " + target.goalId + "…";
-    this.bump();
-    const goals = this.goals;
-    await this.tracked(async () => {
-      try { this.notice = await goals.propose(target.goalId); }
-      catch (error) { this.notice = "Could not request a proposal for " + target.goalId + ": " + (error instanceof Error ? error.message : String(error)); }
-    });
-    await this.refresh();
-    this.bump();
+    const target = this.proposing; this.proposing = undefined;
+    if (target && this.goals) await this.runConfirmed(target, () => this.goals!.propose(target.goalId), `Could not request a proposal for ${target.goalId}: `);
   }
 
-  /** The selected seat's newest goal whose sprint is at one of `views`. */
-  sprintGoal(...views: NonNullable<TerminalSession["sprint"]>[]): TerminalSession | undefined {
-    return this.seat ? newestPlanningRecord(this.sessionsFor(this.seat.id).filter((session) => !!session.sprint && views.includes(session.sprint))) : undefined;
-  }
-
-  /** Runs the sprint action the owner confirmed with y; merges go through the same path as a ✅ on the merge post. */
   async sprintConfirmed(): Promise<void> {
-    const target = this.sprinting;
-    this.sprinting = undefined;
-    const goals = this.goals;
+    const target = this.sprinting; this.sprinting = undefined;
     const action = target && sprintActions[target.action];
-    if (!target || !goals?.sprint || !action) return;
-    this.notice = "Running " + action + " for sprint " + target.goalId + "…";
-    this.bump();
-    await this.tracked(async () => {
-      try { this.notice = await goals.sprint!(action, target.goalId); }
-      catch (error) { this.notice = "Could not " + action + " sprint " + target.goalId + ": " + (error instanceof Error ? error.message : String(error)); }
-    });
-    await this.refresh();
-    this.bump();
+    if (target && action && this.goals?.sprint) await this.runConfirmed(target, () => this.goals!.sprint!(action, target.goalId), `Could not ${action} sprint ${target.goalId}: `);
   }
 
-  /** Runs the approval the owner confirmed with y; the CLI posts the same thread confirmation as a ✅ reaction. */
   async approveConfirmed(): Promise<void> {
-    const target = this.approving;
-    this.approving = undefined;
-    if (!target || !this.goals) return;
-    this.notice = "Approving " + target.goalId + "…";
-    this.bump();
-    const goals = this.goals;
-    await this.tracked(async () => {
-      try { this.notice = await goals.approve(target.goalId); }
-      catch (error) { this.notice = "Could not approve " + target.goalId + ": " + (error instanceof Error ? error.message : String(error)); }
-    });
-    await this.refresh();
-    this.bump();
+    const target = this.approving; this.approving = undefined;
+    if (target && this.goals) await this.runConfirmed(target, () => this.goals!.approve(target.goalId), `Could not approve ${target.goalId}: `);
   }
 
   get teams(): StateTeam[] { return this.snapshot?.teams ?? []; }
@@ -462,9 +542,10 @@ export class TerminalUiModel {
 
   /** Team history includes every planning sprint, independent of which seat currently holds work. */
   sprintsForTeam(): TerminalSprint[] {
-    const sessions = this.sessionResult.sessions.filter((session) => session.teamId === this.teamId && session.loop && !isFinishedSprint(session.loop));
+    const sessions = this.sessionResult.sessions.filter((session) => session.teamId === this.teamId);
     return [
-      ...sessions.map((session) => ({ id: session.id, goal: session.goal, loop: session.loop! })),
+      // Finished sprints leave the list; they stay out of the drafts below too, since `sessions` still holds them.
+      ...sessions.map(sessionSprint).filter((sprint) => !isFinishedSprint(sprint.loop)),
       ...(this.snapshot?.sprints ?? []).filter((sprint) => sprint.teamId === this.teamId && !sessions.some((session) => session.id === sprint.id)).map((sprint): TerminalSprint => ({
         id: sprint.id, goal: sprint.goal, draft: true, loop: { stage: "Goal", tickets: sprint.proposedWork.map((work) => ({
           id: work.id, title: work.title, seatId: sprint.proposedAllocations.find((item) => item.workIds.includes(work.id))?.seatId ?? "unassigned", status: "not assigned",
@@ -503,9 +584,16 @@ export class TerminalUiModel {
     } else {
       this.stateError = state.reason instanceof Error ? state.reason.message : "State could not be read.";
     }
+    this.sessionsReadable = sessions.status === "fulfilled";
     if (sessions.status === "fulfilled") this.sessionResult = sessions.value;
     else this.sessionResult = { connection: "error", sessions: [], message: sessions.reason instanceof Error ? sessions.reason.message : "Session reader failed." };
-    const changed = previous !== JSON.stringify([this.snapshot, this.stateError, this.sessionResult, this.live]);
+    let staleConfirmation = false;
+    if (this.confirm && this.confirm.action !== "retry" && this.confirm.action !== "rollback" && !this.confirmationCurrent(this.confirm)) {
+      this.notice = `Confirmation for ${this.confirm.goalId} expired: its operation changed or is unavailable. Review the refreshed ceremony and confirm again.`;
+      this.confirm = undefined;
+      staleConfirmation = true;
+    }
+    const changed = staleConfirmation || previous !== JSON.stringify([this.snapshot, this.stateError, this.sessionResult, this.live]);
     if (changed) this.revision++;
     return changed;
   }
@@ -561,27 +649,26 @@ export class TerminalUiModel {
       else this.confirm = { ...target, action: "retry" };
     } else if (text === "A") {
       const target = this.reviewGoal();
-      if (this.page !== "seat") this.notice = "Open Chick's seat to approve a proposal.";
+      if (this.page !== "seat" || !this.seat?.roles.includes("Team Lead")) this.notice = "Open Chick's seat to approve a proposal.";
       else if (!this.goals) this.notice = "Proposals cannot be approved from this screen.";
       else if (!target) this.notice = "No proposal is awaiting review for this seat.";
-      else this.confirm = { action: "approve", goalId: target.id, goal: target.goal };
+      else this.confirm = this.operation(target, "approve");
     } else if (text === "P") {
       const target = this.clarifyingGoal();
-      if (this.page !== "seat") this.notice = "Open Chick's seat to request a proposal.";
+      if (this.page !== "seat" || !this.seat?.roles.includes("Team Lead")) this.notice = "Open Chick's seat to request a proposal.";
       else if (!this.goals) this.notice = "Proposals cannot be requested from this screen.";
       else if (!target) this.notice = "No goal is being clarified for this seat.";
-      else this.confirm = { action: "propose", goalId: target.id, goal: target.goal };
+      else this.confirm = this.operation(target, "propose");
     } else if (text === "I" || text === "M" || text === "V") {
       const action = text === "I" ? "integrate" : text === "M" ? "merge" : "revert";
-      const target = text === "I" ? this.sprintGoal("collecting") : text === "M" ? this.sprintGoal("pr-open", "revert-open") : this.sprintGoal("merged");
-      if (this.page !== "seat") this.notice = "Open Chick's seat to " + action + " a sprint.";
+      const target = this.actionGoal(action);
+      if (this.page !== "seat" || !this.seat?.roles.includes("Team Lead")) this.notice = "Open Chick's seat to " + action + " a sprint.";
       else if (!this.goals?.sprint) this.notice = "Sprints cannot be managed from this screen.";
-      else if (!target) this.notice = text === "I" ? "No sprint is collecting merges for this seat." : text === "M" ? "No sprint has an integration or revert PR open for this seat." : "No merged sprint to roll back for this seat.";
-      else this.confirm = { action, goalId: target.id, goal: target.goal, ...(target.sprint === "revert-open" ? { revert: true } : {}) };
+      else if (!target) this.notice = text === "I" ? "Integration unavailable: a sprint needs merged work and no outcome building or in review." : text === "M" ? "No sprint has an eligible release, revert or retro PR open for this seat." : "No merged sprint to roll back for this seat.";
+      else this.confirm = this.operation(target, action);
     } else if (input === "n") {
-      const missing = missingTeamHome(this.team);
-      if (!this.goals || !this.team) this.notice = "Planning goals cannot be started from this screen.";
-      else if (missing.length) this.notice = "Cannot start a planning goal: " + missingTeamMessage(this.team.displayName, missing);
+      const blocked = this.newGoalBlocked();
+      if (blocked) this.notice = blocked;
       else this.input = { value: "" };
     } else if (input === "s" || input === "x") {
       if (this.page === "teams" || !this.seat) this.notice = "Choose a seat first.";

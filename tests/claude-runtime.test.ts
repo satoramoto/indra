@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CLAUDE_OUTPUT_LIMIT, CLAUDE_STDERR_LIMIT, ClaudeRuntime } from "../src/claude-runtime.js";
+import { AgentRunError } from "../src/runtime-facts.js";
 
 vi.mock("node:child_process", () => ({ spawn: vi.fn(), execFile: vi.fn() }));
 const id = "12345678-1234-4321-8765-123456789abc";
@@ -35,12 +36,13 @@ describe("Claude runtime", () => {
     await launched();
     expect(spawn).toHaveBeenCalledWith("claude", expect.any(Array), expect.objectContaining({ cwd: dir, stdio: ["pipe", "pipe", "pipe"] }));
     expect(child.input).toBe("Task text stays on stdin"); expect(args().join(" ")).not.toContain(child.input);
-    expect(args()).toContain("--print"); expect(flag("--output-format")).toBe("json");
+    expect(args()).toContain("--print"); expect(flag("--output-format")).toBe("stream-json");
+    expect(args()).toEqual(expect.arrayContaining(["--verbose", "--include-partial-messages"]));
     expect(JSON.parse(flag("--json-schema"))).toMatchObject({ type: "object", required: ["summary"] });
     expect(args()).not.toContain("--resume"); expect(args()).not.toContain("--continue");
     child.close();
     const result = await run;
-    expect(result).toMatchObject({ sessionId: handle, response: { summary: "Done" }, usage: { input_tokens: 32, output_tokens: 9 } });
+    expect(result).toMatchObject({ sessionId: handle, response: { summary: "Done" }, usage: { uncachedInputTokens: 32, outputTokens: 9 }, facts: { engine: "claude", sessionId: handle, status: "succeeded" } });
     expect(Date.parse(result.finishedAt)).toBeGreaterThanOrEqual(Date.parse(result.startedAt));
   });
 
@@ -90,7 +92,7 @@ describe("Claude runtime", () => {
 
   it("reports a missing executable without reflecting process diagnostics", async () => {
     const run = new ClaudeRuntime(dir).message("Task", schema); const check = expect(run).rejects.toThrow("Claude executable not found");
-    await launched(); child.emit("error", Object.assign(new Error("private diagnostic"), { code: "ENOENT" })); await check;
+    await launched(); child.emit("error", Object.assign(new Error("private diagnostic"), { code: "ENOENT" })); child.close("", -2); await check;
   });
 
   it.each([
@@ -116,10 +118,13 @@ describe("Claude runtime", () => {
   });
 
   it("honors the per-turn timeout and kills an unresponsive child after cancellation", async () => {
-    const run = new ClaudeRuntime(dir, 60_000).message("Task", schema, undefined, { timeoutMs: 100 });
+    vi.useFakeTimers();
+    const run = new ClaudeRuntime(dir, 60_000).message("Task", schema, undefined, { timeoutMs: 500 });
     const check = expect(run).rejects.toThrow("timed out"); await launched();
-    await check; expect(child.kill).toHaveBeenCalledWith("SIGTERM");
-    await vi.waitFor(() => expect(child.kill).toHaveBeenCalledWith("SIGKILL"), { timeout: 1500 }); child.emit("close", null);
+    await vi.advanceTimersByTimeAsync(500); expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    await vi.advanceTimersByTimeAsync(1000); expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+    child.emit("close", null); await check;
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("does not launch an already-aborted turn", async () => {
@@ -130,8 +135,8 @@ describe("Claude runtime", () => {
   it("cancels an active turn and removes its abort listener", async () => {
     const controller = new AbortController(); const remove = vi.spyOn(controller.signal, "removeEventListener");
     const run = new ClaudeRuntime(dir).message("Task", schema, undefined, { signal: controller.signal }); const check = expect(run).rejects.toThrow("cancelled");
-    await launched(); controller.abort(); await check;
-    expect(child.kill).toHaveBeenCalledWith("SIGTERM"); expect(remove).toHaveBeenCalledWith("abort", expect.any(Function)); child.emit("close", null);
+    await launched(); controller.abort(); child.emit("close", null); await check;
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM"); expect(remove).toHaveBeenCalledWith("abort", expect.any(Function));
   });
 
   it("does not resolve successfully when terminating a child closes it immediately", async () => {
@@ -147,17 +152,17 @@ describe("Claude runtime", () => {
     const kill = vi.spyOn(process, "kill").mockReturnValue(true);
     const controller = new AbortController();
     const run = new ClaudeRuntime(dir).message("Task", schema, undefined, { signal: controller.signal }); const check = expect(run).rejects.toThrow("cancelled");
-    await launched(); controller.abort(); await check;
+    await launched(); controller.abort();
     expect(kill).toHaveBeenCalledWith(-12345, "SIGTERM");
-    child.emit("close", 0);
+    child.emit("close", 0); await check;
     await vi.advanceTimersByTimeAsync(1000);
     expect(kill).toHaveBeenCalledWith(-12345, "SIGKILL");
   });
 
   it.each(["stdout", "stderr"] as const)("bounds %s without logging a truncated secret", async (stream) => {
     const run = new ClaudeRuntime(dir).message("Task", schema); const check = expect(run).rejects.toThrow(`${stream} exceeded the output limit`);
-    await launched(); child[stream].write("x".repeat((stream === "stdout" ? CLAUDE_OUTPUT_LIMIT : CLAUDE_STDERR_LIMIT) + 1)); await check;
-    expect(child.kill).toHaveBeenCalledWith("SIGTERM"); child.emit("close", null);
+    await launched(); child[stream].write("x".repeat((stream === "stdout" ? CLAUDE_OUTPUT_LIMIT : CLAUDE_STDERR_LIMIT) + 1));
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM"); child.emit("close", null); await check;
   });
 
   it("rejects an unreadable or malformed schema before starting a model", async () => {
@@ -165,5 +170,116 @@ describe("Claude runtime", () => {
     await expect(new ClaudeRuntime(dir).message("Task", schema)).rejects.toThrow("schema could not be read as JSON");
     await expect(new ClaudeRuntime(dir).message("Task", join(dir, "missing"))).rejects.toThrow("schema could not be read as JSON");
     expect(spawn).not.toHaveBeenCalled();
+  });
+});
+
+// Reduced Claude Code 2.1.283 stream-json frames. Assistant output_tokens is a placeholder;
+// message_delta usage is cumulative for that API response, and result.usage covers the current turn.
+const partial = [
+  { type: "system", subtype: "init", session_id: id },
+  { type: "stream_event", session_id: id, parent_tool_use_id: null, event: { type: "message_start", message: { id: "msg_example", usage: { input_tokens: 32, cache_creation_input_tokens: 8, cache_read_input_tokens: 12, output_tokens: 1 } } } },
+  { type: "stream_event", session_id: id, parent_tool_use_id: null, event: { type: "message_delta", delta: { stop_reason: null }, usage: { output_tokens: 9 } } },
+  { type: "assistant", session_id: id, parent_tool_use_id: null, message: { id: "msg_example", content: [{ type: "text", text: "private response" }], usage: { input_tokens: 32, cache_creation_input_tokens: 8, cache_read_input_tokens: 12, output_tokens: 1 } } },
+].map((event) => JSON.stringify(event)).join("\n") + "\n";
+const failure = (run: Promise<unknown>) => run.then(() => { throw new Error("Expected runtime failure"); }, (error: unknown) => {
+  expect(error).toBeInstanceOf(AgentRunError);
+  return error as AgentRunError;
+});
+
+describe("Claude invocation facts", () => {
+  it("deduplicates streaming and final usage while retaining only allowlisted facts", async () => {
+    const run = new ClaudeRuntime(dir).message("private prompt", schema); await launched();
+    for (let n = 0; n < partial.length; n += 23) child.stdout.write(partial.slice(n, n + 23));
+    child.close(envelope({ usage: { input_tokens: 32, cache_creation_input_tokens: 8, cache_read_input_tokens: 12, output_tokens: 9, diagnostic: "private diagnostic" } }));
+    const result = await run;
+    expect(result.facts?.usage).toEqual({ inputTokens: 52, uncachedInputTokens: 32, cachedInputTokens: 12, cacheWriteInputTokens: 8, outputTokens: 9 });
+    expect(result.facts?.startedAt).toBe(result.startedAt); expect(result.facts?.finishedAt).toBe(result.finishedAt);
+    expect(JSON.stringify(result.facts)).not.toMatch(/private|content|message|diagnostic/);
+  });
+
+  it.each([0, 7])("preserves error-envelope counters when Claude exits with %s", async (code) => {
+    const run = failure(new ClaudeRuntime(dir).message("Task", schema)); await launched();
+    child.close(envelope({ subtype: "error_max_turns", is_error: true, errors: ["private diagnostic"] }), code);
+    const error = await run;
+    expect(error.facts).toMatchObject({ engine: "claude", status: "failed", sessionId: handle, usage: { uncachedInputTokens: 32, outputTokens: 9 }, startedAt: expect.any(String), finishedAt: expect.any(String) });
+    expect(JSON.stringify(error)).not.toMatch(/private diagnostic|structured_output/);
+  });
+
+  it("keeps partial usage after an output truncation and a zeroed crash result", async () => {
+    const run = failure(new ClaudeRuntime(dir).message("Task", schema)); await launched();
+    child.stdout.write(partial);
+    child.close(envelope({ subtype: "error_during_execution", is_error: true, usage: { input_tokens: 0, output_tokens: 0 } }) + '\n{"partial', 1);
+    const error = await run;
+    expect(error.facts.usage).toEqual({ inputTokens: 52, uncachedInputTokens: 32, cachedInputTokens: 12, cacheWriteInputTokens: 8, outputTokens: 9 });
+  });
+
+  it.each(["interrupted", "timed-out"] as const)("records %s with identity and usage received before termination", async (status) => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const run = failure(new ClaudeRuntime(dir).message("Task", schema, undefined, { timeoutMs: 500, signal: controller.signal }));
+    await launched(); child.stdout.write(partial);
+    if (status === "interrupted") controller.abort(); else await vi.advanceTimersByTimeAsync(500);
+    child.emit("close", null);
+    const error = await run;
+    expect(error.facts).toMatchObject({ engine: "claude", status, sessionId: handle, usage: { inputTokens: 52, outputTokens: 9 } });
+    expect(Date.parse(error.facts.finishedAt)).toBeGreaterThanOrEqual(Date.parse(error.facts.startedAt));
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+  });
+
+  it.each(["interrupted", "timed-out", "stdin-error", "process-error"] as const)("drains buffered and shutdown usage before recording %s", async (reason) => {
+    vi.useFakeTimers();
+    const controller = new AbortController(); let settled = false;
+    const run = failure(new ClaudeRuntime(dir).message("Task", schema, undefined, { timeoutMs: 500, signal: controller.signal }));
+    void run.then(() => { settled = true; });
+    await launched();
+    const shutdown = envelope({ usage: { input_tokens: 40, cache_creation_input_tokens: 8, cache_read_input_tokens: 12, output_tokens: 12 } });
+    child.stdout.write(partial + shutdown.slice(0, 40));
+    if (reason === "interrupted") controller.abort();
+    else if (reason === "timed-out") await vi.advanceTimersByTimeAsync(500);
+    else if (reason === "stdin-error") child.stdin.emit("error", new Error("private stdin diagnostic"));
+    else child.emit("error", new Error("private process diagnostic"));
+    child.emit("exit", 0);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(settled).toBe(false);
+    child.close(shutdown.slice(40) + "\n" + shutdown);
+    const error = await run;
+    expect(error.facts).toMatchObject({ engine: "claude", status: reason.endsWith("error") ? "failed" : reason, sessionId: handle, usage: { inputTokens: 60, outputTokens: 12 }, finishedAt: new Date().toISOString() });
+    expect(JSON.stringify(error)).not.toContain("private");
+  });
+
+  it("continues enforcing the stdout limit during cancellation", async () => {
+    const controller = new AbortController();
+    const run = failure(new ClaudeRuntime(dir).message("Task", schema, undefined, { signal: controller.signal }));
+    await launched(); child.stdout.write(partial); controller.abort();
+    child.stdout.write("x".repeat(CLAUDE_OUTPUT_LIMIT + 1));
+    child.close(envelope({ usage: { input_tokens: 100, output_tokens: 100 } }), null);
+    expect((await run).facts).toMatchObject({ status: "interrupted", usage: { inputTokens: 52, outputTokens: 9 } });
+  });
+
+  it("resumes the same handle but records only current-turn usage, not lifetime model totals", async () => {
+    const run = new ClaudeRuntime(dir).message("Continue", schema, handle); await launched();
+    child.close(envelope({ usage: { input_tokens: 10, output_tokens: 3 }, modelUsage: { "model": { inputTokens: 1000, outputTokens: 500 } } }));
+    const result = await run;
+    expect(result.facts?.usage).toEqual({ uncachedInputTokens: 10, outputTokens: 3 });
+    expect(result.sessionId).toBe(handle); expect(flag("--resume")).toBe(id);
+  });
+
+  it("keeps missing usage unknown on success and failed launch", async () => {
+    const run = new ClaudeRuntime(dir).message("Task", schema); await launched(); child.close(envelope({ usage: undefined }));
+    expect((await run).facts?.usage).toBeUndefined();
+    vi.mocked(spawn).mockImplementationOnce(() => { throw new Error("private process diagnostic"); });
+    const error = await failure(new ClaudeRuntime(dir).message("Task", schema));
+    expect(error.facts).toMatchObject({ engine: "claude", status: "failed" });
+    expect(error.facts.usage).toBeUndefined(); expect(error.facts.sessionId).toBeUndefined();
+    expect(error.message).not.toContain("private");
+  });
+
+  it("records pre-launch cancellation and schema failures without exposing schema contents", async () => {
+    const cancelled = await failure(new ClaudeRuntime(dir).message("Task", schema, handle, { signal: AbortSignal.abort() }));
+    expect(cancelled.facts).toMatchObject({ engine: "claude", status: "interrupted", sessionId: handle });
+    await writeFile(schema, "private schema text");
+    const invalid = await failure(new ClaudeRuntime(dir).message("Task", schema));
+    expect(invalid.facts).toMatchObject({ engine: "claude", status: "failed" });
+    expect(JSON.stringify(invalid)).not.toContain("private schema text"); expect(spawn).not.toHaveBeenCalled();
   });
 });
