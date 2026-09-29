@@ -26,12 +26,26 @@ export function ownerCodexAuth(env: NodeJS.ProcessEnv = process.env): string {
   return join(env.CODEX_HOME || join(homedir(), ".codex"), "auth.json");
 }
 
-/** The owner's seat allocation: the model and reasoning effort every Codex seat runs with, so sprints stay comparable. */
-export const CODEX_MODEL = "gpt-6-astra";
-export const CODEX_REASONING_EFFORT = "max";
+/** The owner's seat allocation per role: planning carries the heavy reasoning, implementation runs cheap. */
+export const TEAM_LEAD_CODEX_MODEL = "gpt-6-astra";
+export const TEAM_LEAD_CODEX_REASONING_EFFORT = "max";
+export const PRODUCT_CODEX_MODEL = "gpt-6-astra";
+export const PRODUCT_CODEX_REASONING_EFFORT = "medium";
+export const DEVELOPER_CODEX_MODEL = "gpt-6-sol";
+export const DEVELOPER_CODEX_REASONING_EFFORT = "medium";
 
-/** The whole harness `config.toml`: model and reasoning effort only. No instructions, MCP servers, hooks, skills, plugins or profiles. */
-export const CODEX_CONFIG = `model = "${CODEX_MODEL}"\nmodel_reasoning_effort = "${CODEX_REASONING_EFFORT}"\n`;
+/** A whole harness `config.toml`: model and reasoning effort only. No instructions, MCP servers, hooks, skills, plugins or profiles. */
+const codexConfig = (model: string, effort: string) => `model = "${model}"\nmodel_reasoning_effort = "${effort}"\n`;
+export const TEAM_LEAD_CODEX_CONFIG = codexConfig(TEAM_LEAD_CODEX_MODEL, TEAM_LEAD_CODEX_REASONING_EFFORT);
+export const PRODUCT_CODEX_CONFIG = codexConfig(PRODUCT_CODEX_MODEL, PRODUCT_CODEX_REASONING_EFFORT);
+export const DEVELOPER_CODEX_CONFIG = codexConfig(DEVELOPER_CODEX_MODEL, DEVELOPER_CODEX_REASONING_EFFORT);
+
+/** The harness `config.toml` for a seat's roles as recorded in state; an unknown or missing role gets the Developer settings. */
+export function codexConfigForRoles(roles: readonly string[] | undefined): string {
+  if (roles?.includes("Team Lead")) return TEAM_LEAD_CODEX_CONFIG;
+  if (roles?.includes("Product")) return PRODUCT_CODEX_CONFIG;
+  return DEVELOPER_CODEX_CONFIG;
+}
 
 /** Writes `content` to `path` through a temp file and a rename, so no reader sees a partial file; skipped when already identical. */
 export async function writeFileAtomic(path: string, content: string, mode = 0o600): Promise<void> {
@@ -91,10 +105,10 @@ export async function promoteSeatAuth(home: string, auth = ownerCodexAuth()): Pr
  * refreshes write through to it. A regular file at `auth.json` is first promoted (see promoteSeatAuth); anything else
  * there is replaced by the link. Codex runs call it before and after each run.
  */
-export async function ensureCodexHome(home: string, auth = ownerCodexAuth()): Promise<string> {
+export async function ensureCodexHome(home: string, auth = ownerCodexAuth(), config = DEVELOPER_CODEX_CONFIG): Promise<string> {
   await mkdir(home, { recursive: true, mode: 0o700 });
   for (const dir of [join(home, "..", ".."), join(home, ".."), home]) await chmod(dir, 0o700);
-  await writeFileAtomic(join(home, "config.toml"), CODEX_CONFIG);
+  await writeFileAtomic(join(home, "config.toml"), config);
   await promoteSeatAuth(home, auth);
   const link = join(home, "auth.json");
   let current: string | undefined;

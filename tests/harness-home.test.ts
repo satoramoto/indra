@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { CODEX_CONFIG, engineHome, ensureCodexHome, ownerCodexAuth, promoteSeatAuth, seatHarnessDir, writeFileAtomic } from "../src/harness-home.js";
+import { DEVELOPER_CODEX_CONFIG as CODEX_CONFIG, PRODUCT_CODEX_CONFIG, TEAM_LEAD_CODEX_CONFIG, codexConfigForRoles, engineHome, ensureCodexHome, ownerCodexAuth, promoteSeatAuth, seatHarnessDir, writeFileAtomic } from "../src/harness-home.js";
 import { CodexRuntime } from "../src/codex-runtime.js";
 import { claudePermissionArgs } from "../src/claude-runtime.js";
 
@@ -57,7 +57,23 @@ describe("seat harness homes", () => {
       expect(await readlink(join(home, "auth.json"))).toBe(join(owner, ".codex", "auth.json"));
     }
     // Exactly the owner's seat model and effort; no MCP, hooks, skills or profiles.
-    expect(CODEX_CONFIG).toBe("model = \"gpt-6-astra\"\nmodel_reasoning_effort = \"max\"\n");
+    expect(CODEX_CONFIG).toBe("model = \"gpt-6-sol\"\nmodel_reasoning_effort = \"medium\"\n");
+  });
+
+  it("picks the Codex model by the seat's role, falling back to Developer", () => {
+    expect(codexConfigForRoles(["Developer"])).toBe("model = \"gpt-6-sol\"\nmodel_reasoning_effort = \"medium\"\n");
+    expect(codexConfigForRoles(["Team Lead"])).toBe("model = \"gpt-6-astra\"\nmodel_reasoning_effort = \"max\"\n");
+    expect(codexConfigForRoles(["Product"])).toBe("model = \"gpt-6-astra\"\nmodel_reasoning_effort = \"medium\"\n");
+    expect(TEAM_LEAD_CODEX_CONFIG).not.toBe(PRODUCT_CODEX_CONFIG);
+    for (const roles of [undefined, [], ["Unknown"]]) expect(codexConfigForRoles(roles)).toBe(CODEX_CONFIG);
+  });
+
+  it("rewrites an existing home's config when the seat's role config changes", async () => {
+    const home = engineHome(seatHarnessDir(runtimeDir, "seat-002"), "codex");
+    await ensureCodexHome(home, undefined, TEAM_LEAD_CODEX_CONFIG);
+    expect(await readFile(join(home, "config.toml"), "utf8")).toBe(TEAM_LEAD_CODEX_CONFIG);
+    await ensureCodexHome(home, undefined, codexConfigForRoles(["Developer"]));
+    expect(await readFile(join(home, "config.toml"), "utf8")).toBe(CODEX_CONFIG);
   });
 
   it("replaces a copied auth file or a stale link with the link to the owner's login", async () => {

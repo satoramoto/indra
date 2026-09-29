@@ -291,17 +291,19 @@ export async function createCeremonyAdapters({ store }: { store: PlanningStore }
   const profiles = await loadSeatPersonas(import.meta.url);
   const runtimeFor = async (context: CeremonyContext, cwd: string) => {
     const state = await store.read();
-    const seats = (state.teams as { seats: { id: string }[] }[]).flatMap((team) => team.seats).map((seat) => seat.id);
-    const engines = await loadSeatEngines(store.runtimeDir, seats);
-    return new SeatRuntime(engines[context.goal.seatId] ?? "codex", cwd, undefined, undefined, undefined, seatHarnessDir(store.runtimeDir, context.goal.seatId));
+    const all = (state.teams as { seats: { id: string; roles?: string[] }[] }[]).flatMap((team) => team.seats);
+    const engines = await loadSeatEngines(store.runtimeDir, all.map((seat) => seat.id));
+    const roles = all.find((seat) => seat.id === context.goal.seatId)?.roles;
+    return new SeatRuntime(engines[context.goal.seatId] ?? "codex", cwd, undefined, undefined, undefined, seatHarnessDir(store.runtimeDir, context.goal.seatId), roles);
   };
   const retro = new RetroPublication(new SprintGitHub(processShell, store.runtimeDir), async (context, prior) => {
     const state = await store.read();
-    const seats = (state.teams as { seats: { id: string }[] }[]).flatMap((team) => team.seats).map((seat) => seat.id);
-    const engines = await loadSeatEngines(store.runtimeDir, seats);
+    const all = (state.teams as { seats: { id: string; roles?: string[] }[] }[]).flatMap((team) => team.seats);
+    const engines = await loadSeatEngines(store.runtimeDir, all.map((seat) => seat.id));
+    const roles = all.find((seat) => seat.id === context.goal.seatId)?.roles;
     const input = await recordedRetroInput(context, prior);
     return await draftSprintRetro(input, (cwd) => {
-      const runtime = withPersonaRuntime(new SeatRuntime(engines[context.goal.seatId] ?? "codex", cwd, undefined, undefined, undefined, seatHarnessDir(store.runtimeDir, context.goal.seatId)), profiles[context.goal.seatId]);
+      const runtime = withPersonaRuntime(new SeatRuntime(engines[context.goal.seatId] ?? "codex", cwd, undefined, undefined, undefined, seatHarnessDir(store.runtimeDir, context.goal.seatId), roles), profiles[context.goal.seatId]);
       return { message: async (...args) => {
         try { const run = await runtime.message(...args); await context.recordRun(run); return run; }
         catch (error) { if (error instanceof AgentRunError) await context.recordSession(error.facts); throw error; }

@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentResult, AgentRuntime } from "../src/codex-runtime.js";
 import { CEREMONY_STAGES } from "../src/ceremony.js";
 import type { ImplementationFacts } from "../src/implementation-facts.js";
-import { CODEX_CONFIG, engineHome, seatHarnessDir } from "../src/harness-home.js";
+import { TEAM_LEAD_CODEX_CONFIG, engineHome, seatHarnessDir } from "../src/harness-home.js";
 import type { PlanningGoal } from "../src/planning.js";
 import { SeatRuntime } from "../src/seat-runtime.js";
 import {
@@ -269,7 +269,7 @@ describe("fresh read-only retro generation", () => {
     const child = Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), kill: vi.fn(() => true) });
     vi.mocked(spawn).mockReturnValue(child as unknown as ReturnType<typeof spawn>);
     try {
-      const draft = draftSprintRetro(input(), (cwd) => new SeatRuntime("codex", cwd, undefined, undefined, undefined, harness));
+      const draft = draftSprintRetro(input(), (cwd) => new SeatRuntime("codex", cwd, undefined, undefined, undefined, harness, ["Team Lead"]));
       await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
       const args = vi.mocked(spawn).mock.calls[0][1] as string[];
       expect(args.slice(0, 4)).toEqual(["exec", "--json", "--sandbox", "read-only"]);
@@ -277,7 +277,7 @@ describe("fresh read-only retro generation", () => {
       const configuredHome = engineHome(harness, "codex");
       expect(vi.mocked(spawn).mock.calls[0][2]?.env?.CODEX_HOME).toBe(configuredHome);
       expect(await readdir(configuredHome)).toEqual(["auth.json", "config.toml"]);
-      expect(await readFile(join(configuredHome, "config.toml"), "utf8")).toBe(CODEX_CONFIG);
+      expect(await readFile(join(configuredHome, "config.toml"), "utf8")).toBe(TEAM_LEAD_CODEX_CONFIG);
       const snapshot = buildRetroSnapshot(input());
       child.stdout.write([
         { type: "thread.started", thread_id: "new-retro" },
