@@ -291,7 +291,9 @@ class ProductTurn {
     const key = event.kind === "startup" ? `product-startup:${this.services.teamId}` : event.id;
     await this.reconcile();
     if (this.journal.active && this.record.handledEventIds.includes(this.journal.active.causeId)) { this.journal.active = null; await this.journalSave(); }
-    if (this.record.pending) await this.settleDelivery();
+    // Scope-correcting vetting can be durable before its delivery intent. Recover that exact
+    // verified revision before receipt deduplication or model-retry guards can return early.
+    if (this.record.pending || event.kind === "startup" || event.kind === "proposal-vetted" || event.kind === "retry") await this.publishNext();
     if (this.record.handledEventIds.includes(key)) return this.result();
     if (event.kind === "proposal-vetted") { if (!await this.vet(event)) return this.result(); await this.publishNext(); this.record.handledEventIds.push(key); await this.save(); return this.result(); }
     // Own queue/proposal receipts settle. They never generate or invalidate a draft awaiting vetting.

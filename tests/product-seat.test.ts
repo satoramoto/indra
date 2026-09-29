@@ -112,6 +112,36 @@ describe("finite Product seat with real store and own-bot delivery", () => {
     expect(goals[0].goalAssignment).toBeUndefined(); expect(goals[0].integration).toBeUndefined(); expect(goals[0].mattermost.rootPostId).toBe(f.posts[0].id);
     expect(f.requests.filter((request) => request.method !== "GET").map((request) => request.path)).toEqual(["/posts"]);
   });
+  it.each(["startup", "receipt", "retry"] as const)("recovers a saved scope correction before delivery on %s without another model turn", async (trigger) => {
+    const f = await fixture(); await f.runner().turn(startup);
+    const source = structuredClone((await f.current()).queue[0].proposal); const vetted = await f.vet();
+    const corrected = { ...source, ownedFiles: vetted.vetting.ownedFiles };
+    expect(productProposalDigest(source)).not.toBe(productProposalDigest(corrected));
+    const save = f.store.saveRuntime.bind(f.store); let crashed = false;
+    const persistence = vi.spyOn(f.store, "saveRuntime").mockImplementation(async (name, value) => {
+      // Model process death immediately after the public correction is durable: no later write,
+      // including the outer catch's failure record, reaches disk.
+      if (crashed) throw new Error("Process stopped after durable vetting");
+      await save(name, value);
+      if (name === productRuntimeFilename(teamId) && (value as ProductRuntimeRecord).queue.some((entry) => entry.proposal.proposalId === source.proposalId && entry.vetting !== null)) {
+        crashed = true; throw new Error("Process stopped after durable vetting");
+      }
+    });
+    await expect(f.runner().turn(vetted)).rejects.toThrow("Process stopped after durable vetting"); persistence.mockRestore();
+    const saved = await f.current(); expect(saved.queue[0]).toMatchObject({ proposal: corrected, vetting: vetted.vetting, status: "proposed" });
+    expect(saved.pending).toBeNull(); expect(saved.failure).toBeNull(); expect(saved.handledEventIds).toContain(`product-startup:${teamId}`);
+    const journal = await f.store.readRuntimeFile<{ active: unknown; vetting: Record<string, unknown>; deliveries: Record<string, unknown> }>(productJournalFilename(teamId));
+    expect(journal).toMatchObject({ active: null, vetting: { [source.proposalId]: { source, event: vetted } } }); expect(journal?.deliveries).toEqual({});
+    expect((await f.store.read()).planningGoals).toHaveLength(0); expect(f.posts).toHaveLength(0); expect(f.requests.filter((request) => request.method === "POST")).toHaveLength(0);
+    // No queue event or synthetic failure flag compensates for the lost publication turn.
+    await f.runner().turn(trigger === "startup" ? startup : trigger === "receipt" ? vetted : f.retry());
+    expect(f.posts).toHaveLength(1); expect((await f.store.read()).planningGoals).toHaveLength(1);
+    for (const event of [startup, vetted, f.retry(), startup]) await f.runner().turn(event);
+    const goals = (await f.store.read()).planningGoals!;
+    expect(goals).toHaveLength(1); expect(goals[0].goalProposal).toEqual(corrected); expect(goals[0].ownedFiles).toEqual(vetted.vetting.ownedFiles);
+    expect((await f.current()).queue).toHaveLength(5); expect((await f.current()).pending).toBeNull(); expect(f.calls).toHaveLength(5);
+    expect(f.requests.filter((request) => request.method === "POST")).toHaveLength(1); expect(f.posts).toHaveLength(1);
+  });
   it("serializes concurrent startup and vetting deliveries across fresh runners", async () => {
     const f = await fixture(); await Promise.all([f.runner().turn(startup), f.runner().turn(startup)]);
     expect(f.calls).toHaveLength(5); const vetted = await f.vet(); await Promise.all([f.runner().turn(vetted), f.runner().turn(vetted)]);
