@@ -1,9 +1,12 @@
 import type { AgentRuntime } from "./codex-runtime.js";
 import type { WorkflowEvent } from "./goal-contract.js";
 import type { PlanningStore } from "./planning.js";
+import type { RuntimeFactory } from "./developer-seat.js";
+import type { Shell } from "./command-shell.js";
+import { proposeGoals, type ProductChat } from "./product-proposals.js";
 
 export interface ProductSeatIdentity { id: string; teamId: string; displayName: string; username: string; roles: ["Product"] }
-export interface ProductSeatServices { store: PlanningStore; seat: ProductSeatIdentity; runtime: AgentRuntime }
+export interface ProductSeatServices { store: PlanningStore; seat: ProductSeatIdentity; runtime: AgentRuntime; runtimeFor?: RuntimeFactory; chat?: ProductChat; shell?: Shell }
 export interface ProductTurnResult { status: "disabled" | "idle" | "proposed" | "refined"; proposalIds: string[] }
 
 /** Readiness is explicit; never reassign George or invent identity/project/channel data. */
@@ -17,8 +20,13 @@ export async function loadProductSeat(store: PlanningStore, seatId: string): Pro
   }
   return undefined;
 }
-/** Contract stub: exactly one finite event turn, no model run, credential read, post, timer or write. */
+/** One finite Product turn; the host supplies the project runtime and its authenticated own-bot chat. */
 export class ProductSeat {
   constructor(readonly services: ProductSeatServices) {}
-  async turn(_event: WorkflowEvent): Promise<ProductTurnResult> { return { status: "disabled", proposalIds: [] }; }
+  async turn(event: WorkflowEvent): Promise<ProductTurnResult> {
+    const current = await loadProductSeat(this.services.store, this.services.seat.id);
+    if (!current || current.teamId !== this.services.seat.teamId) return { status: "disabled", proposalIds: [] };
+    const result = await proposeGoals({ ...this.services, teamId: current.teamId, productSeatId: current.id }, event);
+    return { status: result.status, proposalIds: result.proposals.map((proposal) => proposal.proposalId) };
+  }
 }

@@ -14,6 +14,13 @@ describe("shared persona profiles", () => {
     for (const profile of Object.values(profiles)) for (const value of Object.values(profile)) expect(value.trim()).not.toBe("");
     expect(new Set(Object.values(profiles).map((profile) => profile.voice)).size).toBe(5);
   });
+  it("assigns only George's checked-in persona to Product while preserving its identity and voice", () => {
+    expect(profiles["seat-002"].background).toBe("Product bot inspired by George Duke, the jazz, fusion, and funk pianist, producer, and composer.");
+    expect(profiles["seat-002"].voice).toBe("Relaxed, practical, and groove-conscious. Explain the next concrete step with an easy warmth; keep the rhythm steady when a problem gets complicated.");
+    expect(profiles["seat-002"].postPrefix).toBe("Keeping a steady groove.");
+    expect(profiles["seat-001"].background).toContain("Team Lead bot");
+    for (const id of ["seat-003", "seat-004", "seat-005"]) expect(profiles[id].background).toContain("Developer bot");
+  });
   it.each(ids)("adds only %s's persona without changing engine/session/options or task instructions", async (id) => {
     const message = vi.fn<AgentRuntime["message"]>(async () => ({ sessionId: "session", startedAt: "2026-09-01T00:00:00Z", finishedAt: "2026-09-01T00:00:01Z", response: {} }));
     const runtime = withPersonaRuntime({ message }, profiles[id]);
