@@ -21,6 +21,7 @@ import { seatHarnessDir } from "./harness-home.js";
 import { loadSeatPersonas, withPersonaChat, withPersonaRuntime } from "./seat-persona.js";
 import { defaultAppDir, signalReady, TmuxHost, turnLockFile } from "./tmux-host.js";
 import { withFileLock } from "./state-commit.js";
+import { syncStateSchema } from "./state-schema.js";
 import { readBuildStamp } from "./build-stamp.js";
 import { recordRunningBuild, SelfUpdater } from "./self-update.js";
 import { appRootOf, isEntry, LAUNCHER_ENV, RELOAD_EXIT_CODE } from "./reload.js";
@@ -309,6 +310,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       const view = await readFile(viewFile, "utf8").then((text) => JSON.parse(text) as UiView, () => undefined);
       await rm(viewFile, { force: true });
       recordRunningBuild(`${options.checkout}.runtime`, import.meta.url);
+      await syncStateSchema(options.checkout).then((result) => { if (result.outcome !== "unchanged") console.log(result.message); });
       const updater = new SelfUpdater(defaultAppDir, undefined, undefined, `${resolve(options.checkout)}.runtime`);
       const store = createPlanningStore(options.checkout);
       return await runTerminalUi(new StateInventory(new LocalStateRepository(options.checkout)), new LocalSessionReader(options.checkout), {

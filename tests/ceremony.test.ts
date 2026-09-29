@@ -62,7 +62,7 @@ afterEach(async () => { await Promise.all(dirs.splice(0).flatMap((dir) => [dir, 
 async function store(goals: PlanningGoal[] = [], enabled = true): Promise<PlanningStore> {
   const checkout = await stateCheckout("indra-ceremony-", document(goals)); dirs.push(checkout);
   await mkdir(join(checkout, "schema/v1"), { recursive: true });
-  await copyFile(resolve("tests/fixtures/ceremony-state.schema.json"), join(checkout, "schema/v1/state.schema.json"));
+  await copyFile(resolve("schema/v1/state.schema.json"), join(checkout, "schema/v1/state.schema.json"));
   return new PlanningStore(checkout, undefined, enabled ? ready : undefined);
 }
 

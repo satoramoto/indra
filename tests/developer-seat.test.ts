@@ -44,7 +44,7 @@ async function fixture(assignments: Assignment[], stage = "approved", project: {
   const state = { $schema: "./schema/v1/state.schema.json", schemaVersion: 1, sprints: [], planningGoals: [goal], teams: [{ id: "team-001", slug: "yahaha", displayName: "Yahaha", ...(project ? { project } : {}), externalIdentities: { mattermost: { teamId: "team", homeChannelId: "channel" } }, seats: [seat("seat-001", "Chick", ["Team Lead"]), seat("seat-002", "George", ["Developer"]), seat("seat-003", "Herbie", ["Developer"])] }] };
   const checkout = await stateCheckout("indra-seat-", state);
   await mkdir(join(checkout, "schema/v1"), { recursive: true });
-  await copyFile("tests/fixtures/ceremony-state.schema.json", join(checkout, "schema/v1/state.schema.json"));
+  await copyFile("schema/v1/state.schema.json", join(checkout, "schema/v1/state.schema.json"));
   return new PlanningStore(checkout, undefined, READY);
 }
 const queued = (outcomeId: string, updatedAt: string, seatId = "seat-002"): Assignment => ({ outcomeId, seatId, status: "queued", updatedAt });

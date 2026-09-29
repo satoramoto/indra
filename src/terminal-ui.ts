@@ -1,6 +1,7 @@
 import type { StateInventory, StateSeat, StateSnapshot, StateTeam } from "./state-domain.js";
 import type { AssignmentRetry, GoalStarter, SeatLive, SeatProcessPort, SprintAction } from "./supervisor.js";
-import { missingTeamHome, missingTeamMessage } from "./planning.js";
+import { isFinishedSprint } from "./finished-sprint.js";
+import { missingTeamHome,missingTeamMessage } from "./planning.js";
 import type { StateSyncResult } from "./state-commit.js";
 import type { BuildStamp } from "./build-stamp.js";
 import type { RollbackPlan, UpdateResult } from "./self-update.js";
@@ -543,7 +544,8 @@ export class TerminalUiModel {
   sprintsForTeam(): TerminalSprint[] {
     const sessions = this.sessionResult.sessions.filter((session) => session.teamId === this.teamId);
     return [
-      ...sessions.map(sessionSprint),
+      // Finished sprints leave the list; they stay out of the drafts below too, since `sessions` still holds them.
+      ...sessions.map(sessionSprint).filter((sprint) => !isFinishedSprint(sprint.loop)),
       ...(this.snapshot?.sprints ?? []).filter((sprint) => sprint.teamId === this.teamId && !sessions.some((session) => session.id === sprint.id)).map((sprint): TerminalSprint => ({
         id: sprint.id, goal: sprint.goal, draft: true, loop: { stage: "Goal", tickets: sprint.proposedWork.map((work) => ({
           id: work.id, title: work.title, seatId: sprint.proposedAllocations.find((item) => item.workIds.includes(work.id))?.seatId ?? "unassigned", status: "not assigned",

@@ -133,6 +133,22 @@ describe("codex progress", () => {
     expect(lines).toEqual(["12:34 # build", "12:34 $ ✓ ls", "12:34 $ … npm test", "12:34 $ ✓ npm test"]);
   });
 
+  it("redacts the delayed start line of a slow command", () => {
+    const timers = new FakeTimers();
+    const lines: string[] = [];
+    const token = `ghp_${"a1".repeat(20)}`;
+    const progress = codexProgress({ write: (line) => lines.push(line), now, timers });
+    progress.push(command("c1", "started", `/bin/zsh -lc 'curl -H "Authorization: Bearer ${token}" https://api.github.com'`));
+    expect(lines).toEqual([]);
+    timers.fire();
+    expect(lines).toHaveLength(1);
+    expect(lines[0].startsWith("12:34 $ … curl")).toBe(true);
+    expect(lines[0]).toContain("[redacted]");
+    expect(lines[0]).not.toContain(token);
+    expect(lines[0]).not.toContain("ghp_");
+    progress.end();
+  });
+
   it("redacts secrets and caps every line", () => {
     const token = `ghp_${"a1".repeat(20)}`;
     const [line] = run([`{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc 'GH_TOKEN=${token} gh pr view'","exit_code":0}}\n`]);

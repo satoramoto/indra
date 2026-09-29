@@ -42,7 +42,7 @@ async function fixture(goals: PlanningGoal[] = []) {
   temporary.push(checkout, `${checkout}.runtime`);
   if (!goals.length) return new PlanningStore(checkout);
   await mkdir(join(checkout, "schema/v1"), { recursive: true });
-  await copyFile(new URL("./fixtures/ceremony-state.schema.json", import.meta.url), join(checkout, "schema/v1/state.schema.json"));
+  await copyFile(new URL("../schema/v1/state.schema.json", import.meta.url), join(checkout, "schema/v1/state.schema.json"));
   return new PlanningStore(checkout, undefined, { version: 1, consumers: { planning: 1, developer: 1, release: 1, retro: 1, tui: 1 } });
 }
 

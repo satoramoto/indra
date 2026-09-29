@@ -95,7 +95,7 @@ async function fixture() {
   }] });
   roots.push(checkout, `${checkout}.runtime`);
   await mkdir(join(checkout, "schema/v1"), { recursive: true });
-  await copyFile(resolve("tests/fixtures/ceremony-state.schema.json"), join(checkout, "schema/v1/state.schema.json"));
+  await copyFile(resolve("schema/v1/state.schema.json"), join(checkout, "schema/v1/state.schema.json"));
   const store = new PlanningStore(checkout, undefined, ceremonyReadiness);
   const chat = new Chat(); const agent = new Agent(); const services = new Services();
   const adapters = (): CeremonyAdapters => ({

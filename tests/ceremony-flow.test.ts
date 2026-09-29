@@ -73,7 +73,7 @@ async function fixture(adapters: CeremonyAdapters = {}) {
     ],
   }] });
   await mkdir(join(checkout, "schema/v1"), { recursive: true });
-  await copyFile(resolve("tests/fixtures/ceremony-state.schema.json"), join(checkout, "schema/v1/state.schema.json"));
+  await copyFile(resolve("schema/v1/state.schema.json"), join(checkout, "schema/v1/state.schema.json"));
   const store = new PlanningStore(checkout, undefined, ready);
   const chat = new Chat(); const runtime = new Runtime(); const github = new GitHub();
   const bridge = new PlanningBridge(store, chat, runtime, 20, github, adapters);

@@ -63,7 +63,7 @@ async function fixture(goals: PlanningGoal[] = []) {
   await mkdir(join(dir, "dist"));
   await writeFile(join(dir, "dist", "cli.js"), "");
   await mkdir(join(dir, "schema/v1"), { recursive: true });
-  await copyFile("tests/fixtures/ceremony-state.schema.json", join(dir, "schema/v1/state.schema.json"));
+  await copyFile("schema/v1/state.schema.json", join(dir, "schema/v1/state.schema.json"));
   const tmux = new FakeTmux();
   tmux.onStart = async (_session, nonce) => { await signalReady(dir, nonce); };
   return { dir, tmux, supervisor: new Supervisor(dir, tmux, dir, 1000, new PlanningStore(dir, undefined, READY)) };

@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { CEREMONY_SCHEMA_DEFS, startCeremony } from "../src/ceremony.js";
 import { parseState } from "../src/local-state.js";
 
-const schema = JSON.parse(await readFile(new URL("./fixtures/ceremony-state.schema.json", import.meta.url), "utf8"));
+const schema = JSON.parse(await readFile(new URL("../schema/v1/state.schema.json", import.meta.url), "utf8"));
 const ajv = new Ajv2020({ strict: false }); addFormats.default(ajv);
 const validate = ajv.compile(schema);
 const time = "2026-09-01T00:00:00Z";
