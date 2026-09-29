@@ -5,8 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { CLAUDE_OUTPUT_LIMIT, CLAUDE_STDERR_LIMIT, ClaudeRuntime } from "../src/claude-runtime.js";
+import { CLAUDE_OUTPUT_LIMIT, CLAUDE_STDERR_LIMIT, ClaudeRuntime, claudeModelArgs } from "../src/claude-runtime.js";
 import { AgentRunError } from "../src/runtime-facts.js";
+import { AGENT_PROMPT_LIMIT_BYTES } from "../src/codex-runtime.js";
+import { SeatRuntime } from "../src/seat-runtime.js";
 
 vi.mock("node:child_process", () => ({ spawn: vi.fn(), execFile: vi.fn() }));
 const id = "12345678-1234-4321-8765-123456789abc";
@@ -46,6 +48,24 @@ describe("Claude runtime", () => {
     expect(Date.parse(result.finishedAt)).toBeGreaterThanOrEqual(Date.parse(result.startedAt));
   });
 
+  it.each([
+    { seat: { id: "seat-004", roles: ["Developer"] }, effort: "medium" },
+    { seat: { id: "seat-001", roles: ["Team Lead"] }, effort: "max" },
+  ])("a Claude $seat.roles seat reached through SeatRuntime runs claude-opus-5-5 at $effort effort", async ({ seat, effort }) => {
+    const run = new SeatRuntime("claude", dir, undefined, undefined, undefined, undefined, seat.roles).message("Build", schema);
+    await launched();
+    expect(flag("--model")).toBe("claude-opus-5-5"); expect(flag("--effort")).toBe(effort);
+    child.close(); await run;
+    expect(claudeModelArgs(undefined)).toEqual(["--model", "claude-opus-5-5", "--effort", "medium"]);
+  });
+
+  it("refuses an oversized prompt before launching a process", async () => {
+    const error = await new ClaudeRuntime(dir).message("x".repeat(AGENT_PROMPT_LIMIT_BYTES + 1), schema).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(AgentRunError);
+    expect((error as AgentRunError).message).toContain("byte limit");
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
   it("resumes only the explicit Claude UUID, reapplies the schema, and disables interrupted-turn replay", async () => {
     vi.stubEnv("CLAUDE_CODE_RESUME_INTERRUPTED_TURN", "1");
     vi.stubEnv("ANTHROPIC_API_KEY", "test-only-must-not-forward");
@@ -54,6 +74,7 @@ describe("Claude runtime", () => {
     await launched(); expect(flag("--resume")).toBe(id); expect(args()).toContain("--json-schema");
     const env = vi.mocked(spawn).mock.calls[0][2]?.env;
     expect(env?.CLAUDE_CODE_RESUME_INTERRUPTED_TURN).toBe("0"); expect(env).not.toHaveProperty("ANTHROPIC_API_KEY");
+    expect(env?.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBe("300000");
     expect(env).not.toHaveProperty("OP_SESSION_example");
     child.close(); expect((await run).sessionId).toBe(handle);
   });

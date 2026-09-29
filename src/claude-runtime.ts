@@ -2,7 +2,8 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { claudePermissionArgs } from "./claude-permissions.js";
 import { claudeProgress } from "./claude-progress.js";
-import { CLARIFY_TIMEOUT_MS, type RecordedAgentResult, type AgentRuntime, type MessageOptions, type WriteAccess } from "./codex-runtime.js";
+import { CLARIFY_TIMEOUT_MS, checkPromptSize, type RecordedAgentResult, type AgentRuntime, type MessageOptions, type WriteAccess } from "./codex-runtime.js";
+import { HARNESS_CONTEXT_TOKEN_LIMIT } from "./harness-home.js";
 import { childEnv } from "./op-env.js";
 import { RuntimeEventStream, RuntimeFacts, RuntimeStop, recordedError } from "./runtime-facts.js";
 
@@ -14,6 +15,24 @@ const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export const CLAUDE_OUTPUT_LIMIT = 10_000_000;
 export const CLAUDE_STDERR_LIMIT = 100_000;
 
+/** The owner's Claude seat allocation: every role runs this model for now. */
+export const CLAUDE_MODEL = "claude-opus-5-5";
+/** Reasoning effort by role (`claude --effort`), mirroring the Codex allocation: planning reasons hardest, implementation runs at medium. */
+export const TEAM_LEAD_CLAUDE_EFFORT = "max";
+export const PRODUCT_CLAUDE_EFFORT = "medium";
+export const DEVELOPER_CLAUDE_EFFORT = "medium";
+
+/** `--model` and `--effort` for a seat's roles as recorded in state; an unknown or missing role gets the Developer settings. */
+export function claudeModelArgs(roles: readonly string[] | undefined): string[] {
+  const effort = roles?.includes("Team Lead") ? TEAM_LEAD_CLAUDE_EFFORT : roles?.includes("Product") ? PRODUCT_CLAUDE_EFFORT : DEVELOPER_CLAUDE_EFFORT;
+  return ["--model", CLAUDE_MODEL, "--effort", effort];
+}
+
+/** Never replay interrupted turns, and auto-compact at the owner's per-session context cap. */
+export function claudeEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return { ...env, CLAUDE_CODE_RESUME_INTERRUPTED_TURN: "0", CLAUDE_CODE_AUTO_COMPACT_WINDOW: String(HARNESS_CONTEXT_TOKEN_LIMIT) };
+}
+
 export function claudeSessionId(handle: string): string {
   const id = handle.slice(CLAUDE_SESSION_PREFIX.length);
   if (!handle.startsWith(CLAUDE_SESSION_PREFIX) || !uuid.test(id)) throw new RuntimeStop("Invalid Claude session handle; expected claude:<UUID>.");
@@ -22,7 +41,8 @@ export function claudeSessionId(handle: string): string {
 
 /** The authenticated Claude CLI, with schema output on every turn and explicit same-engine continuation. */
 export class ClaudeRuntime implements AgentRuntime {
-  constructor(private readonly cwd: string, private readonly timeoutMs = CLARIFY_TIMEOUT_MS, private readonly write?: WriteAccess) {}
+  /** `roles` are the seat's roles from state; they pick the effort (see claudeModelArgs). */
+  constructor(private readonly cwd: string, private readonly timeoutMs = CLARIFY_TIMEOUT_MS, private readonly write?: WriteAccess, private readonly roles?: readonly string[]) {}
 
   async message(prompt: string, schemaPath: string, sessionId?: string, options: MessageOptions = {}): Promise<RecordedAgentResult> {
     const evidence = new RuntimeFacts("claude", sessionId);
@@ -35,9 +55,10 @@ export class ClaudeRuntime implements AgentRuntime {
       try { schema = JSON.parse(await readFile(schemaPath, "utf8")); }
       catch { throw new RuntimeStop("Claude output schema could not be read as JSON."); }
       if (!schema || typeof schema !== "object" || Array.isArray(schema)) throw new RuntimeStop("Claude output schema must be a JSON Schema object.");
-      const args = ["--print", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--json-schema", JSON.stringify(schema), ...await claudePermissionArgs(this.cwd, this.write), ...(resumeId ? ["--resume", resumeId] : [])];
+      const args = ["--print", "--output-format", "stream-json", "--verbose", "--include-partial-messages", ...claudeModelArgs(this.roles), "--json-schema", JSON.stringify(schema), ...await claudePermissionArgs(this.cwd, this.write), ...(resumeId ? ["--resume", resumeId] : [])];
       const timeoutMs = options.timeoutMs ?? this.timeoutMs;
       if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new RuntimeStop("Claude timeout must be a positive number of milliseconds.");
+      checkPromptSize(prompt);
       await this.run(args, prompt, timeoutMs, stream, options.signal);
       if (stream.malformed) throw new RuntimeStop("Claude returned malformed JSON output.");
       if (!result || result.subtype !== "success" || result.is_error !== false) throw new RuntimeStop("Claude did not complete successfully; diagnostics withheld.");
@@ -58,7 +79,7 @@ export class ClaudeRuntime implements AgentRuntime {
       try {
         // Authentication belongs to the logged-in CLI, never an injected API key. Never replay interrupted turns.
         const env = Object.fromEntries(Object.entries(childEnv()).filter(([key]) => !/token|password|passwd|secret|api_?key/i.test(key)));
-        child = spawn("claude", args, { cwd: this.cwd, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32", env: { ...env, CLAUDE_CODE_RESUME_INTERRUPTED_TURN: "0" } });
+        child = spawn("claude", args, { cwd: this.cwd, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32", env: claudeEnv(env) });
       } catch { reject(new RuntimeStop("Claude could not be started; check the executable and working directory.")); return; }
       let settled = false; let stdoutBytes = 0; let stderrBytes = 0; const progress = claudeProgress({ cwd: this.cwd });
       let failure: RuntimeStop | undefined;

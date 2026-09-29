@@ -34,8 +34,14 @@ export const PRODUCT_CODEX_REASONING_EFFORT = "medium";
 export const DEVELOPER_CODEX_MODEL = "gpt-6-sol";
 export const DEVELOPER_CODEX_REASONING_EFFORT = "medium";
 
-/** A whole harness `config.toml`: model and reasoning effort only. No instructions, MCP servers, hooks, skills, plugins or profiles. */
-const codexConfig = (model: string, effort: string) => `model = "${model}"\nmodel_reasoning_effort = "${effort}"\n`;
+/**
+ * The owner's cap on one harness session's context, in tokens. Each engine auto-compacts at about this size, so a single
+ * task cannot balloon: Codex through `model_auto_compact_token_limit`, Claude through `CLAUDE_CODE_AUTO_COMPACT_WINDOW`.
+ */
+export const HARNESS_CONTEXT_TOKEN_LIMIT = 300_000;
+
+/** A whole harness `config.toml`: model, reasoning effort and the context cap only. No instructions, MCP servers, hooks, skills, plugins or profiles. */
+const codexConfig = (model: string, effort: string) => `model = "${model}"\nmodel_reasoning_effort = "${effort}"\nmodel_auto_compact_token_limit = ${HARNESS_CONTEXT_TOKEN_LIMIT}\n`;
 export const TEAM_LEAD_CODEX_CONFIG = codexConfig(TEAM_LEAD_CODEX_MODEL, TEAM_LEAD_CODEX_REASONING_EFFORT);
 export const PRODUCT_CODEX_CONFIG = codexConfig(PRODUCT_CODEX_MODEL, PRODUCT_CODEX_REASONING_EFFORT);
 export const DEVELOPER_CODEX_CONFIG = codexConfig(DEVELOPER_CODEX_MODEL, DEVELOPER_CODEX_REASONING_EFFORT);

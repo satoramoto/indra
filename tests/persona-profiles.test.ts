@@ -202,9 +202,8 @@ describe("repository Yahaha persona profiles", () => {
     expect(captured.calls.map((call) => basename(call.schema))).toEqual(["brief.json", "brief.json", "proposal.json"]);
     expect(captured.calls.map((call) => call.engine)).toEqual([engine, engine, engine]);
     expect(captured.calls.map((call) => call.options?.timeoutMs)).toEqual([CLARIFY_TIMEOUT_MS, CLARIFY_TIMEOUT_MS, DRAFT_TIMEOUT_MS]);
-    expect(captured.calls[0].session).toBeUndefined();
-    expect(captured.calls[1].session).toBeTruthy();
-    expect(captured.calls[2].session).toBe(captured.calls[1].session);
+    // Every clarify turn and the draft run in a fresh session; none resumes an earlier turn's.
+    expect(captured.calls.map((call) => call.session)).toEqual([undefined, undefined, undefined]);
     for (const call of captured.calls) {
       expectPersona(call.prompt, "seat-001");
       expect(call.write).toBeUndefined();

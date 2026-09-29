@@ -19,6 +19,17 @@ export const DRAFT_TIMEOUT_MS = 20 * 60_000;
 /** Developer seat build, review and fix sessions. */
 export const DEVELOPER_SESSION_TIMEOUT_MS = 60 * 60_000;
 
+/**
+ * The largest prompt Indra sends one session: about 64k tokens, well under HARNESS_CONTEXT_TOKEN_LIMIT, and above the
+ * retro's bounded evidence snapshot (128 KB). Prompts carry references (PR URLs, paths), never whole files; a bigger one fails.
+ */
+export const AGENT_PROMPT_LIMIT_BYTES = 256_000;
+
+/** Refuses an oversized prompt before any process starts. */
+export function checkPromptSize(prompt: string): void {
+  if (Buffer.byteLength(prompt, "utf8") > AGENT_PROMPT_LIMIT_BYTES) throw new RuntimeStop(`Agent prompt exceeds the ${AGENT_PROMPT_LIMIT_BYTES}-byte limit; not sent.`);
+}
+
 const minutes = (ms: number) => `${Math.round(ms / 60_000)} min`;
 
 /**
@@ -59,6 +70,7 @@ export class CodexRuntime implements AgentRuntime {
     try {
       if (signal?.aborted) throw new RuntimeStop("Codex run cancelled.", "interrupted");
       if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new RuntimeStop("Codex timeout must be a positive number of milliseconds.");
+      checkPromptSize(prompt);
       const env = this.home ? { ...childEnv(), CODEX_HOME: await ensureCodexHome(this.home, this.config) } : childEnv();
       const sandbox = sandboxArgs(this.write);
       const args = sessionId ? ["exec", "resume", sessionId, "--json", "-c", "sandbox_mode=\"read-only\"", "-"] : ["exec", "--json", ...sandbox, "--output-schema", schemaPath, "-"];
