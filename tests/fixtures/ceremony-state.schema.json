@@ -776,8 +776,78 @@
               }
             }
           }
+        },
+        "omissions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "outcomeId",
+              "seatId",
+              "reason"
+            ],
+            "properties": {
+              "outcomeId": {
+                "$ref": "#/$defs/ceremonyId"
+              },
+              "seatId": {
+                "$ref": "#/$defs/ceremonyId"
+              },
+              "reason": {
+                "$ref": "#/$defs/ceremonyText"
+              }
+            }
+          }
+        },
+        "partialApproval": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "source",
+            "command",
+            "at"
+          ],
+          "properties": {
+            "source": {
+              "const": "owner-command"
+            },
+            "command": {
+              "const": "planning integrate"
+            },
+            "at": {
+              "$ref": "#/$defs/ceremonyTime"
+            }
+          }
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "omissions"
+            ]
+          },
+          "then": {
+            "required": [
+              "partialApproval"
+            ]
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "partialApproval"
+            ]
+          },
+          "then": {
+            "required": [
+              "omissions"
+            ]
+          }
+        }
+      ]
     },
     "ceremonyRelease": {
       "type": "object",

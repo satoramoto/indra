@@ -3,9 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentRuntime, MessageOptions, WriteAccess } from "../src/codex-runtime.js";
-import type { PlanningChat } from "../src/planning-bridge.js";
+import type { CeremonyAdapters, PlanningChat } from "../src/planning-bridge.js";
 import type { RuntimeFactory } from "../src/developer-seat.js";
-import { main } from "../src/cli.js";
+import { createPlanningBridge, createPlanningStore, main } from "../src/cli.js";
 import { PlanningStore } from "../src/planning.js";
 import { loadSeatPersonas, type SeatPersona } from "../src/seat-persona.js";
 
@@ -13,6 +13,7 @@ const fakes = vi.hoisted(() => ({
   calls: [] as { engine: string; cwd: string; timeout?: number; write?: WriteAccess; home?: string; prompt: string; schema: string; session?: string; options?: MessageOptions }[],
   posts: [] as { username: string; channel: string; message: string; root?: string; delivery?: string }[],
   actions: [] as string[],
+  adapters: [] as CeremonyAdapters[],
   token: vi.fn(async () => "test-bot-token"),
   request: vi.fn(async () => ({ goal: { id: "goal-1" }, alreadyRequested: false })),
   resume: undefined as string | undefined,
@@ -47,7 +48,7 @@ vi.mock("../src/planning-mattermost.js", async (original) => ({
 vi.mock("../src/planning-bridge.js", () => ({
   PlanningBridge: class {
     static requestProposal = fakes.request;
-    constructor(_store: PlanningStore, private chat: PlanningChat, private runtime: AgentRuntime) {}
+    constructor(_store: PlanningStore, private chat: PlanningChat, private runtime: AgentRuntime, _maxQueue?: number, _shell?: unknown, adapters: CeremonyAdapters = {}) { fakes.adapters.push(adapters); }
     async exercise(action: string) {
       fakes.actions.push(action);
       await this.runtime.message("Human approval is required. Do not execute work.", "brief-schema", fakes.resume, { timeoutMs: 1234 });
@@ -79,7 +80,7 @@ const developer: SeatPersona = { voice: "Direct", background: "Keyboardist", fun
 let checkout: string;
 beforeEach(async () => {
   checkout = join(await mkdtemp(join(tmpdir(), "indra-engine-cli-")), "state"); await mkdir(`${checkout}.runtime`);
-  fakes.calls.length = 0; fakes.posts.length = 0; fakes.actions.length = 0; fakes.resume = undefined; fakes.token.mockClear(); fakes.request.mockClear();
+  fakes.calls.length = 0; fakes.posts.length = 0; fakes.actions.length = 0; fakes.adapters.length = 0; fakes.resume = undefined; fakes.token.mockClear(); fakes.request.mockClear();
   vi.mocked(loadSeatPersonas).mockResolvedValue({});
   vi.spyOn(console, "log").mockImplementation(() => {}); vi.spyOn(console, "error").mockImplementation(() => {});
   vi.spyOn(PlanningStore.prototype, "read").mockResolvedValue({ $schema: "schema", schemaVersion: 1, sprints: [], teams: [{ id: "team-001", slug: "yahaha", externalIdentities: { mattermost: { teamId: "team", homeChannelId: "home" } }, seats: [
@@ -164,4 +165,35 @@ describe("every CLI runtime/chat construction path", () => {
     expect(await planning("propose")).toBe(0); expect(fakes.request).toHaveBeenCalledTimes(1);
     expect(fakes.token).not.toHaveBeenCalled(); expect(fakes.calls).toEqual([]); expect(fakes.posts).toEqual([]);
   });
+
+  it("discovers optional adapters without changing the CLI's seat runtime", async () => {
+    const store = new PlanningStore(checkout);
+    const runtime = new (fakeRuntime("codex"))("/project");
+    const release = { poll: vi.fn(async () => ({ status: "pending" as const, reason: "Waiting for reload" })) };
+    const factory = vi.fn(async (services: { store: PlanningStore; runtime: AgentRuntime }) => {
+      expect(services.store).toBe(store);
+      expect(services.runtime).toBe(runtime);
+      return { release };
+    });
+    await createPlanningBridge(store, {} as PlanningChat, runtime, { "./release-activation.ts": { createCeremonyAdapters: factory } });
+    expect(factory).toHaveBeenCalledOnce();
+    expect(fakes.adapters).toEqual([{ release }]);
+    expect(release.poll).not.toHaveBeenCalled();
+  });
+
+  it("leaves absent adapters pending and rejects duplicate ownership", async () => {
+    const store = new PlanningStore(checkout);
+    const runtime = new (fakeRuntime("codex"))("/project");
+    await createPlanningBridge(store, {} as PlanningChat, runtime, {});
+    expect(fakes.adapters).toEqual([{}]);
+    const module = { createCeremonyAdapters: () => ({ release: { poll: async () => ({ status: "pending" as const, reason: "Reload" }) } }) };
+    await expect(createPlanningBridge(store, {} as PlanningChat, runtime, { a: module, b: module })).rejects.toThrow("Multiple ceremony adapters");
+  });
+
+  it("refuses incomplete rollout declarations before any posting or model invocation", () => {
+    expect(() => createPlanningStore(checkout, { adapter: { ceremonyReadiness: { version: 1, consumers: { planning: 1 } } as never } })).toThrow("all consumers");
+    expect(fakes.posts).toEqual([]);
+    expect(fakes.calls).toEqual([]);
+  });
+
 });
