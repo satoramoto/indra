@@ -95,8 +95,10 @@ class FakeGh implements Shell {
     if (line.startsWith("gh api -X POST repos/satoramoto/indra/git/refs")) { this.branches.add(flag("-f").replace("ref=refs/heads/", "")); return ok(); }
     if (line.startsWith("gh pr list")) { const pr = this.prs.get(flag("--head")); return ok(pr?.state === "OPEN" ? `${pr.url}\n` : "\n"); }
     if (line.startsWith("gh pr create")) { const url = `https://github.com/satoramoto/indra/pull/${++this.next}`; this.prs.set(flag("--head"), { url, state: "OPEN" }); return ok(`${url}\n`); }
-    if (line.startsWith("gh pr view")) { const pr = byUrl(); return ok(JSON.stringify({ state: pr?.state ?? "UNKNOWN", mergeCommit: pr?.sha ? { oid: pr.sha } : null })); }
-    if (line.startsWith("gh pr checks")) return { code: this.checksCode, stdout: "", stderr: "" };
+    if (line.startsWith("gh pr view")) { const pr = byUrl(); return ok(JSON.stringify({ state: pr?.state ?? "UNKNOWN", mergeCommit: pr?.sha ? { oid: pr.sha } : null,
+      headRefName: [...this.prs].find(([, item]) => item === pr)?.[0], baseRefName: "main", headRefOid: MAIN_SHA, isCrossRepository: false, isDraft: false, author: { login: "owner" } })); }
+    if (args[0] === "api" && args[1].includes("/reviews?")) return ok(JSON.stringify([[{ id: 1, user: { login: "satori-miyamoto" }, state: "APPROVED", commit_id: MAIN_SHA }]]));
+    if (line.startsWith("gh pr checks")) return { code: this.checksCode, stdout: JSON.stringify([{ name: "checks", bucket: "pass" }]), stderr: "" };
     if (line.startsWith("gh pr merge")) { const pr = byUrl()!; pr.state = "MERGED"; pr.sha = MERGE_SHA; return ok(); }
     return ok();
   }
@@ -700,7 +702,7 @@ describe("sprint integration", () => {
     await bridge.poll();
     expect(await sprintOf(store)).toMatchObject({ status: "merged", mergedSha: MERGE_SHA });
     expect(chat.posts.at(-1)?.message).toContain("merged into main");
-    expect(gh.calls.filter((line) => line.startsWith("gh pr merge"))).toEqual([`gh pr merge ${integration!.prUrl} --squash`]);
+    expect(gh.calls.filter((line) => line.startsWith("gh pr merge"))).toEqual([`gh pr merge ${integration!.prUrl} --squash --match-head-commit ${MAIN_SHA}`]);
     // Idempotent: another check mark and the M path merge nothing again.
     chat.react(post.id, CHECK, "alex");
     await bridge.poll();

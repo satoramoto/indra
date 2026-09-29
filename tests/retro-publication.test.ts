@@ -2,7 +2,8 @@ import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CeremonyContext } from "../src/planning-bridge.js";
 import { advanceCeremony, startCeremony, type HumanApproval } from "../src/ceremony.js";
-import type { PlanningGoal, PlanningStore } from "../src/planning.js";
+import type { PlanningDocument, PlanningGoal, PlanningStore } from "../src/planning.js";
+import type { StandingPolicy } from "../src/state-domain.js";
 import { createCeremonyAdapters, RetroPublication, retroRetryDelayMs, retroRuntimeName, type RetroPublicationRecord } from "../src/retro-publication.js";
 import { buildRetroSnapshot, renderSprintRetro, RetroGenerationError, type RetroPriorAttempt, type SprintRetroDraft } from "../src/sprint-retro.js";
 import { SprintGitHub, type RetroArchive, type RetroPr } from "../src/sprint.js";
@@ -26,13 +27,14 @@ function goalAtRetro(): PlanningGoal {
 }
 async function fixture() {
   const goal = goalAtRetro();
-  const state = { planningGoals: [goal], teams: [{ id: goal.teamId, project: { github: "test/project" }, seats: [{ id: goal.seatId }], externalIdentities: { mattermost: { homeChannelId: "home" } } }] };
+  const state = { planningGoals: [goal], teams: [{ id: goal.teamId, standingPolicy: undefined as StandingPolicy | undefined, project: { github: "test/project" }, seats: [{ id: goal.seatId }], externalIdentities: { mattermost: { homeChannelId: "home" } } }] };
   const records = new Map<string, object>();
   const deliveries = new Map<string, { id: string; message: string; mergePost?: string }>();
   let lostPost = false;
   const context: CeremonyContext = { goal, runtime: { message: vi.fn() }, store: {
     checkout: "/nonexistent-retro-test-state", runtimeDir: "/nonexistent-retro-test-state.runtime",
     read: async () => structuredClone(state), readRuntimeFile: async (name: string) => structuredClone(records.get(name)),
+    update: async (change: (state: PlanningDocument) => void) => { change(state as unknown as PlanningDocument); },
     saveRuntime: async (name: string, value: object) => { records.set(name, structuredClone(value)); },
   } as unknown as PlanningStore,
     post: vi.fn(async (key, message, mergePost) => {
@@ -66,6 +68,40 @@ async function fixture() {
 }
 
 describe("recoverable retro publication", () => {
+  it("requests automatic archival approval only for a reviewed green head and preserves its durable provenance", async () => {
+    const f = await fixture();
+    f.state.teams[0].standingPolicy = { revisions: [{ revision: 1, source: "owner-command", enabled: true, at: at(0) }] };
+    const request = vi.fn<NonNullable<CeremonyContext["automaticGate"]>>(async (gate) => {
+      if (gate.kind !== "retro") throw new Error("Wrong gate");
+      return { source: "automatic", policyRevision: 1, at: new Date().toISOString(), target: { kind: "retro", goalId: f.context.goal.id, prUrl: gate.pr.url, headSha: gate.pr.headSha, checksPassed: true, reviewApproved: true, reviewer: "satori-miyamoto", reviewedHeadSha: gate.pr.headSha } };
+    });
+    f.context.automaticGate = request;
+    f.pr.checksPassed = false;
+    expect((await f.restart().poll(f.context)).status).toBe("pending");
+    expect(request).not.toHaveBeenCalled();
+    f.pr.checksPassed = true;
+    const progress = await f.restart().poll(f.context);
+    expect(progress).toMatchObject({ status: "complete", evidence: { authorization: { headSha: f.pr.headSha, approval: { source: "automatic", policyRevision: 1 } } } });
+    expect(f.state.planningGoals[0].automaticApprovals).toHaveLength(1);
+    expect(f.archive.mergeRetroPr).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not resume a policy-authorized archive after the owner switches the policy off", async () => {
+    const f = await fixture();
+    f.state.teams[0].standingPolicy = { revisions: [{ revision: 1, source: "owner-command", enabled: true, at: at(0) }] };
+    f.context.automaticGate = async () => undefined;
+    await f.restart().poll(f.context);
+    vi.mocked(f.archive.mergeRetroPr).mockRejectedValueOnce(new Error("Interrupted"));
+    await expect(f.restart().merge(f.context, { source: "automatic", policyRevision: 1, at: new Date().toISOString(), target: { kind: "retro", goalId: f.context.goal.id, prUrl: f.pr.url, headSha: f.pr.headSha, checksPassed: true, reviewApproved: true, reviewer: "satori-miyamoto", reviewedHeadSha: f.pr.headSha } })).rejects.toThrow("Interrupted");
+    f.context.goal = structuredClone(f.state.planningGoals[0]);
+    f.state.teams[0].standingPolicy.revisions.push({ revision: 2, source: "owner-command", enabled: false, at: new Date().toISOString() });
+    expect((await f.restart().poll(f.context)).status).toBe("pending");
+    expect(f.archive.mergeRetroPr).toHaveBeenCalledTimes(1);
+    expect(f.pr.state).toBe("OPEN");
+    await f.restart().merge(f.context, f.owner());
+    expect(await f.restart().poll(f.context)).toMatchObject({ status: "complete", evidence: { authorization: { approval: { source: "owner-command" } } } });
+  });
+
   it("wires production review to a new read-only runtime at the archive head without resuming Chick", async () => {
     const f = await fixture(); await f.restart().poll(f.context); f.pr.reviewed = false;
     try {
@@ -247,6 +283,20 @@ describe("recoverable retro publication", () => {
     expect((await f.restart().poll(f.context)).status).toBe("complete");
   });
 
+  it("does not revive interrupted authorization when a changed head returns to the original commit", async () => {
+    const f = await fixture(); await f.restart().poll(f.context);
+    const original = f.pr.headSha;
+    vi.mocked(f.archive.mergeRetroPr).mockRejectedValueOnce(new Error("Interrupted"));
+    await expect(f.restart().merge(f.context, f.owner())).rejects.toThrow("Interrupted");
+    f.pr.headSha = "e".repeat(40);
+    await f.restart().poll(f.context);
+    expect(f.record().authorization).toBeUndefined();
+    f.pr.headSha = original;
+    await f.restart().poll(f.context);
+    expect(f.archive.mergeRetroPr).toHaveBeenCalledTimes(1);
+    expect(f.pr.state).toBe("OPEN");
+  });
+
   it("persists human authorization before merge and recovers a lost merge response", async () => {
     const f = await fixture(); await f.restart().poll(f.context);
     vi.mocked(f.archive.mergeRetroPr).mockImplementationOnce(async () => {
@@ -328,6 +378,14 @@ describe("recoverable retro publication", () => {
     expect(posted.every((message) => message.length <= 10_001)).toBe(true);
     expect(posted.join("")).toBe(f.record().frozen!.markdown);
     expect(f.record().postIds).toHaveLength(posted.length);
+    const thread = f.services.thread.getMockImplementation()!;
+    f.services.thread.mockImplementation(async () => {
+      const evidence = await thread();
+      return { ...evidence, posts: evidence.posts.filter((post) => post.id !== f.record().postIds![1]) };
+    });
+    await expect(f.restart().merge(f.context, f.owner())).rejects.toThrow("unverified");
+    expect(f.archive.mergeRetroPr).not.toHaveBeenCalled();
+    expect((await f.restart().poll(f.context)).status).toBe("pending");
   });
 
   it("rejects edited post fragments even when the archived document hash is unchanged", async () => {
