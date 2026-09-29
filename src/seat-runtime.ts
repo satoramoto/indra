@@ -28,10 +28,10 @@ export async function loadSeatEngines(runtimeDir: string, seatIds: readonly stri
 }
 
 /** `harness` is the seat's harness directory (`seatHarnessDir`); each engine's home lives inside it. */
-/** `roles` are the seat's roles from state; they pick the Codex model (see codexConfigForRoles). */
+/** `roles` are the seat's roles from state; they pick the Codex model (see codexConfigForRoles) and the Claude effort (see claudeModelArgs). */
 export type EngineFactory = (engine: SeatEngine, cwd: string, timeoutMs?: number, write?: WriteAccess, harness?: string, roles?: readonly string[]) => AgentRuntime;
 // Claude keeps the owner's config directory, where its login lives; it is isolated with flags instead.
-const engineRuntime: EngineFactory = (engine, cwd, timeoutMs, write, harness, roles) => engine === "claude" ? new ClaudeRuntime(cwd, timeoutMs, write) : new CodexRuntime(cwd, timeoutMs, write, harness === undefined ? undefined : engineHome(harness, "codex"), codexConfigForRoles(roles));
+const engineRuntime: EngineFactory = (engine, cwd, timeoutMs, write, harness, roles) => engine === "claude" ? new ClaudeRuntime(cwd, timeoutMs, write, roles) : new CodexRuntime(cwd, timeoutMs, write, harness === undefined ? undefined : engineHome(harness, "codex"), codexConfigForRoles(roles));
 
 /** A handle always wins over the seat's current default. Never migrate, replay or fall back to another engine. */
 export class SeatRuntime implements AgentRuntime {

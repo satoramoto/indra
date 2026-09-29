@@ -449,25 +449,28 @@ describe("failure boundaries", () => {
     expect(chat.posts.filter((post) => post.message.includes("Draft proposal"))).toHaveLength(1);
   });
 
-  it("records session facts and forwards a persisted cumulative baseline on resume", async () => {
+  it("records session facts for each turn's fresh session, with no carried-over usage baseline", async () => {
     const { store, runtime, chat } = await fixture();
     const message = runtime.message.bind(runtime);
-    let options: unknown;
+    const calls: { session?: string; options: unknown }[] = [];
     let invocation = 0;
     const completed: AgentRuntime = { message: async (prompt, schema, session, supplied) => {
-      options = supplied;
+      calls.push({ session, options: supplied });
       const run = await message(prompt, schema, session);
-      const facts = { invocationId: `call-${++invocation}`, engine: "codex" as const, sessionId: run.sessionId, startedAt: run.startedAt, finishedAt: run.finishedAt,
-        status: "succeeded" as const, usage: { inputTokens: 7, outputTokens: 3 }, cumulativeUsage: { inputTokens: invocation * 7, outputTokens: invocation * 3 } };
-      return { ...run, facts };
+      // A fresh session's cumulative usage is its own usage, so nothing is double-counted or dropped.
+      const facts = { invocationId: `call-${++invocation}`, engine: "codex" as const, sessionId: `session-${invocation}`, startedAt: run.startedAt, finishedAt: run.finishedAt,
+        status: "succeeded" as const, usage: { inputTokens: 7, outputTokens: 3 }, cumulativeUsage: { inputTokens: 7, outputTokens: 3 } };
+      return { ...run, sessionId: `session-${invocation}`, facts };
     } };
     const active = new PlanningBridge(store, chat, completed, 20, new GitHub());
     const goal = await active.start("Goal");
     await PlanningBridge.requestProposal(store, goal.id);
     await active.poll();
-    expect(options).toMatchObject({ previousSessionUsage: { inputTokens: 7, outputTokens: 3 } });
+    expect(calls.map((call) => call.session)).toEqual([undefined, undefined]);
+    for (const call of calls) expect(call.options).not.toHaveProperty("previousSessionUsage");
     const record = await store.readRuntimeFile<BridgeCeremonyRecord>(ceremonyRuntimeName(goal.id));
     expect(record?.invocations).toHaveLength(2);
+    expect(record?.invocations.map((item) => item.usage)).toEqual([{ inputTokens: 7, outputTokens: 3 }, { inputTokens: 7, outputTokens: 3 }]);
     expect(record?.facts.sessions).toHaveLength(2);
     expect(record?.stageEvents?.map((event) => event.stage)).toEqual(["planning", "proposal"]);
   });
