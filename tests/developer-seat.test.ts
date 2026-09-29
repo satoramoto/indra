@@ -188,6 +188,23 @@ async function retainRecord(store: PlanningStore, shell: FakeShell, changes: Par
 const reviewing = (): Assignment => ({ outcomeId: "outcome-1", seatId: "seat-002", status: "in-review", updatedAt: "2026-01-01T00:00:00Z", prUrl: PR });
 
 describe("developer seat", () => {
+  it.each([1, 128])("records a checked-command exit %s as a SeatError without command output", async (code) => {
+    const { store, shell, codex, seat, chat, assignment } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
+    const run = shell.run.bind(shell);
+    const calls = vi.spyOn(shell, "run").mockImplementation(async (command, args, cwd) => {
+      if (command === "gh" && args[0] === "pr" && args[1] === "edit") return { code, stdout: "private stdout", stderr: "private stderr" };
+      return await run(command, args, cwd);
+    });
+    await seat.tick();
+    // The assignment handler preserves only SeatError/ProjectCheckoutError messages.
+    expect(await assignment("outcome-1")).toMatchObject({ status: "failed", note: `build: gh pr edit failed (exit ${code}).` });
+    const record = await store.readRuntimeFile<SeatTaskRecord>(RECORD);
+    expect(calls).toHaveBeenCalledWith("gh", ["pr", "edit", PR, "--base", "sprint/goal-abc"], record!.worktree);
+    expect(codex.runs).toHaveLength(1);
+    expect(shell.calls.some((call) => call.startsWith("gh pr merge"))).toBe(false);
+    expect(chat.messages.join("\n")).not.toMatch(/private stdout|private stderr/);
+  });
+
   it("rechecks implement under the goal lock when release wins the claim race", async () => {
     const { store, shell, codex, seat } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
     const lock = store.withGoalLock.bind(store);
