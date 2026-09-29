@@ -53,6 +53,7 @@ export class CodexRuntime implements AgentRuntime {
     let stop: RuntimeStop | undefined;
     const controller = new AbortController(); let timeout: ReturnType<typeof setTimeout> | undefined;
     let killTimer: ReturnType<typeof setTimeout> | undefined;
+    let ownsProcessGroup = false;
     const abort = () => { stop ??= new RuntimeStop("Codex run cancelled.", "interrupted"); controller.abort(); };
     let progress: ReturnType<typeof codexProgress> | undefined;
     try {
@@ -64,8 +65,17 @@ export class CodexRuntime implements AgentRuntime {
       if (signal?.aborted) throw new RuntimeStop("Codex run cancelled.", "interrupted");
       timeout = setTimeout(() => { stop ??= new RuntimeStop(`Codex run timed out after ${minutes(timeoutMs)}.`, "timed-out"); controller.abort(); }, timeoutMs);
       signal?.addEventListener("abort", abort, { once: true });
-      const child = spawn("codex", args, { cwd: this.cwd, stdio: ["pipe", "pipe", "pipe"], signal: controller.signal, env });
-      controller.signal.addEventListener("abort", () => { killTimer = setTimeout(() => child.kill("SIGKILL"), 1000); }, { once: true });
+      const child = spawn("codex", args, { cwd: this.cwd, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32", signal: controller.signal, env });
+      ownsProcessGroup = process.platform !== "win32" && child.pid !== undefined;
+      controller.signal.addEventListener("abort", () => {
+        killTimer = setTimeout(() => {
+          // Codex's launcher gives its native child these pipes; killing only the launcher cannot drain them.
+          try {
+            if (ownsProcessGroup && child.pid) process.kill(-child.pid, "SIGKILL");
+            else child.kill("SIGKILL");
+          } catch { /* already exited */ }
+        }, 1000);
+      }, { once: true });
       let stdoutBytes = 0; let stderrBytes = 0; let stderrTail = ""; let missingRollout = false;
       child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
       progress = codexProgress({ purpose: options.purpose, cwd: this.cwd });
@@ -104,7 +114,8 @@ export class CodexRuntime implements AgentRuntime {
       throw recordedError(stop ?? error, evidence);
     } finally {
       clearTimeout(timeout);
-      clearTimeout(killTimer);
+      // Owned descendants may outlive the launcher even after its pipes close.
+      if (!ownsProcessGroup) clearTimeout(killTimer);
       signal?.removeEventListener("abort", abort);
       progress?.end();
       if (this.home) await ensureCodexHome(this.home).catch(() => undefined);

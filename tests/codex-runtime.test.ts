@@ -154,6 +154,47 @@ describe("Codex invocation facts", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it.skipIf(process.platform === "win32")("drains inherited pipes when a Codex launcher's native child ignores termination", async () => {
+    const realSpawn = (await vi.importActual<typeof import("node:child_process")>("node:child_process")).spawn;
+    const native = `process.on("SIGTERM", () => process.stdout.write(${JSON.stringify(usage)})); process.stdout.write(${JSON.stringify(started)}); setInterval(() => {}, 1000);`;
+    const launcher = `const { spawn } = require("node:child_process"); const child = spawn(process.execPath, ["-e", ${JSON.stringify(native)}], { stdio: "inherit" }); process.on("SIGTERM", () => child.kill("SIGTERM")); child.on("exit", () => process.exit(0));`;
+    let runner: ReturnType<typeof spawn> | undefined;
+    let ready!: () => void;
+    const startedChild = new Promise<void>((resolve) => { ready = resolve; });
+    vi.mocked(spawn).mockImplementationOnce((_command, _args, options) => {
+      // Always isolate the fixture for cleanup, including when testing a regression in the runtime's options.
+      runner = realSpawn(process.execPath, ["-e", launcher], { ...options, detached: true });
+      let output = "";
+      runner.stdout?.on("data", (part) => { output += String(part); if (output.includes('"type":"turn.started"')) ready(); });
+      return runner;
+    });
+    const controller = new AbortController();
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_resolve, reject) => { watchdog = setTimeout(() => reject(new Error("Codex fixture pipes did not close")), 5000); });
+    const run = failure(new CodexRuntime(process.cwd()).message("Task", "/schema.json", undefined, { signal: controller.signal }));
+    try {
+      await Promise.race([startedChild, deadline]);
+      expect(vi.mocked(spawn).mock.calls[0][2]?.detached).toBe(true);
+      controller.abort();
+      const error = await Promise.race([run, deadline]);
+      expect(error.facts).toMatchObject({ status: "interrupted", sessionId: id, usage: { inputTokens: 100, outputTokens: 9 } });
+    } finally {
+      clearTimeout(watchdog); controller.abort();
+      if (runner?.pid) { try { process.kill(-runner.pid, "SIGKILL"); } catch { /* already exited */ } }
+    }
+  }, 10_000);
+
+  it.skipIf(process.platform === "win32")("escalates for the owned Codex process group even after the launcher closes", async () => {
+    vi.useFakeTimers();
+    Object.assign(child, { pid: 12345 });
+    const kill = vi.spyOn(process, "kill").mockReturnValue(true);
+    const controller = new AbortController();
+    const run = failure(new CodexRuntime("/workspace").message("Task", "/schema.json", undefined, { signal: controller.signal }));
+    controller.abort(); child.close("", null); await run;
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(kill).toHaveBeenCalledWith(-12345, "SIGKILL");
+  });
+
   it("continues enforcing the stdout limit during cancellation", async () => {
     const controller = new AbortController();
     const run = failure(new CodexRuntime("/workspace").message("Task", "/schema.json", undefined, { signal: controller.signal }));
