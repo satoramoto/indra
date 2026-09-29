@@ -687,10 +687,10 @@ export class PlanningBridge {
     await this.store.saveRuntime(id, metadata);
     let run: Awaited<ReturnType<AgentRuntime["message"]>> | undefined;
     try {
-      const recorded = await this.store.readRuntimeFile<BridgeCeremonyRecord>(ceremonyRuntimeName(id));
-      const baseline = [...(recorded?.invocations ?? [])].reverse().find((item) => item.sessionId === metadata.sessionId && item.cumulativeUsage)?.cumulativeUsage;
-      const options = { timeoutMs: drafting ? DRAFT_TIMEOUT_MS : CLARIFY_TIMEOUT_MS, purpose: drafting ? "draft" : "clarify", ...(baseline ? { previousSessionUsage: baseline } : {}) };
-      run = await this.runtime.message(prompt(goal, message, drafting, developers), drafting ? proposalSchema : briefSchema, metadata.sessionId, options);
+      const options = { timeoutMs: drafting ? DRAFT_TIMEOUT_MS : CLARIFY_TIMEOUT_MS, purpose: drafting ? "draft" : "clarify" };
+      // Every turn (one clarify reply, one proposal draft) is a fresh session: the prompt carries the goal, the durable
+      // brief and the new message, so no turn resumes an earlier one. `metadata.sessionId` is only the last session, for display.
+      run = await this.runtime.message(prompt(goal, message, drafting, developers), drafting ? proposalSchema : briefSchema, undefined, options);
       metadata.sessionId = run.sessionId;
       metadata.runs.push({ startedAt: run.startedAt, finishedAt: run.finishedAt, usage: run.usage });
       const response = drafting ? proposal(run.response, developers) : brief(run.response);

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { CODEX_CONFIG, engineHome, ensureCodexHome, ownerCodexAuth, promoteSeatAuth, seatHarnessDir, writeFileAtomic } from "../src/harness-home.js";
+import { CODEX_CONFIG, HARNESS_CONTEXT_TOKEN_LIMIT, engineHome, ensureCodexHome, ownerCodexAuth, promoteSeatAuth, seatHarnessDir, writeFileAtomic } from "../src/harness-home.js";
 import { CodexRuntime } from "../src/codex-runtime.js";
 import { claudePermissionArgs } from "../src/claude-runtime.js";
 
@@ -56,8 +56,9 @@ describe("seat harness homes", () => {
       expect((await lstat(join(home, "auth.json"))).isSymbolicLink()).toBe(true);
       expect(await readlink(join(home, "auth.json"))).toBe(join(owner, ".codex", "auth.json"));
     }
-    // Exactly the owner's seat model and effort; no MCP, hooks, skills or profiles.
-    expect(CODEX_CONFIG).toBe("model = \"gpt-6-astra\"\nmodel_reasoning_effort = \"max\"\n");
+    // Exactly the owner's seat model and effort, plus the 300k-token auto-compaction cap; no MCP, hooks, skills or profiles.
+    expect(HARNESS_CONTEXT_TOKEN_LIMIT).toBe(300_000);
+    expect(CODEX_CONFIG).toBe("model = \"gpt-6-astra\"\nmodel_reasoning_effort = \"max\"\nmodel_auto_compact_token_limit = 300000\n");
   });
 
   it("replaces a copied auth file or a stale link with the link to the owner's login", async () => {

@@ -30,8 +30,14 @@ export function ownerCodexAuth(env: NodeJS.ProcessEnv = process.env): string {
 export const CODEX_MODEL = "gpt-6-astra";
 export const CODEX_REASONING_EFFORT = "max";
 
-/** The whole harness `config.toml`: model and reasoning effort only. No instructions, MCP servers, hooks, skills, plugins or profiles. */
-export const CODEX_CONFIG = `model = "${CODEX_MODEL}"\nmodel_reasoning_effort = "${CODEX_REASONING_EFFORT}"\n`;
+/**
+ * The owner's cap on one harness session's context, in tokens. Each engine auto-compacts at about this size, so a single
+ * task cannot balloon: Codex through `model_auto_compact_token_limit`, Claude through `CLAUDE_CODE_AUTO_COMPACT_WINDOW`.
+ */
+export const HARNESS_CONTEXT_TOKEN_LIMIT = 300_000;
+
+/** The whole harness `config.toml`: model, reasoning effort and the context cap only. No instructions, MCP servers, hooks, skills, plugins or profiles. */
+export const CODEX_CONFIG = `model = "${CODEX_MODEL}"\nmodel_reasoning_effort = "${CODEX_REASONING_EFFORT}"\nmodel_auto_compact_token_limit = ${HARNESS_CONTEXT_TOKEN_LIMIT}\n`;
 
 /** Writes `content` to `path` through a temp file and a rename, so no reader sees a partial file; skipped when already identical. */
 export async function writeFileAtomic(path: string, content: string, mode = 0o600): Promise<void> {

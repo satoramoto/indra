@@ -51,6 +51,15 @@ const GH_CREDENTIAL = ["-c", "credential.helper=", "-c", "credential.helper=!gh 
 /** A failure whose message is ours and safe to record in state and the thread. */
 export class SeatError extends Error { override name = "SeatError"; }
 
+/** The assignment note for a failed session: a timeout says so and after how long, from the recorded wall time. */
+export function sessionFailureNote(role: string, error: unknown): string {
+  if (error instanceof AgentRunError && error.facts.status === "timed-out") {
+    const ms = Date.parse(error.facts.finishedAt) - Date.parse(error.facts.startedAt);
+    return `Agent ${role} session timed out after ${Number.isFinite(ms) ? Math.round(ms / 60_000) : "?"} min.`;
+  }
+  return `Agent ${role} session failed.`;
+}
+
 /** Reads a seat from state and refuses unknown or Team Lead seats. */
 export async function loadDeveloperSeat(store: PlanningStore, seatId: string): Promise<SeatIdentity> {
   const state = await store.read();
@@ -331,7 +340,7 @@ export class DeveloperSeat {
     try { run = await this.runtimeFor(record.worktree, write).message(prompt, schema, undefined, { purpose: role === "developer" ? "build" : role === "reviewer" ? "review" : "fix" }); }
     catch (error) {
       if (error instanceof AgentRunError) await this.event(record, { kind: "session", role, session: error.facts }, `session:${error.facts.invocationId}`);
-      this.log(`Agent ${role} session error.`); throw new SeatError(`Agent ${role} session failed.`);
+      this.log(`Agent ${role} session error.`); throw new SeatError(sessionFailureNote(role, error));
     }
     if (run.facts) await this.event(record, { kind: "session", role, session: run.facts }, `session:${run.facts.invocationId}`);
     record.sessions.push({ role, sessionId: run.sessionId, startedAt: run.startedAt, finishedAt: run.finishedAt, usage: run.usage });
