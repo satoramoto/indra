@@ -47,7 +47,13 @@ export interface OpCredential {
 /** 1Password refused the service account token itself, rather than the item. The message never holds the token. */
 export class ServiceAccountRejectedError extends Error { override name = "ServiceAccountRejectedError"; }
 
-const AUTH_FAILURE = /\b401\b|unauthori[sz]ed|invalid bearer token|authenticat|token (?:is )?(?:invalid|expired|revoked)/i;
+/**
+ * `op`'s wording when it refuses the service account token itself: an HTTP 401 ("(401) Unauthorized", "invalid
+ * bearer token") for a revoked or rotated token, and "failed to DecodeSACredentials" (seen from op 2.34.0) for one
+ * it cannot parse. Other errors that merely mention authentication (a desktop prompt, a network failure) do not
+ * count, so they can never remove a valid staged token.
+ */
+const AUTH_FAILURE = /\b401\b|unauthori[sz]ed|invalid bearer token|DecodeSACredentials|token (?:is )?(?:invalid|expired|revoked)/i;
 
 /**
  * Runs `op read REF` with the service account (or, with none, the desktop) and returns the trimmed value, or

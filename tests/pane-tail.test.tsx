@@ -63,6 +63,11 @@ describe("pane tail", () => {
     for (const line of lines) expect(line).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/);
   });
 
+  it("drops an unterminated OSC or DCS escape only to the end of its line", () => {
+    const text = "before\u001b]0;title with no end\nkept one\n\u001bPq#0;2;0;0;0 sixel\nkept two\n\u009d8;;link\nkept three\n\u001b]0;ok\u0007 shown\n";
+    expect(sanitizePaneText(text, { lines: 10, width: 40 })).toEqual(["before", "kept one", "", "kept two", "", "kept three", " shown"]);
+  });
+
   it("redacts before truncating so a cut never shows part of a secret", () => {
     const [line] = sanitizePaneText("key ghp_abcdefghijklmnopqrstuvwxyz0123456789", { lines: 1, width: 10 });
     expect(line).toBe("key [reda…");
@@ -118,6 +123,28 @@ describe("pane tail", () => {
     expect(results).toHaveLength(1);
     await poller.tick();
     expect(seen).toEqual(["seat-001", "seat-001", "seat-002"]);
+  });
+
+  it("captures a newly selected seat as soon as the in-flight capture ends, without waiting for the next tick", async () => {
+    const timers: PaneTailTimers = { setInterval: () => 1, clearInterval: () => {} };
+    const pending: ((tail: PaneTail) => void)[] = [];
+    const seen: string[] = [];
+    const source: PaneTailSource = { capture: (seat) => new Promise((resolve) => { seen.push(seat.id); pending.push(resolve); }) };
+    let seat: PaneTailSeat = lead;
+    const results: [string, PaneTail][] = [];
+    const poller = new PaneTailPoller(source, () => seat, () => ({ lines: 8, width: 40 }), (id, tail) => results.push([id, tail]), 1000, timers);
+    poller.start();
+    // The panel ticks on a seat change; the lead's capture is still running, so that tick is skipped.
+    seat = dev;
+    void poller.tick();
+    expect(seen).toEqual(["seat-001"]);
+    pending.shift()!({ status: "ok", lines: ["stale"] });
+    await Promise.resolve(); await Promise.resolve();
+    expect(seen).toEqual(["seat-001", "seat-002"]);
+    pending.shift()!({ status: "no-session" });
+    await Promise.resolve(); await Promise.resolve();
+    expect(results).toEqual([["seat-002", { status: "no-session" }]]);
+    poller.stop();
   });
 
   it("classifies progress lines by their mark, and leaves everything else plain", () => {

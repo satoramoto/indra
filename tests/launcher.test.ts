@@ -38,4 +38,22 @@ process.exit(runs < 3 ? ${RELOAD_EXIT_CODE} : 3);
     expect(await launch(cliChild(cli, ["--state", "/tmp/state"], []))).toBe(3);
     expect((await readFile(log, "utf8")).trim().split("\n")).toEqual(Array(3).fill("--state /tmp/state 1"));
   });
+
+  it("passes OP_* variables to the CLI child, which alone captures them for op", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "indra-launcher-"));
+    const log = join(dir, "env.log");
+    const cli = join(dir, "cli.mjs");
+    await writeFile(cli, `import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(log)}, JSON.stringify(Object.fromEntries(Object.entries(process.env).filter(([name]) => name.startsWith("OP_")))));
+`);
+    const saved = { token: process.env.OP_SERVICE_ACCOUNT_TOKEN, session: process.env.OP_SESSION_owner };
+    Object.assign(process.env, { OP_SERVICE_ACCOUNT_TOKEN: "ops_owner_secret", OP_SESSION_owner: "desktop-session" });
+    try {
+      expect(await launch(cliChild(cli, [], []))).toBe(0);
+    } finally {
+      if (saved.token === undefined) delete process.env.OP_SERVICE_ACCOUNT_TOKEN; else process.env.OP_SERVICE_ACCOUNT_TOKEN = saved.token;
+      if (saved.session === undefined) delete process.env.OP_SESSION_owner; else process.env.OP_SESSION_owner = saved.session;
+    }
+    expect(JSON.parse(await readFile(log, "utf8"))).toMatchObject({ OP_SERVICE_ACCOUNT_TOKEN: "ops_owner_secret", OP_SESSION_owner: "desktop-session" });
+  });
 });
