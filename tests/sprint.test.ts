@@ -2,8 +2,8 @@ import { mkdtemp, mkdir, readFile, writeFile, symlink, rm } from "node:fs/promis
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { SprintGitHub, retroPath } from "../src/sprint.js";
-import { processShell, type Shell } from "../src/developer-seat.js";
+import { SprintError, SprintGitHub, retroPath } from "../src/sprint.js";
+import { processShell, type Shell } from "../src/command-shell.js";
 import { git } from "./state-checkout.js";
 
 const roots: string[] = [];
@@ -94,6 +94,30 @@ async function fixture() {
   const shell = new GitHub(remote); const github = new SprintGitHub(shell, runtimeDir);
   return { root, source, remote, runtimeDir, project, shell, github };
 }
+
+describe("sprint checked commands", () => {
+  it.each([
+    [" \n permission\t denied \n", "permission denied"],
+    [" \t\n", "no output"],
+    ["x".repeat(121), "x".repeat(120)],
+    [`${"x".repeat(100)} ${"ab12".repeat(10)}`, `${"x".repeat(100)} [redacted]`],
+  ])("keeps the SprintError stderr excerpt contract (%j)", async (stderr, excerpt) => {
+    const run = vi.fn<Shell["run"]>().mockResolvedValue({ code: 17, stdout: "private stdout", stderr });
+    const github = new SprintGitHub({ run }, "/managed/state.runtime");
+    const opened = github.openPr("test/project", "sprint/goal-test", "Title", "Body");
+    await expect(opened).rejects.toBeInstanceOf(SprintError);
+    await expect(opened).rejects.toMatchObject({ name: "SprintError", message: `gh pr list failed: ${excerpt}` });
+    expect(run).toHaveBeenCalledExactlyOnceWith("gh", ["pr", "list", "--repo", "test/project", "--head", "sprint/goal-test", "--base", "main", "--state", "open", "--json", "url", "--jq", ".[0].url // \"\""], "/managed");
+  });
+
+  it("propagates a shell rejection without converting it to a SprintError", async () => {
+    const error = new Error("shell rejected");
+    const run = vi.fn<Shell["run"]>().mockRejectedValue(error);
+    const github = new SprintGitHub({ run }, "/managed/state.runtime");
+    await expect(github.openPr("test/project", "sprint/goal-test", "Title", "Body")).rejects.toBe(error);
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe("retrospective-only GitHub archival", () => {
   it.each([false, true])("posts the fresh review's line comments and verdict, recovering lost responses (findings: %s)", async (findings) => {

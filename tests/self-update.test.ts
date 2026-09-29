@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { readBuildStamp } from "../src/build-stamp.js";
+import { recordRunningBuild as recordLoadedBuild } from "../src/running-build.js";
 import { IN_USE, processStart, pruneBuilds, readUpdateStatus, recordRunningBuild, SelfUpdater, switchDist } from "../src/self-update.js";
 import { git } from "./state-checkout.js";
 
@@ -67,20 +68,30 @@ fi
 }
 
 describe("self-update", () => {
-  it("captures the loaded application at startup, confirms readiness on its check, and never changes that evidence when dist switches", async () => {
+  it("captures the loaded application at startup, confirms readiness on a paused check, and never changes that evidence when dist switches", async () => {
     const { app, runtime, updater, merge } = await fixture();
     const args = process.argv;
     try {
       process.argv = [process.execPath, join(app, "dist", "cli.js"), "--state", join(runtime, "..", "state")];
-      recordRunningBuild(runtime, pathToFileURL(join(app, "dist", "cli.js")).href, () => "application birth");
+      recordLoadedBuild(runtime, pathToFileURL(join(app, "dist", "cli.js")).href, () => "application birth");
     } finally { process.argv = args; }
-    const receipt = async () => JSON.parse(await readFile(join(runtime, IN_USE, `${process.pid}.json`), "utf8"));
+    const file = join(runtime, IN_USE, `${process.pid}.json`);
+    const receipt = async () => JSON.parse(await readFile(file, "utf8"));
     const original = head(app);
-    expect(await receipt()).toMatchObject({ role: "application", stamp: { id: "running", sha: original }, processStart: "application birth" });
-    expect((await receipt()).readyAt).toBeUndefined();
-    await updater.check();
+    const started = await receipt();
+    expect(started).toMatchObject({ pid: process.pid, build: await realpath(join(app, "dist")), appDir: await realpath(app), role: "application", stamp: { id: "running", sha: original }, processStart: "application birth" });
+    expect(started.readyAt).toBeUndefined();
+    expect((await lstat(join(runtime, IN_USE))).mode & 0o777).toBe(0o700);
+    expect((await lstat(file)).mode & 0o777).toBe(0o600);
+    // The recorder and updater share readiness state even though they are imported from different modules.
+    await updater.setPaused(true);
+    expect(await updater.check()).toMatchObject({ outcome: "paused" });
     const ready = await receipt();
+    expect(ready).toEqual({ ...started, readyAt: expect.any(String) });
     expect(Date.parse(ready.readyAt)).toBeGreaterThanOrEqual(Date.parse(ready.startedAt));
+    expect((await lstat(file)).mode & 0o777).toBe(0o600);
+    expect(await readdir(join(runtime, IN_USE))).toEqual([`${process.pid}.json`]);
+    await updater.setPaused(false);
     await merge("code.ts", "export const version = 2;\n");
     await updater.check();
     expect(await receipt()).toEqual(ready);

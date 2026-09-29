@@ -5,7 +5,8 @@ import { readBuildStamp } from "./build-stamp.js";
 import { childEnv } from "./op-env.js";
 import type { SprintIntegration } from "./planning.js";
 import { appRootOf } from "./reload.js";
-import { IN_USE, processStart, readUpdateSettings, readUpdateStatus, type RunningBuildReceipt } from "./self-update.js";
+import { IN_USE, processStart, type RunningBuildReceipt } from "./running-build.js";
+import { readUpdateSettings, readUpdateStatus } from "./self-update.js";
 import { TmuxHost, type HostRecord } from "./tmux-host.js";
 
 /** Safe to retain as release facts; process identities and startup receipts stay in the runtime directory. */
