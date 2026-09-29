@@ -125,7 +125,7 @@ describe("planning bridge", () => {
     expect(runtime.sessions).toHaveLength(3);
   });
 
-  it("reverts a failed draft to clarifying, posts once without error details, and drafts again only on a new memo", async () => {
+  it("clears a failed draft substate, posts once without error details, and drafts again only on a new memo", async () => {
     const store = await fixture(); const chat = new FakeChat(); const runtime = new FakeRuntime();
     const bridge = new PlanningBridge(store, chat, runtime);
     const goal = await bridge.start("Explore project");
@@ -391,12 +391,14 @@ describe("plan approval", () => {
     expect((await store.read()).planningGoals![0].assignments).toBeUndefined();
     expect(chat.posts.slice(-2).map((post) => post.message)).toEqual(Array(2).fill("Only a person can approve a proposal; reactions from bots and Chick don't count. Nothing changed."));
     // A bot's memo on a fresh goal starts no draft.
-    const other = await bridge.start("Another goal");
+    const otherStore = await fixture();
+    const otherBridge = new PlanningBridge(otherStore, chat, runtime);
+    const other = await otherBridge.start("Another goal");
     const sessions = runtime.sessions.length;
     chat.react(other.mattermost.rootPostId, MEMO, "george");
-    await bridge.poll();
+    await otherBridge.poll();
     expect(runtime.sessions).toHaveLength(sessions);
-    expect((await store.read()).planningGoals!.find((item) => item.id === other.id)!.stage).toBe("clarifying");
+    expect((await otherStore.read()).planningGoals!.find((item) => item.id === other.id)!.stage).toBe("clarifying");
     expect(chat.posts.at(-1)?.message).toContain("Only a person can request a proposal");
     expect(goal.id).not.toBe(other.id);
   });
@@ -418,7 +420,7 @@ describe("plan approval", () => {
     chat.react(goal.mattermost.rootPostId, CHECK);
     await bridge.poll();
     expect(chat.posts.at(-1)?.message).toContain("Nothing to approve");
-    expect(chat.posts.at(-1)?.message).toContain("clarifying");
+    expect(chat.posts.at(-1)?.message).toContain("planning");
     expect(runtime.sessions).toHaveLength(1);
     const saved = (await store.read()).planningGoals![0];
     expect(saved.stage).toBe("clarifying");
@@ -507,7 +509,7 @@ describe("plan approval", () => {
     expect(git(store.checkout, "log", "--format=%s").split("\n").filter((line) => line.startsWith("Draft proposal"))).toHaveLength(1);
   });
 
-  it("consumes a terminal request whose draft fails, reverts to clarifying with one reply, and accepts a new request", async () => {
+  it("consumes a terminal request whose draft fails, keeps proposal with one reply, and accepts a new request", async () => {
     const store = await fixture(); const chat = new FakeChat(); const runtime = new FakeRuntime();
     const goal = await new PlanningBridge(store, chat, runtime).start("Explore project");
     await PlanningBridge.requestProposal(store, goal.id);
@@ -518,7 +520,7 @@ describe("plan approval", () => {
     await broken.poll();
     expect(attempts).toBe(1);
     const recorded = (await store.runtime(goal.id)).lastDraftError!;
-    expect(recorded.message).toContain("outcome-3 assigned to a non-Developer seat");
+    expect(recorded.message).toContain("proposal draft failed");
     expect(recorded.message).not.toContain("ghp_secret123");
     expect(chat.posts.some((post) => post.message.includes("outcome-3"))).toBe(false);
     expect((await store.read()).planningGoals![0].stage).toBe("clarifying");

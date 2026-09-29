@@ -14,6 +14,8 @@ export interface ApprovalEvidence {
 export interface ImplementationEvidence {
   kind: "implementation";
   outcomes: { outcomeId: string; seatId: string; prUrl: string; baseBranch: string; mergedSha: string; checksPassed: true; reviewApproved: true }[];
+  omissions?: { outcomeId: string; seatId: string; reason: string }[];
+  partialApproval?: { source: "owner-command"; command: "planning integrate"; at: string };
 }
 export interface RunningReleaseEvidence {
   kind: "release-running"; prUrl: string; mergedSha: string; mergePostId: string; approval: HumanApproval;
@@ -63,9 +65,14 @@ export const CEREMONY_SCHEMA_DEFS = {
     object({ source: { const: "reaction" }, userId: text, postId: text, emoji: { const: "white_check_mark" }, verifiedHuman: { const: true }, at: time }),
   ] },
   ceremonyApproval: object({ kind: { const: "approval" }, proposalId: id, proposalPostId: text, approval }),
-  ceremonyImplementation: object({ kind: { const: "implementation" }, outcomes: {
+  ceremonyImplementation: { ...object({ kind: { const: "implementation" }, outcomes: {
     type: "array", minItems: 1, items: object({ outcomeId: id, seatId: id, prUrl: ref("ceremonyPr"), baseBranch: text, mergedSha: sha, checksPassed: { const: true }, reviewApproved: { const: true } }),
-  } }),
+  }, omissions: { type: "array", minItems: 1, items: object({ outcomeId: id, seatId: id, reason: text }) },
+  partialApproval: object({ source: { const: "owner-command" }, command: { const: "planning integrate" }, at: time }),
+  }, ["kind", "outcomes"]), allOf: [
+    { if: { required: ["omissions"] }, then: { required: ["partialApproval"] } },
+    { if: { required: ["partialApproval"] }, then: { required: ["omissions"] } },
+  ] },
   ceremonyRelease: object({ kind: { const: "release-running" }, prUrl: ref("ceremonyPr"), mergedSha: sha, mergePostId: text,
     approval, checksPassed: { const: true }, buildSha: sha, runningSha: sha, runningAt: time,
     ancestry: object({ ancestorSha: sha, descendantSha: sha, verified: { const: true } }),
@@ -120,11 +127,17 @@ function validateApproval(goal: PlanningGoal, evidence: ApprovalEvidence): void 
 }
 function validateImplementation(goal: PlanningGoal, evidence: ImplementationEvidence): void {
   const outcomes = goal.proposal?.outcomes ?? [];
-  requireThat(outcomes.length > 0 && evidence.outcomes.length === outcomes.length && new Set(evidence.outcomes.map((item) => item.outcomeId)).size === outcomes.length, "Implementation evidence must cover every outcome exactly once.");
+  const accounted = [...evidence.outcomes, ...(evidence.omissions ?? [])];
+  requireThat(outcomes.length > 0 && accounted.length === outcomes.length && new Set(accounted.map((item) => item.outcomeId)).size === outcomes.length, "Implementation evidence must cover every outcome exactly once.");
   for (const item of evidence.outcomes) {
     const outcome = outcomes.find((outcome) => outcome.id === item.outcomeId);
     const assignment = goal.assignments?.find((assignment) => assignment.outcomeId === item.outcomeId);
     requireThat(outcome?.seatId === item.seatId && assignment?.seatId === item.seatId && assignment.status === "merged" && assignment.prUrl === item.prUrl && item.baseBranch === `sprint/${goal.id}`, "Implementation requires every assigned PR merged into this goal's sprint branch.");
+  }
+  for (const item of evidence.omissions ?? []) {
+    const outcome = outcomes.find((outcome) => outcome.id === item.outcomeId);
+    const assignment = goal.assignments?.find((assignment) => assignment.outcomeId === item.outcomeId);
+    requireThat(outcome?.seatId === item.seatId && assignment?.seatId === item.seatId && assignment.status === "failed", "Only terminal, unmerged outcomes may be explicitly omitted by the owner.");
   }
 }
 function validateRelease(goal: PlanningGoal, evidence: RunningReleaseEvidence): void {
@@ -153,7 +166,14 @@ export function validateCeremony(goal: PlanningGoal, ceremony: CeremonyRecord = 
       if (entry.enteredAt) notBefore(entry.enteredAt, entry.evidence.approval.at);
       else if (ceremony.migratedAt) { notBefore(ceremony.migratedAt, entry.evidence.approval.at); previous = entry.evidence.approval.at; }
     }
-    if (entry.stage === "release") validateImplementation(goal, entry.evidence);
+    if (entry.stage === "release") {
+      validateImplementation(goal, entry.evidence);
+      if (entry.evidence.partialApproval) {
+        const implementation = ceremony.history.find((item) => item.stage === "implement");
+        notBefore(entry.evidence.partialApproval.at, implementation?.enteredAt);
+        if (entry.enteredAt) notBefore(entry.enteredAt, entry.evidence.partialApproval.at);
+      }
+    }
     if (entry.stage === "retro") {
       validateRelease(goal, entry.evidence);
       notBefore(entry.evidence.approval.at, prior);
@@ -225,6 +245,7 @@ export function validateCeremonyMutation(before: PlanningGoal, after: PlanningGo
   requireThat(next, "A ceremony cannot be removed.");
   requireThat(next.migratedAt === old.migratedAt, "Migration provenance is immutable.");
   if (CEREMONY_STAGES.indexOf(old.stage) >= 2) requireThat(same(before.proposal, after.proposal), "An approved proposal is immutable.");
+  if (CEREMONY_STAGES.indexOf(old.stage) >= 3) requireThat(same(before.assignments, after.assignments), "Implementation assignments are frozen once release starts.");
   requireThat(next.history.length >= old.history.length && next.history.length <= old.history.length + 1 && old.history.every((entry, i) => same(entry, next.history[i])), "Ceremony history is append-only, one stage at a time.");
   if (old.closure) requireThat(same(old, next), "A closed ceremony is immutable.");
   if (old.stage === "release" && next.stage === "retro") requireThat(after.integration?.status === "merged", "A running release requires a merged integration PR that has not been reverted.");

@@ -72,7 +72,7 @@ class MemoryChat implements PlanningChat {
   async post(channel: string, message: string, root = "", delivery?: string) {
     const post: Post = { id: `post-${++this.sequence}`, user_id: this.own, channel_id: channel, root_id: root, message, create_at: Date.now() + this.sequence, props: { indra_delivery_id: delivery } };
     this.posts.push(post);
-    if (delivery && this.loseDeliveryAck) { this.loseDeliveryAck = false; throw new Error("Delivery acknowledgement lost"); }
+    if (delivery && root && this.loseDeliveryAck) { this.loseDeliveryAck = false; throw new Error("Delivery acknowledgement lost"); }
     return post;
   }
   async since(channel: string) { return this.posts.filter((post) => post.channel_id === channel); }

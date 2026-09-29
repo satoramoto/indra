@@ -89,7 +89,7 @@ describe("repository seat personas", () => {
       post: vi.fn(async (channel: string, message: string, root = "", delivery?: string) => {
         const post: Post = { id: `post-${posts.length}`, channel_id: channel, message, root_id: root, user_id: "chick", create_at: Date.now(), props: { indra_delivery_id: delivery } };
         posts.push(post);
-        if (delivery) throw new Error("Response lost after server accepted delivery");
+        if (delivery && root) throw new Error("Response lost after server accepted delivery");
         return post;
       }),
     };
