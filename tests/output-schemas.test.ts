@@ -1,5 +1,6 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { Ajv2020 } from "ajv/dist/2020.js";
 import { describe, expect, it } from "vitest";
 
 // OpenAI strict structured outputs (used by `codex exec --output-schema`) accept only these keywords.
@@ -47,5 +48,16 @@ describe("Codex output schemas meet OpenAI strict structured-output rules", () =
     const old = { type: "object", additionalProperties: false, required: ["kind", "text"], properties: { kind: { const: "owner-proposal" }, text: { type: "string", minLength: 1 } } };
     expect(strictSchemaProblems(old)).toEqual(["$.kind: missing type", "$.text: unsupported keyword minLength"]);
     expect(strictSchemaProblems({ type: "object", properties: { a: { type: "string" } } })).toEqual(["$: object without additionalProperties: false", "$.a: property not in required"]);
+  });
+  it("limits backlog output to revision-checked edits and requires a problem, value and acceptance criteria", () => {
+    const validate = new Ajv2020().compile(JSON.parse(readFileSync(join(dir, "backlog.json"), "utf8")));
+    const ticket = { id: "ticket-one", title: "Keep context", problem: "Context is lost between sprints.", value: "The owner repeats less work.", acceptanceCriteria: ["Context survives a restart."], status: "open", dependsOn: [], research: [] };
+    const edit = { expectedRevision: "a".repeat(40), ticketChanges: [{ action: "create", ticket }], candidateChanges: [] };
+    expect(validate(edit)).toBe(true);
+    for (const extra of [{ mission: "Agent-picked mission" }, { autoMode: true }, { standingPolicy: {} }]) expect(validate({ ...edit, ...extra })).toBe(false);
+    expect(validate({ ...edit, expectedRevision: "" })).toBe(false);
+    for (const patch of [{ problem: " " }, { value: "" }, { acceptanceCriteria: [] }, { createdBySeatId: "seat-lead" }]) {
+      expect(validate({ ...edit, ticketChanges: [{ action: "create", ticket: { ...ticket, ...patch } }] })).toBe(false);
+    }
   });
 });
