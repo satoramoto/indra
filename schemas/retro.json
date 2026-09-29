@@ -28,7 +28,7 @@
         "properties": {
           "phase": { "type": "string", "enum": ["planning", "proposal", "implement", "release", "retro"] },
           "evidenceId": { "type": "string" },
-          "kind": { "type": "string", "enum": ["worked", "slowed", "unknown"] },
+          "kind": { "type": "string", "enum": ["worked", "slowed", "noted", "unknown"] },
           "text": { "type": "string" }
         }
       }

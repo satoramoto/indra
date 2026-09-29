@@ -48,7 +48,7 @@ export function retroRetryDelayMs(failures: number): number {
 }
 /** Every attempt before a frozen draft failed or was aborted. */
 export function priorRetroAttempts(attempts: RetroPublicationRecord["attempts"]): RetroPriorAttempt[] {
-  return attempts.map((attempt) => ({ startedAt: attempt.startedAt, sessionId: attempt.generation?.sessionId ?? null,
+  return attempts.map((attempt) => ({ startedAt: attempt.startedAt, sessionId: attempt.generation?.sessionId ?? null, invocationId: attempt.generation?.invocationId ?? null,
     errorKind: attempt.errorKind ?? (attempt.generation?.status === "timed-out" || attempt.generation?.status === "interrupted" ? attempt.generation.status : attempt.generation ? "runtime-failed" : "unrecorded") }));
 }
 /** The persona attribution belongs to the thread post only; the archive holds the frozen parts exactly. */
@@ -127,6 +127,8 @@ export class RetroPublication {
       const archive = legacy ? (await Promise.all(frozen.parts.map((message) => this.formatPost(context, message)))).join("") : archiveOf(frozen.parts);
       if (digest(frozen.markdown) !== frozen.sha256 || frozen.parts.join("") !== frozen.draft.markdown
         || (!legacy && await renderSprintRetro(frozen.draft.snapshot, frozen.draft.narrative, frozen.draft.generation) !== frozen.draft.markdown)
+        // Without a re-render, a legacy archive must at least carry nothing the redactor would remove.
+        || (legacy && redactSecrets(frozen.markdown) !== frozen.markdown)
         || archive !== frozen.markdown) throw new Error("Frozen retrospective content failed verification.");
     }
     return record;

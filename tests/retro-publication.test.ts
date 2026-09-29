@@ -188,15 +188,15 @@ describe("recoverable retro publication", () => {
   it("gives the next draft every earlier failed or aborted attempt with its error kind", async () => {
     vi.useFakeTimers({ toFake: ["Date"] }); const start = Date.parse("2026-01-01T01:00:00.000Z");
     const f = await fixture();
-    const generation = { sessionId: "failed-retro", startedAt: at(8), finishedAt: at(9), status: "timed-out" as const, wallTimeMs: 1000, usage: (await f.draft()).generation.usage };
+    const generation = { sessionId: "failed-retro", invocationId: "failed-invocation", startedAt: at(8), finishedAt: at(9), status: "timed-out" as const, wallTimeMs: 1000, usage: (await f.draft()).generation.usage };
     f.draft.mockClear();
     f.draft.mockRejectedValueOnce(new RetroGenerationError("failed", generation, "timed-out")).mockRejectedValueOnce(new Error("state unavailable"));
     for (const offset of [0, 15_000, 45_000]) { vi.setSystemTime(start + offset); await f.restart().poll(f.context); }
     expect(f.draft.mock.calls.map((call) => call[1])).toEqual([[], [
-      { startedAt: new Date(start).toISOString(), sessionId: "failed-retro", errorKind: "timed-out" },
+      { startedAt: new Date(start).toISOString(), sessionId: "failed-retro", invocationId: "failed-invocation", errorKind: "timed-out" },
     ], [
-      { startedAt: new Date(start).toISOString(), sessionId: "failed-retro", errorKind: "timed-out" },
-      { startedAt: new Date(start + 15_000).toISOString(), sessionId: null, errorKind: "draft-error" },
+      { startedAt: new Date(start).toISOString(), sessionId: "failed-retro", invocationId: "failed-invocation", errorKind: "timed-out" },
+      { startedAt: new Date(start + 15_000).toISOString(), sessionId: null, invocationId: null, errorKind: "draft-error" },
     ]]);
     expect(f.record().frozen).toBeDefined();
   });
@@ -295,10 +295,21 @@ describe("recoverable retro publication", () => {
   it("still verifies a version 1 record frozen with the attribution inside its archive", async () => {
     const f = await attributed(); await f.publication().poll(f.context);
     const frozen = f.record().frozen!;
-    const legacy = frozen.parts.map((part) => `${filler}\n\n${part}`).join("");
-    Object.assign(frozen, { markdown: legacy, sha256: createHash("sha256").update(legacy).digest("hex") });
+    const content = [...f.deliveries.values()].find((item) => !item.mergePost)!;
+    const original = { part: frozen.parts[0], draft: frozen.draft.markdown, post: content.message };
+    // Rewrite the record as version 1 would have frozen it, with `extra` in its first fragment everywhere it appears.
+    const legacyWith = (extra: string, version: number) => {
+      frozen.parts[0] = original.part + extra; frozen.draft.markdown = original.draft.replace(original.part, frozen.parts[0]);
+      content.message = original.post + extra;
+      const legacy = frozen.parts.map((part) => `${filler}\n\n${part}`).join("");
+      Object.assign(frozen, { markdown: legacy, sha256: createHash("sha256").update(legacy).digest("hex") });
+      (frozen.draft.snapshot as { version: number }).version = version;
+    };
+    legacyWith("", 2);
     await expect(f.publication().merge(f.context, f.owner())).rejects.toThrow();
-    (frozen.draft.snapshot as { version: number }).version = 1;
+    legacyWith("\npassword=private-value\n", 1);
+    await expect(f.publication().merge(f.context, f.owner())).rejects.toThrow();
+    legacyWith("", 1);
     await expect(f.publication().merge(f.context, f.owner())).resolves.toContain("merged");
   });
 
