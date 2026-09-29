@@ -8,7 +8,7 @@ import { engineLabel, SPRINT_STAGES, type SprintBuild } from "./session-snapshot
 import type { GoalStarter, SeatLive, SeatProcessPort } from "./supervisor.js";
 import type { PaneTailSource } from "./pane-tail.js";
 import { PaneTailPanel, paneTailLines } from "./pane-tail-panel.js";
-import { oncePerTask } from "./key-batch.js";
+import { keyInput } from "./key-batch.js";
 
 const theme = {
   background: "#111827", panel: "#1F2937", selected: "#243B53",
@@ -398,12 +398,11 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
       if (options.reload && cleanup()) options.reload(view).then(resolve, reject);
     };
     // One screen rebuild per stdin chunk, not per key: a burst of keys otherwise exhausts OpenTUI's native renderables.
-    const publishKeys = oncePerTask(() => { if (active) setRevision(model.revision); });
+    const applyKey = keyInput(model, (current) => { if (active) setRevision(current); });
     const key = (name: string, ctrl?: boolean, text?: string) => {
       if (!active || attaching) return;
       if (ctrl && name === "c") { finish(); return; }
-      const action = model.key(name, text);
-      publishKeys();
+      const action = applyKey(name, text);
       if (action === "quit") finish();
       else if (action === "refresh") { void refresh(); void model.updateCode(); }
       else if (action === "pause") void model.togglePause();

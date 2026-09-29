@@ -5,7 +5,7 @@ import { StateInventory, type StateSnapshot } from "../src/state-domain.js";
 import { GOAL_INPUT_LIMIT, TerminalUiModel } from "../src/terminal-ui.js";
 import { TerminalApp } from "../src/terminal-ui-solid.js";
 import type { GoalStarter } from "../src/supervisor.js";
-import { oncePerTask } from "../src/key-batch.js";
+import { keyInput } from "../src/key-batch.js";
 
 const names = ["Chick Corea", "George Duke", "Aaron Magner", "Corey Henry", "Jordan Rudess"];
 const state: StateSnapshot = {
@@ -21,13 +21,13 @@ const state: StateSnapshot = {
 };
 const goals: GoalStarter = { start: async () => "", approve: async () => { throw new Error("not used"); }, propose: async () => { throw new Error("not used"); } };
 
-/** The goal input on the team page, wired the way `runTerminalUi` wires it. */
+/** The goal input on the team page, through the same `keyInput` path `runTerminalUi` uses. */
 async function goalInput() {
   const model = new TerminalUiModel(new StateInventory({ read: async () => state }), { readSessions: async () => ({ connection: "connected", sessions: [] }) }, undefined, goals);
   await model.refresh();
   const [revision, setRevision] = createSignal(model.revision);
-  const publishKeys = oncePerTask(() => setRevision(model.revision));
-  const onKey = (name: string, _ctrl?: boolean, text?: string) => { model.key(name, text); publishKeys(); };
+  const applyKey = keyInput(model, setRevision);
+  const onKey = (name: string, _ctrl?: boolean, text?: string) => { applyKey(name, text); };
   const setup = await testRender(() => <TerminalApp model={model} revision={revision} onKey={onKey} />, { width: 200, height: 50 });
   await setup.renderOnce();
   setup.renderer.stdin.emit("data", Buffer.from("n"));
