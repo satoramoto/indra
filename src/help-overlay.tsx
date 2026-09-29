@@ -1,5 +1,6 @@
 import { For } from "solid-js";
 import { RETURN_KEY } from "./watch-keys.js";
+import { PALETTE } from "./hub-style.js";
 
 export interface HelpSection { title: string; keys: [key: string, meaning: string][] }
 
@@ -48,15 +49,15 @@ export const HELP_SECTIONS: HelpSection[] = [
 
 export function HelpOverlay() {
   return (
-    <box position="absolute" top={0} left={0} width="100%" height="100%" zIndex={20} padding={1} backgroundColor="#111827">
-      <scrollbox flexGrow={1} scrollY border borderColor="#42536B" title="HELP · Esc, q or ? closes" titleColor="#67E8F9" paddingLeft={1} paddingRight={1}>
+    <box position="absolute" top={0} left={0} width="100%" height="100%" zIndex={20} padding={1} backgroundColor={PALETTE.background}>
+      <scrollbox flexGrow={1} scrollY border borderColor={PALETTE.rule} title=" HELP · Esc, q or ? closes " titleColor={PALETTE.accent} paddingLeft={1} paddingRight={1}>
         <For each={HELP_SECTIONS}>{(section) => (
           <box flexDirection="column" flexShrink={0} paddingBottom={1}>
-            <text fg="#E9D5FF">{section.title}</text>
+            <text fg={PALETTE.text}>{section.title.toUpperCase()}</text>
             <For each={section.keys}>{([key, meaning]) => (
               <box flexDirection="row" flexShrink={0}>
-                <text fg="#67E8F9" width={20} flexShrink={0}>{"  " + key}</text>
-                <text fg="#E5E7EB" wrapMode="word">{meaning}</text>
+                <text fg={PALETTE.accent} width={20} flexShrink={0}>{"  " + key}</text>
+                <text fg={PALETTE.dim} wrapMode="word">{meaning}</text>
               </box>
             )}</For>
           </box>

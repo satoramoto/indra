@@ -1,6 +1,7 @@
 import { createEffect, createSignal, For, Match, on, onCleanup, onMount, Show, Switch, type Accessor } from "solid-js";
 import { PROGRESS_MARK, STATUS, type ProgressKind } from "./codex-progress.js";
 import { PaneTailPoller, type PaneTail, type PaneTailSeat, type PaneTailSource } from "./pane-tail.js";
+import { PALETTE } from "./hub-style.js";
 
 export interface PaneTailPanelProps {
   source: PaneTailSource;
@@ -21,18 +22,19 @@ export function paneTailLines(height: number): number {
 export type PaneLineKind = Exclude<ProgressKind, "error"> | "git" | "fail" | "plain";
 export interface PaneLine { time?: string; kind: PaneLineKind; text: string }
 
+/** The hub's restrained palette: plain text for the run's words, dim for its asides, red only for a failure. */
 export const PANE_LINE_COLOR: Record<PaneLineKind | "time", string> = {
-  time: "#6B7280",
-  purpose: "#67E8F9",
-  thinking: "#7C8799",
-  agent: "#F9FAFB",
-  command: "#93C5FD",
-  tool: "#93C5FD",
-  git: "#FDBA74",
-  files: "#86EFAC",
-  info: "#9CA3AF",
-  fail: "#FCA5A5",
-  plain: "#E5E7EB",
+  time: PALETTE.dim,
+  purpose: PALETTE.accent,
+  thinking: PALETTE.dim,
+  agent: PALETTE.text,
+  command: PALETTE.text,
+  tool: PALETTE.text,
+  git: PALETTE.text,
+  files: PALETTE.text,
+  info: PALETTE.dim,
+  fail: PALETTE.bad,
+  plain: PALETTE.text,
 };
 
 const KIND_BY_MARK = new Map<string, ProgressKind>(Object.entries(PROGRESS_MARK).map(([kind, mark]) => [mark, kind as ProgressKind]));
@@ -65,12 +67,12 @@ export function PaneTailPanel(props: PaneTailPanelProps) {
   const current = () => { const value = tail(); return value && value.seatId === props.seat()?.id ? value.tail : undefined; };
   const clip = (text: string) => { const chars = Array.from(text); const width = Math.max(1, props.width()); return chars.length <= width ? text : chars.slice(0, width - 1).join("") + "…"; };
   return (
-    <box flexDirection="column" flexShrink={0} height={props.lines() + 2} paddingLeft={1} paddingRight={1} backgroundColor="#0B1220" border borderColor="#42536B" title={"LIVE PANE · " + clip(props.seat()?.displayName ?? props.seat()?.id ?? "")} titleColor="#67E8F9">
-      <Switch fallback={<text fg="#9CA3AF">Reading pane…</text>}>
-        <Match when={current()?.status === "no-session"}><text fg="#FDE68A">no session</text></Match>
-        <Match when={current()?.status === "error"}><text fg="#FCA5A5">{clip("Pane read failed: " + ((current() as { message?: string } | undefined)?.message ?? ""))}</text></Match>
+    <box flexDirection="column" flexShrink={0} height={props.lines() + 1} paddingLeft={2} border={["top"]} borderColor={PALETTE.rule} title={" LIVE PANE · " + clip(props.seat()?.displayName ?? props.seat()?.id ?? "") + " "} titleColor={PALETTE.accent}>
+      <Switch fallback={<text fg={PALETTE.dim}>Reading pane…</text>}>
+        <Match when={current()?.status === "no-session"}><text fg={PALETTE.wait}>no session</text></Match>
+        <Match when={current()?.status === "error"}><text fg={PALETTE.bad}>{clip("Pane read failed: " + ((current() as { message?: string } | undefined)?.message ?? ""))}</text></Match>
         <Match when={current()?.status === "ok"}>
-          <For each={(current() as { lines?: string[] } | undefined)?.lines ?? []} fallback={<text fg="#9CA3AF">(pane is empty)</text>}>{(raw) => {
+          <For each={(current() as { lines?: string[] } | undefined)?.lines ?? []} fallback={<text fg={PALETTE.dim}>(pane is empty)</text>}>{(raw) => {
             const line = classifyPaneLine(raw);
             return (
               <box flexDirection="row" flexShrink={0} height={1}>

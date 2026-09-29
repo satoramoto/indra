@@ -87,7 +87,7 @@ describe("terminal UI", () => {
     try {
       await setup.renderOnce();
       expect(setup.captureCharFrame()).toContain("Re-queued goal-retry/outcome-1 for seat-002.");
-      expect(setup.captureCharFrame()).toContain("Assignment: Retry failed work · queued");
+      expect(setup.captureCharFrame()).toMatch(/assignment +Retry failed work · queued/);
     } finally { setup.renderer.destroy(); }
     model.key("t", "T");
     expect(model.confirm).toBeUndefined();
@@ -209,7 +209,7 @@ describe("terminal UI", () => {
       await setup.renderOnce();
       const initial = setup.captureCharFrame();
       for (const name of names) expect(initial).toContain(name);
-      expect(initial).toContain("NO ACTIVE SESSION");
+      expect(initial).toContain("no active session");
       fixture.sessions({ connection: "connected", sessions: [{
         id: "goal-1", teamId: "team-001", seatId: "seat-001", status: "running", engine: "codex",
         sessionId: "codex-123", goal: "Plan the next cycle", stage: "clarifying", recentActivity: ["Old note", "Read the brief"],
@@ -219,21 +219,23 @@ describe("terminal UI", () => {
       setRevision(fixture.model.revision);
       await setup.renderOnce();
       const updated = setup.captureCharFrame();
-      expect(updated).toContain("RUNNING SESSION");
-      expect(updated).toContain("Latest: Read the brief");
-      expect(updated).not.toContain("Latest: Old note");
+      expect(updated).toContain("running session");
+      expect(updated).toContain("Read the brief");
+      expect(updated).not.toContain("Old note");
       fixture.model.key("down");
       fixture.model.key("enter");
       setRevision(fixture.model.revision);
       await setup.renderOnce();
-      expect(setup.captureCharFrame()).toContain("Planning detail: clarifying");
+      expect(setup.captureCharFrame()).toMatch(/detail +clarifying/);
       fixture.model.key("b");
       setRevision(fixture.model.revision);
       const narrow = await testRender(() => <TerminalApp model={fixture.model} revision={revision} onKey={() => {}} />, { width: 80, height: 24 });
       try {
         await narrow.renderOnce();
         const frame = narrow.captureCharFrame();
-        for (const name of names) expect(frame).toContain(name);
+        // At 24 rows the open sprint comes first; the seats table is further down the page.
+        const frames = await scrollFrames(narrow, "team-scroll");
+        for (const name of names) expect(visibleIn(frames, name), name + "\n" + frame).toBe(true);
       } finally { narrow.renderer.destroy(); }
     } finally {
       setup.renderer.destroy();
@@ -263,11 +265,11 @@ describe("terminal UI", () => {
     try {
       await setup.renderOnce();
       const frame = setup.captureCharFrame();
-      expect(frame).toContain("OCCUPANCY UNKNOWN");
+      expect(frame).toContain("occupancy unknown");
       expect(frame).toContain("Earlier response");
-      expect(frame).toContain("Planning goal: Plan the next cycle");
-      expect(frame).toContain("Planning detail: clarifying");
-      expect(frame).toContain("Live view: not available");
+      expect(frame).toMatch(/goal +Plan the next cycle/);
+      expect(frame).toMatch(/detail +clarifying/);
+      expect(frame).toMatch(/live view +not available/);
     } finally { setup.renderer.destroy(); }
   });
 
@@ -283,7 +285,7 @@ describe("terminal UI", () => {
     try {
       await setup.renderOnce();
       const frame = setup.captureCharFrame();
-      expect(frame).toContain("RUNTIME RECORD ERROR");
+      expect(frame).toContain("runtime record error");
       expect(frame).toContain("Runtime metadata is unreadable.");
     } finally { setup.renderer.destroy(); }
   });
@@ -300,16 +302,18 @@ describe("terminal UI", () => {
     try {
       await setup.renderOnce();
       const frame = setup.captureCharFrame();
-      expect(frame).toContain("RUNTIME ERROR · SAVED SESSION");
-      expect(frame).toContain("Latest: Runtime metadata is unreadable.");
-      expect(frame).not.toContain("Latest: Old activity");
+      expect(frame).toContain("runtime error · saved session");
+      // The newest goal's activity is the seat's latest, lower on the page; the older goal's is not.
+      const frames = await scrollFrames(setup, "team-scroll");
+      expect(visibleIn(frames, "Chick Corea Runtime metadata is unreadable.")).toBe(true);
+      expect(visibleIn(frames, "Old activity")).toBe(false);
       fixture.model.key("down");
       fixture.model.key("return");
       setRevision(fixture.model.revision);
       await setup.renderOnce();
       const detail = setup.captureCharFrame();
-      expect(detail).toContain("Planning goal: New goal");
-      expect(detail).toContain("Planning detail: drafting");
+      expect(detail).toMatch(/goal +New goal/);
+      expect(detail).toMatch(/detail +drafting/);
     } finally { setup.renderer.destroy(); }
   });
 
@@ -335,12 +339,12 @@ describe("terminal UI", () => {
     try {
       await wide.renderOnce();
       const frame = wide.captureCharFrame();
-      expect(frame).toMatch(/George Duke +Developer +RUNNING/);
-      expect(frame).toContain("Second · in-review 🐙 #2");
-      expect(frame).toContain("Latest: Opened PR 2");
-      expect(frame).toMatch(/Aaron Magner +Developer +NO CREDENTIAL/);
-      expect(frame).toMatch(/Corey Henry +Developer +STOPPED/);
-      expect(frame).toContain("Third · queued");
+      // One row per seat: name, then its task (or why it has none), then its pipeline, model, tokens, time and PR.
+      expect(frame).toMatch(/● George Duke +(dev +)?Second +■◧□□□ .* ⎇ #2/);
+      expect(frame).toContain("Opened PR 2");
+      expect(frame).toMatch(/✗ Aaron Magner +(dev +)?no credential/);
+      expect(frame).toMatch(/◐ Corey Henry +(dev +)?stopped/);
+      expect(frame).toMatch(/◐ Jordan Rudess +(dev +)?Third +□□□□□/);
       expect(frame).toContain("No thread activity yet.");
     } finally { wide.renderer.destroy(); }
     const narrow = await testRender(() => <TerminalApp model={model} revision={revision} onKey={() => {}} />, { width: 80, height: 24 });
@@ -348,8 +352,8 @@ describe("terminal UI", () => {
       await narrow.renderOnce();
       const frame = narrow.captureCharFrame();
       for (const name of names) expect(frame).toContain(name);
-      expect(frame).toContain("NO CREDENTIAL");
-      expect(frame).toContain("Second · in-review");
+      expect(frame).toContain("no credential");
+      expect(frame).toMatch(/George Duke +Second/);
     } finally { narrow.renderer.destroy(); }
 
     for (const _ of [1, 2, 3]) model.key("down");
@@ -367,8 +371,8 @@ describe("terminal UI", () => {
     try {
       await detail.renderOnce();
       const frame = detail.captureCharFrame();
-      expect(frame).toContain("Process: running (seat runner)");
-      expect(frame).toContain("Assignment: Second · in-review");
+      expect(frame).toMatch(/process +running \(seat runner\)/);
+      expect(frame).toMatch(/assignment +Second · in-review/);
     } finally { detail.renderer.destroy(); }
   });
 
@@ -383,7 +387,7 @@ describe("terminal UI", () => {
       try {
         await view.renderOnce();
         const frame = view.captureCharFrame();
-        expect(frame).toContain("NO CHANNEL");
+        expect(frame).toContain("no channel");
         expect(frame).toContain("@chickcorea can't join the home channel home");
       } finally { view.renderer.destroy(); }
     }
@@ -922,9 +926,9 @@ describe("persisted ceremony and allowed actions", () => {
         const frames = await scrollFrames(setup, view.page === "team" ? "team-scroll" : "detail-scroll");
         const cycle = CEREMONY_STAGES.map((name) => name === stage ? `[${name}]` : name).join(" → ");
         expect(visibleIn(frames, cycle), view.page + " " + view.seatId).toBe(true);
-        expect(visibleIn(frames, "Current stage: " + stage)).toBe(true);
-        expect(visibleIn(frames, "Closure: open")).toBe(true);
-        expect(visibleIn(frames, "Current stage: Updated")).toBe(false);
+        expect(visibleIn(frames, `[${stage}]`)).toBe(true);
+        expect(visibleIn(frames, (stage === "retro" ? "[retro]" : "retro") + " open")).toBe(true);
+        expect(visibleIn(frames, "[Updated]")).toBe(false);
       }
       for (const action of Object.values(fixture.goals)) expect(action).not.toHaveBeenCalled();
     } finally { setup.renderer.destroy(); }
@@ -985,7 +989,7 @@ describe("persisted ceremony and allowed actions", () => {
       await setup.renderOnce();
       expect(setup.captureCharFrame()).toContain("P propose");
       const frames = await scrollFrames(setup, "detail-scroll");
-      expect(visibleIn(frames, "Current stage: proposal")).toBe(true);
+      expect(visibleIn(frames, "[proposal]")).toBe(true);
       expect(visibleIn(frames, "P requests Chick's proposal here")).toBe(true);
     } finally { setup.renderer.destroy(); }
     model.key("p", "P");
@@ -1147,7 +1151,7 @@ describe("persisted ceremony and allowed actions", () => {
     try {
       await setup.renderOnce();
       const frames = await scrollFrames(setup, "team-scroll");
-      expect(visibleIn(frames, "Current stage: proposal")).toBe(true);
+      expect(visibleIn(frames, "[proposal]")).toBe(true);
       expect(visibleIn(frames, detail === "drafting" ? "Chick is drafting the proposal." : "Draft ready; waiting for the owner's plan approval.")).toBe(true);
     } finally { setup.renderer.destroy(); }
   });
@@ -1161,8 +1165,8 @@ describe("persisted ceremony and allowed actions", () => {
       await setup.renderOnce();
       const frames = await scrollFrames(setup, "team-scroll");
       expect(visibleIn(frames, "Release waiting: " + reason)).toBe(true);
-      expect(visibleIn(frames, "Current stage: release")).toBe(true);
-      expect(visibleIn(frames, "Integration PR: 🐙 " + prLabel(session.loop!.integration!.prUrl, true))).toBe(true);
+      expect(visibleIn(frames, "[release]")).toBe(true);
+      expect(visibleIn(frames, "integration ⎇ " + prLabel(session.loop!.integration!.prUrl, true))).toBe(true);
       expect(fixture.model.ceremonyKeys()).not.toContain("M merge release");
     } finally { setup.renderer.destroy(); }
   });
@@ -1191,7 +1195,7 @@ describe("persisted ceremony and allowed actions", () => {
       // Closed means finished (#59): the sprint card leaves the list.
       expect(fixture.model.sprintsForTeam().map((sprint) => sprint.id)).not.toContain("goal-ceremony");
       const frames = await scrollFrames(setup, "detail-scroll");
-      expect(visibleIn(frames, "Current stage: retro")).toBe(false);
+      expect(visibleIn(frames, "[retro]")).toBe(false);
       // The seat's record still carries the published retro and the recorded release.
       const [record] = fixture.model.sessionsFor("seat-001");
       const loop = sessionSprint(record!).loop;
@@ -1214,15 +1218,17 @@ describe("visible sprint loop", () => {
     const setup = await testRender(() => <TerminalApp model={model} revision={() => model.revision} onKey={() => {}} />, { width: 140, height: 35 });
     try {
       await setup.renderOnce();
-      expect(setup.captureCharFrame()).toContain("Current stage: implement");
+      expect(setup.captureCharFrame()).toContain("[implement]");
       const spans = setup.captureSpans().lines.flatMap((line) => line.spans);
       const current = spans.find((span) => span.text.includes("[implement]"));
-      expect(current?.fg.toInts().slice(0, 3)).toEqual([103, 232, 249]);
+      // The one accent colour.
+      expect(current?.fg.toInts().slice(0, 3)).toEqual([165, 180, 252]);
       expect(spans.find((span) => span.text.includes("planning →"))?.fg.toInts()).not.toEqual(current?.fg.toInts());
       const frames = await scrollFrames(setup, "team-scroll");
       for (const ticket of ticketLoop.tickets) {
-        expect(visibleIn(frames, `${ticket.title} · ${ticket.status}`)).toBe(true);
-        expect(visibleIn(frames, "🐙 " + prLabel(ticket.prUrl))).toBe(true);
+        // A table row: the title, then its status in its own column.
+        expect(visibleIn(frames, `${ticket.title} ${ticket.status}`)).toBe(true);
+        expect(visibleIn(frames, "⎇ " + prLabel(ticket.prUrl))).toBe(true);
       }
       for (const action of [processes.ensureAll, processes.stop, processes.restart, processes.retry, goals.start, goals.propose, goals.approve, goals.sprint]) expect(action).not.toHaveBeenCalled();
       expect(model.confirm).toBeUndefined();
@@ -1243,13 +1249,13 @@ describe("visible sprint loop", () => {
     try {
       await setup.renderOnce();
       const frames = await scrollFrames(setup, "team-scroll");
-      for (const text of ["SPRINT · goal-one", "SPRINT · goal-two", "Current stage: implement", "Current stage: release", "Integration PR: 🐙 " + prLabel(second.loop!.integration!.prUrl, true), "Failed ticket retained · failed", "👤 George Duke", "👤 Aaron Magner", "🐙 " + prLabel(second.loop!.tickets[0].prUrl)]) {
+      for (const text of ["SPRINT goal-one", "SPRINT goal-two", "[implement]", "[release]", "integration ⎇ " + prLabel(second.loop!.integration!.prUrl, true), "Failed ticket retained · failed", "George Duke ·", "Aaron Magner ·", "⎇ " + prLabel(second.loop!.tickets[0].prUrl)]) {
         expect(visibleIn(frames, text), text).toBe(true);
       }
       expect(visibleIn(frames, "planning → proposal → [implement] → release → retro")).toBe(true);
       for (const ticket of ticketLoop.tickets) {
         expect(visibleIn(frames, `${ticket.title} · ${ticket.status}`), `${ticket.title} · ${ticket.status}`).toBe(true);
-        expect(visibleIn(frames, "🐙 " + prLabel(ticket.prUrl)), ticket.prUrl).toBe(true);
+        expect(visibleIn(frames, "⎇ " + prLabel(ticket.prUrl)), ticket.prUrl).toBe(true);
       }
     } finally { setup.renderer.destroy(); }
   });
@@ -1292,7 +1298,7 @@ describe("visible sprint loop", () => {
       await setup.renderOnce();
       const frames = await scrollFrames(setup, "team-scroll");
       expect(visibleIn(frames, message), frames[0]).toBe(true);
-      expect(visibleIn(frames, "Current stage: release")).toBe(true);
+      expect(visibleIn(frames, "[release]")).toBe(true);
     } finally { setup.renderer.destroy(); }
   });
 
@@ -1304,7 +1310,7 @@ describe("visible sprint loop", () => {
     try {
       await setup.renderOnce();
       const frame = setup.captureCharFrame();
-      expect(frame).toContain(`IDLE SESSION · ${label}`);
+      expect(frame).toContain(`idle session · ${label}`);
       expect(frame).toContain(`${label} session: ${sessionId}`);
       if (engine !== "codex") expect(frame).not.toContain("Codex");
     } finally { setup.renderer.destroy(); }
