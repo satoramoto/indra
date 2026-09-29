@@ -64,10 +64,22 @@ fi
     git(upstream, "push", "--quiet");
   };
   const runtime = join(root, "state.runtime");
-  return { app, remote, runtime, npm, updater: new SelfUpdater(app, npm, undefined, runtime), npmCalls, merge };
+  return { app, remote, runtime, npm, updater: new SelfUpdater(app, npm, undefined, runtime, 0), npmCalls, merge };
 }
 
 describe("self-update", () => {
+  it("never runs two checks at once: a check requested while one runs gets its result and spawns nothing", async () => {
+    const { updater, merge, npmCalls } = await fixture();
+    await merge("code.ts", "export const version = 2;\n");
+    const [first, second, third] = await Promise.all([updater.check(), updater.check(), updater.check()]);
+    expect(first).toMatchObject({ outcome: "built" });
+    expect(second).toBe(first);
+    expect(third).toBe(first);
+    expect((await npmCalls()).filter((line) => line === "run build")).toHaveLength(1);
+    // Once it ends, the next check runs on its own.
+    expect(await updater.check()).toMatchObject({ outcome: "up-to-date" });
+  });
+
   it("captures the loaded application at startup, confirms readiness on a paused check, and never changes that evidence when dist switches", async () => {
     const { app, runtime, updater, merge } = await fixture();
     const args = process.argv;
@@ -144,23 +156,102 @@ describe("self-update", () => {
     expect(await npmCalls()).toEqual(["ci", "run build"]);
   });
 
-  it("leaves a dirty checkout alone and says why", async () => {
+  it("builds local HEAD of a dirty checkout without the uncommitted edit, and skips the fetch", async () => {
     const { app, updater, npmCalls, merge } = await fixture();
     const before = head(app);
     await writeFile(join(app, "code.ts"), "export const version = 99;\n");
+    await writeFile(join(app, "fail-build"), "");
     await merge("code.ts", "export const version = 2;\n");
-    expect(await updater.check()).toMatchObject({ outcome: "blocked", message: "the Indra checkout has uncommitted changes" });
-    expect(head(app)).toBe(before);
+    expect(await updater.check()).toMatchObject({ outcome: "up-to-date", branch: "main", sha: before });
+    await writeFile(join(app, "local.txt"), "committed\n");
+    git(app, "add", "local.txt");
+    git(app, "commit", "--quiet", "-m", "Local work");
+    expect(await updater.check()).toMatchObject({ outcome: "built", branch: "main", sha: head(app) });
+    expect(git(app, "rev-parse", "HEAD~1").trim()).toBe(before);
     expect(await readFile(join(app, "code.ts"), "utf8")).toBe("export const version = 99;\n");
-    expect(await npmCalls()).toEqual([]);
+    expect(await readBuildStamp(app)).toMatchObject({ sha: head(app) });
+    expect(await npmCalls()).toEqual(["run build"]);
   });
 
-  it("leaves a checkout on another branch alone", async () => {
+  it("builds each local commit once", async () => {
+    const { app, updater, npmCalls } = await fixture();
+    await writeFile(join(app, "code.ts"), "export const version = 5;\n");
+    git(app, "commit", "--quiet", "-am", "Local change");
+    expect(await updater.check()).toMatchObject({ outcome: "built", sha: head(app) });
+    expect(await readBuildStamp(app)).toMatchObject({ sha: head(app) });
+    expect(await updater.check()).toMatchObject({ outcome: "up-to-date" });
+    expect(await npmCalls()).toEqual(["run build"]);
+  });
+
+  it("runs npm ci in the checkout when a local commit changes package-lock.json", async () => {
+    const { app, updater, npmCalls } = await fixture();
+    await writeFile(join(app, "package-lock.json"), "{\"lockfileVersion\": 3, \"packages\": {}}\n");
+    git(app, "commit", "--quiet", "-am", "Lock change");
+    expect(await updater.check()).toMatchObject({ outcome: "built" });
+    expect(await npmCalls()).toEqual(["ci", "run build"]);
+    expect(await readFile(join(app, "node_modules", "installed"), "utf8")).toBe("ok\n");
+  });
+
+  it("does not build a local commit while paused", async () => {
+    const { app, updater, npmCalls } = await fixture();
+    await updater.setPaused(true);
+    await writeFile(join(app, "code.ts"), "export const version = 5;\n");
+    git(app, "commit", "--quiet", "-am", "Local change");
+    expect(await updater.check()).toMatchObject({ outcome: "paused" });
+    expect(await npmCalls()).toEqual([]);
+    expect(await readBuildStamp(app)).toMatchObject({ id: "running" });
+  });
+
+  it("fetches only when the fetch interval is due", async () => {
+    const { app, runtime, npm, merge } = await fixture();
+    const updater = new SelfUpdater(app, npm, undefined, runtime, 60_000);
+    expect(await updater.check()).toMatchObject({ outcome: "up-to-date" });
+    const before = head(app);
+    await merge("code.ts", "export const version = 2;\n");
+    expect(await updater.check()).toMatchObject({ outcome: "up-to-date" });
+    expect(head(app)).toBe(before);
+  });
+
+  it("follows origin/main on main", async () => {
+    const { app, updater, merge } = await fixture();
+    await merge("code.ts", "export const version = 2;\n");
+    expect(await updater.check()).toMatchObject({ outcome: "built", following: "origin/main" });
+    expect(await readFile(join(app, "code.ts"), "utf8")).toBe("export const version = 2;\n");
+  });
+
+  it("follows another branch's upstream and ignores origin/main", async () => {
+    const { app, remote, updater, merge } = await fixture();
+    const other = join(app, "..", "other");
+    execFileSync("git", ["clone", "--quiet", remote, other]);
+    git(other, "checkout", "--quiet", "-b", "hotfix");
+    git(other, "push", "--quiet", "-u", "origin", "hotfix");
+    git(app, "fetch", "--quiet", "origin");
+    git(app, "checkout", "--quiet", "--track", "origin/hotfix");
+    await merge("code.ts", "export const version = 2;\n");
+    await writeFile(join(other, "code.ts"), "export const version = 3;\n");
+    git(other, "commit", "--quiet", "-am", "Hotfix");
+    git(other, "push", "--quiet");
+    expect(await updater.check()).toMatchObject({ outcome: "built", following: "origin/hotfix" });
+    expect(head(app)).toBe(head(other));
+    expect(await readFile(join(app, "code.ts"), "utf8")).toBe("export const version = 3;\n");
+  });
+
+  it("leaves a branch with no upstream alone", async () => {
     const { app, updater, npmCalls, merge } = await fixture();
     git(app, "checkout", "--quiet", "-b", "feature");
     const before = head(app);
     await merge("code.ts", "export const version = 2;\n");
-    expect(await updater.check()).toMatchObject({ outcome: "blocked", message: "the Indra checkout is on feature, not main" });
+    expect(await updater.check()).toMatchObject({ outcome: "blocked", message: "not following a branch: feature has no upstream on origin" });
+    expect(head(app)).toBe(before);
+    expect(await npmCalls()).toEqual([]);
+  });
+
+  it("leaves a detached HEAD alone", async () => {
+    const { app, updater, npmCalls, merge } = await fixture();
+    git(app, "checkout", "--quiet", "--detach");
+    const before = head(app);
+    await merge("code.ts", "export const version = 2;\n");
+    expect(await updater.check()).toMatchObject({ outcome: "blocked", message: "not following a branch: the Indra checkout has a detached HEAD" });
     expect(head(app)).toBe(before);
     expect(await npmCalls()).toEqual([]);
   });
@@ -180,7 +271,8 @@ describe("self-update", () => {
   it("keeps the old build when the new one fails, shows the error, and does not rebuild the same commit", async () => {
     const { app, runtime, updater, npmCalls, merge } = await fixture();
     await writeFile(join(app, "fail-build"), "");
-    await merge("code.ts", "export const version = 2\n");
+    git(app, "add", "fail-build");
+    git(app, "commit", "--quiet", "-m", "Break the build");
     const failed = await updater.check();
     expect(failed.outcome).toBe("failed");
     expect(failed.message).toContain("still running the previous build");

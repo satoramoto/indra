@@ -1,5 +1,7 @@
 import { SprintGitHub } from "../src/sprint.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { Ajv2020 } from "ajv/dist/2020.js";
+import addFormats from "ajv-formats";
 import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { git, stateCheckout } from "./state-checkout.js";
@@ -18,6 +20,7 @@ afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 const PR = "https://github.com/satoramoto/indra/pull/9";
 const BRANCH = "seat-002/goal-abc-outcome-1";
 const RECORD = "seat-seat-002-goal-abc-outcome-1";
+const seat_ = (id: string, name: string, roles: string[]) => seat(id, name, roles);
 const seat = (id: string, name: string, roles: string[]) => ({ id, displayName: name, roles, externalIdentities: { mattermost: { userId: id, username: name.toLowerCase() } } });
 
 const READY = { version: 1 as const, consumers: { planning: 1 as const, developer: 1 as const, release: 1 as const, retro: 1 as const, tui: 1 as const } };
@@ -634,6 +637,84 @@ describe("developer seat", () => {
     const { seat, store: approved } = await setup([queued("outcome-3", "2026-01-01T00:00:00Z", "seat-003")]);
     expect(await seat.tick()).toBe("idle");
     expect((await approved.read()).planningGoals![0].assignments![0].status).toBe("queued");
+  });
+
+  describe("idle seats take over queued work", () => {
+    const busy = (): Assignment => ({ outcomeId: "outcome-1", seatId: "seat-003", status: "running", updatedAt: "2026-01-01T00:00:00Z" });
+    const stateOf = async (store: PlanningStore) => JSON.parse(await readFile(join(store.checkout, "state.json"), "utf8"));
+    const schemaValid = async (store: PlanningStore) => {
+      const ajv = new Ajv2020({ strict: false }); addFormats.default(ajv);
+      const validate = ajv.compile(JSON.parse(await readFile("schema/v1/state.schema.json", "utf8")));
+      return validate(await stateOf(store)) ? [] : validate.errors;
+    };
+
+    it("takes a queued outcome from a busy seat, reassigns and claims it in one schema-valid write, and says so", async () => {
+      const { store, shell, seat, chat, assignment } = await setup([busy(), queued("outcome-2", "2026-01-01T00:00:00Z", "seat-003")]);
+      let claimed: Assignment | undefined;
+      shell.onFirst = async () => { claimed = await assignment("outcome-2"); expect(await schemaValid(store)).toEqual([]); };
+      expect(await seat.tick()).toBe("worked");
+      expect(claimed).toMatchObject({ seatId: "seat-002", status: "running", note: "taken over from seat-003 (idle)" });
+      expect(await assignment("outcome-1")).toEqual(busy());
+      expect(chat.messages[0]).toContain("taken over from seat-003");
+      expect(git(store.checkout, "log", "--format=%s")).toContain("Seat seat-002 takes over goal-abc/outcome-2 from seat-003: running");
+      // File ownership stays with the outcome in the approved proposal.
+      expect((await store.read()).planningGoals![0].proposal!.outcomes.find((item) => item.id === "outcome-2")!.seatId).toBe("seat-003");
+      expect((await new ImplementationRecorder(store, "seat-002", "goal-abc", "outcome-2").read()).attempts).toHaveLength(1);
+      expect(await schemaValid(store)).toEqual([]);
+    });
+
+    it("leaves an idle seat's next queued outcome with it", async () => {
+      const { seat, assignment } = await setup([queued("outcome-3", "2026-01-01T00:00:00Z", "seat-003")]);
+      expect(await seat.tick()).toBe("idle");
+      expect(await assignment("outcome-3")).toMatchObject({ seatId: "seat-003", status: "queued" });
+    });
+
+    it("never takes running, in-review, failed or retained work", async () => {
+      const failed: Assignment = { outcomeId: "outcome-2", seatId: "seat-003", status: "failed", updatedAt: "2026-01-01T00:00:00Z", note: "ci: failed" };
+      const { store, seat, assignment, shell } = await setup([busy(), failed, queued("outcome-3", "2026-01-01T00:00:00Z", "seat-003")]);
+      const before = await stateOf(store);
+      // A retained record from seat-003's earlier attempt.
+      await store.saveRuntime("seat-seat-003-goal-abc-outcome-3", { goalId: "goal-abc", outcomeId: "outcome-3", step: "ci", branch: "seat-003/goal-abc-outcome-3", worktree: "x", sessions: [] });
+      expect(await seat.tick()).toBe("idle");
+      await rm(join(store.runtimeDir, "seat-seat-003-goal-abc-outcome-3.json"));
+      // An attempt in seat-003's ledger.
+      await new ImplementationRecorder(store, "seat-003", "goal-abc", "outcome-3").prepareClaim("2026-01-01T00:00:00Z", "2026-01-01T00:01:00Z");
+      expect(await seat.tick()).toBe("idle");
+      await rm(join(store.runtimeDir, "implementation-goal-abc-seat-003-outcome-3.json"));
+      // A retained worktree.
+      await mkdir(join(store.runtimeDir, "worktrees", "goal-abc-outcome-3"), { recursive: true });
+      expect(await seat.tick()).toBe("idle");
+      expect(await stateOf(store)).toEqual(before);
+      expect(shell.calls).toEqual([]);
+      await rm(join(store.runtimeDir, "worktrees", "goal-abc-outcome-3"), { recursive: true });
+      shell.onFirst = async () => { expect(await assignment("outcome-3")).toMatchObject({ seatId: "seat-002", status: "running" }); };
+      expect(await seat.tick()).toBe("worked");
+      expect(await assignment("outcome-2")).toEqual(failed);
+      expect(await assignment("outcome-1")).toEqual(busy());
+    });
+
+    it("gives one winner when two idle seats race for the same outcome", async () => {
+      const { store, chat, shell, codex, seat } = await setup([busy(), queued("outcome-2", "2026-01-01T00:00:00Z", "seat-003")]);
+      codex.findings = [];
+      await store.update((state) => { (state.teams as { seats: unknown[] }[])[0].seats.push(seat_("seat-004", "Dizzy", ["Developer"])); }, "Add seat-004");
+      const other = Object.assign(new DeveloperSeat(store, await loadDeveloperSeat(store, "seat-004"), chat, shell, codex.factory), { mergeRetryMs: 0 });
+      const lock = store.withGoalLock.bind(store);
+      let entrants = 0; let release!: () => void;
+      const both = new Promise<void>((done) => { release = done; });
+      vi.spyOn(store, "withGoalLock").mockImplementation(async (id, work) => {
+        if (++entrants <= 2) { if (entrants === 2) release(); await both; }
+        return lock(id, work);
+      });
+      const results = await Promise.all([seat.tick(), other.tick()]);
+      expect(results.sort()).toEqual(["idle", "worked"]);
+      const winner = (await store.read()).planningGoals![0].assignments!.find((item) => item.outcomeId === "outcome-2")!.seatId;
+      expect(["seat-002", "seat-004"]).toContain(winner);
+      const loser = winner === "seat-002" ? "seat-004" : "seat-002";
+      expect((await new ImplementationRecorder(store, winner, "goal-abc", "outcome-2").read()).attempts).toHaveLength(1);
+      expect((await new ImplementationRecorder(store, loser, "goal-abc", "outcome-2").read()).attempts).toEqual([]);
+      expect(git(store.checkout, "log", "--format=%s").match(/takes over/g)).toHaveLength(1);
+      expect(await schemaValid(store)).toEqual([]);
+    });
   });
 
   it("on restart resumes an in-review assignment from its recorded step instead of claiming another", async () => {

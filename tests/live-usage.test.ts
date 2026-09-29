@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LiveUsageReader, LiveUsageTail, type LiveUsage, type LiveUsagePort } from "../src/live-usage.js";
+import { contextTokens, isCompaction, LiveUsageReader, LiveUsageTail, type LiveUsage, type LiveUsagePort } from "../src/live-usage.js";
 import { headedMarkerFile } from "../src/headed-session.js";
 import { TmuxHost, type HostedProcess } from "../src/tmux-host.js";
 import { StateInventory, type StateSnapshot } from "../src/state-domain.js";
@@ -48,6 +48,53 @@ describe("incremental live-token reader", () => {
   });
 });
 
+describe("the live context window", () => {
+  it("takes a Codex rollout's newest call from last_token_usage, never the cumulative total, and notes a compaction", async () => {
+    const log = join(dir, "rollout-2026-09-29T10-00-00-01a0edc4-5423-7bb1-a275-d78d1bc9c520.jsonl");
+    const count = (last: object, total: object) => JSON.stringify({ timestamp: "2026-09-29T10:05:00.000Z", type: "event_msg", payload: { type: "token_count", info: { total_token_usage: total, last_token_usage: last, model_context_window: 400_000 } } }) + "\n";
+    await writeFile(log, count({ input_tokens: 120_000, cached_input_tokens: 100_000, output_tokens: 1_500, reasoning_output_tokens: 500, total_tokens: 121_500 }, { input_tokens: 900_000, cached_input_tokens: 700_000, output_tokens: 9_000, total_tokens: 909_000 })
+      + count({ input_tokens: 180_000, cached_input_tokens: 170_000, output_tokens: 2_000, total_tokens: 182_000 }, { input_tokens: 1_080_000, cached_input_tokens: 870_000, output_tokens: 11_000, total_tokens: 1_091_000 }));
+    const tail = new LiveUsageTail(log, "codex", () => Date.parse("2026-09-29T10:06:00.000Z"));
+    expect(await tail.read()).toEqual({ inputTokens: 1_080_000, cachedInputTokens: 870_000, outputTokens: 11_000 });
+    expect([tail.context, tail.compactedAt]).toEqual([182_000, undefined]);
+    await appendFile(log, JSON.stringify({ timestamp: "2026-09-29T10:07:00.000Z", type: "compacted", payload: { message: "summary" } }) + "\n"
+      + count({ input_tokens: 30_000, cached_input_tokens: 0, output_tokens: 800 }, { input_tokens: 1_110_000, cached_input_tokens: 870_000, output_tokens: 11_800 }));
+    await tail.read();
+    // Without total_tokens the window is input plus output.
+    expect([tail.context, tail.compactedAt]).toEqual([30_800, "2026-09-29T10:07:00.000Z"]);
+  });
+
+  it("takes a Claude transcript's newest main-thread message: input plus cache reads plus cache writes", async () => {
+    const log = join(dir, `${id}.jsonl`);
+    const message = (messageId: string, usage: object, extra: object = {}) => JSON.stringify({ type: "assistant", sessionId: id, timestamp: "2026-09-29T10:05:00.000Z", message: { id: messageId, usage }, ...extra }) + "\n";
+    await writeFile(log, message("msg_1", { input_tokens: 2_000, cache_read_input_tokens: 170_000, cache_creation_input_tokens: 10_000, output_tokens: 900 })
+      // A subagent's message is not the session's window.
+      + message("msg_side", { input_tokens: 5, cache_read_input_tokens: 5, cache_creation_input_tokens: 5, output_tokens: 1 }, { isSidechain: true }));
+    const tail = new LiveUsageTail(log, "claude", () => Date.parse("2026-09-29T10:06:00.000Z"));
+    await tail.read();
+    expect([tail.context, tail.compactedAt]).toEqual([182_000, undefined]);
+    await appendFile(log, JSON.stringify({ type: "system", subtype: "compact_boundary", sessionId: id, timestamp: "2026-09-29T10:08:00.000Z" }) + "\n"
+      + message("msg_2", { input_tokens: 1_000, cache_read_input_tokens: 0, cache_creation_input_tokens: 24_000, output_tokens: 300 }));
+    await tail.read();
+    expect([tail.context, tail.compactedAt]).toEqual([25_000, "2026-09-29T10:08:00.000Z"]);
+  });
+
+  it("reads the window from one entry, and treats a window that halves as a compaction", async () => {
+    expect(contextTokens("codex", { type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 } } } })).toBe(12);
+    expect(contextTokens("codex", { type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { input_tokens: 10 } } } })).toBeUndefined();
+    expect(contextTokens("claude", { type: "assistant", message: { usage: { input_tokens: 1, cache_read_input_tokens: 2, cache_creation_input_tokens: 3 } } })).toBe(6);
+    expect(contextTokens("claude", { type: "user", message: { usage: { input_tokens: 1 } } })).toBeUndefined();
+    expect([isCompaction("codex", { type: "compacted" }), isCompaction("claude", { type: "system", subtype: "compact_boundary" }), isCompaction("claude", { type: "compacted" })]).toEqual([true, true, false]);
+    // No marker, but the window fell from 200k to 40k: noted at the read time when the entry carries none.
+    const log = join(dir, `${id}.jsonl`);
+    const plain = (messageId: string, input: number) => JSON.stringify({ type: "assistant", sessionId: id, message: { id: messageId, usage: { input_tokens: input, output_tokens: 1 } } }) + "\n";
+    await writeFile(log, plain("msg_1", 200_000) + plain("msg_2", 40_000));
+    const tail = new LiveUsageTail(log, "claude", () => Date.parse("2026-09-29T11:00:00.000Z"));
+    await tail.read();
+    expect([tail.context, tail.compactedAt]).toEqual([40_000, "2026-09-29T11:00:00.000Z"]);
+  });
+});
+
 describe("live usage of a hosted process", () => {
   const nonce = "0123abcd-0000-4000-8000-000000000000";
   const seat: HostedProcess = { kind: "seat", seatId: "seat-002" };
@@ -66,7 +113,7 @@ describe("live usage of a hosted process", () => {
     expect(await reader.read(seat)).toBeUndefined();
     now = 5000;
     await writeFile(headedMarkerFile(dir, nonce), JSON.stringify({ pid: 4242, engine: "claude", startedAt: "t", log }));
-    expect(await reader.read(seat)).toEqual({ engine: "claude", sessionId: `claude:${id}`, usage: { uncachedInputTokens: 100, outputTokens: 10 } });
+    expect(await reader.read(seat)).toEqual({ engine: "claude", sessionId: `claude:${id}`, usage: { uncachedInputTokens: 100, outputTokens: 10 }, context: 100 });
     await appendFile(log, assistant("msg_2", 50, 5));
     now = 9999;
     expect((await reader.read(seat))?.usage.uncachedInputTokens).toBe(100);

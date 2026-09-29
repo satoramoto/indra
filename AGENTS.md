@@ -36,6 +36,8 @@ Reviewers flag only these, each with the file, the line and a one-line reason:
 
 Don't comment on style or naming. Put small edge cases in a follow-up issue rather than blocking the PR.
 
+Claude write-mode seats run in Claude Code's `auto` permission mode (owner decision): a classifier approves safe actions instead of prompting. Read-only reviewer runs keep `plan`/`dontAsk`.
+
 ## Git
 
 - One branch per PR, created from `origin/main`: `git checkout --no-track -b <branch> origin/main`. Push with `git push -u origin HEAD:refs/heads/<branch>`.

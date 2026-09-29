@@ -1,7 +1,9 @@
 import { execFile } from "node:child_process";
 import { join, resolve } from "node:path";
 import { developerSeats, PlanningStore, type PlanningDocument } from "./planning.js";
-import { defaultAppDir, hostedProcessFor, NoChannelError, NoCredentialError, SystemTmux, TmuxHost, turnLockFile, type HostRecord, type TmuxRunner } from "./tmux-host.js";
+import { defaultAppDir, hostedProcessFor, NoChannelError, NoCredentialError, sweepHostFiles, SystemTmux, TmuxHost, turnLockFile, type HostRecord, type TmuxRunner } from "./tmux-host.js";
+import { headedMarkerFile, readHeadedMarker } from "./headed-session.js";
+import { reapOrphans } from "./process-tree.js";
 import { readBuildStamp } from "./build-stamp.js";
 import { withFileLock } from "./state-commit.js";
 import { ImplementationRecorder, implementationEligible } from "./implementation-facts.js";
@@ -55,6 +57,15 @@ export interface GoalStarter {
 }
 export type SprintAction = "integrate" | "merge" | "rollback";
 
+/** An update restarts a hosted process at most once per this interval, however many builds land meanwhile. */
+export const RESTART_DEBOUNCE_MS = 60_000;
+export interface SupervisorOptions {
+  /** Minimum uptime before an update restarts a process; defaults to RESTART_DEBOUNCE_MS. */
+  restartDebounceMs?: number;
+  /** Ends process trees left by hosted processes that are gone; defaults to reapOrphans. */
+  reap?: (runtimeDir: string) => Promise<number>;
+}
+
 /** Newest progress post a Developer seat made in its goal thread; kept in `<state-checkout>.runtime`. */
 export const activityRecordName = (seatId: string) => `activity-${seatId}`;
 
@@ -99,9 +110,35 @@ export class Supervisor implements SeatProcessPort {
      * each restart, where it keeps an already staged token unless `force` is set.
      */
     private readonly stageCredential?: (force: boolean) => Promise<void>,
-  ) {}
+    options: SupervisorOptions = {},
+  ) {
+    this.restartDebounceMs = options.restartDebounceMs ?? RESTART_DEBOUNCE_MS;
+    this.reap = options.reap ?? reapOrphans;
+  }
 
+  private readonly restartDebounceMs: number;
+  private readonly reap: (runtimeDir: string) => Promise<number>;
+  /** Sessions with a stop, restart or upgrade restart in flight: at most one at a time per hosted process. */
+  private readonly restarting = new Set<string>();
   private staged = false;
+
+  private get runtimeDir(): string { return `${resolve(this.checkout)}.runtime`; }
+
+  /**
+   * Ends process trees that hosted processes no longer running left behind (see process-tree.ts), and removes
+   * readiness signals and headed-run markers of replaced processes. Never throws.
+   */
+  async housekeeping(): Promise<void> {
+    await this.reap(this.runtimeDir).catch(() => 0);
+    await sweepHostFiles(this.runtimeDir).catch(() => 0);
+  }
+
+  /** Runs `work` unless another stop or restart of the same session is in flight; returns false when it was skipped. */
+  private async exclusive(session: string, work: () => Promise<void>): Promise<boolean> {
+    if (this.restarting.has(session)) return false;
+    this.restarting.add(session);
+    try { await work(); return true; } finally { this.restarting.delete(session); }
+  }
 
   /**
    * Stages the credential until it succeeds once; a failure is reported and the processes show "no credential".
@@ -124,6 +161,8 @@ export class Supervisor implements SeatProcessPort {
   }
 
   async ensureAll(): Promise<string[]> {
+    // At start-up, before hosting anything: what earlier runs left behind is ended first.
+    await this.housekeeping();
     const problems: string[] = [];
     const credentialProblem = await this.credential();
     if (credentialProblem) problems.push(credentialProblem);
@@ -222,12 +261,17 @@ export class Supervisor implements SeatProcessPort {
    * takes the process's turn lock (so no bridge poll or seat step is in flight), and a seat runner must also hold
    * no running or in-review assignment. A process that is busy stays up and is named in `pending`; the next call
    * tries again. Only this checkout's own verified sessions are stopped, through TmuxHost.
+   *
+   * Restarts are debounced: a process started less than `restartDebounceMs` ago, one with a headed run going, or one
+   * already being stopped or restarted stays up and is pending, so a burst of builds restarts each process once, onto
+   * the newest build, rather than once per build.
    */
   async upgrade(): Promise<{ pending: string[]; problems: string[] }> {
     const stamp = await readBuildStamp(this.appDir);
     const pending: string[] = [];
     const problems: string[] = [];
     if (!stamp) return { pending, problems };
+    await this.housekeeping();
     const seen = new Set<string>();
     for (const seat of seatsOf(await this.store.read())) {
       const host = this.host(seat);
@@ -236,33 +280,45 @@ export class Supervisor implements SeatProcessPort {
       const record = await host.verifiedRecord().catch(() => undefined);
       if (!record || record.build === stamp.id) continue;
       const label = host.hosted.kind === "bridge" ? "bridge" : seat.id;
+      const age = Date.now() - Date.parse(record.startedAt);
+      if (!(age >= this.restartDebounceMs) || await readHeadedMarker(headedMarkerFile(this.checkout, record.readyNonce))) { pending.push(label); continue; }
       let stopped = false as boolean;
-      try {
-        await withFileLock(turnLockFile(this.checkout, host.hosted), async () => {
-          // Read under the lock: a seat runner claims work only while it holds this lock.
-          if (host.hosted.kind === "seat" && holdsWork(await this.store.read(), seat.id)) return;
-          stopped = await host.stop();
-        }, 1000);
-      } catch { /* The turn lock is held: a poll or step is in flight. */ }
-      if (!stopped) { pending.push(label); continue; }
-      try { await host.start(); }
-      catch (error) { if (!shownOnSeat(error)) problems.push(`${label}: ${error instanceof Error ? error.message : String(error)}`); }
+      const ran = await this.exclusive(host.session, async () => {
+        try {
+          await withFileLock(turnLockFile(this.checkout, host.hosted), async () => {
+            // Read under the lock: a seat runner claims work only while it holds this lock.
+            if (host.hosted.kind === "seat" && holdsWork(await this.store.read(), seat.id)) return;
+            stopped = await host.stop();
+          }, 1000);
+        } catch { /* The turn lock is held: a poll or step is in flight. */ }
+        if (!stopped) return;
+        try { await host.start(); }
+        catch (error) { if (!shownOnSeat(error)) problems.push(`${label}: ${error instanceof Error ? error.message : String(error)}`); }
+      });
+      if (!ran || !stopped) pending.push(label);
     }
     return { pending, problems };
   }
 
+  /** The owner's stop: forced, even during a headed run; the stopped process ends its engine process trees. */
   async stop(seatId: string): Promise<void> {
-    await this.host(await this.seat(seatId)).stop();
+    const host = this.host(await this.seat(seatId));
+    if (!await this.exclusive(host.session, async () => { await host.stop(); })) throw new Error(`Seat '${seatId}' is already being stopped or restarted.`);
   }
 
+  /** The owner's restart: forced, like stop, and never run twice at once for the same process. */
   async restart(seatId: string): Promise<void> {
     const host = this.host(await this.seat(seatId));
-    // A seat that exited for a missing credential may hold a revoked token: read a fresh one.
-    const noCredential = (await this.processState(host)).process === "no credential";
-    const credentialProblem = await this.credential(true, noCredential);
-    await host.stop();
-    try { await host.start(); }
-    catch (error) { if (!shownOnSeat(error)) throw error; }
+    let credentialProblem: string | undefined;
+    const ran = await this.exclusive(host.session, async () => {
+      // A seat that exited for a missing credential may hold a revoked token: read a fresh one.
+      const noCredential = (await this.processState(host)).process === "no credential";
+      credentialProblem = await this.credential(true, noCredential);
+      await host.stop();
+      try { await host.start(); }
+      catch (error) { if (!shownOnSeat(error)) throw error; }
+    });
+    if (!ran) throw new Error(`Seat '${seatId}' is already being stopped or restarted.`);
     if (credentialProblem) throw new Error(credentialProblem);
   }
 }

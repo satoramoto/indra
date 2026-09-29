@@ -17,13 +17,19 @@ seats in Indra's own seat server (socket `indra-<hash>`), which keeps running af
 Indra never touches your own tmux server or configuration. Commands other than the UI (`npm start -- planning …`,
 `--once`, `--mattermost`, `seat run`) run directly in your terminal as before.
 
-In the UI, `a` watches a seat's live process: `Ctrl-]` comes back to Indra, the mouse wheel or `PgUp` scrolls back,
-and `q`, `Esc` or scrolling to the bottom returns to live. Nothing you type reaches the seat's run. `t` shows the seat's
-current Claude or Codex session as a read-only transcript that follows it live. `?` lists every key.
+A seat's screen shows its live session in a pane inside Indra, next to a seat list, the seat's details and the sprints:
+the headed `claude` or `codex` CLI, or the progress output of a headless run, mirrored in colour a few times a second.
+You never leave Indra and never see tmux. `Tab` and `Shift-Tab` move between those parts, and a click focuses one; the
+focused part has a bright border, and the mouse wheel scrolls whatever is under the pointer. Watching is the default:
+nothing you type reaches the seat. Focusing the session pane (`i`, `Tab` or a click) drives it during a headed run: the
+border turns orange, the pane reads "DRIVING <seat> — Esc Esc or Tab to stop", and your keys go to the agent CLI,
+`Ctrl-C` and a single `Esc` included. Two quick `Esc`s, `Tab`, or a click outside the pane stop driving. The bar at the
+bottom always lists the keys that apply right now. `t` shows the seat's current Claude or Codex session as a read-only
+transcript that follows it live. `?` lists every key.
 
 The screens are designed for a window of about 720×720 logical pixels at a 13 px font: 96 columns by 42 rows. At that
-size the team screen (seats plus the sprint card) and a seat's screen (live pane, seat detail, sprint strip) fit
-without scrolling; smaller terminals scroll with `PgUp`/`PgDn`. Colours and icons mean the same everywhere: 🏃 green
+size the team screen (seats plus the sprint card) fits without scrolling; on a seat's screen the live session takes
+most rows and the details and sprints scroll in their own panels. Smaller terminals scroll with `PgUp`/`PgDn`. Colours and icons mean the same everywhere: 🏃 green
 running, ⌛ amber waiting, 🙋 pink needs you, 💥 red failed, ✅ blue done, 💤 grey idle; needs-you and failed blink.
 Each assignment shows its pipeline 🔨 build, 🔍 review, 🩹 fix, 🧪 CI, 🔀 merge, lit as it advances, with a 🟢 🟡 🔴 dot
 for its last recorded CI run. Tokens (🧮) are the recorded input, cached input and output of finished sessions.

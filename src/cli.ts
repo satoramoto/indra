@@ -20,6 +20,8 @@ import { CHICK_USERNAME, MattermostAccessError, MattermostPlanningChat, readBotT
 import { opCredential, stageServiceToken } from "./service-account.js";
 import { captureOpEnvironment } from "./op-env.js";
 import { DeveloperSeat, loadDeveloperSeat, processShell } from "./developer-seat.js";
+import { shellWithEnv } from "./command-shell.js";
+import { withSeatGit } from "./seat-git.js";
 import { DEVELOPER_SESSION_TIMEOUT_MS, type AgentRuntime, type WriteAccess } from "./codex-runtime.js";
 import { loadSeatEngines, SeatRuntime } from "./seat-runtime.js";
 import { seatHarnessDir } from "./harness-home.js";
@@ -35,10 +37,9 @@ import { readFile, rm, writeFile, mkdir } from "node:fs/promises";
 import type { UiView } from "./terminal-ui.js";
 import { LocalSessionReader } from "./session-snapshot.js";
 import { CliGoalStarter, Supervisor } from "./supervisor.js";
-import { TmuxPaneTail } from "./pane-tail.js";
-import { attachTmux, parseOwnedTmuxTarget } from "./tmux-attach.js";
-import { verifyOwnedSession } from "./tmux-attach-owned.js";
+import { TmuxSeatSession } from "./session-mirror.js";
 import { headedMarkerFile, useHeadedMarker } from "./headed-session.js";
+import { ownedProcesses } from "./process-tree.js";
 import { LiveUsageReader } from "./live-usage.js";
 import { LocalTranscriptSource, TranscriptLocator } from "./session-transcript.js";
 import { checkConsistency, printConsistency, type TeamMemberReader } from "./consistency.js";
@@ -201,7 +202,7 @@ const isGoalAction = (action: string | undefined): action is GoalAction => (GOAL
 /** All model and posting paths use the seat from state, local engine selection and optional Indra profiles. */
 async function seatServices(store: PlanningStore, username: string, seatId?: string) {
   const state = await store.read();
-  const teams = state.teams as { slug: string; seats: { id: string; roles?: string[]; externalIdentities: { mattermost: { username: string } } }[] }[];
+  const teams = state.teams as { slug: string; seats: { id: string; displayName: string; roles?: string[]; externalIdentities: { mattermost: { username: string } } }[] }[];
   const seats = teams.flatMap((team) => team.seats);
   const candidates = seatId === undefined ? teams.find((team) => team.slug === "yahaha")?.seats ?? [] : seats.filter((item) => item.id === seatId);
   const seat = candidates.find((item) => item.externalIdentities.mattermost.username === username);
@@ -212,7 +213,7 @@ async function seatServices(store: PlanningStore, username: string, seatId?: str
   const engine = Object.hasOwn(engines, seat.id) ? engines[seat.id] : "codex";
   return {
     chat: (token: string) => withPersonaChat(new MattermostPlanningChat(token, username), profile),
-    runtime: (cwd: string, timeoutMs?: number, write?: WriteAccess) => withPersonaRuntime(new SeatRuntime(engine, cwd, timeoutMs, write, undefined, seatHarnessDir(store.runtimeDir, seat.id), seat.roles), profile),
+    runtime: (cwd: string, timeoutMs?: number, write?: WriteAccess) => withPersonaRuntime(new SeatRuntime(engine, cwd, timeoutMs, write, undefined, seatHarnessDir(store.runtimeDir, seat.id), seat.roles, (env) => withSeatGit(env, { displayName: seat.displayName, username })), profile),
   };
 }
 
@@ -297,6 +298,8 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
     if (options.mode === "seat") {
       recordRunningBuild(`${options.checkout}.runtime`, import.meta.url);
       if (options.readyNonce) useHeadedMarker(headedMarkerFile(options.checkout, options.readyNonce));
+      // A hosted runner records the engine process trees it starts and ends them when its pane or process is stopped.
+      if (options.readyNonce) ownedProcesses.useRecord(`${options.checkout}.runtime`);
       try {
         const store = createPlanningStore(options.checkout);
         const product = await loadProductSeat(store, options.seatId);
@@ -313,7 +316,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         const chat = services.chat(await hostedToken(options.checkout, options.readyNonce, (tokenOptions) => readBotToken(seat.username, tokenOptions)));
         await joinTeamHome(options.checkout, options.readyNonce, store, chat, seat.username);
         if (options.readyNonce) await signalReady(options.checkout, options.readyNonce);
-        const runner = new DeveloperSeat(store, seat, chat, processShell, (cwd, write) => services.runtime(cwd, DEVELOPER_SESSION_TIMEOUT_MS, write), (line) => console.log(`[${new Date().toISOString()}] ${line}`));
+        const runner = new DeveloperSeat(store, seat, chat, shellWithEnv((env) => withSeatGit(env, seat)), (cwd, write) => services.runtime(cwd, DEVELOPER_SESSION_TIMEOUT_MS, write), (line) => console.log(`[${new Date().toISOString()}] ${line}`));
         console.log(`Developer seat ${seat.id} (@${seat.username}) running. Stop with Ctrl-C.`);
         while (true) {
           // Each step holds the turn lock, so the supervisor only restarts this runner for an update between steps.
@@ -351,14 +354,9 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       return await runTerminalUi(new StateInventory(new LocalStateRepository(options.checkout)), new LocalSessionReader(options.checkout), {
         processes: new Supervisor(options.checkout, undefined, undefined, undefined, store, (force) => stageServiceToken(options.checkout, { force })),
         goals: new CliGoalStarter(options.checkout),
-        paneTail: new TmuxPaneTail(options.checkout),
-        // Watching a seat sets up keys, scrolling and the status line only on this checkout's verified sessions.
-        // Driving leaves the pane's input on, only for a verified session with a headed run going.
-        attach: (target, mode) => attachTmux(target, undefined, (socket, session) => verifyOwnedSession(options.checkout, socket, session), mode),
-        driveCheck: async (target) => {
-          const { socket, session } = parseOwnedTmuxTarget(target);
-          return (await verifyOwnedSession(options.checkout, socket, session))?.headed === true;
-        },
+        // The seat's live session is mirrored inside the UI from this checkout's verified panes only; driving switches
+        // a pane's input on only for a verified session with a headed run going, and only while its pane is focused.
+        session: new TmuxSeatSession(options.checkout),
         liveUsage: new LiveUsageReader(options.checkout),
         transcript: new LocalTranscriptSource(new TranscriptLocator(options.checkout)),
         launchCheck: () => checkLaunch(options.checkout, new SystemTmux(), new TmuxHost(options.checkout).socket),
@@ -374,6 +372,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
           rollback: () => updater.rollback(),
           rolledBack: () => updater.rolledBack(),
         },
+        updateMs: 5_000,
         view,
         reload: async (current) => {
           // Best effort: without the saved view the reloaded UI opens on its default page.
@@ -453,6 +452,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       }
       recordRunningBuild(`${options.checkout}.runtime`, import.meta.url);
       if (options.readyNonce) useHeadedMarker(headedMarkerFile(options.checkout, options.readyNonce));
+      if (options.readyNonce) ownedProcesses.useRecord(`${options.checkout}.runtime`);
       const chat = services.chat(await hostedToken(options.checkout, options.readyNonce, readChickToken));
       await joinTeamHome(options.checkout, options.readyNonce, store, chat, CHICK_USERNAME);
       const bridge = await createPlanningBridge(store, chat, services.runtime(process.cwd()));

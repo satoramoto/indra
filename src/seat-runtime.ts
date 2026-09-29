@@ -29,13 +29,13 @@ export async function loadSeatEngines(runtimeDir: string, seatIds: readonly stri
 
 /** `harness` is the seat's harness directory (`seatHarnessDir`); each engine's home lives inside it. */
 /** `roles` are the seat's roles from state; they pick the Codex model (see codexConfigForRoles) and the Claude effort (see claudeModelArgs). */
-export type EngineFactory = (engine: SeatEngine, cwd: string, timeoutMs?: number, write?: WriteAccess, harness?: string, roles?: readonly string[]) => AgentRuntime;
+export type EngineFactory = (engine: SeatEngine, cwd: string, timeoutMs?: number, write?: WriteAccess, harness?: string, roles?: readonly string[], envFor?: (env: NodeJS.ProcessEnv) => NodeJS.ProcessEnv) => AgentRuntime;
 // Claude keeps the owner's config directory, where its login lives; it is isolated with flags instead.
-const engineRuntime: EngineFactory = (engine, cwd, timeoutMs, write, harness, roles) => engine === "claude" ? new ClaudeRuntime(cwd, timeoutMs, write, roles) : new CodexRuntime(cwd, timeoutMs, write, harness === undefined ? undefined : engineHome(harness, "codex"), codexConfigForRoles(roles));
+export const engineRuntime: EngineFactory = (engine, cwd, timeoutMs, write, harness, roles, envFor) => engine === "claude" ? new ClaudeRuntime(cwd, timeoutMs, write, roles, undefined, envFor) : new CodexRuntime(cwd, timeoutMs, write, harness === undefined ? undefined : engineHome(harness, "codex"), codexConfigForRoles(roles), undefined, envFor);
 
 /** A handle always wins over the seat's current default. Never migrate, replay or fall back to another engine. */
 export class SeatRuntime implements AgentRuntime {
-  constructor(private readonly engine: SeatEngine, private readonly cwd: string, private readonly timeoutMs?: number, private readonly write?: WriteAccess, private readonly create: EngineFactory = engineRuntime, private readonly harness?: string, private readonly roles?: readonly string[]) {}
+  constructor(private readonly engine: SeatEngine, private readonly cwd: string, private readonly timeoutMs?: number, private readonly write?: WriteAccess, private readonly create: EngineFactory = engineRuntime, private readonly harness?: string, private readonly roles?: readonly string[], private readonly envFor?: (env: NodeJS.ProcessEnv) => NodeJS.ProcessEnv) {}
   async message(prompt: string, schemaPath: string, sessionId?: string, options?: MessageOptions) {
     let engine = this.engine;
     if (sessionId !== undefined) {
@@ -45,7 +45,7 @@ export class SeatRuntime implements AgentRuntime {
         engine = "codex";
       }
     }
-    return await this.create(engine, this.cwd, this.timeoutMs, this.write, this.harness, this.roles).message(prompt, schemaPath, sessionId, options);
+    return await this.create(engine, this.cwd, this.timeoutMs, this.write, this.harness, this.roles, this.envFor).message(prompt, schemaPath, sessionId, options);
   }
 }
 

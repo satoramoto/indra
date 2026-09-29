@@ -9,6 +9,7 @@ import { CLARIFY_TIMEOUT_MS, checkPromptSize, type RecordedAgentResult, type Age
 import { HARNESS_CONTEXT_TOKEN_LIMIT } from "./harness-home.js";
 import { claimHeaded, firstMessage, HeadedStartError, headedAvailable, prepareTaskFiles, readLog, resultValidator, runHeaded, taskDocument } from "./headed-session.js";
 import { childEnv } from "./op-env.js";
+import { ownedProcesses, TREE_REFRESH_MS } from "./process-tree.js";
 import { AgentRunError, RuntimeEventStream, RuntimeFacts, RuntimeStop, recordedError } from "./runtime-facts.js";
 
 export { claudePermissionArgs };
@@ -73,7 +74,7 @@ export class ClaudeRuntime implements AgentRuntime {
    * `roles` are the seat's roles from state; they pick the effort (see claudeModelArgs). `headed` defaults to
    * headedAvailable(): a new session in a hosted seat pane runs the interactive CLI there (see headed-session.ts).
    */
-  constructor(private readonly cwd: string, private readonly timeoutMs = CLARIFY_TIMEOUT_MS, private readonly write?: WriteAccess, private readonly roles?: readonly string[], private readonly headed = headedAvailable()) {}
+  constructor(private readonly cwd: string, private readonly timeoutMs = CLARIFY_TIMEOUT_MS, private readonly write?: WriteAccess, private readonly roles?: readonly string[], private readonly headed = headedAvailable(), private readonly envFor: (env: NodeJS.ProcessEnv) => NodeJS.ProcessEnv = (env) => env) {}
 
   async message(prompt: string, schemaPath: string, sessionId?: string, options: MessageOptions = {}): Promise<RecordedAgentResult> {
     const release = this.headed && sessionId === undefined ? claimHeaded() : undefined;
@@ -101,7 +102,7 @@ export class ClaudeRuntime implements AgentRuntime {
       const args = [...claudeModelArgs(this.roles), "--session-id", id, ...await claudePermissionArgs(this.cwd, this.write, files.result), "--", firstMessage(files)];
       // Indra disables every project setting source, hook and MCP server, so the workspace trust dialog guards nothing
       // here; CLAUDE_CODE_SANDBOXED skips it so the session never waits on it.
-      const env = { ...claudeEnv(claudeChildEnv()), CLAUDE_CODE_SANDBOXED: "1" };
+      const env = { ...claudeEnv(this.envFor(claudeChildEnv())), CLAUDE_CODE_SANDBOXED: "1" };
       const transcript = () => claudeTranscript(id);
       const response = await runHeaded({
         label: "Claude", cwd: this.cwd, files, validate: resultValidator(schema), launch: { command: "claude", args, env },
@@ -149,8 +150,12 @@ export class ClaudeRuntime implements AgentRuntime {
       if (signal?.aborted) { reject(new RuntimeStop("Claude run cancelled.", "interrupted")); return; }
       let child: ChildProcessWithoutNullStreams;
       try {
-        child = spawn("claude", args, { cwd: this.cwd, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32", env: claudeEnv(claudeChildEnv()) });
+        child = spawn("claude", args, { cwd: this.cwd, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32", env: claudeEnv(this.envFor(claudeChildEnv())) });
       } catch { reject(new RuntimeStop("Claude could not be started; check the executable and working directory.")); return; }
+      // Claude's tools run in process groups of their own: track the whole tree and end it with the run.
+      const tree = ownedProcesses.track(child.pid);
+      const treeTimer = setInterval(() => { void tree.then((run) => run.refresh()); }, TREE_REFRESH_MS);
+      treeTimer.unref?.();
       let settled = false; let stdoutBytes = 0; let stderrBytes = 0; const progress = claudeProgress({ cwd: this.cwd });
       let failure: RuntimeStop | undefined;
       let killTimer: ReturnType<typeof setTimeout> | undefined;
@@ -194,7 +199,9 @@ export class ClaudeRuntime implements AgentRuntime {
       child.on("error", (error: NodeJS.ErrnoException) => cancel(error.code === "ENOENT" ? "Claude executable not found; install Claude Code and sign in before selecting it for a seat." : "Claude process failed; diagnostics withheld."));
       child.on("close", (code) => {
         if (process.platform === "win32" || !child.pid) clearTimeout(killTimer);
-        finish(failure ?? (code === 0 ? undefined : new RuntimeStop(`Claude run failed (${code ?? "cancelled"}); diagnostics withheld.`, code === null ? "interrupted" : "failed")));
+        clearInterval(treeTimer);
+        const outcome = failure ?? (code === 0 ? undefined : new RuntimeStop(`Claude run failed (${code ?? "cancelled"}); diagnostics withheld.`, code === null ? "interrupted" : "failed"));
+        void tree.then((run) => run.end(1000)).catch(() => 0).then(() => finish(outcome));
       });
       child.stdin.on("error", () => cancel("Claude could not read the prompt; diagnostics withheld."));
       child.stdin.end(prompt);

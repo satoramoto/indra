@@ -5,7 +5,9 @@
  *
  * The hosted seat process (`seat run` or `planning serve`) owns its pane's terminal. A headed run spawns the CLI as its
  * child with the pane's terminal as stdin, stdout and stderr, in the same (foreground) process group, so the owner's
- * keystrokes reach the CLI. Nothing here runs tmux commands, so no other tmux session or pane is ever touched.
+ * keystrokes reach the CLI. Nothing here runs tmux commands, so no other tmux session or pane is ever touched. The
+ * CLI's tools run in process groups of their own, so the CLI's whole process tree is tracked while it runs and ended
+ * with it (process-tree.ts), however the run ends.
  *
  * The task is a file: Indra writes the prompt, plus the result schema and where to write the result, to
  * `.indra/task-<id>.md` in the task's working directory (git-ignored by `.indra/.gitignore`, never committed) and starts
@@ -30,6 +32,7 @@ import { dirname, join, resolve } from "node:path";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import { RuntimeStop, type RuntimeFacts } from "./runtime-facts.js";
+import { ownedProcesses, TREE_REFRESH_MS, type OwnedProcesses } from "./process-tree.js";
 
 /** Set to `1` by TmuxHost in the command of every hosted seat pane. */
 export const SEAT_PANE_VARIABLE = "INDRA_SEAT_PANE";
@@ -38,8 +41,11 @@ export const HEADLESS_VARIABLE = "INDRA_HEADLESS";
 /** The task and result files live here, relative to the task's working directory. */
 export const TASK_DIR = ".indra";
 
-/** Poll interval for the result and session log, how long a CLI may take to start a session, and the SIGTERM-to-SIGKILL grace. */
-export const headedTiming = { pollMs: 1000, startupMs: 120_000, killGraceMs: 3000 };
+/**
+ * Poll interval for the result and session log, how long a CLI may take to start a session, the SIGTERM-to-SIGKILL
+ * grace, and how often the CLI's process tree is snapshotted.
+ */
+export const headedTiming = { pollMs: 1000, startupMs: 120_000, killGraceMs: 3000, treeMs: TREE_REFRESH_MS };
 
 const truthy = (value: string | undefined) => !!value && !/^(0|false|no|off)$/i.test(value.trim());
 
@@ -164,6 +170,8 @@ export interface HeadedSpec {
   marker?: string;
   /** The console held while the CLI owns the pane; defaults to the global console. */
   console?: HeldConsole;
+  /** Tracks and ends the CLI's process tree; defaults to this process's ownedProcesses. */
+  owned?: Pick<OwnedProcesses, "track">;
 }
 
 /** The CLI never started a session; the caller may run the task headless instead. Nothing was sent to a model. */
@@ -192,8 +200,12 @@ export async function runHeaded(spec: HeadedSpec): Promise<unknown> {
   let child: ChildProcess;
   try {
     // Same process group as this hosted process, which is the pane's foreground group: the CLI can read the terminal.
+    // Its tools run in groups of their own, so the whole tree is tracked and ended with the run (process-tree.ts).
     child = spawn(spec.launch.command, spec.launch.args, { cwd: spec.cwd, stdio: "inherit", env: spec.launch.env });
   } catch { await cleanup(files); throw new RuntimeStop(`${label} could not be started; check the executable and working directory.`); }
+  const owned = spec.owned ?? ownedProcesses;
+  const tree = await owned.track(child.pid);
+  let treeAt = Date.now();
   // From here the CLI owns the pane: this process's log lines wait until it ends, and the marker says a headed run is on.
   const releaseConsole = holdConsole(spec.console);
   const marker = spec.marker ?? markerFile;
@@ -226,10 +238,15 @@ export async function runHeaded(spec: HeadedSpec): Promise<unknown> {
         if (log && marker) await writeMarker(marker, { ...markerState, log }).catch(() => undefined);
         if (!seenStart && Date.now() - startedAt >= headedTiming.startupMs) throw new HeadedStartError(`${label} did not start a headed session within ${Math.round(headedTiming.startupMs / 1000)} s.`);
       }
+      if (Date.now() - treeAt >= headedTiming.treeMs) { treeAt = Date.now(); await tree.refresh(); }
       await waitFor(headedTiming.pollMs, exited, spec.signal);
     }
   } finally {
+    // The CLI and everything it started end together: its own tools, background jobs and their process groups.
+    if (running) await tree.refresh();
+    await tree.end(headedTiming.killGraceMs);
     if (running) {
+      // Not found by `ps` (or `ps` failed): end the CLI itself, as before.
       try { child.kill("SIGTERM"); } catch { /* already exited */ }
       const escalate = setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* already exited */ } }, headedTiming.killGraceMs);
       await exited; clearTimeout(escalate);

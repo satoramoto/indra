@@ -43,8 +43,18 @@ export function uiSessionPlan(facts: UiSessionFacts): UiSessionPlan {
 }
 
 const exact = `=${UI_SESSION}`;
-/** Hides the status bar in the UI session, so nothing on screen names tmux. */
-const hideStatus = [";", "set-option", "-t", `${exact}:`, "status", "off"];
+/**
+ * Hides the status bar in the UI session, so nothing on screen names tmux, and switches every tmux key off on Indra's
+ * own UI socket (never the owner's server): no prefix key and no root-table bindings, so Ctrl-b and the rest reach
+ * Indra, and with tmux's mouse off every click and wheel goes to Indra too.
+ */
+const hideStatus = [
+  ";", "set-option", "-t", `${exact}:`, "status", "off",
+  ";", "set-option", "-g", "prefix", "None",
+  ";", "set-option", "-g", "prefix2", "None",
+  ";", "set-option", "-g", "mouse", "off",
+  ";", "unbind-key", "-a", "-T", "root",
+];
 
 /**
  * The tmux command that brings the owner to the UI: attach when the session exists, otherwise create it running

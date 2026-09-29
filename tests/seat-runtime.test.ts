@@ -40,12 +40,12 @@ describe("seat engine configuration and routing", () => {
     const roles = ["Team Lead"];
     const runtime = new SeatRuntime(engine, "/work", 60_000, write, create, harness, roles);
     expect(await runtime.message("Legacy", "schema", "legacy-codex", options)).toBe(result);
-    expect(create).toHaveBeenLastCalledWith("codex", "/work", 60_000, write, harness, roles);
+    expect(create).toHaveBeenLastCalledWith("codex", "/work", 60_000, write, harness, roles, undefined);
     expect(message).toHaveBeenLastCalledWith("Legacy", "schema", "legacy-codex", options);
     await runtime.message("Claude", "other-schema", claudeHandle, options);
-    expect(create).toHaveBeenLastCalledWith("claude", "/work", 60_000, write, harness, roles);
+    expect(create).toHaveBeenLastCalledWith("claude", "/work", 60_000, write, harness, roles, undefined);
     expect(message).toHaveBeenLastCalledWith("Claude", "other-schema", claudeHandle, options);
-    await runtime.message("New turn", "schema"); expect(create).toHaveBeenLastCalledWith(engine, "/work", 60_000, write, harness, roles);
+    await runtime.message("New turn", "schema"); expect(create).toHaveBeenLastCalledWith(engine, "/work", 60_000, write, harness, roles, undefined);
     expect(message).toHaveBeenLastCalledWith("New turn", "schema", undefined, undefined);
   });
 
