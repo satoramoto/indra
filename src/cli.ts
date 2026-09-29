@@ -14,6 +14,7 @@ import { captureOpEnvironment } from "./op-env.js";
 import { DeveloperSeat, loadDeveloperSeat, processShell } from "./developer-seat.js";
 import { DEVELOPER_SESSION_TIMEOUT_MS, type WriteAccess } from "./codex-runtime.js";
 import { loadSeatEngines, SeatRuntime } from "./seat-runtime.js";
+import { seatHarnessDir } from "./harness-home.js";
 import { loadSeatPersonas, withPersonaChat, withPersonaRuntime } from "./seat-persona.js";
 import { defaultAppDir, signalReady, TmuxHost, turnLockFile } from "./tmux-host.js";
 import { withFileLock } from "./state-commit.js";
@@ -150,7 +151,7 @@ async function seatServices(store: PlanningStore, username: string, seatId?: str
   const engine = Object.hasOwn(engines, seat.id) ? engines[seat.id] : "codex";
   return {
     chat: (token: string) => withPersonaChat(new MattermostPlanningChat(token, username), profile),
-    runtime: (cwd: string, timeoutMs?: number, write?: WriteAccess) => withPersonaRuntime(new SeatRuntime(engine, cwd, timeoutMs, write), profile),
+    runtime: (cwd: string, timeoutMs?: number, write?: WriteAccess) => withPersonaRuntime(new SeatRuntime(engine, cwd, timeoutMs, write, undefined, seatHarnessDir(store.runtimeDir, seat.id)), profile),
   };
 }
 

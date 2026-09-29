@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { CodexRuntime, type AgentRuntime, type MessageOptions, type WriteAccess } from "./codex-runtime.js";
 import { CLAUDE_SESSION_PREFIX, ClaudeRuntime, claudeSessionId } from "./claude-runtime.js";
+import { engineHome } from "./harness-home.js";
 
 export type SeatEngine = "codex" | "claude";
 export type SeatEngines = Readonly<Record<string, SeatEngine>>;
@@ -26,12 +27,14 @@ export async function loadSeatEngines(runtimeDir: string, seatIds: readonly stri
   return value as SeatEngines;
 }
 
-export type EngineFactory = (engine: SeatEngine, cwd: string, timeoutMs?: number, write?: WriteAccess) => AgentRuntime;
-const engineRuntime: EngineFactory = (engine, cwd, timeoutMs, write) => engine === "claude" ? new ClaudeRuntime(cwd, timeoutMs, write) : new CodexRuntime(cwd, timeoutMs, write);
+/** `harness` is the seat's harness directory (`seatHarnessDir`); each engine's home lives inside it. */
+export type EngineFactory = (engine: SeatEngine, cwd: string, timeoutMs?: number, write?: WriteAccess, harness?: string) => AgentRuntime;
+// Claude keeps the owner's config directory, where its login lives; it is isolated with flags instead.
+const engineRuntime: EngineFactory = (engine, cwd, timeoutMs, write, harness) => engine === "claude" ? new ClaudeRuntime(cwd, timeoutMs, write) : new CodexRuntime(cwd, timeoutMs, write, harness === undefined ? undefined : engineHome(harness, "codex"));
 
 /** A handle always wins over the seat's current default. Never migrate, replay or fall back to another engine. */
 export class SeatRuntime implements AgentRuntime {
-  constructor(private readonly engine: SeatEngine, private readonly cwd: string, private readonly timeoutMs?: number, private readonly write?: WriteAccess, private readonly create: EngineFactory = engineRuntime) {}
+  constructor(private readonly engine: SeatEngine, private readonly cwd: string, private readonly timeoutMs?: number, private readonly write?: WriteAccess, private readonly create: EngineFactory = engineRuntime, private readonly harness?: string) {}
   async message(prompt: string, schemaPath: string, sessionId?: string, options?: MessageOptions) {
     let engine = this.engine;
     if (sessionId !== undefined) {
@@ -41,6 +44,6 @@ export class SeatRuntime implements AgentRuntime {
         engine = "codex";
       }
     }
-    return await this.create(engine, this.cwd, this.timeoutMs, this.write).message(prompt, schemaPath, sessionId, options);
+    return await this.create(engine, this.cwd, this.timeoutMs, this.write, this.harness).message(prompt, schemaPath, sessionId, options);
   }
 }

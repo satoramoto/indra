@@ -10,7 +10,7 @@ import { PlanningStore } from "../src/planning.js";
 import { loadSeatPersonas, type SeatPersona } from "../src/seat-persona.js";
 
 const fakes = vi.hoisted(() => ({
-  calls: [] as { engine: string; cwd: string; timeout?: number; write?: WriteAccess; prompt: string; schema: string; session?: string; options?: MessageOptions }[],
+  calls: [] as { engine: string; cwd: string; timeout?: number; write?: WriteAccess; home?: string; prompt: string; schema: string; session?: string; options?: MessageOptions }[],
   posts: [] as { username: string; channel: string; message: string; root?: string; delivery?: string }[],
   actions: [] as string[],
   token: vi.fn(async () => "test-bot-token"),
@@ -19,9 +19,9 @@ const fakes = vi.hoisted(() => ({
 }));
 function fakeRuntime(engine: string) {
   return class implements AgentRuntime {
-    constructor(private cwd: string, private timeout?: number, private write?: WriteAccess) {}
+    constructor(private cwd: string, private timeout?: number, private write?: WriteAccess, private home?: string) {}
     async message(prompt: string, schema: string, session?: string, options?: MessageOptions) {
-      fakes.calls.push({ engine, cwd: this.cwd, timeout: this.timeout, write: this.write, prompt, schema, session, options });
+      fakes.calls.push({ engine, cwd: this.cwd, timeout: this.timeout, write: this.write, home: this.home, prompt, schema, session, options });
       return { sessionId: session ?? (engine === "claude" ? "claude:12345678-1234-4321-8765-123456789abc" : "codex-new"), response: {}, startedAt: "start", finishedAt: "finish" };
     }
   };
@@ -139,6 +139,18 @@ describe("every CLI runtime/chat construction path", () => {
     expect(fakes.calls.map((call) => call.write)).toEqual([{ extraDirs: ["/shared.git"] }, undefined, { extraDirs: ["/shared.git"] }]);
     for (const call of fakes.calls) expect(call).toMatchObject({ cwd: "/assignment-worktree", timeout: 60 * 60_000, prompt: expect.stringContaining(developer.voice) });
     expect(fakes.posts[0]).toMatchObject({ username: "developer", channel: "home", root: "goal-root", delivery: undefined, message: expect.stringContaining(developer.funFact) });
+  });
+
+  it("gives each seat's Codex runs its own harness home under the runtime directory, and Claude none", async () => {
+    await configure({ "seat-lead": "codex", "seat-dev": "claude" });
+    await planning("start");
+    expect(fakes.calls[0]).toMatchObject({ engine: "codex", home: join(`${checkout}.runtime`, "harness", "seat-lead", "codex") });
+    await configure({ "seat-lead": "codex", "seat-dev": "codex" });
+    await main(["seat", "run", "--seat", "seat-dev", "--state", checkout]);
+    for (const call of fakes.calls.slice(1)) expect(call.home).toBe(join(`${checkout}.runtime`, "harness", "seat-dev", "codex"));
+    await configure({ "seat-lead": "claude" }); fakes.calls.length = 0;
+    await planning("start");
+    expect(fakes.calls[0]).toMatchObject({ engine: "claude", home: undefined });
   });
 
   it("surfaces invalid config before reading a token or constructing a model/chat", async () => {

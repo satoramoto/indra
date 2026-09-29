@@ -36,14 +36,15 @@ describe("seat engine configuration and routing", () => {
     const result = { sessionId: "saved", response: {}, usage: { count: 1 }, startedAt: "start", finishedAt: "finish" };
     const message = vi.fn().mockResolvedValue(result); const create = vi.fn<EngineFactory>(() => ({ message }));
     const write = { extraDirs: ["/shared.git"] }; const options = { signal: new AbortController().signal, timeoutMs: 20_000 };
-    const runtime = new SeatRuntime(engine, "/work", 60_000, write, create);
+    const harness = "/state.runtime/harness/seat-001";
+    const runtime = new SeatRuntime(engine, "/work", 60_000, write, create, harness);
     expect(await runtime.message("Legacy", "schema", "legacy-codex", options)).toBe(result);
-    expect(create).toHaveBeenLastCalledWith("codex", "/work", 60_000, write);
+    expect(create).toHaveBeenLastCalledWith("codex", "/work", 60_000, write, harness);
     expect(message).toHaveBeenLastCalledWith("Legacy", "schema", "legacy-codex", options);
     await runtime.message("Claude", "other-schema", claudeHandle, options);
-    expect(create).toHaveBeenLastCalledWith("claude", "/work", 60_000, write);
+    expect(create).toHaveBeenLastCalledWith("claude", "/work", 60_000, write, harness);
     expect(message).toHaveBeenLastCalledWith("Claude", "other-schema", claudeHandle, options);
-    await runtime.message("New turn", "schema"); expect(create).toHaveBeenLastCalledWith(engine, "/work", 60_000, write);
+    await runtime.message("New turn", "schema"); expect(create).toHaveBeenLastCalledWith(engine, "/work", 60_000, write, harness);
     expect(message).toHaveBeenLastCalledWith("New turn", "schema", undefined, undefined);
   });
 
