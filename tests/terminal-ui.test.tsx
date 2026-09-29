@@ -943,6 +943,7 @@ describe("persisted ceremony and allowed actions", () => {
       }
     };
     await check(ceremonySession("planning"), ["P propose"]);
+    await check({ ...ceremonySession("proposal"), stage: "clarifying" }, ["P propose"]);
     await check({ ...ceremonySession("proposal"), stage: "drafting" }, []);
     await check(ceremonySession("proposal"), ["A approve"]);
     await check(ceremonySession("implement"), ["I integrate"]);
@@ -969,6 +970,36 @@ describe("persisted ceremony and allowed actions", () => {
     await check(inconsistent, []);
     fixture.model.seatId = "seat-002";
     await check(ceremonySession("proposal"), []);
+  });
+
+  it.each(["refresh", "restart"])("offers a confirmed proposal retry after draft recovery on %s", async (recovery) => {
+    const drafting = { ...ceremonySession("proposal"), stage: "drafting" };
+    const fixture = await ceremonyHarness([drafting]);
+    expect(fixture.model.ceremonyKeys()).toEqual([]);
+    fixture.sessions([{ ...drafting, stage: "clarifying" }]);
+    const model = recovery === "restart" ? new TerminalUiModel(fixture.state, fixture.reader, undefined, fixture.goals) : fixture.model;
+    model.restore(fixture.model.view());
+    await model.refresh();
+    expect(model.ceremonyKeys()).toEqual(["P propose"]);
+    const setup = await testRender(() => <TerminalApp model={model} revision={() => model.revision} onKey={() => {}} />, { width: 100, height: 32 });
+    try {
+      await setup.renderOnce();
+      expect(setup.captureCharFrame()).toContain("P propose");
+      const frames = await scrollFrames(setup, "detail-scroll");
+      expect(visibleIn(frames, "Current stage: proposal")).toBe(true);
+      expect(visibleIn(frames, "P requests Chick's proposal here")).toBe(true);
+    } finally { setup.renderer.destroy(); }
+    model.key("p", "P");
+    expect(model.confirm).toEqual({ action: "propose", goalId: drafting.id, goal: drafting.goal });
+    await model.proposeConfirmed();
+    expect(fixture.goals.propose).not.toHaveBeenCalled();
+    vi.mocked(fixture.goals.propose).mockImplementation(async () => { fixture.sessions([drafting]); return "Proposal requested."; });
+    expect(model.key("y", "y")).toBe("propose");
+    await model.proposeConfirmed();
+    expect(fixture.goals.propose).toHaveBeenCalledExactlyOnceWith(drafting.id);
+    expect(model.ceremonyKeys()).toEqual([]);
+    expect(model.sprintsForTeam()[0].loop.ceremony).toEqual(drafting.loop!.ceremony);
+    expect(fixture.goals.approve).not.toHaveBeenCalled();
   });
 
   it("blocks new goals for open and legacy goals after restart, retaining closed history", async () => {
@@ -1008,6 +1039,41 @@ describe("persisted ceremony and allowed actions", () => {
     expect(fixture.goals.start).toHaveBeenCalledExactlyOnceWith("My next goal");
     expect(fixture.model.input).toBeUndefined();
     expect(fixture.model.newGoalBlocked()).toContain("goal-new");
+  });
+
+  it.each(["update", "refresh"])("cancels a goal submission with Escape while waiting for %s", async (waitingFor) => {
+    const fixture = await ceremonyHarness([]);
+    let finish = () => {};
+    const waiting = new Promise<void>((resolve) => { finish = resolve; });
+    const update: UpdatePort = {
+      canReload: false, current: async () => undefined,
+      check: vi.fn(async (): Promise<UpdateResult> => { await waiting; return { outcome: "up-to-date", message: "Up to date.", at: "now" }; }),
+    };
+    const model = new TerminalUiModel(fixture.state, fixture.reader, undefined, fixture.goals, undefined, update);
+    await model.refresh();
+    const readSessions = vi.spyOn(fixture.reader, "readSessions");
+    let updating: Promise<void> | undefined;
+    if (waitingFor === "update") {
+      updating = model.updateCode();
+      await vi.waitFor(() => expect(update.check).toHaveBeenCalledOnce());
+    } else {
+      readSessions.mockImplementationOnce(async () => { await waiting; return { connection: "disconnected", sessions: [] }; });
+    }
+    model.key("n"); model.key("paste", "The canceled goal");
+    expect(model.key("return")).toBe("submit");
+    const submitting = model.submitInput();
+    if (waitingFor === "refresh") expect(readSessions).toHaveBeenCalledOnce();
+    expect(fixture.goals.start).not.toHaveBeenCalled();
+    model.key("escape");
+    expect(model.input).toBeUndefined();
+    finish();
+    await Promise.all([updating, submitting]);
+    expect(fixture.goals.start).not.toHaveBeenCalled();
+    expect(model.input).toBeUndefined();
+    expect(model.newGoalBlocked()).toBeUndefined();
+    model.key("n"); model.key("paste", "A later goal");
+    await model.submitInput();
+    expect(fixture.goals.start).toHaveBeenCalledExactlyOnceWith("A later goal");
   });
 
   it("expires stale confirmations on refresh and refuses an approval that changes after y", async () => {

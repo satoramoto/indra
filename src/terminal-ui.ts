@@ -404,6 +404,8 @@ export class TerminalUiModel {
     try {
       await this.tracked(async () => {
         await this.refresh();
+        // Escape can cancel this input while an update or refresh is in flight.
+        if (this.input !== input) return;
         const blocked = this.newGoalBlocked(true);
         if (blocked || teamId !== this.teamId) {
           this.notice = blocked ?? "The selected team changed; review the goal before starting it.";
@@ -455,7 +457,7 @@ export class TerminalUiModel {
     if (action === "merge" && this.goals.sprint && integration?.status === "merged" && integration.revertPrUrl
       && (stage === "release" || stage === "retro")) return { ...target, mergeKind: "revert", prUrl: integration.revertPrUrl };
     if (loop.closedAt) return undefined;
-    if (action === "propose") return stage === "planning" && session.stage === "clarifying" ? target : undefined;
+    if (action === "propose") return (stage === "planning" || stage === "proposal") && session.stage === "clarifying" ? target : undefined;
     if (action === "approve") return stage === "proposal" && session.stage === "awaiting-review" ? { ...target, updatedAt: session.updatedAt } : undefined;
     if (!this.goals.sprint || session.stage !== "approved") return undefined;
     if (action === "integrate") return (stage === "implement" || stage === "release") && integration?.status === "collecting"
