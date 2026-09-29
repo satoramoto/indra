@@ -17,7 +17,7 @@ export interface LaneJournal {
   id: string; branch: string; worktree: string; baseSha: string; gitDir: string; prepared: boolean;
   sessions: GoalAgentSession[]; attempt: number; built: boolean; summary: LaneAgentSummary | null;
   checks: LaneCheck[]; prUrl: string | null; headSha: string | null; mergedSha: string | null;
-  fixes: string[]; review: SavedReview | null; reviewWorktrees: Record<string, string>; cleaned: boolean;
+  fixes: string[]; fixAttempts?: { key: string; attempt: number; status: "started" | "failed" | "complete" }[]; review: SavedReview | null; reviewWorktrees: Record<string, string>; cleaned: boolean;
 }
 export interface LaneObservation {
   url: string; headSha: string; baseSha: string; state: "OPEN" | "CLOSED" | "MERGED"; mergedSha: string | null;
@@ -30,7 +30,7 @@ export interface DeveloperLaneServices {
   publish(lane: GoalLane, brief: GoalBrief, journal: LaneJournal, persist: () => Promise<void>): Promise<string>;
   observe(lane: GoalLane, brief: GoalBrief, journal: LaneJournal): Promise<LaneObservation>;
   review(lane: GoalLane, brief: GoalBrief, journal: LaneJournal, observation: LaneObservation, persist: () => Promise<void>): Promise<void>;
-  fix(lane: GoalLane, brief: GoalBrief, journal: LaneJournal, problem: string, key: string, conflictBase: string | null, persist: () => Promise<void>): Promise<void>;
+  fix(lane: GoalLane, brief: GoalBrief, journal: LaneJournal, problem: string, key: string, conflictBase: string | null, persist: () => Promise<void>, retry?: boolean): Promise<void>;
   merge(url: string): Promise<{ merged: true; sha: string } | { merged: false; reason: string }>;
   finish(brief: GoalBrief, lanes: { lane: GoalLane; journal: LaneJournal }[]): Promise<{ headSha: string; checks: GoalReport["checks"]; followUps: string[] }>;
 }
@@ -153,22 +153,31 @@ export class GitDeveloperLanes implements DeveloperLaneServices {
     await this.noProcesses(journal.worktree, project);
     if (journal.built) return;
     const scoped = { ...brief, header: { ...brief.header, baseSha: journal.baseSha } };
-    const plan = journal.attempt > 0 ? { workers: [], decisions: [], followUps: [] } : await this.agent(journal, persist, { key: `workers:${journal.attempt}`, role: "lead-plan", brief: scoped, cwd: journal.worktree, schema: LANE_WORKER_PLAN_SCHEMA,
+    const completedPlan = journal.sessions.find((session) => session.role === "lead-plan" && session.status === "complete");
+    const leadStarted = journal.sessions.some((session) => session.role === "lead");
+    const plan = await this.agent(journal, persist, { key: completedPlan?.key ?? `workers:${journal.attempt}`, role: "lead-plan", brief: scoped, cwd: journal.worktree, schema: LANE_WORKER_PLAN_SCHEMA,
       instruction: "You lead this lane. Return a plan of independent single-file worker tasks (zero is allowed when work cannot usefully split). Each worker file is a literal repository-relative owned path, once only. The lead owns remaining work and integration. Read only: do not edit, run checks, commit or push." }) as LaneWorkerPlan;
     if (!plan || !Array.isArray(plan.workers) || plan.workers.length > 32 || new Set(plan.workers.map((item) => item.file)).size !== plan.workers.length || ![plan.decisions, plan.followUps].every((items) => Array.isArray(items) && items.every((item) => typeof item === "string"))) throw new LaneError("Invalid single-file worker plan.");
     for (const worker of plan.workers) {
       if (typeof worker.file !== "string" || typeof worker.task !== "string" || !worker.task.trim()) throw new LaneError("Invalid worker ownership.");
       requireLaneFiles([worker.file], lane, brief.ownedFiles);
     }
-    const workers = await Promise.all(plan.workers.map(async (worker) => {
+    const results = await Promise.allSettled(plan.workers.map(async (worker) => {
       const workerBrief = { ...scoped, ownedFiles: [worker.file], exclusions: [...scoped.exclusions, ...plan.workers.filter((other) => other.file !== worker.file).map((other) => ({ files: [other.file], owner: `worker ${other.file}`, reason: "One file per worker" }))] };
-      const response = await this.agent(journal, persist, { key: `worker:${journal.attempt}:${worker.file}`, role: "worker", brief: workerBrief, cwd: journal.worktree, schema: LANE_WORKER_SCHEMA,
+      const completedWorker = journal.sessions.find((session) => session.role === "worker" && session.status === "complete" && /^worker:\d+:/.test(session.key) && session.key.replace(/^worker:\d+:/, "") === worker.file);
+      if (leadStarted && !completedWorker) throw new LaneError("Interrupted lead is missing its completed worker provenance.");
+      const response = await this.agent(journal, persist, { key: completedWorker?.key ?? `worker:${journal.attempt}:${worker.file}`, role: "worker", brief: workerBrief, cwd: journal.worktree, schema: LANE_WORKER_SCHEMA,
         instruction: `Own exactly ${worker.file}. Task: ${worker.task}. Your actual runtime is read-only. Return the complete final file in content (null to delete), with decisions/followUps/neededButUnowned. Never edit another file or run checks, commits, pushes, servers or other workers. Do not claim delivery or merge; the host validates/applies this one file.` }) as LaneWorkerResult;
       laneAgentSummary(response);
       if (response.neededButUnowned.length || !(response.content === null || typeof response.content === "string")) throw new LaneError("Worker needs unowned files or returned invalid content.");
       return { file: worker.file, response };
     }));
-    for (const worker of workers) await applyLaneWorker(journal.worktree, worker.file, worker.response.content);
+    // Never release the goal lock while a started sibling can still finish or persist its result.
+    const failed = results.find((result) => result.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
+    const workers = results.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
+    // A prior lead may have refined these files before interruption; replay provenance, not stale contents.
+    if (!leadStarted) for (const worker of workers) await applyLaneWorker(journal.worktree, worker.file, worker.response.content);
     requireLaneFiles(await this.paths(journal), lane, brief.ownedFiles);
     const response = await this.agent(journal, persist, { key: `lead:${journal.attempt}`, role: "lead", brief: scoped, cwd: journal.worktree, write: { extraDirs: [journal.gitDir] }, schema: LANE_AGENT_SCHEMA,
       instruction: "Finish this lane's owned outcomes and integrate the workers' existing changes. Preserve any draft changes from interrupted earlier turns; do not discard or overwrite them blindly. You are the lead, with exclusive ownership only of the listed files. Add meaningful regression tests for changed behavior. Do not run checks, commit, push, create/merge PRs or spawn workers: the host runs the final targeted checks once and owns Git/PR operations. Return summary, all decisions/followUps and any neededButUnowned files. Stop every process you start." });
@@ -270,28 +279,36 @@ export class GitDeveloperLanes implements DeveloperLaneServices {
     await this.noProcesses(worktree, project);
     await this.must("git", ["worktree", "remove", worktree], project);
   }
-  async fix(lane: GoalLane, brief: GoalBrief, journal: LaneJournal, problem: string, key: string, conflictBase: string | null, persist: () => Promise<void>): Promise<void> {
+  async fix(lane: GoalLane, brief: GoalBrief, journal: LaneJournal, problem: string, key: string, conflictBase: string | null, persist: () => Promise<void>, retry = false): Promise<void> {
     const project = await this.project(brief); await this.verifyWorkspace(journal, project);
-    if (journal.fixes.includes(key)) throw new LaneError("This exact problem already received its targeted fix; preserved for explicit retry.");
-    journal.fixes.push(key); journal.attempt++; await persist();
-    if (conflictBase) {
-      if (!SHA.test(conflictBase)) throw new LaneError("Invalid conflict base.");
-      await this.must("git", [...credential, "fetch", "origin", conflictBase], project);
-      // A failed merge is left in progress for this one conflict agent; never reset, rebase or discard work.
-      await this.run("git", ["merge", "--no-edit", conflictBase], journal.worktree);
+    if (journal.fixes.includes(key) && (!retry || journal.fixAttempts?.some((attempt) => attempt.key === key && attempt.status === "complete"))) throw new LaneError("This exact problem already received its targeted fix; only an incomplete attempt may be explicitly retried.");
+    if (!journal.fixes.includes(key)) journal.fixes.push(key);
+    journal.attempt++;
+    const attempt = { key, attempt: journal.attempt, status: "started" as "started" | "failed" | "complete" };
+    (journal.fixAttempts ??= []).push(attempt); await persist();
+    try {
+      if (conflictBase) {
+        if (!SHA.test(conflictBase)) throw new LaneError("Invalid conflict base.");
+        await this.must("git", [...credential, "fetch", "origin", conflictBase], project);
+        // A failed merge is left in progress for this one conflict agent; never reset, rebase or discard work.
+        await this.run("git", ["merge", "--no-edit", conflictBase], journal.worktree);
+      }
+      const response = await this.agent(journal, persist, { key: `fix:${key}:${journal.attempt}`, role: "fix", brief, cwd: journal.worktree, write: { extraDirs: [journal.gitDir] }, schema: LANE_AGENT_SCHEMA,
+        instruction: `Resolve exactly this accepted problem:\n${redactSecrets(problem)}\n${conflictBase ? `A merge of sprint base ${conflictBase} is in progress. Resolve it and commit that merge; never rebase or force push.` : "Add a regression test that fails without the fix."} Preserve all other edits and owned boundaries. Run no checks, push, PR creation or merge; the host validates and runs the targeted checks once. Return summary, decisions, followUps and neededButUnowned.` });
+      const summary = laneAgentSummary(response);
+      if (summary.neededButUnowned.length) throw new LaneError(`Needed but unowned files: ${summary.neededButUnowned.join(", ")}`);
+      if (conflictBase) {
+        await this.must("git", ["merge-base", "--is-ancestor", conflictBase, "HEAD"], journal.worktree);
+        journal.baseSha = conflictBase;
+      }
+      requireLaneFiles(await this.paths(journal), lane, brief.ownedFiles);
+      journal.summary = { summary: summary.summary, decisions: [...journal.summary!.decisions, ...summary.decisions], followUps: [...journal.summary!.followUps, ...summary.followUps], neededButUnowned: [] };
+      journal.headSha = null; journal.review = null; await persist();
+      await this.publish(lane, brief, journal, persist);
+      attempt.status = "complete"; await persist();
+    } catch (error) {
+      attempt.status = "failed"; await persist(); throw error;
     }
-    const response = await this.agent(journal, persist, { key: `fix:${key}:${journal.attempt}`, role: "fix", brief, cwd: journal.worktree, write: { extraDirs: [journal.gitDir] }, schema: LANE_AGENT_SCHEMA,
-      instruction: `Resolve exactly this accepted problem:\n${redactSecrets(problem)}\n${conflictBase ? `A merge of sprint base ${conflictBase} is in progress. Resolve it and commit that merge; never rebase or force push.` : "Add a regression test that fails without the fix."} Preserve all other edits and owned boundaries. Run no checks, push, PR creation or merge; the host validates and runs the targeted checks once. Return summary, decisions, followUps and neededButUnowned.` });
-    const summary = laneAgentSummary(response);
-    if (summary.neededButUnowned.length) throw new LaneError(`Needed but unowned files: ${summary.neededButUnowned.join(", ")}`);
-    if (conflictBase) {
-      await this.must("git", ["merge-base", "--is-ancestor", conflictBase, "HEAD"], journal.worktree);
-      journal.baseSha = conflictBase;
-    }
-    requireLaneFiles(await this.paths(journal), lane, brief.ownedFiles);
-    journal.summary = { summary: summary.summary, decisions: [...journal.summary!.decisions, ...summary.decisions], followUps: [...journal.summary!.followUps, ...summary.followUps], neededButUnowned: [] };
-    journal.headSha = null; journal.review = null; await persist();
-    await this.publish(lane, brief, journal, persist);
   }
   merge(url: string) { return new SprintGitHub(this.shell, this.store.runtimeDir).merge(url); }
   async finish(brief: GoalBrief, lanes: { lane: GoalLane; journal: LaneJournal }[]): Promise<{ headSha: string; checks: GoalReport["checks"]; followUps: string[] }> {

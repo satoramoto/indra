@@ -119,7 +119,7 @@ export class DeveloperGoal {
             const failedCheck = [...saved.checks].reverse().find((check) => check.exitCode !== 0);
             if (event.kind === "retry" && failedCheck) {
               const key = id([failedCheck.headSha, failedCheck.command, failedCheck.diagnostic]);
-              await this.services.fix(lane, scoped, saved, `${failedCheck.command} exited ${failedCheck.exitCode}:\n${failedCheck.diagnostic}`, key, null, persist);
+              await this.services.fix(lane, scoped, saved, `${failedCheck.command} exited ${failedCheck.exitCode}:\n${failedCheck.diagnostic}`, key, null, persist, true);
             }
             laneProgress.prUrl = saved.prUrl ?? await this.services.publish(lane, scoped, saved, persist); laneProgress.status = "pr-open"; laneProgress.headSha = saved.headSha;
             emit({ kind: "agent-completed", id: `lead:${goal.id}:${lane.id}:${saved.headSha}`, goalId: goal.id, teamId: goal.teamId, laneId: lane.id, agentId: `lead:${lane.id}:${saved.attempt}`, status: "succeeded", headSha: saved.headSha, report: null, at: now() }); await persist();
@@ -139,10 +139,10 @@ export class DeveloperGoal {
           const problem = findings.length ? findings.join("\n") : observation.ci === "failed" ? observation.ciFailure : observation.conflict ? `PR ${observation.url} conflicts with sprint commit ${observation.baseSha}.` : null;
           if (problem && observation.state === "OPEN") {
             const key = id([observation.headSha, problem]);
-            if (saved.fixes.includes(key)) throw new LaneError(`Lane ${lane.id} retains an unresolved already-attempted problem.`);
+            if (saved.fixes.includes(key) && (event.kind !== "retry" || saved.fixAttempts?.some((attempt) => attempt.key === key && attempt.status === "complete"))) throw new LaneError(`Lane ${lane.id} retains an unresolved already-attempted problem.`);
             if (observation.conflict && !findings.length && observation.ci !== "failed") laneProgress.conflictRounds++; else laneProgress.fixRounds++;
             await persist();
-            await this.services.fix(lane, scoped, saved, problem, key, observation.conflict && !findings.length && observation.ci !== "failed" ? observation.baseSha : null, persist);
+            await this.services.fix(lane, scoped, saved, problem, key, observation.conflict && !findings.length && observation.ci !== "failed" ? observation.baseSha : null, persist, event.kind === "retry");
             observation = await this.services.observe(lane, scoped, saved);
             await this.services.review(lane, scoped, saved, observation, persist);
             laneProgress.headSha = saved.headSha; laneProgress.status = "pr-open";

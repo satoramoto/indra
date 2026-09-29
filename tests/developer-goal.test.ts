@@ -3,8 +3,8 @@ import { execFileSync } from "node:child_process";
 import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { DeveloperSeat, type Shell } from "../src/developer-seat.js";
-import { DeveloperGoal } from "../src/developer-goal.js";
-import { changedPaths } from "../src/developer-lanes.js";
+import { DeveloperGoal, developerGoalJournalName } from "../src/developer-goal.js";
+import { changedPaths, type LaneJournal } from "../src/developer-lanes.js";
 import { PlanningStore, type PlanningGoal } from "../src/planning.js";
 import { goalRuntimeFilename, type GoalBrief, type GoalRuntimeRecord, type LanePlan, type WorkflowEvent } from "../src/goal-contract.js";
 import { SprintGitHub } from "../src/sprint.js";
@@ -27,6 +27,7 @@ const summary = { summary: "Implemented owned outcome", decisions: ["Host owns G
 interface Pull { url: string; branch: string; base: string; head: string; merged: boolean; mergedSha: string | null; reviews: { id: number; user: { login: string }; state: string; commit_id: string; body: string }[] }
 
 class LocalGitHub implements Shell {
+  bodies: string[] = [];
   prs = new Map<string, Pull>(); calls: { command: string; args: string[]; cwd: string }[] = [];
   ci = "pending"; failLog = "tests/a.test.ts: expected 2, got 1"; mergeBlocker: string | undefined;
   tamperBase = false; tamperHead = false; loseCreate = false;
@@ -45,6 +46,7 @@ class LocalGitHub implements Shell {
     if (args[0] === "run") return ok(this.failLog);
     if (args[0] === "pr" && args[1] === "list") return ok(JSON.stringify([...this.prs.values()].filter((pr) => pr.branch === args[args.indexOf("--head") + 1]).map(({ url }) => ({ url }))));
     if (args[0] === "pr" && args[1] === "create") {
+      this.bodies.push(await readFile(args[args.indexOf("--body-file") + 1], "utf8"));
       const branch = args[args.indexOf("--head") + 1]; const url = `https://github.com/${repo}/pull/${this.prs.size + 1}`;
       const head = git(this.project, "rev-parse", branch); const base = git(this.project, "rev-parse", sprint);
       this.prs.set(url, { url, branch, head, base, merged: false, mergedSha: null, reviews: [] });
@@ -57,7 +59,7 @@ class LocalGitHub implements Shell {
     if (args[0] === "api") { const number = /\/pulls\/(\d+)/.exec(args[1])?.[1]; pr = this.prs.get(`https://github.com/${repo}/pull/${number}`); }
     if (!pr) throw new Error(`No fixture PR for ${args.join(" ")}`);
     pr.head = git(this.project, "rev-parse", pr.branch);
-    if (args[0] === "pr" && args[1] === "edit") return ok();
+    if (args[0] === "pr" && args[1] === "edit") { this.bodies.push(await readFile(args[args.indexOf("--body-file") + 1], "utf8")); return ok(); }
     if (args[0] === "pr" && args[1] === "checks") return ok(JSON.stringify([{ name: "checks", bucket: this.ci, link: `https://github.com/${repo}/actions/runs/8/job/9` }]), this.ci === "pass" ? 0 : this.ci === "pending" ? 8 : 1);
     if (args[0] === "pr" && args[1] === "merge") {
       expect(args).toEqual(["pr", "merge", pr.url, "--squash", "--match-head-commit", pr.head]);
@@ -112,19 +114,34 @@ async function fixture(lanes = 1) {
   ] : [{ id: "code", branch: `codex/${goalId}/code`, ownedFiles: ["src/**", "tests/**"], dependsOn: [] }] };
   const shell = new LocalGitHub(project);
   const calls: { role: string; write?: WriteAccess; cwd: string; prompt: string; session?: string }[] = [];
-  let findings = false; let failLead = false;
+  let findings = false; let failLead = false; let failFix = false;
+  let workerFiles: string[] | undefined;
+  let workerHook: ((file: string) => Promise<void>) | undefined;
+  const fixDrafts: string[] = [];
+  const workerDecisions = ["Worker preserved source compatibility"];
+  const workerFollowUps = ["Worker suggests a separate migration"];
+  const planDecisions = ["Lead plan isolates one source file"];
+  const planFollowUps = ["Lead plan leaves a documented follow-up"];
   const runtimeFor = (cwd: string, write?: WriteAccess): AgentRuntime => ({ message: async (prompt, _schema, session, options) => {
     const role = options!.purpose!; calls.push({ role, write, cwd, prompt, session });
     const second = prompt.includes(`Branch: codex/${goalId}/second`); const file = second ? "b" : "a";
     let response: unknown = summary;
     if (role === "planner") response = plan;
-    if (role === "lead-plan") response = { workers: [{ file: `src/${file}.ts`, task: "Implement source" }], decisions: [], followUps: [] };
-    if (role === "worker") response = { ...summary, content: `export const ${second ? "other" : "value"} = 2;\n` };
+    if (role === "lead-plan") response = { workers: (workerFiles ?? [`src/${file}.ts`]).map((path) => ({ file: path, task: "Implement source" })), decisions: planDecisions, followUps: planFollowUps };
+    if (role === "worker") {
+      const path = /Own exactly ([^ ]+)\. Task:/.exec(prompt)![1]; await workerHook?.(path);
+      response = { ...summary, decisions: workerDecisions, followUps: workerFollowUps, content: `export const ${second ? "other" : "value"} = 2;\n` };
+    }
     if (role === "lead") {
-      if (failLead) { failLead = false; throw new Error("Interrupted lead"); }
+      if (failLead) { failLead = false; await writeFile(join(cwd, `src/${file}.ts`), "export const value = 7;\n"); throw new Error("Interrupted lead"); }
       await writeFile(join(cwd, `tests/${file}.test.ts`), "// regression coverage fixture\n");
     }
-    if (role === "fix") { await writeFile(join(cwd, `src/${file}.ts`), "export const value = 3;\n"); shell.ci = "pass"; }
+    if (role === "fix") {
+      fixDrafts.push(await readFile(join(cwd, `src/${file}.ts`), "utf8"));
+      await writeFile(join(cwd, `src/${file}.ts`), "export const value = 3;\n");
+      if (failFix) { failFix = false; throw new Error("Interrupted fix"); }
+      shell.ci = "pass";
+    }
     if (role === "reviewer") { response = { findings: findings ? [`src/${file}.ts:1: Exact bug requiring regression`] : [], summary: "Reviewed" }; findings = false; }
     return { sessionId: `session-${calls.length}`, response, startedAt: at, finishedAt: at };
   } });
@@ -132,7 +149,8 @@ async function fixture(lanes = 1) {
   const runner = () => new DeveloperSeat(store, { id: seatId, displayName: "Developer", username: "developer", roles: ["Developer"] }, { post: vi.fn() }, shell, runtimeFor);
   const current = () => store.readRuntimeFile<GoalRuntimeRecord>(goalRuntimeFilename(goalId));
   const ciEvent = async (name = "ci-one"): Promise<Extract<WorkflowEvent, { kind: "ci" }>> => { const lane = (await current())!.lanes.find((item) => item.status !== "merged")!; return { kind: "ci", id: name, teamId: "team-one", goalId, laneId: lane.id, prUrl: lane.prUrl!, headSha: lane.headSha!, state: "passed", at }; };
-  return { store, shell, calls, runner, current, ciEvent, plan, brief, runtimeFor, blocker, setFindings: () => { findings = true; }, failLead: () => { failLead = true; } };
+  return { store, shell, calls, runner, current, ciEvent, plan, brief, runtimeFor, blocker, fixDrafts, workerDecisions, workerFollowUps, planDecisions, planFollowUps,
+    setWorkers: (files: string[], hook: (file: string) => Promise<void>) => { workerFiles = files; workerHook = hook; }, failFix: () => { failFix = true; }, setFindings: () => { findings = true; }, failLead: () => { failLead = true; } };
 }
 
 describe("finite production Developer goal orchestration", () => {
@@ -174,6 +192,32 @@ describe("finite production Developer goal orchestration", () => {
     expect(f.calls.filter((call) => call.role === "reviewer")).toHaveLength(2);
     const done = await f.runner().turn(await f.ciEvent()); expect(done.report).not.toBeNull();
     expect(f.calls.filter((call) => call.role === "fix")).toHaveLength(1);
+  });
+  it("explicitly retries an interrupted targeted fix with a fresh context and preserved draft", async () => {
+    const f = await fixture(); f.setFindings(); f.failFix(); await f.runner().turn(event());
+    expect((await f.current())!.failure).not.toBeNull(); expect(f.calls.filter((call) => call.role === "fix")).toHaveLength(1);
+    await f.runner().turn(event()); expect(f.calls.filter((call) => call.role === "fix")).toHaveLength(1);
+    await f.runner().turn(event("retry"));
+    expect((await f.current())!.failure).toBeNull(); expect(f.calls.filter((call) => call.role === "fix")).toHaveLength(2);
+    expect(f.fixDrafts[1]).toBe("export const value = 3;\n");
+    const journal = await f.store.readRuntimeFile<{ lanes: Record<string, LaneJournal> }>(developerGoalJournalName(goalId));
+    expect(journal!.lanes.code.fixAttempts!.map((attempt) => attempt.status)).toEqual(["failed", "complete"]);
+    expect(new Set(journal!.lanes.code.fixAttempts!.map((attempt) => attempt.key)).size).toBe(1);
+    const done = await f.runner().turn(await f.ciEvent()); expect(done.report).not.toBeNull();
+    await f.runner().turn(event("retry")); expect(f.calls.filter((call) => call.role === "fix")).toHaveLength(2);
+  });
+  it("settles every started worker before a failed turn releases its journal and goal lock", async () => {
+    const f = await fixture(); let release!: () => void; let started!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; }); const siblingStarted = new Promise<void>((resolve) => { started = resolve; });
+    f.setWorkers(["src/a.ts", "src/b.ts"], async (file) => { if (file === "src/a.ts") throw new Error("Failed worker"); started(); await gate; });
+    const saves = vi.spyOn(f.store, "saveRuntime"); let settled = false;
+    const turn = f.runner().turn(event()).finally(() => { settled = true; });
+    await siblingStarted; await new Promise<void>((resolve) => setImmediate(resolve));
+    try { expect(settled).toBe(false); } finally { release(); await turn; }
+    expect((await f.current())!.failure).not.toBeNull();
+    const journal = await f.store.readRuntimeFile<{ lanes: Record<string, LaneJournal> }>(developerGoalJournalName(goalId));
+    expect(journal!.lanes.code.sessions.filter((session) => session.role === "worker").map((session) => session.status)).toEqual(["failed", "complete"]);
+    const writes = saves.mock.calls.length; await new Promise<void>((resolve) => setImmediate(resolve)); expect(saves).toHaveBeenCalledTimes(writes);
   });
   it("uses exact observed CI failure logs for a fix instead of believing an event's passing claim", async () => {
     const f = await fixture(); await f.runner().turn(event()); f.shell.ci = "fail";
@@ -230,6 +274,12 @@ describe("finite production Developer goal orchestration", () => {
     await f.runner().turn(event("retry")); expect((await f.current())!.failure).toBeNull();
     expect(f.calls.filter((call) => call.role === "worker")).toHaveLength(1);
     expect(f.calls.filter((call) => call.role === "lead")).toHaveLength(2);
+    const body = f.shell.bodies.at(-1)!;
+    for (const value of [...f.workerDecisions, ...f.workerFollowUps, ...f.planDecisions, ...f.planFollowUps]) expect(body.split(value)).toHaveLength(2);
+    const pr = [...f.shell.prs.values()][0]; expect(git(f.shell.project, "show", `${pr.head}:src/a.ts`)).toBe("export const value = 7;");
+    f.shell.ci = "pass"; const done = await f.runner().turn(await f.ciEvent()); expect(done.report).not.toBeNull();
+    expect(done.report!.decisions).toEqual([...f.planDecisions, ...f.workerDecisions, ...summary.decisions]);
+    expect(done.report!.followUps).toEqual([...f.planFollowUps, ...f.workerFollowUps]);
   });
   it("rejects a brief that expands approved ownership before running any agent", async () => {
     const f = await fixture(); const record = (await f.current())!; record.brief!.ownedFiles = ["src/**", "tests/**", "extra/**"]; await f.store.saveRuntime(goalRuntimeFilename(goalId), record);
