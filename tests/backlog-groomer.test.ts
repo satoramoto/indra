@@ -50,6 +50,7 @@ describe("validated Product/Lead mutations", () => {
     const bad: unknown[] = [
       { ...output, mission: "Agent mission" }, { ...output, approval: true }, { ...output, assignments: [] },
       { ...output, edit: { ...output.edit, standingPolicy: {} } },
+      { ...output, evidence: [], edit: { ...output.edit, ticketChanges: [] } },
       { ...output, evidence: [{ ...evidence, url: "https://unknown.test" }] },
       { ...output, evidence: [{ ...evidence, quote: "Invented source quote." }] },
       { ...output, edit: { ...output.edit, expectedRevision: "b".repeat(40) } },

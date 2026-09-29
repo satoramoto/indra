@@ -29,7 +29,7 @@ function runner(store: PlanningStore, team: TeamRecord, message: AgentRuntime["m
   const runtime = vi.fn<RuntimeFactory>(() => ({ message }));
   const chat = { post: vi.fn() };
   const research = vi.fn(async () => ({ cwd: join(store.runtimeDir, "projects/acme/demo"), sources: [source] }));
-  const services = { store: { read: () => store.read(), update: store.update.bind(store), runtimeDir: store.runtimeDir, readRuntimeFile: store.readRuntimeFile.bind(store), saveRuntime: store.saveRuntime.bind(store) },
+  const services = { store: { read: () => store.read(), update: vi.fn(store.update.bind(store)), runtimeDir: store.runtimeDir, readRuntimeFile: store.readRuntimeFile.bind(store), saveRuntime: store.saveRuntime.bind(store) },
     team, seat: team.seats.find((seat) => seat.id === product)!, chat, runtimeFor: runtime, log: vi.fn() };
   return { runtime, chat, research, services, seat: new ProductSeat(services, { research }) };
 }
@@ -89,12 +89,34 @@ describe("Product role dispatch and isolation", () => {
     await expect(groomingRuntimeFor(f.store, "seat-missing")).rejects.toThrow("Unknown grooming seat");
   });
 
+  it("commits through the restricted serving writer and preserves its transaction guards", async () => {
+    const f = await fixture();
+    const message = vi.fn<AgentRuntime["message"]>(async (prompt) => {
+      const snapshot = JSON.parse(/^Current team and backlog snapshot: (.+)$/m.exec(prompt)![1]);
+      return { sessionId: "product-session", startedAt: "2026-09-29T00:00:00Z", finishedAt: "2026-09-29T00:01:00Z", response: { summary: "Preserve planning context.", evidence: [{ url: source.url, quote: source.text, finding: "Planning requires retained context." }], edit: { expectedRevision: snapshot.revision,
+        ticketChanges: [{ action: "create", ticket: { id: "ticket-one", title: "Retain context", problem: "The owner repeats planning.", value: "Less repeated owner work.", acceptanceCriteria: ["Planning survives a restart."], status: "open", dependsOn: [], research: [{ url: source.url, finding: "Planning requires retained context." }] } }], candidateChanges: [] } } };
+    });
+    const run = runner(f.store, f.team, message);
+    // The production services object has no checkout path, owner settings writer or ceremony mutators.
+    expect(run.services.store).not.toHaveProperty("checkout");
+    expect(run.services.store).not.toHaveProperty("updateOwnerSettings");
+    await run.seat.tick();
+    expect(run.services.store.update.mock.calls.map(([, subject]) => subject)).toContain("Groom team backlog and candidate sprints");
+    expect((await new BacklogStore(f.store).read(teamId)).tickets[0]).toMatchObject({ id: "ticket-one", createdBySeatId: product });
+    const blocked = await fixture();
+    const blockedRun = runner(blocked.store, blocked.team, message);
+    blockedRun.services.store.update.mockRejectedValue(new Error("Serving writer disabled"));
+    await blockedRun.seat.tick();
+    expect((await new BacklogStore(blocked.store).read(teamId)).tickets).toEqual([]);
+    expect(blockedRun.runtime).not.toHaveBeenCalled();
+  });
+
   it("returns from the bridge hook while runtime preparation is pending and dispatches only the active Lead", async () => {
     const f = await fixture(); let resolve!: (runtime: (cwd: string) => AgentRuntime) => void;
     const preparing = new Promise<(cwd: string) => AgentRuntime>((done) => { resolve = done; });
     const factory = vi.fn(() => preparing);
     const poll = vi.spyOn(BacklogGroomer.prototype, "poll").mockImplementation(() => {});
-    const grooming = createLeadGrooming(f.store, factory);
+    const grooming = createLeadGrooming(f.store, async () => "chick", factory);
     await grooming({ teamId });
     await vi.waitFor(() => expect(factory).toHaveBeenCalledWith("seat-lead"));
     await grooming({ teamId }); await grooming({ teamId });
@@ -103,5 +125,14 @@ describe("Product role dispatch and isolation", () => {
     resolve(() => ({ message: vi.fn() }));
     await vi.waitFor(() => expect(poll).toHaveBeenCalledTimes(1));
     expect(f.team.seats.find((seat) => seat.roles[0] === "Team Lead" && isActiveSeat(seat))?.id).toBe("seat-lead");
+  });
+
+  it("does not groom as another team's Lead using the bridge's credential", async () => {
+    const f = await fixture(); const identified = vi.fn(async () => "other-lead");
+    const factory = vi.fn(async () => () => ({ message: vi.fn<AgentRuntime["message"]>() }));
+    const poll = vi.spyOn(BacklogGroomer.prototype, "poll").mockImplementation(() => {});
+    await createLeadGrooming(f.store, identified, factory)({ teamId });
+    await vi.waitFor(() => expect(identified).toHaveBeenCalled());
+    expect(factory).not.toHaveBeenCalled(); expect(poll).not.toHaveBeenCalled();
   });
 });

@@ -27,6 +27,7 @@ export function parseProductOutput(value: unknown, snapshot: BacklogSnapshot, so
   const output = structuredClone(value) as ProductOutput;
   parseBacklogEdit(output.edit);
   if (output.edit.expectedRevision !== snapshot.revision) throw new Error("Invalid grooming revision.");
+  if ((output.edit.ticketChanges.length || output.edit.candidateChanges.length) && !output.evidence.length) throw new Error("Grooming changes require cited evidence.");
   const inspect = (item: unknown, key = ""): void => {
     if (typeof item === "string") {
       const text = key === "url" ? item.replace(/\/[a-f0-9]{40}\//g, "/revision/") : item;

@@ -4,6 +4,7 @@ import { BacklogGroomer, type GroomerOptions } from "./backlog-groomer.js";
 import type { SeatIdentity } from "./developer-seat.js";
 import { seatHarnessDir } from "./harness-home.js";
 import { requireTeamHome, PlanningStore } from "./planning.js";
+import type { CeremonyAdapters, PlanningChat } from "./planning-bridge.js";
 import { productResearchReader } from "./product-research.js";
 import { loadSeatPersonas, withPersonaRuntime } from "./seat-persona.js";
 import { loadSeatEngines, SeatRuntime } from "./seat-runtime.js";
@@ -74,7 +75,7 @@ export async function groomingRuntimeFor(store: PlanningStore, seatId: string): 
 }
 
 /** Adapter invoked by each bridge poll. Starting preparation is asynchronous as well as the model turn. */
-export function createLeadGrooming(store: PlanningStore, runtimeFor = (seatId: string) => groomingRuntimeFor(store, seatId)) {
+export function createLeadGrooming(store: PlanningStore, ownUserId: () => Promise<string>, runtimeFor = (seatId: string) => groomingRuntimeFor(store, seatId)) {
   const jobs = new Map<string, { groomer?: BacklogGroomer; starting?: Promise<void> }>();
   return async ({ teamId }: { teamId: string }): Promise<void> => {
     const job = jobs.get(teamId) ?? {};
@@ -82,7 +83,9 @@ export function createLeadGrooming(store: PlanningStore, runtimeFor = (seatId: s
     if (job.starting) return;
     job.starting = (async () => {
       const team = ((await store.read()).teams as TeamRecord[]).find((item) => item.id === teamId);
-      const lead = team?.seats.find((seat) => seat.roles[0] === "Team Lead" && isActiveSeat(seat));
+      if (!team?.mission?.trim()) return;
+      const own = await ownUserId();
+      const lead = team?.seats.find((seat) => seat.roles[0] === "Team Lead" && isActiveSeat(seat) && seat.externalIdentities.mattermost.userId === own);
       if (!lead) return;
       // Rebuild if the owner replaced the serving lead; an old runner will fail its active-seat check.
       const identity = `${teamId}/${lead.id}`;
@@ -95,8 +98,8 @@ export function createLeadGrooming(store: PlanningStore, runtimeFor = (seatId: s
 }
 
 /** Picked up by the CLI's optional ceremony-module wiring once the grooming hook is present. */
-export function createCeremonyAdapters({ store }: { store: PlanningStore }) {
-  return { grooming: createLeadGrooming(store) };
+export function createCeremonyAdapters({ store, chat }: { store: PlanningStore; chat: Pick<PlanningChat, "ownUserId"> }): Pick<CeremonyAdapters, "grooming"> {
+  return { grooming: createLeadGrooming(store, () => chat.ownUserId()) };
 }
 
 export const controlServices = ["grooming"] as const;
