@@ -7,6 +7,7 @@ import { GITHUB_REPO } from "./local-state.js";
 import { homedir } from "node:os";
 import { redactSecrets } from "./redact.js";
 import type { MergeVerification } from "./ceremony.js";
+import { ownedFileMatches, validateGoalReport, type GoalBrief, type GoalReport } from "./goal-contract.js";
 
 /** A sprint GitHub problem whose message is ours and safe to post in the goal thread. */
 export class SprintError extends Error { override name = "SprintError"; }
@@ -19,6 +20,14 @@ const SHA = /^[0-9a-f]{40}$/;
 const GH_CREDENTIAL = ["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential"];
 
 export type MergeResult = { merged: true; sha: string } | { merged: false; reason: string };
+export interface ReleaseAttempts {
+  version: 1; goalId: string; startedAt: string;
+  conflicts: { prUrl: string; headSha: string; baseSha: string; at: string }[];
+  merges: { prUrl: string; headSha: string; at: string }[];
+  corrections?: { headSha: string; baseSha: string; startedAt: string; finishedAt?: string; resultSha?: string; status: "running" | "pushed" | "blocked"; decisions: string[] }[];
+}
+export const releaseAttemptsName = (goalId: string) => { retroPath(goalId); return `release-attempts-${goalId}`; };
+export interface PrRetrospective { url: string; headSha: string; decisions: string | null; followUps: string | null }
 
 export function retroPath(goalId: string): string {
   if (!/^[a-z][a-z0-9-]+$/.test(goalId)) throw new SprintError("Invalid retrospective goal ID.");
@@ -52,6 +61,149 @@ export class SprintGitHub implements RetroArchive {
   private async run(command: string, args: string[], cwd = dirname(this.runtimeDir)): Promise<ShellResult> { return await this.shell.run(command, args, cwd); }
   private async must(command: string, args: string[], cwd = dirname(this.runtimeDir)): Promise<ShellResult> {
     return await runChecked(this.shell, command, args, cwd, (result) => new SprintError(`${command} ${args.slice(0, 2).join(" ")} failed: ${stderrExcerpt(result.stderr)}`));
+  }
+
+  async projectContext(github: string): Promise<{ cwd: string; mission: string; retros: GoalBrief["retros"] }> {
+    if (!GITHUB_REPO.test(github)) throw new SprintError("Invalid project repository.");
+    const cwd = await ensureProjectCheckout(this.shell, this.runtimeDir, github);
+    const mission = (await this.must("git", ["show", "origin/main:docs/mission.md"], cwd)).stdout;
+    const paths = (await this.must("git", ["ls-tree", "-r", "--name-only", "origin/main", "--", "docs/retros"], cwd)).stdout.trim().split("\n").filter((path) => /^docs\/retros\/[a-z][a-z0-9-]*\.md$/.test(path));
+    const rows = await Promise.all(paths.map(async (path) => ({ path, time: Number((await this.must("git", ["log", "-1", "--format=%ct", "origin/main", "--", path], cwd)).stdout.trim()) })));
+    rows.sort((a, b) => b.time - a.time || a.path.localeCompare(b.path));
+    const retros = await Promise.all(rows.slice(0, 3).map(async ({ path }) => ({ goalId: path.slice("docs/retros/".length, -3), path, summary: (await this.must("git", ["show", `origin/main:${path}`], cwd)).stdout.trim() })));
+    return { cwd, mission, retros };
+  }
+
+  /** The report is a claim. Re-read all lane proofs, prospective file boundaries and sprint ancestry. */
+  async verifyGoalReport(github: string, ownedFiles: string[], input: GoalReport, baseSha: string): Promise<void> {
+    const report = validateGoalReport(input);
+    if (!GITHUB_REPO.test(github) || !SHA.test(baseSha) || !report.lanePrs.length || !report.checks.length || report.checks.some((check) => check.exitCode !== 0) || report.neededButUnowned.length) throw new SprintError("Goal report needs successful checks, merged lanes and no unowned work.");
+    const cwd = await ensureProjectCheckout(this.shell, this.runtimeDir, github);
+    const head = (await this.must("gh", ["api", `repos/${github}/git/ref/heads/${report.sprintBranch}`, "--jq", ".object.sha"])).stdout.trim();
+    if (head !== report.headSha) throw new SprintError("Reported sprint head differs from GitHub.");
+    await this.must("git", [...GH_CREDENTIAL, "fetch", "origin", report.sprintBranch, baseSha], cwd);
+    const files = (await this.must("git", ["diff", "--name-only", "-z", baseSha, head, "--"], cwd)).stdout.split("\0").filter(Boolean);
+    if (!files.length || files.some((file) => !ownedFiles.some((pattern) => ownedFileMatches(pattern, file)))) throw new SprintError("Sprint changes exceed the approved goal scope or contain no implementation.");
+    for (const lane of report.lanePrs) {
+      if (!lane.url.startsWith(`https://github.com/${github}/pull/`)) throw new SprintError("Reported lane belongs to a different repository.");
+      const proof = await this.inspectMerge(lane.url);
+      const view = JSON.parse((await this.must("gh", ["pr", "view", lane.url, "--json", "baseRefName,isCrossRepository"])).stdout) as { baseRefName?: string; isCrossRepository?: boolean };
+      if (proof.state !== "MERGED" || proof.headSha !== lane.headSha || proof.mergedSha !== lane.mergedSha || !proof.reviewed || !proof.checksPassed || view.baseRefName !== report.sprintBranch || view.isCrossRepository !== false) throw new SprintError("Lane report is not supported by current GitHub merge, bot review and CI evidence.");
+      await this.must("git", ["merge-base", "--is-ancestor", lane.mergedSha, head], cwd);
+      const changed = await this.retroPages<{ filename: string; previous_filename?: string }>(`repos/${github}/pulls/${lane.url.split("/").at(-1)}/files?per_page=100`);
+      if (!changed.length || changed.flatMap((file) => [file.filename, ...(file.previous_filename ? [file.previous_filename] : [])]).some((file) => !ownedFiles.some((pattern) => ownedFileMatches(pattern, file)))) throw new SprintError("Lane changes exceed approved ownership.");
+    }
+  }
+
+  /** A new integration head is allowed only inside the already approved boundary. Renames check both paths. */
+  async integrationScope(github: string, goalId: string, ownedFiles: string[], prUrl: string, revert = false): Promise<{ headSha: string; baseSha: string; conflicting: boolean }> {
+    const endpoint = this.retroRepo(github, goalId, prUrl);
+    const pr = JSON.parse((await this.must("gh", ["pr", "view", prUrl, "--json", "headRefName,baseRefName,headRefOid,baseRefOid,isCrossRepository,mergeable"])).stdout) as Record<string, unknown>;
+    if (pr.baseRefName !== "main" || pr.headRefName !== (revert ? revertBranch(goalId) : sprintBranch(goalId)) || pr.isCrossRepository !== false || !SHA.test(String(pr.headRefOid)) || !SHA.test(String(pr.baseRefOid))) throw new SprintError("Integration does not match the approved goal's project and branches.");
+    const files = await this.retroPages<{ filename: string; previous_filename?: string }>(`${endpoint}/files?per_page=100`);
+    if (!files.length || files.flatMap((file) => [file.filename, ...(file.previous_filename ? [file.previous_filename] : [])]).some((file) => !ownedFiles.some((pattern) => ownedFileMatches(pattern, file)))) throw new SprintError("Integration changes exceed the approved goal scope.");
+    return { headSha: String(pr.headRefOid), baseSha: String(pr.baseRefOid), conflicting: pr.mergeable === "CONFLICTING" };
+  }
+
+  /** Merge the observed main commit into a detached integration checkout; publish only verified owned changes. */
+  async resolveIntegration(github: string, goalId: string, ownedFiles: string[], prUrl: string, headSha: string, baseSha: string,
+    resolve: (cwd: string, sharedGitDir: string) => Promise<{ decisions: string[]; blocked: string[] }>, revert = false): Promise<{ headSha: string; decisions: string[] }> {
+    this.retroRepo(github, goalId, prUrl);
+    if (!SHA.test(headSha) || !SHA.test(baseSha)) throw new SprintError("Invalid integration correction commits.");
+    const project = await ensureProjectCheckout(this.shell, this.runtimeDir, github);
+    const branch = revert ? revertBranch(goalId) : sprintBranch(goalId);
+    await this.must("git", [...GH_CREDENTIAL, "fetch", "origin", branch, baseSha], project);
+    const shared = (await this.must("git", ["rev-parse", "--absolute-git-dir"], project)).stdout.trim();
+    const parent = join(this.runtimeDir, "worktrees"); await mkdir(parent, { recursive: true, mode: 0o700 });
+    const root = await mkdtemp(join(parent, `integration-fix-${goalId}-`)); const cwd = join(root, "checkout");
+    try {
+      await this.must("git", ["worktree", "add", "--detach", cwd, headSha], project);
+      const merged = await this.run("git", ["merge", "--no-commit", "--no-ff", baseSha], cwd);
+      const conflicts = (await this.must("git", ["diff", "--name-only", "--diff-filter=U", "-z"], cwd)).stdout.split("\0").filter(Boolean);
+      const within = (files: string[]) => files.every((file) => ownedFiles.some((pattern) => ownedFileMatches(pattern, file)));
+      if ((merged.code !== 0 && !conflicts.length) || !within(conflicts)) throw new SprintError("Integration conflict needs files outside approved ownership or could not be prepared.");
+      let decisions = ["Merged the observed main commit into the sprint without rebasing."];
+      if (conflicts.length) {
+        const result = await resolve(cwd, shared);
+        if (result.blocked.length) throw new SprintError(`Integration correction needs an owner decision: ${redactSecrets(result.blocked.join("; ")).slice(0, 800)}`);
+        decisions = result.decisions;
+      }
+      if ((await this.must("git", ["rev-parse", "HEAD"], cwd)).stdout.trim() !== headSha || (await this.must("git", ["rev-parse", "MERGE_HEAD"], cwd)).stdout.trim() !== baseSha) throw new SprintError("Resolver changed the pinned integration history.");
+      const unstaged = (await this.must("git", ["diff", "--name-only", "--no-renames", "-z"], cwd)).stdout.split("\0").filter(Boolean);
+      const untracked = (await this.must("git", ["ls-files", "--others", "--exclude-standard", "-z"], cwd)).stdout.split("\0").filter(Boolean);
+      if (!within([...unstaged, ...untracked])) throw new SprintError("Resolver edited files outside approved ownership.");
+      await this.must("git", ["add", "--all"], cwd);
+      if ((await this.must("git", ["diff", "--name-only", "--diff-filter=U", "-z"], cwd)).stdout) throw new SprintError("Integration conflicts remain unresolved.");
+      const changed = (await this.must("git", ["diff", "--cached", "--name-only", "--no-renames", "-z", baseSha], cwd)).stdout.split("\0").filter(Boolean);
+      if (!within(changed)) throw new SprintError("Corrected integration exceeds approved ownership relative to main.");
+      const current = await this.integrationScope(github, goalId, ownedFiles, prUrl, revert);
+      if (current.headSha !== headSha || current.baseSha !== baseSha) throw new SprintError("Integration changed during correction; a fresh event must reconcile it.");
+      await this.must("git", ["commit", "-m", `Merge main into ${branch} within approved scope`], cwd);
+      const resultSha = (await this.must("git", ["rev-parse", "HEAD"], cwd)).stdout.trim();
+      await this.must("git", [...GH_CREDENTIAL, "push", "origin", `HEAD:refs/heads/${branch}`], cwd);
+      const remote = (await this.must("gh", ["api", `repos/${github}/git/ref/heads/${branch}`, "--jq", ".object.sha"])).stdout.trim();
+      if (remote !== resultSha) throw new SprintError("Corrected integration push is not verified.");
+      // A bounded Decisions addition is reconciled by its immutable result marker after a lost response.
+      const marker = `<!-- indra-integration-correction:${resultSha} -->`;
+      const body = JSON.parse((await this.must("gh", ["pr", "view", prUrl, "--json", "body"])).stdout).body as unknown;
+      if (typeof body !== "string") throw new SprintError("Integration PR body is unreadable.");
+      if (!body.includes(marker)) {
+        const path = join(root, "body.md"); await writeFile(path, `${body}\n\n## Integration correction\n\n${marker}\nMerged ${baseSha} into ${headSha}, producing ${resultSha}.\n\nDecisions:\n${decisions.map((item) => `- ${redactSecrets(item)}`).join("\n")}\n\nFresh review and CI are required on the new head.\n`, { mode: 0o600 });
+        await this.must("gh", ["pr", "edit", prUrl, "--body-file", path]);
+      }
+      return { headSha: resultSha, decisions };
+    } finally {
+      const removed = await this.run("git", ["worktree", "remove", "--force", cwd], project);
+      if (removed.code === 0) await rm(root, { recursive: true, force: true });
+    }
+  }
+
+  /** Archive only sections read from the actual merged PR, bound to the delivered lane head. */
+  async prRetrospective(github: string, goalId: string, url: string, headSha: string): Promise<PrRetrospective> {
+    this.retroRepo(github, goalId, url);
+    const pr = JSON.parse((await this.must("gh", ["pr", "view", url, "--json", "state,headRefOid,body"])).stdout) as { state?: string; headRefOid?: string; body?: unknown };
+    if (pr.state !== "MERGED" || pr.headRefOid !== headSha || typeof pr.body !== "string") throw new SprintError("Lane retrospective source is not the verified merged PR head.");
+    const section = (title: RegExp) => {
+      const lines = pr.body!.toString().split(/\r?\n/); const start = lines.findIndex((line) => title.test(line));
+      if (start < 0) return null;
+      const end = lines.findIndex((line, index) => index > start && /^#{1,3}\s/.test(line));
+      return redactSecrets(lines.slice(start + 1, end < 0 ? undefined : end).join("\n").trim()) || null;
+    };
+    return { url, headSha, decisions: section(/^#{1,3}\s+Decisions\s*$/i), followUps: section(/^#{1,3}\s+Follow[ -]?ups\s*$/i) };
+  }
+
+  /** One independent bot review per immutable integration/revert head, immediately after opening. */
+  async reviewIntegration(github: string, goalId: string, prUrl: string, headSha: string, review: (cwd: string) => Promise<unknown>): Promise<void> {
+    this.retroRepo(github, goalId, prUrl);
+    if (!SHA.test(headSha)) throw new SprintError("Invalid integration review head.");
+    await withFileLock(join(this.runtimeDir, `integration-review-${goalId}.lock`), async () => {
+      const endpoint = `repos/${github}/pulls/${prUrl.split("/").at(-1)}`;
+      const marker = `<!-- indra-integration-review:${goalId}:${headSha} -->`;
+      const delivered = async () => (await this.retroPages<{ user: { login: string }; commit_id: string; body: string; state: string }>(`${endpoint}/reviews?per_page=100`)).some((item) => item.user?.login === "satori-miyamoto" && item.commit_id === headSha && item.body?.trimEnd().endsWith(marker) && ["APPROVED", "CHANGES_REQUESTED", "DISMISSED"].includes(item.state));
+      if (await delivered()) return;
+      const before = await this.inspectMerge(prUrl);
+      if (before.state !== "OPEN" || before.headSha !== headSha) throw new SprintError("Integration changed before review.");
+      const details = JSON.parse((await this.must("gh", ["pr", "view", prUrl, "--json", "baseRefName,isCrossRepository"])).stdout) as { baseRefName?: string; isCrossRepository?: boolean };
+      if (details.baseRefName !== "main" || details.isCrossRepository !== false) throw new SprintError("Integration review requires the project's main target.");
+      const account = await this.run("env", [`GH_CONFIG_DIR=${join(homedir(), ".config/gh-yahaha-bot")}`, "gh", "api", "user", "--jq", ".login"]);
+      if (account.code !== 0 || account.stdout.trim() !== "satori-miyamoto") throw new SprintError("Integration review requires satori-miyamoto.");
+      const cwd = await ensureProjectCheckout(this.shell, this.runtimeDir, github);
+      await this.must("git", [...GH_CREDENTIAL, "fetch", "origin", `refs/pull/${prUrl.split("/").at(-1)}/head`], cwd);
+      const root = join(this.runtimeDir, "worktrees"); await mkdir(root, { recursive: true, mode: 0o700 });
+      const temp = await mkdtemp(join(root, `integration-review-${goalId}-`)); const checkout = join(temp, "checkout");
+      try {
+        await this.must("git", ["worktree", "add", "--detach", checkout, headSha], cwd);
+        const value = await review(checkout) as RetroReview;
+        const files = await this.retroPages<{ filename: string }>(`${endpoint}/files?per_page=100`);
+        if (typeof value?.summary !== "string" || !Array.isArray(value.findings) || value.findings.some((finding) => !files.some((file) => file.filename === finding.path) || !Number.isSafeInteger(finding.line) || finding.line < 1 || typeof finding.reason !== "string" || !finding.reason.trim())) throw new SprintError("Invalid integration reviewer findings.");
+        const current = await this.inspectMerge(prUrl);
+        if (current.state !== "OPEN" || current.headSha !== headSha) throw new SprintError("Integration changed during review.");
+        if (await delivered()) return;
+        const file = join(temp, "review.json"); await writeFile(file, JSON.stringify({ commit_id: headSha, event: value.findings.length ? "REQUEST_CHANGES" : "APPROVE", body: `${redactSecrets(value.summary)}\n\n${marker}`, comments: value.findings.map((finding) => ({ path: finding.path, line: finding.line, side: "RIGHT", body: redactSecrets(finding.reason) })) }), { mode: 0o600 });
+        await this.run("env", [`GH_CONFIG_DIR=${join(homedir(), ".config/gh-yahaha-bot")}`, "gh", "api", `${endpoint}/reviews`, "--method", "POST", "--input", file]);
+        if (!await delivered()) throw new SprintError("Integration review delivery is not confirmed.");
+      } finally { if ((await this.run("git", ["worktree", "remove", "--force", checkout], cwd)).code === 0) await rm(temp, { recursive: true, force: true }); }
+    });
   }
 
   /** Creates `sprint/<goal-id>` on GitHub from main's current head unless it exists; returns the branch's head. */
@@ -170,13 +322,14 @@ export class SprintGitHub implements RetroArchive {
   }
 
   /** Current-head bot approval and green CI gate release; a request alone never proves a merge. */
-  async merge(prUrl: string): Promise<MergeResult> {
+  async merge(prUrl: string, beforeMutation?: (headSha: string) => Promise<void>): Promise<MergeResult> {
     const before = await this.inspectMerge(prUrl);
     if (!before.reviewed || !before.checksPassed) return { merged: false, reason: `Current-head satori-miyamoto approval and passing CI are required on ${prUrl}` };
     if (before.state === "MERGED" && before.mergedSha) return { merged: true, sha: before.mergedSha };
     if (before.state !== "OPEN") return { merged: false, reason: `${prUrl} is ${before.state.toLowerCase()}` };
     const blocker = await this.serverMergeBlocker(prUrl, before.headSha);
     if (blocker) return { merged: false, reason: blocker };
+    await beforeMutation?.(before.headSha);
     // GitHub enforces the Code Owner verdict at mutation time; the SHA precondition pins this attempt.
     // Never arm deferred auto-merge, which can outlive this process and its inspected head.
     try { await this.run("gh", ["pr", "merge", prUrl, "--squash", "--match-head-commit", before.headSha]); }

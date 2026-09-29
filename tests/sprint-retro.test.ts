@@ -60,6 +60,23 @@ function run(snapshot = buildRetroSnapshot(input()), response: unknown = narrati
 }
 
 describe("bounded retro evidence and numeric accounting", () => {
+  it("freezes actual lane sections and recorded integration rounds without filling missing history with zero", async () => {
+    const data = input(); const headSha = "a".repeat(40); const baseSha = "b".repeat(40);
+    data.lanePrs = [{ url: pr, headSha, decisions: "Preserved the approved boundary", followUps: null }];
+    data.releaseAttempts = { version: 1, goalId: data.goal.id, startedAt: at(30), conflicts: [{ prUrl: pr, headSha, baseSha, at: at(31) }, { prUrl: pr, headSha, baseSha, at: at(32) }],
+      merges: [{ prUrl: pr, headSha, at: at(33) }, { prUrl: pr, headSha, at: at(34) }, { prUrl: pr, headSha, at: at(60) }] };
+    const snapshot = buildRetroSnapshot(data);
+    expect(snapshot.phases.find((phase) => phase.phase === "release")!.facts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ evidenceId: "release-integration-conflicts", value: 1 }), expect.objectContaining({ evidenceId: "release-merge-rounds", value: 2 }),
+    ]));
+    data.lanePrs[0].decisions = "Changed after cutoff";
+    const markdown = await renderSprintRetro(snapshot, narrative(snapshot), generation());
+    expect(markdown).toContain("Preserved the approved boundary"); expect(markdown).not.toContain("Changed after cutoff"); expect(markdown).toContain("unknown — section absent");
+    expect(markdown).toContain("Integration PR merge attempts started | 2");
+    const without = buildRetroSnapshot(input());
+    expect(without.phases.find((phase) => phase.phase === "release")!.facts.find((fact) => fact.evidenceId === "release-merge-rounds")!.value).toBeNull();
+    data.releaseAttempts.goalId = "goal-wrong"; expect(() => buildRetroSnapshot(data)).toThrow("integration attempt evidence");
+  });
   it("computes known tables, includes generation usage and preserves the cutoff rather than guessing closure", async () => {
     const snapshot = buildRetroSnapshot(input());
     expect(snapshot.missing).toEqual([]);

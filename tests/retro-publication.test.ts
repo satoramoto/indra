@@ -3,12 +3,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CeremonyContext } from "../src/planning-bridge.js";
 import { advanceCeremony, startCeremony, type HumanApproval } from "../src/ceremony.js";
 import type { PlanningGoal, PlanningStore } from "../src/planning.js";
-import { createCeremonyAdapters, RetroPublication, retroRetryDelayMs, retroRuntimeName, type RetroPublicationRecord } from "../src/retro-publication.js";
+import { createCeremonyAdapters, recordedRetroInput, RetroPublication, retroRetryDelayMs, retroRuntimeName, type RetroPublicationRecord } from "../src/retro-publication.js";
 import { buildRetroSnapshot, renderSprintRetro, RetroGenerationError, type RetroPriorAttempt, type SprintRetroDraft } from "../src/sprint-retro.js";
 import { SprintGitHub, type RetroArchive, type RetroPr } from "../src/sprint.js";
 import { SeatRuntime } from "../src/seat-runtime.js";
 import { TEAM_LEAD_CODEX_CONFIG, codexConfigForRoles } from "../src/harness-home.js";
 import * as mattermost from "../src/planning-mattermost.js";
+import { goalRuntimeFilename, type GoalReport } from "../src/goal-contract.js";
+import { releaseAttemptsName } from "../src/sprint.js";
 
 afterEach(() => { vi.useRealTimers(); });
 const at = (second: number) => `2026-01-01T00:00:${String(second).padStart(2, "0")}.000Z`;
@@ -67,6 +69,30 @@ async function fixture() {
 }
 
 describe("recoverable retro publication", () => {
+  it("reads new-model lane PR sections and shared runtime facts without importing legacy seat records or inventing timings", async () => {
+    const f = await fixture(); const goal = f.context.goal;
+    const report: GoalReport = { version: 1, goalId: goal.id, teamId: goal.teamId, seatId: "seat-dev", sprintBranch: "sprint/goal-one", headSha: "a".repeat(40),
+      lanePrs: [{ laneId: "lane-one", url: "https://github.com/test/project/pull/1", headSha: "a".repeat(40), mergedSha: "b".repeat(40), reviewer: "satori-miyamoto", ci: "passed" }], checks: [{ command: "typecheck", exitCode: 0 }], decisions: ["Unverified report claim"], followUps: [], neededButUnowned: [] };
+    goal.workflowModel = "goals-v1"; goal.ownedFiles = ["src/**"]; goal.goalAssignment = { seatId: "seat-dev", status: "reported", updatedAt: at(3) };
+    goal.goalProposal = { version: 1, goalId: goal.id, proposalId: "proposal-one", productSeatId: "seat-product", rank: 1, mission: "docs/mission.md", summary: "Ship", outcomes: [{ number: 1, title: "Deliver", description: "Deliver the goal", reason: "Mission", currentCode: ["src/a.ts"] }], ownedFiles: goal.ownedFiles, risks: [], rationale: "Useful", basedOnRetros: [] };
+    delete goal.proposal; delete goal.assignments;
+    const approval = goal.ceremony!.history.find((entry) => entry.stage === "implement")!; if (approval.evidence.kind === "approval") approval.evidence.proposalPostId = goal.mattermost.rootPostId;
+    const release = goal.ceremony!.history.find((entry) => entry.stage === "release")!; release.evidence = { kind: "implementation", outcomes: [], goalDelivery: report };
+    f.records.set(goalRuntimeFilename(goal.id), { goalId: goal.id, teamId: goal.teamId, lanes: [{ id: "lane-one", headSha: "a".repeat(40), mergedSha: "b".repeat(40), fixRounds: 2, conflictRounds: 1, findings: [{ path: "src/a.ts", line: 5, reason: "Latest recorded finding" }] }] });
+    f.records.set(releaseAttemptsName(goal.id), { version: 1, goalId: goal.id, startedAt: at(3), conflicts: [], merges: [{ prUrl: goal.integration!.prUrl, headSha: "a".repeat(40), at: at(4) }] });
+    const github = new SprintGitHub({ run: vi.fn() }, "/unused");
+    const source = vi.spyOn(github, "prRetrospective").mockResolvedValue({ url: report.lanePrs[0].url, headSha: "a".repeat(40), decisions: "Actual merged PR decision", followUps: null });
+    const read = vi.spyOn(f.context.store, "readRuntimeFile");
+    const input = await recordedRetroInput(f.context, [], github);
+    expect(source).toHaveBeenCalledExactlyOnceWith("test/project", goal.id, report.lanePrs[0].url, report.lanePrs[0].headSha);
+    expect(input.lanePrs).toEqual([{ url: report.lanePrs[0].url, headSha: "a".repeat(40), decisions: "Actual merged PR decision", followUps: null }]);
+    expect(input.facts.rounds).toEqual([{ outcomeId: "lane-one", fix: 2, conflict: 1 }]);
+    expect(input.facts.seats).toContainEqual({ seatId: "seat-dev", wallTimeMs: null });
+    expect(input.missing).toEqual(expect.arrayContaining([expect.stringContaining("token counters"), expect.stringContaining("Follow-ups")]));
+    expect(buildRetroSnapshot(input).seats.find((seat) => seat.seatId === "seat-dev")!.wallTimeMs).toBeNull();
+    expect(read.mock.calls.every(([name]) => !name.startsWith("seat-") && !name.startsWith("implementation-"))).toBe(true);
+    source.mockRejectedValueOnce(new Error("The head no longer matches")); await expect(recordedRetroInput(f.context, [], github)).rejects.toThrow("head no longer matches");
+  });
   it("surfaces the protected merge setup blocker while retaining the open retrospective", async () => {
     const f = await fixture();
     const reason = "Automatic merge blocked: The target must require approving Code Owner reviews and dismiss stale approvals. See docs/remodel-contract.md for the required server-side Code Owner policy.";

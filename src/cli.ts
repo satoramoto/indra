@@ -1,5 +1,6 @@
 /// <reference types="vite/client" />
 import { createInterface } from "node:readline/promises";
+import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { readToken } from "./credential.js";
 import { Inventory, InventoryError, type Seat, type Team } from "./domain.js";
@@ -7,18 +8,20 @@ import { LocalStateRepository, StateDataError } from "./local-state.js";
 import { MattermostClient, MattermostInventory } from "./mattermost.js";
 import { printState } from "./state-cli.js";
 import { StateInventory } from "./state-domain.js";
-import { botTeamHome, PlanningStore, teamProject } from "./planning.js";
+import { botTeamHome, PlanningStore, requireTeamHome, teamProject } from "./planning.js";
 import { SprintGitHub } from "./sprint.js";
 import { closeLegacyGoals } from "./legacy-closure.js";
 import { loadProductSeat, ProductSeat } from "./product-seat.js";
-import { mergedWithCeremony } from "./project-checkout.js";
+import { ensureProjectCheckout, mergedWithCeremony } from "./project-checkout.js";
 import { PlanningBridge, type CeremonyAdapters, type PlanningChat } from "./planning-bridge.js";
 import { assertCeremonyReady, type CeremonyWriteReadiness } from "./ceremony-ports.js";
 import type { ReleaseActivationOptions, ReleaseActivationReadPort } from "./release-activation.js";
 import { MATTERMOST_SERVER } from "./hub-format.js";
 import { CHICK_USERNAME, MattermostAccessError, MattermostPlanningChat, readBotToken, readChickToken, type BotTokenOptions } from "./planning-mattermost.js";
 import { opCredential, stageServiceToken } from "./service-account.js";
-import { captureOpEnvironment } from "./op-env.js";
+import { captureOpEnvironment, opRead } from "./op-env.js";
+import { WorkflowInbox, runWorkflowHost, workflowDigest } from "./remodel-events.js";
+import { productRuntimeFilename, validateProductProposal, type GoalReport, type ProductRuntimeRecord, type WorkflowEvent } from "./goal-contract.js";
 import { DeveloperSeat, loadDeveloperSeat, processShell } from "./developer-seat.js";
 import { DEVELOPER_SESSION_TIMEOUT_MS, type AgentRuntime, type WriteAccess } from "./codex-runtime.js";
 import { loadSeatEngines, SeatRuntime } from "./seat-runtime.js";
@@ -59,7 +62,7 @@ export function createPlanningStore(checkout: string, modules: Record<string, Ce
   for (const item of readiness) assertCeremonyReady(item);
   return new PlanningStore(checkout, undefined, readiness[0]);
 }
-export async function createPlanningBridge(store: PlanningStore, chat: PlanningChat, runtime: AgentRuntime, modules: Record<string, CeremonyAdapterModule> = ceremonyModules): Promise<PlanningBridge> {
+export async function createPlanningBridge(store: PlanningStore, chat: PlanningChat, runtime: AgentRuntime, modules: Record<string, CeremonyAdapterModule> = ceremonyModules, runtimeFor?: (cwd: string, write?: WriteAccess) => AgentRuntime): Promise<PlanningBridge> {
   const adapters: CeremonyAdapters = {};
   for (const module of Object.values(modules)) {
     let supplied = await module.createCeremonyAdapters?.({ store, runtime, appDir: defaultAppDir });
@@ -86,7 +89,28 @@ export async function createPlanningBridge(store: PlanningStore, chat: PlanningC
       Object.assign(adapters, { [key]: supplied[key] });
     }
   }
-  return new PlanningBridge(store, chat, runtime, 20, processShell, adapters);
+  return new PlanningBridge(store, chat, runtime, 20, processShell, adapters, { runtimeFor });
+}
+
+/** The Developer lane can land before or after the Scheduler without an unsafe legacy fallback. */
+export async function developerEventTurn(runner: object, event: WorkflowEvent): Promise<{ events: WorkflowEvent[]; report: GoalReport | null }> {
+  const finite = runner as { turn?: (event: WorkflowEvent) => Promise<{ events: WorkflowEvent[]; report: GoalReport | null }> };
+  if (typeof finite.turn !== "function") throw new Error("The goals-v1 Developer service is unavailable in this build. Install the Developer lane before starting this seat.");
+  return await finite.turn(event);
+}
+function hostSignals() {
+  const controller = new AbortController(); const stop = () => controller.abort();
+  process.once("SIGINT", stop); process.once("SIGTERM", stop);
+  return { signal: controller.signal, close: () => { process.off("SIGINT", stop); process.off("SIGTERM", stop); } };
+}
+type WorkflowTeam = { id: string; slug: string; workflowModel?: "goals-v1"; seats: { id: string }[] };
+/** Only a non-secret reference is configured; op is the sole child receiving its credential. */
+export async function workflowDelivery(store: PlanningStore): Promise<{ port: number; secret: string }> {
+  const config = await store.readRuntimeFile<{ version?: unknown; port?: unknown; secretRef?: unknown }>("workflow-delivery");
+  if (!config || Object.keys(config).sort().join() !== "port,secretRef,version" || config.version !== 1 || !Number.isInteger(config.port) || Number(config.port) < 1024 || Number(config.port) > 65535 || typeof config.secretRef !== "string" || !/^op:\/\/[^\s]+$/.test(config.secretRef)) throw new Error("Configure workflow-delivery.json with version 1, a loopback port and an op:// secretRef, then configure HTTPS GitHub webhook forwarding. See docs/remodel-events.md.");
+  const secret = await opRead(config.secretRef, await opCredential(store.checkout));
+  if (!secret) throw new Error("The GitHub webhook secret could not be read from 1Password. Check the workflow-delivery secret reference and service account access.");
+  return { port: Number(config.port), secret };
 }
 
 export const SERVER = MATTERMOST_SERVER;
@@ -194,7 +218,7 @@ export async function runConsistencyCheck(state: StateInventory, reader: TeamMem
 }
 
 /** Planning actions on one existing goal, each taking `--goal GOAL_ID`. */
-const GOAL_ACTIONS = ["approve", "propose", "integrate", "merge", "rollback"] as const;
+const GOAL_ACTIONS = ["approve", "propose", "integrate", "merge", "rollback", "retry"] as const;
 type GoalAction = typeof GOAL_ACTIONS[number];
 const isGoalAction = (action: string | undefined): action is GoalAction => (GOAL_ACTIONS as readonly (string | undefined)[]).includes(action);
 
@@ -302,19 +326,48 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         const product = await loadProductSeat(store, options.seatId);
         if (product) {
           const services = await seatServices(store, product.username, product.id);
-          const runner = new ProductSeat({ store, seat: product, runtime: services.runtime(store.checkout) });
-          if (options.readyNonce) await signalReady(options.checkout, options.readyNonce);
-          const result = await runner.turn({ kind: "startup", at: new Date().toISOString(), teamId: product.teamId });
-          console.log(`Product seat ${product.id}: ${result.status}.`);
-          return 0;
+          const chat = services.chat(await hostedToken(options.checkout, options.readyNonce, (tokenOptions) => readBotToken(product.username, tokenOptions)));
+          await joinTeamHome(options.checkout, options.readyNonce, store, chat, product.username);
+          const inbox = new WorkflowInbox(store.runtimeDir); const signals = hostSignals();
+          try { await runWorkflowHost({ store, teamId: product.teamId, consumer: product.id, signal: signals.signal,
+            onReady: async () => { if (options.readyNonce) await signalReady(options.checkout, options.readyNonce); },
+            turn: async (event) => {
+              if (!["startup", "proposal-vetted", "approval", "goal-closed", "redirect", "queue-changed", "retry"].includes(event.kind)) return;
+              const fresh = await loadProductSeat(store, product.id); if (!fresh) throw new Error("The Product seat is no longer configured.");
+              const project = requireTeamHome(await store.read(), product.teamId).github;
+              const cwd = await ensureProjectCheckout(processShell, store.runtimeDir, project);
+              const productServices = { store, seat: fresh, runtime: services.runtime(cwd), runtimeFor: services.runtime, chat };
+              const result = await withFileLock(turnLockFile(options.checkout, { kind: "seat", seatId: product.id }), () => new ProductSeat(productServices).turn(event), 24 * 60 * 60_000);
+              if (result.status === "disabled") throw new Error("The goals-v1 Product service is unavailable in this build. Install the Product lane before starting this seat.");
+              const record = await store.readRuntimeFile<ProductRuntimeRecord>(productRuntimeFilename(product.teamId));
+              for (const entry of record?.queue ?? []) if (entry.status === "proposed" && !entry.vetting) {
+                const proposal = validateProductProposal(entry.proposal);
+                await inbox.publish({ kind: "proposal", id: `proposal:${workflowDigest(proposal)}`, teamId: product.teamId, goalId: proposal.goalId, proposalId: proposal.proposalId, at: new Date().toISOString() });
+              }
+            },
+          }); return 0; } finally { signals.close(); }
         }
         const seat = await loadDeveloperSeat(store, options.seatId);
         const services = await seatServices(store, seat.username, seat.id);
         const chat = services.chat(await hostedToken(options.checkout, options.readyNonce, (tokenOptions) => readBotToken(seat.username, tokenOptions)));
         await joinTeamHome(options.checkout, options.readyNonce, store, chat, seat.username);
-        if (options.readyNonce) await signalReady(options.checkout, options.readyNonce);
         const runner = new DeveloperSeat(store, seat, chat, processShell, (cwd, write) => services.runtime(cwd, DEVELOPER_SESSION_TIMEOUT_MS, write), (line) => console.log(`[${new Date().toISOString()}] ${line}`));
         console.log(`Developer seat ${seat.id} (@${seat.username}) running. Stop with Ctrl-C.`);
+        const team = ((await store.read()).teams as WorkflowTeam[]).find((team) => team.seats.some((item) => item.id === seat.id));
+        if (team?.workflowModel === "goals-v1") {
+          const inbox = new WorkflowInbox(store.runtimeDir); const signals = hostSignals();
+          try { await runWorkflowHost({ store, teamId: team.id, consumer: seat.id, signal: signals.signal,
+            onReady: async () => { if (options.readyNonce) await signalReady(options.checkout, options.readyNonce); },
+            turn: async (event) => {
+              if ("goalId" in event && event.goalId && !(await store.read()).planningGoals?.some((goal) => goal.id === event.goalId && goal.goalAssignment?.seatId === seat.id && !goal.ceremony?.closure)) return;
+              const fresh = new DeveloperSeat(store, seat, chat, processShell, (cwd, write) => services.runtime(cwd, DEVELOPER_SESSION_TIMEOUT_MS, write), (line) => console.log(`[${new Date().toISOString()}] ${line}`));
+              const result = await withFileLock(turnLockFile(options.checkout, { kind: "seat", seatId: seat.id }), () => developerEventTurn(fresh, event), 24 * 60 * 60_000);
+              for (const next of result.events) await inbox.publish(next);
+              if (result.report) await inbox.publish({ kind: "developer-report", id: `report:${workflowDigest(result.report)}`, teamId: team.id, goalId: result.report.goalId, seatId: seat.id, report: result.report, at: new Date().toISOString() });
+            },
+          }); return 0; } finally { signals.close(); }
+        }
+        if (options.readyNonce) await signalReady(options.checkout, options.readyNonce);
         while (true) {
           // Each step holds the turn lock, so the supervisor only restarts this runner for an update between steps.
           if (await withFileLock(turnLockFile(options.checkout, { kind: "seat", seatId: seat.id }), () => runner.tick(), 24 * 60 * 60_000) === "idle") await new Promise((resolve) => setTimeout(resolve, 30_000));
@@ -348,7 +401,8 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       });
       await store.retireLegacySprints().then((removed) => { if (removed) console.log("Retired the legacy draft sprints in state.json."); },
         (error: unknown) => console.log(`Legacy draft sprints were not retired: ${error instanceof Error ? error.message : String(error)}`));
-      return await runTerminalUi(new StateInventory(new LocalStateRepository(options.checkout)), new LocalSessionReader(options.checkout), {
+      const workflowTeams = ((await store.read()).teams as WorkflowTeam[]).filter((team) => team.workflowModel === "goals-v1");
+      const uiOptions = {
         processes: new Supervisor(options.checkout, undefined, undefined, undefined, store, (force) => stageServiceToken(options.checkout, { force })),
         goals: new CliGoalStarter(options.checkout),
         paneTail: new TmuxPaneTail(options.checkout),
@@ -375,12 +429,19 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
           rolledBack: () => updater.rolledBack(),
         },
         view,
-        reload: async (current) => {
+        workflowEvents: workflowTeams.length ? async (onEvent: (event: WorkflowEvent) => Promise<void>, signal: AbortSignal) => {
+          const controller = new AbortController(); const abort = () => controller.abort();
+          signal.addEventListener("abort", abort, { once: true }); if (signal.aborted) abort();
+          const hosts = workflowTeams.map((team) => runWorkflowHost({ store, teamId: team.id, consumer: `ui-${team.id}`, signal: controller.signal, turn: onEvent }));
+          try { await Promise.all(hosts); } finally { abort(); signal.removeEventListener("abort", abort); await Promise.allSettled(hosts); }
+        } : undefined,
+        reload: async (current: UiView) => {
           // Best effort: without the saved view the reloaded UI opens on its default page.
           await mkdir(dirname(viewFile), { recursive: true, mode: 0o700 }).then(() => writeFile(viewFile, JSON.stringify(current), { mode: 0o600 })).catch(() => undefined);
           return RELOAD_EXIT_CODE;
         },
-      });
+      } satisfies Parameters<typeof runTerminalUi>[2] & { workflowEvents?: (onEvent: (event: WorkflowEvent) => Promise<void>, signal: AbortSignal) => Promise<void> };
+      return await runTerminalUi(new StateInventory(new LocalStateRepository(options.checkout)), new LocalSessionReader(options.checkout), uiOptions);
     }
     if (options.mode === "state") {
       const inventory = new StateInventory(new LocalStateRepository(options.checkout));
@@ -401,6 +462,12 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         return 0;
       }
       const store = createPlanningStore(options.checkout);
+      if (options.action === "retry") {
+        const goal = (await store.read()).planningGoals?.find((goal) => goal.id === options.goal);
+        if (!goal || goal.workflowModel !== "goals-v1" || goal.ceremony?.closure) throw new StateDataError("A retry requires an open goals-v1 goal.");
+        await new WorkflowInbox(store.runtimeDir).publish({ kind: "retry", id: `owner-retry:${goal.id}:${randomUUID()}`, teamId: goal.teamId, goalId: goal.id, at: new Date().toISOString(), reason: "Owner requested reconciliation after resolving the recorded blocker." });
+        console.log(`Queued a finite retry for ${goal.id}; approval, scope and merge gates still apply.`); return 0;
+      }
       if (options.action === "propose") {
         // Run by the terminal UI: records the request for the bridge, which drafts through the 📝 path. No credential is read.
         try {
@@ -419,6 +486,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
           const chat = services.chat(await readChickToken({ ...await opCredential(options.checkout), headless: true }));
           await joinTeamHome(options.checkout, undefined, store, chat, CHICK_USERNAME);
           const { goal, alreadyApproved } = await (await createPlanningBridge(store, chat, services.runtime(process.cwd()))).approve(options.goal!);
+          if (goal.workflowModel === "goals-v1") await new WorkflowInbox(store.runtimeDir).publish({ kind: "approval", id: `owner-approval:${goal.id}`, teamId: goal.teamId, goalId: goal.id, at: goal.updatedAt });
           console.log(alreadyApproved ? `Goal ${goal.id} was already approved; no new assignments.` : `Approved goal ${goal.id}: ${goal.assignments?.length ?? 0} outcome(s) queued for Developer seats.`);
           return 0;
         } catch (error) {
@@ -453,8 +521,25 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       }
       recordRunningBuild(`${options.checkout}.runtime`, import.meta.url);
       if (options.readyNonce) useHeadedMarker(headedMarkerFile(options.checkout, options.readyNonce));
-      const chat = services.chat(await hostedToken(options.checkout, options.readyNonce, readChickToken));
+      const token = await hostedToken(options.checkout, options.readyNonce, readChickToken);
+      const chat = services.chat(token);
       await joinTeamHome(options.checkout, options.readyNonce, store, chat, CHICK_USERNAME);
+      const state = await store.read();
+      const team = (state.teams as WorkflowTeam[]).find((team) => team.slug === "yahaha" && team.workflowModel === "goals-v1");
+      if (team) {
+        const home = requireTeamHome(state, team.id); const github = await workflowDelivery(store);
+        const inbox = new WorkflowInbox(store.runtimeDir); const signals = hostSignals();
+        try { await runWorkflowHost({ store, teamId: team.id, consumer: `scheduler-${team.id}`, signal: signals.signal,
+          mattermost: { server: SERVER, token, channelId: home.channelId }, github,
+          onReady: async () => { if (options.readyNonce) await signalReady(options.checkout, options.readyNonce); },
+          turn: async (event) => {
+            const fresh = await createPlanningBridge(store, chat, services.runtime(process.cwd()), ceremonyModules, (cwd, write) => services.runtime(cwd, undefined, write));
+            const result = await withFileLock(turnLockFile(options.checkout, { kind: "bridge" }), () => fresh.turn(event), 24 * 60 * 60_000);
+            for (const next of result.events) await inbox.publish(next);
+            if (result.record.failure) console.log(result.record.failure.message);
+          },
+        }); return 0; } finally { signals.close(); }
+      }
       const bridge = await createPlanningBridge(store, chat, services.runtime(process.cwd()));
       console.log("Chick planning bridge running. Stop with Ctrl-C.");
       let ready = false;

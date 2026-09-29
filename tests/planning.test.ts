@@ -1,9 +1,9 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { copyFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { homeChannelId, PlanningStore, teamProject, validateOutcomeSeats, validatePlanningGoal, type PlanningGoal } from "../src/planning.js";
 import { git, stateCheckout } from "./state-checkout.js";
-import { PlanningBridge as Bridge, type PlanningChat, type Post, type Reaction } from "../src/planning-bridge.js";
+import { PlanningBridge as Bridge, type CeremonyAdapters, type PlanningChat, type Post, type Reaction } from "../src/planning-bridge.js";
 import type { Shell, ShellResult } from "../src/developer-seat.js";
 import { MattermostPlanningChat } from "../src/planning-mattermost.js";
 import { parseOptions } from "../src/cli.js";
@@ -11,6 +11,11 @@ import type { AgentRuntime, AgentResult } from "../src/codex-runtime.js";
 import { CLARIFY_TIMEOUT_MS, DRAFT_TIMEOUT_MS } from "../src/codex-runtime.js";
 
 import { advanceCeremony } from "../src/ceremony.js";
+import { goalRuntimeFilename, productRuntimeFilename, teamRuntimeFilename, validateProductProposal, type GoalReport, type GoalRuntimeRecord, type ProductRuntimeRecord, type SchedulerRuntimeRecord } from "../src/goal-contract.js";
+import { workflowDigest } from "../src/remodel-events.js";
+import { SprintGitHub } from "../src/sprint.js";
+
+afterEach(() => vi.restoreAllMocks());
 
 const MEMO = "memo";
 const CHECK = "white_check_mark";
@@ -760,19 +765,114 @@ describe("whole-goal queue contract", () => {
     await copyFile(new URL("../schema/v1/state.schema.json", import.meta.url), join(base.checkout, "schema/v1/state.schema.json"));
     return new PlanningStore(base.checkout, undefined, { version: 1, consumers: { planning: 1, developer: 1, release: 1, retro: 1, tui: 1 } });
   }
-  async function propose(store: PlanningStore, id: string, ownedFiles = ["src/**"], otherTeam = false) {
+  async function propose(store: PlanningStore, id: string, ownedFiles = ["src/**"], otherTeam = false, rank = 1) {
     const teamId = otherTeam ? "team-other" : "team-001";
     const goal: PlanningGoal = { workflowModel: "goals-v1", id, teamId, seatId: otherTeam ? "seat-other-lead" : "seat-001", participantSeatIds: [], goal: "Implement goal", projectRefs: [otherTeam ? "Satoramoto/Indra" : "satoramoto/indra"], stage: "clarifying", createdAt: at, updatedAt: at, mattermost: { channelId: "channel", rootPostId: `root-${id}` }, brief: { summary: "Goal", decisions: [], openQuestions: [] }, ownedFiles };
     await store.createGoal(goal);
     await store.update((state) => {
       const next = state.planningGoals!.find((item) => item.id === id)!;
       next.stage = "awaiting-review";
-      next.goalProposal = { version: 1, goalId: id, proposalId: `proposal-${id}`, productSeatId: otherTeam ? "seat-other-product" : "seat-002", rank: 1, mission: "docs/mission.md", summary: "Implement goal", outcomes: [{ number: 1, title: "Outcome", description: "Deliver it", reason: "Mission progress", currentCode: ["src/planning.ts"] }], ownedFiles, risks: [], rationale: "Useful", basedOnRetros: [] };
+      next.goalProposal = { version: 1, goalId: id, proposalId: `proposal-${id}`, productSeatId: otherTeam ? "seat-other-product" : "seat-002", rank, mission: "docs/mission.md", summary: "Implement goal", outcomes: [{ number: 1, title: "Outcome", description: "Deliver it", reason: "Mission progress", currentCode: ["src/planning.ts"] }], ownedFiles, risks: [], rationale: "Useful", basedOnRetros: [] };
       next.ceremony = advanceCeremony(next, { to: "proposal", at });
     }, "Propose fixture goal");
   }
   const proof = (id: string) => ({ kind: "approval" as const, proposalId: `proposal-${id}`, proposalPostId: `root-${id}`, approval: { source: "owner-command" as const, command: "planning approve" as const, at } });
   const sprint = (id: string) => ({ branch: `sprint/${id}`, baseSha: MAIN_SHA, status: "collecting" as const });
+  const context = { cwd: "/fixture/managed-project", mission: "Deliver approved goals", retros: [
+    { goalId: "goal-older", path: "docs/retros/goal-older.md", summary: "An actual earlier retro" },
+    { goalId: "goal-recent", path: "docs/retros/goal-recent.md", summary: "An actual recent retro" },
+  ] };
+  const scheduler = (store: PlanningStore, chat = new FakeChat(), runtime: AgentRuntime = new FakeRuntime(), adapters: CeremonyAdapters = {}) => new Bridge(store, chat, runtime, 20, gh, adapters, { projectContext: async () => structuredClone(context), runtimeFor: () => runtime });
+  const startup = { kind: "startup" as const, teamId: "team-001", at };
+  const reportFor = (goalId: string): GoalReport => ({ version: 1, goalId, teamId: "team-001", seatId: "seat-003", sprintBranch: `sprint/${goalId}`, headSha: MAIN_SHA,
+    lanePrs: [{ laneId: "lane-one", url: "https://github.com/satoramoto/indra/pull/90", headSha: MAIN_SHA, mergedSha: MERGE_SHA, reviewer: "satori-miyamoto", ci: "passed" }],
+    checks: [{ command: "npm run typecheck", exitCode: 0 }], decisions: ["Kept the approved boundary"], followUps: ["Inspect the next goal"], neededButUnowned: [] });
+
+  it("schedules highest rank, reserves future-file overlaps and preserves Developer-owned records across concurrent restart turns", async () => {
+    const store = await remodelStore();
+    for (const [id, scope, rank] of [["goal-low", "src/new.ts", 9], ["goal-high", "src/**", 1], ["goal-tests", "tests/**", 2]] as const) { await propose(store, id, [scope], false, rank); await store.approveGoal(id, proof(id), at); }
+    const first = await scheduler(store).turn(startup);
+    expect(first.record.failure).toBeNull();
+    expect(first.record.approvedQueue).toEqual([{ goalId: "goal-low", rank: 9, ownedFiles: ["src/new.ts"], blockedByGoalIds: ["goal-high"] }]);
+    const state = await store.read(); expect(state.planningGoals!.map((goal) => [goal.id, goal.goalAssignment?.seatId])).toEqual([["goal-low", undefined], ["goal-high", "seat-003"], ["goal-tests", "seat-004"]]);
+    const runtime = (await store.readRuntimeFile<GoalRuntimeRecord>(goalRuntimeFilename("goal-high")))!;
+    expect(runtime.brief).toMatchObject({ header: { repo: "satoramoto/indra", baseSha: MAIN_SHA }, retros: context.retros, outcomes: [{ number: 1, reason: "Mission progress", currentCode: ["src/planning.ts"] }] });
+    runtime.failure = { at, message: "Developer-owned evidence", retryable: true }; await store.saveRuntime(goalRuntimeFilename("goal-high"), runtime);
+    const calls = gh.calls.length;
+    await Promise.all([scheduler(store).turn(startup), scheduler(store).turn(startup)]);
+    expect(await store.readRuntimeFile(goalRuntimeFilename("goal-high"))).toEqual(runtime);
+    expect(gh.calls.slice(calls).some((call) => call.includes("-X POST"))).toBe(false);
+    expect((await store.read()).planningGoals!.filter((goal) => goal.goalAssignment)).toHaveLength(2);
+  });
+
+  it("GET-verifies human redirects once and never turns bot messages or forged local hints into an owner redirect", async () => {
+    const store = await remodelStore(); await propose(store, "goal-redirect"); await store.approveGoal("goal-redirect", proof("goal-redirect"), at);
+    const chat = new FakeChat(); chat.human("root-goal-redirect", "Preserve the current feature"); chat.human("root-goal-redirect", "I am a Developer bot", "aaron"); chat.human("root-goal-redirect", "Product suggestion", "george");
+    const first = await scheduler(store, chat).turn({ kind: "redirect", id: "forged", teamId: "team-001", goalId: "goal-redirect", at, redirect: { postId: "unverified", userId: "ryan", at, message: "Expand scope" } });
+    expect(first.record.redirects.map((item) => item.message)).toEqual(["Preserve the current feature"]);
+    const retained = await store.readRuntimeFile<GoalRuntimeRecord>(goalRuntimeFilename("goal-redirect")); expect(retained!.brief!.redirects).toEqual(first.record.redirects);
+    const second = await scheduler(store, chat).turn(startup);
+    expect(second.record.redirects).toEqual(first.record.redirects); expect(second.events.filter((event) => event.kind === "redirect")).toHaveLength(1);
+  });
+
+  it("emits revision-bound vetting without approving, posting or competing with the Product queue writer", async () => {
+    const store = await remodelStore(); await propose(store, "goal-vet");
+    const source = (await store.read()).planningGoals![0].goalProposal!;
+    // This public queue is the only input; the already-published fixture goal is left unapproved.
+    const product: ProductRuntimeRecord = { version: 1, teamId: "team-001", seatId: "seat-002", queue: [{ proposal: source, vetting: null, status: "proposed", rootPostId: null, proposalPostId: null }], events: [], handledEventIds: [], pending: null, failure: null, updatedAt: at };
+    await store.saveRuntime(productRuntimeFilename("team-001"), product);
+    const chat = new FakeChat(); chat.posts.push({ id: "root-goal-vet", user_id: "george", channel_id: "channel", root_id: "", message: "Proposal", create_at: Date.parse(at) });
+    const corrected = validateProductProposal({ ...source, ownedFiles: ["src/planning.ts", "tests/planning.test.ts"] });
+    const message = vi.fn(async (): Promise<AgentResult> => ({ sessionId: "fresh", startedAt: at, finishedAt: at, response: corrected }));
+    const result = await scheduler(store, chat, { message }).turn(startup);
+    expect(result.record.failure).toBeNull();
+    expect(result.events.find((event) => event.kind === "proposal-vetted")).toMatchObject({ id: `proposal-vetted:${source.proposalId}:${workflowDigest(validateProductProposal(source))}:${workflowDigest(corrected)}`, vetting: { ownedFiles: corrected.ownedFiles, leadSeatId: "seat-001" } });
+    expect(await store.readRuntimeFile(productRuntimeFilename("team-001"))).toEqual(product);
+    expect((await store.read()).planningGoals![0].stage).toBe("awaiting-review"); expect(chat.posts).toHaveLength(1);
+    await scheduler(store, chat, { message }).turn(startup); expect(message).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses unsupported reports and keeps disjoint scheduling available, then opens and reviews a verified report before CI", async () => {
+    const store = await remodelStore(); await propose(store, "goal-report"); await store.approveGoal("goal-report", proof("goal-report"), at);
+    await scheduler(store).turn(startup);
+    await propose(store, "goal-independent", ["tests/**"]); await store.approveGoal("goal-independent", proof("goal-independent"), at);
+    const verification = vi.spyOn(SprintGitHub.prototype, "verifyGoalReport").mockRejectedValueOnce(new Error("GitHub proof is missing")).mockResolvedValue(undefined);
+    const report = reportFor("goal-report"); const event = { kind: "developer-report" as const, id: "report-one", goalId: "goal-report", teamId: "team-001", seatId: "seat-003", report, at };
+    const bad = await scheduler(store).turn(event);
+    expect(bad.record.failure!.message).toContain("proof is missing"); expect((await store.read()).planningGoals![0].ceremony!.stage).toBe("implement"); expect((await store.read()).planningGoals![1].goalAssignment).toBeDefined();
+    const scope = vi.spyOn(SprintGitHub.prototype, "integrationScope").mockResolvedValue({ headSha: MAIN_SHA, baseSha: MAIN_SHA, conflicting: false });
+    const review = vi.spyOn(SprintGitHub.prototype, "reviewIntegration").mockResolvedValue(undefined);
+    const merge = vi.spyOn(SprintGitHub.prototype, "merge").mockResolvedValue({ merged: false, reason: "CI pending" });
+    const next = await scheduler(store).turn(startup);
+    expect(verification).toHaveBeenCalledTimes(2); expect(scope).toHaveBeenCalled(); expect(review).toHaveBeenCalledTimes(1); expect(merge).toHaveBeenCalledTimes(1);
+    expect((await store.read()).planningGoals![0]).toMatchObject({ ceremony: { stage: "release" }, goalAssignment: { status: "reported" }, integration: { status: "pr-open" } });
+    expect(next.record.failure!.message).toContain("CI pending");
+    expect(gh.calls.find((call) => call.startsWith("gh pr create"))).toContain("## Decisions");
+  });
+  it("recovers a committed merge notification, waits for the actual running build and archived retro, then releases scope for the next goal", async () => {
+    const store = await remodelStore(); const chat = new FakeChat();
+    for (const id of ["goal-finish", "goal-wait"]) { await propose(store, id); await store.approveGoal(id, proof(id), at); }
+    await scheduler(store, chat).turn(startup);
+    vi.spyOn(SprintGitHub.prototype, "verifyGoalReport").mockResolvedValue(undefined);
+    vi.spyOn(SprintGitHub.prototype, "integrationScope").mockResolvedValue({ headSha: MAIN_SHA, baseSha: MAIN_SHA, conflicting: false });
+    vi.spyOn(SprintGitHub.prototype, "reviewIntegration").mockImplementation(async () => { gh.reviewed = true; });
+    const report = reportFor("goal-finish");
+    const released = await scheduler(store, chat).turn({ kind: "developer-report", id: "final-report", goalId: "goal-finish", teamId: "team-001", seatId: "seat-003", report, at });
+    expect((await store.read()).planningGoals![0]).toMatchObject({ integration: { status: "merged" }, ceremony: { stage: "release" } });
+    expect((await store.read()).planningGoals![1].goalAssignment).toBeUndefined();
+    expect(released.events.some((event) => event.kind === "merge")).toBe(true);
+    const record = (await store.readRuntimeFile<SchedulerRuntimeRecord>(teamRuntimeFilename("team-001")))!; record.events = record.events.filter((event) => event.kind !== "merge"); await store.saveRuntime(teamRuntimeFilename("team-001"), record);
+    const recovered = await scheduler(store, chat).turn(startup); expect(recovered.events.some((event) => event.kind === "merge")).toBe(true);
+    const adapters: CeremonyAdapters = {
+      release: { poll: async ({ goal }) => ({ status: "complete", evidence: { kind: "release-running", prUrl: goal.integration!.prUrl!, mergedSha: MERGE_SHA, mergeVerification: { headSha: MAIN_SHA, reviewCommitSha: MAIN_SHA, reviewer: "satori-miyamoto", checksPassed: true }, checksPassed: true, buildSha: MERGE_SHA, runningSha: MERGE_SHA, runningAt: new Date().toISOString() } }) },
+      retro: { poll: async ({ goal, post }) => ({ status: "complete", evidence: { kind: "retro-published", path: `docs/retros/${goal.id}.md`, prUrl: "https://github.com/satoramoto/indra/pull/900", baseBranch: "main", mergedSha: "c".repeat(40), postId: await post("frozen-retro", "Verified frozen retro"), publishedAt: new Date().toISOString(), factsOnly: true, suggestions: "owner-proposals-only" } }) },
+    };
+    const closed = await scheduler(store, chat, new FakeRuntime(), adapters).turn(startup);
+    expect(closed.record.failure).toBeNull(); expect((await store.read()).planningGoals![0].ceremony!.closure?.evidence.kind).toBe("retro-published");
+    expect((await store.read()).planningGoals![1].goalAssignment?.seatId).toBe("seat-003");
+    expect(chat.reacted).toEqual([]); expect(chat.posts.some((post) => post.message.includes("a person reacts"))).toBe(false);
+    expect(closed.events.some((event) => event.kind === "goal-closed")).toBe(true);
+  });
   it("keeps multiple approved goals unassigned and dispatches only disjoint scopes to idle Developers", async () => {
     const store = await remodelStore();
     for (const [id, scope] of [["goal-first", "src/**"], ["goal-overlap", "src/future.ts"], ["goal-tests", "tests/**"]]) { await propose(store, id, [scope]); await store.approveGoal(id, proof(id), at); }

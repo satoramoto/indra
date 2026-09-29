@@ -12,6 +12,7 @@ import { childEnv } from "./op-env.js";
 import { redactSecrets } from "./redact.js";
 import { schemaPathOf } from "./reload.js";
 import { normalizeUsage } from "./runtime-facts.js";
+import type { PrRetrospective, ReleaseAttempts } from "./sprint.js";
 
 const schema = schemaPathOf(import.meta.url, "retro.json");
 export const RETRO_LIMITS = { records: 2_000, text: 2_000, snapshotBytes: 128_000 } as const;
@@ -33,6 +34,10 @@ export interface RetroInput {
   implementation?: ImplementationFacts[];
   /** Earlier retro-generation attempts for this goal that failed or were aborted, oldest first. */
   retroAttempts?: RetroPriorAttempt[];
+  /** Read from actual merged lane PR bodies, not copied from report claims. */
+  lanePrs?: PrRetrospective[];
+  /** Scheduler records observations and starts before invoking a protected merge. */
+  releaseAttempts?: ReleaseAttempts;
 }
 export interface RetroPriorAttempt { startedAt: string; errorKind: string; sessionId?: string | null; invocationId?: string | null }
 export type RetroPhaseName = CeremonyStage;
@@ -72,6 +77,8 @@ export interface RetroEvidenceSnapshot {
   missing: string[];
   /** Exact, supported sentences. A citation alone cannot establish an arbitrary claim. */
   choices: RetroNarrative;
+  lanePrs?: PrRetrospective[];
+  integrationCorrections?: { headSha: string; baseSha: string; resultSha: string | null; status: string; decisions: string[] }[];
 }
 /** Runtime-only accounting, to persist even when narrative validation fails. Never commit this object. */
 export interface RetroGeneration {
@@ -205,7 +212,7 @@ export function buildRetroSnapshot(input: RetroInput): RetroEvidenceSnapshot {
   const retroAttempts: RetroAttemptSummary = { failed: attempts.length, firstErrorKind: attempts[0]?.errorKind ?? null, lastErrorKind: attempts.at(-1)?.errorKind ?? null,
     sessions: sum(attemptRows.map((row) => row.invocations)) ?? 0, usage: attemptRows.length ? usageSum(attemptRows.map((row) => row.usage)) : unknownUsage() };
   const sessionSeatIds = new Set(sessions.map((session) => session.seatId));
-  const seatIds = new Set([goal.seatId, ...goal.participantSeatIds, ...(goal.assignments ?? []).map((item) => item.seatId), ...facts.seats.map((item) => item.seatId), ...sessions.map((item) => item.seatId)]);
+  const seatIds = new Set([goal.seatId, ...goal.participantSeatIds, ...(goal.goalAssignment ? [goal.goalAssignment.seatId] : []), ...(goal.assignments ?? []).map((item) => item.seatId), ...facts.seats.map((item) => item.seatId), ...sessions.map((item) => item.seatId)]);
   const seats = [...seatIds].sort(compare).map((seatId) => {
     const values = [...new Set(facts.seats.filter((item) => item.seatId === seatId).map((item) => number(item.wallTimeMs)))];
     const wallTimeMs = values.length === 1 ? values[0] : null;
@@ -268,8 +275,16 @@ export function buildRetroSnapshot(input: RetroInput): RetroEvidenceSnapshot {
     choices.ownerProposals.push({ evidenceId: "missing", kind: "owner-proposal", text: "Consider improving recording for the explicitly missing historical evidence.", phase: null });
   }
   const released = goal.ceremony.history.find((entry) => entry.stage === "retro")!.evidence;
+  const lanePrs = input.lanePrs?.map((pr) => {
+    if (!/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/[1-9]\d*$/.test(pr.url) || !/^[a-f0-9]{40}$/.test(pr.headSha)) throw new Error("Invalid lane PR retrospective source.");
+    return { url: pr.url, headSha: pr.headSha, decisions: pr.decisions === null ? null : safeText(pr.decisions), followUps: pr.followUps === null ? null : safeText(pr.followUps) };
+  });
+  const integrationCorrections = input.releaseAttempts?.corrections?.filter((row) => time(row.startedAt) <= cutoffAt).map((row) => {
+    if (![row.headSha, row.baseSha, ...(row.resultSha ? [row.resultSha] : [])].every((sha) => /^[a-f0-9]{40}$/.test(sha)) || !["running", "pushed", "blocked"].includes(row.status)) throw new Error("Invalid integration correction evidence.");
+    return { headSha: row.headSha, baseSha: row.baseSha, resultSha: row.resultSha ?? null, status: row.status, decisions: row.decisions.map(safeText) };
+  });
   return bounded({ version: 2, goalId: identity(goal.id), leadSeatId: identity(goal.seatId), cutoffAt,
-    release: { prUrl: safeText(released.prUrl), runningAt: time(released.runningAt) }, seats, sessions, reviews, rounds, failures, stages, phases, retroAttempts, missing: [...missing].sort(compare), choices });
+    release: { prUrl: safeText(released.prUrl), runningAt: time(released.runningAt) }, seats, sessions, reviews, rounds, failures, stages, phases, retroAttempts, missing: [...missing].sort(compare), choices, ...(lanePrs ? { lanePrs } : {}), ...(integrationCorrections ? { integrationCorrections } : {}) });
 }
 
 /* ---------- Process phases: facts are computed here; Chick may only pick among the supported sentences. ---------- */
@@ -324,14 +339,25 @@ function phaseFacts(input: RetroInput, stages: RetroEvidenceSnapshot["stages"], 
 
   const work = implementationPhase(input, reviews, rounds, missing);
   const release = goal.ceremony!.history.find((entry) => entry.stage === "retro")!.evidence;
-  // No recorder captures integration PR conflict or merge rounds yet; the phase table shows them as unknown.
+  const attempts = input.releaseAttempts;
+  if (attempts && (attempts.version !== 1 || attempts.goalId !== goal.id || time(attempts.startedAt) > input.cutoffAt || !Array.isArray(attempts.conflicts) || !Array.isArray(attempts.merges))) throw new Error("Invalid integration attempt evidence.");
+  const observed = <T extends { at: string; prUrl: string; headSha: string }>(rows: T[]) => rows.filter((row) => {
+    if (!/^[a-f0-9]{40}$/.test(row.headSha)) throw new Error("Invalid integration attempt head.");
+    return time(row.at) <= input.cutoffAt && row.prUrl === goal.integration?.prUrl;
+  });
+  const conflicts = attempts ? new Set(observed(attempts.conflicts).map((row) => {
+    if (!/^[a-f0-9]{40}$/.test(row.baseSha)) throw new Error("Invalid integration conflict base.");
+    return `${row.headSha}:${row.baseSha}`;
+  })).size : null;
+  const mergeRounds = attempts ? observed(attempts.merges).length : null;
   const running = release.approval ? Date.parse(time(release.runningAt)) - Date.parse(time(release.approval.at)) : null;
   return [
     { phase: "planning", facts: [fact("planning-turns", "Clarification turns", turns), fact("planning-failures", "Failed clarification turns", failed(CLARIFY_FAILURE, turns))] },
     { phase: "proposal", facts: [fact("proposal-drafts", "Draft attempts", drafts), fact("proposal-draft-failures", "Failed draft attempts", failed(DRAFT_FAILURE, drafts)),
       fact("proposal-approval-wait", "Draft waiting for plan approval", wait !== null && wait >= 0 ? wait : null, "ms")] },
     work,
-    { phase: "release", facts: [fact("release-integration-conflicts", "Integration PR conflict rounds", null), fact("release-merge-rounds", "Integration PR merge rounds", null),
+    { phase: "release", facts: [fact("release-integration-conflicts", "Integration PR conflict rounds", conflicts), fact("release-merge-rounds", "Integration PR merge attempts started", mergeRounds),
+      ...(attempts ? [fact("release-fix-rounds", "Integration correction runs started", (attempts.corrections ?? []).filter((row) => time(row.startedAt) <= input.cutoffAt).length)] : []),
       fact("release-approval-to-running", "From merge approval to the new build running (includes CI wait, merge and build)", running !== null && running >= 0 ? running : null, "ms")] },
     { phase: "retro", facts: [fact("retro-drafts", "Draft attempts, including this one", retro.failed + 1), fact("retro-failed-drafts", "Failed or aborted draft attempts", retro.failed),
       fact("retro-first-error", "First failed attempt's error kind", retro.firstErrorKind, "text"), fact("retro-last-error", "Last failed attempt's error kind", retro.lastErrorKind, "text")] },
@@ -563,6 +589,8 @@ export async function renderSprintRetro(snapshot: RetroEvidenceSnapshot, value: 
     "## Owner proposals", narrative.ownerProposals.length ? bullets(narrative.ownerProposals) : "No owner proposals selected.",
     "Proposals require the owner's decision. This retrospective applies no configuration or workflow changes.",
     renderPhases(snapshot, narrative),
+    ...(snapshot.lanePrs ? ["## Lane PR decisions and follow-ups", "Sections below were read from the merged PRs at their recorded heads. They remain the lane authors' decisions and proposals; no process change is applied.", ...snapshot.lanePrs.map((pr) => `${display(pr.url)} at ${pr.headSha}\n\nDecisions: ${pr.decisions === null ? "unknown — section absent" : display(pr.decisions)}\n\nFollow-ups: ${pr.followUps === null ? "unknown — section absent" : display(pr.followUps)}`)] : []),
+    ...(snapshot.integrationCorrections?.length ? ["## Integration correction decisions", ...snapshot.integrationCorrections.map((row) => `Head ${row.headSha}, main ${row.baseSha}: ${display(row.status)}; resulting head ${row.resultSha ?? "unknown"}.\n\n${row.decisions.map((item) => `- ${display(item)}`).join("\n") || "No decision notes were recorded."}`)] : []),
     "## Per-seat wall time (ms)", table(["Seat", "Through cutoff", "Retro generation", "Accounted total"], [...seatRows, ["Total", sum(snapshot.seats.map((seat) => seat.wallTimeMs)), generation.wallTimeMs, sum([...snapshot.seats.map((seat) => seat.wallTimeMs), generation.wallTimeMs])]]),
     "## Per-session token usage", "Session labels are local to this document. Totals cover supplied sessions only. Input includes cache reads/writes; reasoning is part of output. Subcategories are not added again. Totals are unknown if any contributing counter is unavailable.",
     table(["Session", "Seat", "Invocations", "Input", "Uncached input", "Cached input", "Cache write", "Output", "Reasoning output", "Input + output"], [
