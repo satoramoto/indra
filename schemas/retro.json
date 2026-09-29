@@ -1,7 +1,7 @@
 {
   "type": "object",
   "additionalProperties": false,
-  "required": ["observations", "ownerProposals"],
+  "required": ["observations", "phaseReflections", "ownerProposals"],
   "properties": {
     "observations": {
       "type": "array",
@@ -18,17 +18,33 @@
         }
       }
     },
-    "ownerProposals": {
+    "phaseReflections": {
       "type": "array",
-      "maxItems": 3,
+      "maxItems": 20,
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["evidenceId", "kind", "text"],
+        "required": ["phase", "evidenceId", "kind", "text"],
+        "properties": {
+          "phase": { "type": "string", "enum": ["planning", "proposal", "implement", "release", "retro"] },
+          "evidenceId": { "type": "string" },
+          "kind": { "type": "string", "enum": ["worked", "slowed", "unknown"] },
+          "text": { "type": "string" }
+        }
+      }
+    },
+    "ownerProposals": {
+      "type": "array",
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["evidenceId", "kind", "text", "phase"],
         "properties": {
           "evidenceId": { "type": "string" },
           "kind": { "type": "string", "enum": ["owner-proposal"] },
-          "text": { "type": "string" }
+          "text": { "type": "string" },
+          "phase": { "anyOf": [{ "type": "string", "enum": ["planning", "proposal", "implement", "release", "retro"] }, { "type": "null" }] }
         }
       }
     }

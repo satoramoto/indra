@@ -7,7 +7,8 @@ import { requireTeamHome, type PlanningStore } from "./planning.js";
 import { processShell, type SeatTaskRecord } from "./developer-seat.js";
 import { seatRecordName } from "./developer-maintenance.js";
 import { retroPath, SprintGitHub, type RetroArchive, type RetroPr, type RetroReview } from "./sprint.js";
-import { draftSprintRetro, renderSprintRetro, RetroGenerationError, type RetroGeneration, type RetroInput, type SprintRetroDraft } from "./sprint-retro.js";
+import { draftSprintRetro, renderSprintRetro, RetroGenerationError, type RetroGeneration, type RetroInput, type RetroPriorAttempt, type SprintRetroDraft } from "./sprint-retro.js";
+import { readImplementationFacts } from "./implementation-facts.js";
 import { loadSeatEngines, SeatRuntime } from "./seat-runtime.js";
 import { seatHarnessDir } from "./harness-home.js";
 import { loadSeatPersonas, personaPost, withPersonaRuntime } from "./seat-persona.js";
@@ -25,7 +26,8 @@ const pending = (reason: string): CeremonyProgress<PublishedRetroEvidence> => ({
 
 export interface RetroPublicationRecord {
   version: 1; goalId: string; github: string;
-  attempts: { startedAt: string; generation?: RetroGeneration }[];
+  /** Older records have neither finishedAt nor errorKind; a missing finishedAt on a new attempt means it was aborted. */
+  attempts: { startedAt: string; finishedAt?: string; errorKind?: string; generation?: RetroGeneration }[];
   frozen?: { draft: SprintRetroDraft; parts: string[]; markdown: string; sha256: string };
   postIds?: string[];
   prUrl?: string;
@@ -36,7 +38,21 @@ export interface RetroPublicationRecord {
   /** Final completion timing, recorded before returning closure proof; the bridge journals closedAt from state. */
   stageTimings?: { stage: CeremonyStage; enteredAt: string | null; throughAt: string | null; elapsedMs: number | null }[];
 }
-export type RetroDraft = (context: CeremonyContext) => Promise<SprintRetroDraft>;
+/** `prior` lists the earlier failed or aborted attempts, oldest first, for the retro phase facts. */
+export type RetroDraft = (context: CeremonyContext, prior: RetroPriorAttempt[]) => Promise<SprintRetroDraft>;
+
+/** Exponential backoff between failed drafts: 15 s, 30 s, 1 min, 2 min, 4 min, then every 5 min. */
+export const RETRO_RETRY = { baseMs: 15_000, maxMs: 5 * 60_000 } as const;
+export function retroRetryDelayMs(failures: number): number {
+  return failures < 1 ? 0 : Math.min(RETRO_RETRY.baseMs * 2 ** Math.min(failures - 1, 20), RETRO_RETRY.maxMs);
+}
+/** Every attempt before a frozen draft failed or was aborted. */
+export function priorRetroAttempts(attempts: RetroPublicationRecord["attempts"]): RetroPriorAttempt[] {
+  return attempts.map((attempt) => ({ startedAt: attempt.startedAt, sessionId: attempt.generation?.sessionId ?? null,
+    errorKind: attempt.errorKind ?? (attempt.generation?.status === "timed-out" || attempt.generation?.status === "interrupted" ? attempt.generation.status : attempt.generation ? "runtime-failed" : "unrecorded") }));
+}
+/** The persona attribution belongs to the thread post only; the archive holds the frozen parts exactly. */
+const archiveOf = (parts: string[]) => parts.join("");
 export interface RetroPublicationServices {
   /** Fresh GET evidence, independent of the bridge's cached outbox acknowledgements. */
   thread(context: CeremonyContext): Promise<{ ownUserId: string; posts: (Post & { delete_at?: number })[] }>;
@@ -105,9 +121,13 @@ export class RetroPublication {
     if (record.version !== 1 || record.goalId !== goal.id || record.github !== home.github) throw new Error("Retrospective journal does not match the team's configured project.");
     if (record.frozen) {
       const frozen = record.frozen;
+      // Version 1 drafts were frozen before phase reflections, with the persona attribution inside the archive.
+      // They are verified against their own frozen bytes and cannot be re-rendered by the current renderer.
+      const legacy = (frozen.draft.snapshot as { version: number }).version === 1;
+      const archive = legacy ? (await Promise.all(frozen.parts.map((message) => this.formatPost(context, message)))).join("") : archiveOf(frozen.parts);
       if (digest(frozen.markdown) !== frozen.sha256 || frozen.parts.join("") !== frozen.draft.markdown
-        || await renderSprintRetro(frozen.draft.snapshot, frozen.draft.narrative, frozen.draft.generation) !== frozen.draft.markdown
-        || (await Promise.all(frozen.parts.map((message) => this.formatPost(context, message)))).join("") !== frozen.markdown) throw new Error("Frozen retrospective content failed verification.");
+        || (!legacy && await renderSprintRetro(frozen.draft.snapshot, frozen.draft.narrative, frozen.draft.generation) !== frozen.draft.markdown)
+        || archive !== frozen.markdown) throw new Error("Frozen retrospective content failed verification.");
     }
     return record;
   }
@@ -119,20 +139,36 @@ export class RetroPublication {
     try {
       const record = await this.load(context);
       if (!record.frozen) {
+        const failures = record.attempts.length;
+        if (failures) {
+          const last = record.attempts.at(-1)!;
+          const retryAt = Date.parse(last.finishedAt ?? last.startedAt) + retroRetryDelayMs(failures);
+          if (!(Date.now() >= retryAt)) return pending(`Chick's retrospective draft failed or was interrupted ${failures} time(s); the next attempt starts after ${new Date(Number.isFinite(retryAt) ? retryAt : Date.now()).toISOString()}.`);
+        }
+        const prior = priorRetroAttempts(record.attempts);
         record.attempts.push({ startedAt: new Date().toISOString() });
         await this.save(context, record);
+        const attempt = record.attempts.at(-1)!;
         let draft: SprintRetroDraft;
-        try { draft = await this.draft(context); }
+        try { draft = await this.draft(context, prior); }
         catch (error) {
-          if (error instanceof RetroGenerationError) record.attempts.at(-1)!.generation = error.generation;
+          attempt.finishedAt = new Date().toISOString();
+          if (error instanceof RetroGenerationError) { attempt.generation = error.generation; attempt.errorKind = error.kind; }
+          else attempt.errorKind = "draft-error";
           await this.save(context, record);
-          return pending("Chick's retrospective draft failed or was interrupted; it will be retried.");
+          return pending("Chick's retrospective draft failed or was interrupted; it will be retried with backoff.");
         }
-        if (draft.snapshot.goalId !== context.goal.id || draft.snapshot.leadSeatId !== context.goal.seatId || draft.markdown !== await renderSprintRetro(draft.snapshot, draft.narrative, draft.generation)) throw new Error("Retrospective content was not rendered from this goal's recorded facts.");
+        if (draft.snapshot.goalId !== context.goal.id || draft.snapshot.leadSeatId !== context.goal.seatId || draft.markdown !== await renderSprintRetro(draft.snapshot, draft.narrative, draft.generation)) {
+          Object.assign(attempt, { finishedAt: new Date().toISOString(), errorKind: "unverified-content", generation: draft.generation });
+          await this.save(context, record);
+          throw new Error("Retrospective content was not rendered from this goal's recorded facts.");
+        }
         const messages = parts(draft.markdown);
-        // The normal Chick chat adds its persona attribution. Freeze those same bytes in the archive too.
-        const markdown = (await Promise.all(messages.map((message) => this.formatPost(context, message)))).join("");
-        record.attempts.at(-1)!.generation = draft.generation;
+        // The Chick chat adds its persona attribution to each thread post; verifyPosts expects exactly that.
+        // The archive keeps the frozen parts only, so no attribution lines appear between fragments.
+        const markdown = archiveOf(messages);
+        attempt.finishedAt = new Date().toISOString();
+        attempt.generation = draft.generation;
         record.frozen = { draft, parts: messages, markdown, sha256: digest(markdown) };
         await this.save(context, record);
       }
@@ -211,7 +247,7 @@ export class RetroPublication {
 }
 
 /** Read only persisted evidence. Missing attempt coverage and unrecorded wall time stay explicitly unknown. */
-export async function recordedRetroInput(context: CeremonyContext): Promise<RetroInput> {
+export async function recordedRetroInput(context: CeremonyContext, retroAttempts: RetroPriorAttempt[] = []): Promise<RetroInput> {
   const { goal, store } = context;
   const record = await store.readRuntimeFile<BridgeCeremonyRecord>(ceremonyRuntimeName(goal.id));
   const facts: RetroInput["facts"] = structuredClone(record?.facts ?? { seats: [], sessions: [], reviews: [], rounds: [], failures: [] });
@@ -244,7 +280,8 @@ export async function recordedRetroInput(context: CeremonyContext): Promise<Retr
   }
   missing.push("Seat attempt records may omit interrupted invocations, earlier findings, failures and retry counts; absence is not zero.");
   for (const seatId of new Set([goal.seatId, ...(goal.assignments ?? []).map((item) => item.seatId)])) if (!facts.seats.some((seat) => seat.seatId === seatId)) facts.seats.push({ seatId, wallTimeMs: null });
-  return { goal, facts, cutoffAt: new Date().toISOString(), missing };
+  const implementation = await readImplementationFacts(store, goal.id);
+  return { goal, facts, cutoffAt: new Date().toISOString(), missing, implementation, retroAttempts };
 }
 
 /** Discovered by cli.ts's existing module extension point; no shared wiring changes are needed. */
@@ -256,11 +293,11 @@ export async function createCeremonyAdapters({ store }: { store: PlanningStore }
     const engines = await loadSeatEngines(store.runtimeDir, seats);
     return new SeatRuntime(engines[context.goal.seatId] ?? "codex", cwd, undefined, undefined, undefined, seatHarnessDir(store.runtimeDir, context.goal.seatId));
   };
-  const retro = new RetroPublication(new SprintGitHub(processShell, store.runtimeDir), async (context) => {
+  const retro = new RetroPublication(new SprintGitHub(processShell, store.runtimeDir), async (context, prior) => {
     const state = await store.read();
     const seats = (state.teams as { seats: { id: string }[] }[]).flatMap((team) => team.seats).map((seat) => seat.id);
     const engines = await loadSeatEngines(store.runtimeDir, seats);
-    const input = await recordedRetroInput(context);
+    const input = await recordedRetroInput(context, prior);
     return await draftSprintRetro(input, (cwd) => {
       const runtime = withPersonaRuntime(new SeatRuntime(engines[context.goal.seatId] ?? "codex", cwd, undefined, undefined, undefined, seatHarnessDir(store.runtimeDir, context.goal.seatId)), profiles[context.goal.seatId]);
       return { message: async (...args) => {
