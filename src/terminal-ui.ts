@@ -182,10 +182,11 @@ export class TerminalUiModel {
   /**
    * Every action that spawns Indra code (s, n, P, A, hosting) goes through here. It waits while an update may be
    * changing node_modules or dist, and does not run at all after a failed dependency install.
+   * Settings-only policy revocation may bypass the install failure while retaining update and reload coordination.
    */
-  private async tracked(work: () => Promise<void>): Promise<void> {
+  private async tracked(work: () => Promise<void>, options: { allowFailedInstall?: boolean } = {}): Promise<void> {
     while (this.updateRun) await this.updateRun;
-    if (this.updateResult?.installFailed) {
+    if (this.updateResult?.installFailed && !options.allowFailedInstall) {
       this.notice = "Not started: Indra is blocked because a dependency install failed; it retries on the next update check.";
       this.bump();
       return;
@@ -436,7 +437,7 @@ export class TerminalUiModel {
           }
         } catch (error) { this.notice = "Team change failed: " + redactSecrets(error instanceof Error ? error.message : String(error)); }
         await this.refresh();
-      });
+      }, { allowFailedInstall: target.change.kind === "auto" && !target.change.enabled });
     } finally { this.teamPending = false; this.bump(); }
   }
 

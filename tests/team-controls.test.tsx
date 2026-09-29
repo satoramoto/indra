@@ -117,6 +117,69 @@ describe("owner team controls", () => {
     expect(f.autoMode.enable).not.toHaveBeenCalled();
   });
 
+  it.each([true, false])("revokes policy after a failed dependency install with automation available: %s", async (available) => {
+    const update: UpdatePort = { canReload: true, current: async () => undefined,
+      check: async () => ({ outcome: "blocked", message: "Dependency install failed", at: "now", installFailed: true }) };
+    const f = await fixture(available, update);
+    await f.settings.updateOwnerSettings("team-one", { autoMode: true }); await f.model.refresh();
+    f.settings.updateOwnerSettings.mockClear();
+    await f.model.updateCode();
+    expect(f.model.updateResult?.installFailed).toBe(true);
+
+    f.key("o"); f.key("n"); await f.model.teamConfirmed();
+    expect(f.settings.updateOwnerSettings).not.toHaveBeenCalled();
+    expect(f.model.team?.standingPolicy?.revisions.at(-1)?.enabled).toBe(true);
+    f.key("o"); expect(f.model.confirm).toMatchObject({ change: { kind: "auto", enabled: false } });
+    expect(f.key("y")).toBe("team-control"); await f.model.teamConfirmed();
+    expect(f.settings.updateOwnerSettings).toHaveBeenCalledExactlyOnceWith("team-one", { autoMode: false });
+    expect(f.model.team?.standingPolicy?.revisions.map((item) => item.enabled)).toEqual([true, false]);
+    expect(f.model.notice).toBe("Auto mode off; the next approval gate waits for the owner.");
+
+    const reopened = new TerminalUiModel(f.inventory, f.sessions, undefined, undefined, undefined, update, f.controls);
+    reopened.restore(f.model.view()); await reopened.refresh();
+    expect(reopened.team?.standingPolicy?.revisions.at(-1)?.enabled).toBe(false);
+    const setup = await testRender(() => <TerminalApp model={reopened} revision={() => reopened.revision} onKey={() => {}} />, { width: 120, height: 42 });
+    try {
+      await setup.renderOnce(); expect(setup.captureCharFrame()).toContain("Auto mode: OFF · policy revision 2");
+    } finally { setup.renderer.destroy(); }
+
+    if (available) {
+      f.settings.updateOwnerSettings.mockClear();
+      f.key("o"); expect(f.model.confirm).toMatchObject({ change: { kind: "auto", enabled: true } });
+      f.key("y"); await f.model.teamConfirmed();
+      expect(f.model.notice).toContain("dependency install failed");
+      expect(f.settings.updateOwnerSettings).not.toHaveBeenCalled();
+    }
+    expect(f.autoMode.enable).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("rechecks revocation after an in-flight install fails with stale confirmation: %s", async (stale) => {
+    let finish = () => {};
+    const update: UpdatePort = { canReload: true, current: async () => undefined,
+      check: vi.fn<UpdatePort["check"]>(() => new Promise((resolve) => { finish = () => resolve({ outcome: "blocked", message: "Dependency install failed", at: "now", installFailed: true }); })) };
+    const f = await fixture(false, update);
+    await f.settings.updateOwnerSettings("team-one", { autoMode: true }); await f.model.refresh();
+    f.settings.updateOwnerSettings.mockClear();
+    const updating = f.model.updateCode();
+    f.key("o"); expect(f.key("y")).toBe("team-control");
+    const revoking = f.model.teamConfirmed();
+    await vi.waitFor(() => expect(update.check).toHaveBeenCalledOnce());
+    expect(f.settings.updateOwnerSettings).not.toHaveBeenCalled();
+    if (stale) {
+      await f.settings.updateOwnerSettings("team-one", { autoMode: true });
+      f.settings.updateOwnerSettings.mockClear();
+    }
+    finish(); await Promise.all([updating, revoking]);
+    if (stale) {
+      expect(f.model.notice).toContain("confirmation expired");
+      expect(f.settings.updateOwnerSettings).not.toHaveBeenCalled();
+      expect(f.model.team?.standingPolicy?.revisions.at(-1)?.enabled).toBe(true);
+    } else {
+      expect(f.settings.updateOwnerSettings).toHaveBeenCalledExactlyOnceWith("team-one", { autoMode: false });
+      expect(f.model.team?.standingPolicy?.revisions.at(-1)?.enabled).toBe(false);
+    }
+  });
+
   it.each(["mission", "auto", "remove", "add"] as const)("expires a stale %s confirmation after y and before dispatch", async (kind) => {
     const f = await fixture();
     f.key({ mission: "e", auto: "o", remove: "-", add: "+" }[kind]);
