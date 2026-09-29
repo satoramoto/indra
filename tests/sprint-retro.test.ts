@@ -8,9 +8,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentResult, AgentRuntime } from "../src/codex-runtime.js";
 import { CEREMONY_STAGES } from "../src/ceremony.js";
 import type { ImplementationFacts } from "../src/implementation-facts.js";
-import type { ReleaseFacts } from "../src/release-facts.js";
+import { ReleaseRecorder, type ReleaseFacts } from "../src/release-facts.js";
+import { recordedRetroInput } from "../src/retro-publication.js";
+import { ceremonyRuntimeName } from "../src/planning-bridge.js";
 import { CODEX_CONFIG, engineHome, seatHarnessDir } from "../src/harness-home.js";
-import type { PlanningGoal } from "../src/planning.js";
+import { PlanningStore, type PlanningGoal } from "../src/planning.js";
 import { SeatRuntime } from "../src/seat-runtime.js";
 import {
   buildRetroSnapshot, draftSprintRetro, renderSprintRetro, retroPrompt, validateRetroNarrative,
@@ -377,6 +379,25 @@ const lateGeneration = (): RetroGeneration => ({ ...generation(), startedAt: at(
 const phaseValue = (snapshot: RetroEvidenceSnapshot, phase: string, id: string) => snapshot.phases.find((item) => item.phase === phase)!.facts.find((item) => item.evidenceId === id)!.value;
 
 describe("per-phase process reflection", () => {
+  it("carries the durable release ledger through the standard retro reader without replacing other ceremony facts", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "indra-retro-release-"));
+    try {
+      const store = new PlanningStore(join(directory, "state")); const data = input();
+      const ledger = data.facts.releaseFacts!; delete data.facts.releaseFacts;
+      await store.saveRuntime(ceremonyRuntimeName(data.goal.id), { facts: data.facts, deliveredStages: ["release"] });
+      const recorder = new ReleaseRecorder(store, data.goal.id);
+      for (const event of ledger.events) await recorder.record(event);
+      const captured = await recordedRetroInput({ store, goal: data.goal, runtime: { message: vi.fn() },
+        post: vi.fn(), recordRun: vi.fn(), recordSession: vi.fn() });
+      expect(captured.facts.releaseFacts).toEqual(ledger);
+      expect(captured.facts.sessions).toEqual(data.facts.sessions);
+      expect((await store.readRuntimeFile<{ deliveredStages: string[] }>(recorder.name))!.deliveredStages).toEqual(["release"]);
+      const snapshot = buildRetroSnapshot({ ...captured, cutoffAt: data.cutoffAt });
+      expect(phaseValue(snapshot, "release", "release-integration-conflicts")).toBe(0);
+      expect(phaseValue(snapshot, "release", "release-merge-rounds")).toBe(1);
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+
   it("renders recorded conflict and merge rounds with their evidence and explicit zeros", async () => {
     const data = input(); const events = data.facts.releaseFacts!.events;
     events.splice(2, 0,
