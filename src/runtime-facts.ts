@@ -59,12 +59,15 @@ export function usageDelta(current: TokenUsage | undefined, previous: TokenUsage
   return compact(result);
 }
 
-function maximum(left: TokenUsage | undefined, right: TokenUsage | undefined): TokenUsage | undefined {
+function mergeClaudeUsage(left: TokenUsage | undefined, right: TokenUsage | undefined): TokenUsage | undefined {
   const result: TokenUsage = {};
   for (const key of keys) {
     const values = [left?.[key], right?.[key]].filter((value): value is number => value !== undefined);
     if (values.length) result[key] = Math.max(...values);
   }
+  // Partial reports can update one component without reporting a new inclusive total.
+  const { uncachedInputTokens: input, cachedInputTokens: cached, cacheWriteInputTokens: written } = result;
+  result.inputTokens = input !== undefined && cached !== undefined && written !== undefined ? input + cached + written : undefined;
   return compact(result);
 }
 
@@ -103,7 +106,7 @@ export class RuntimeFacts {
     if ((event.type === "system" && event.subtype === "init") || event.type === "result" || event.type === "assistant" || event.type === "stream_event") {
       this.sessionId ??= sessionHandle("claude", event.session_id);
     }
-    if (event.type === "result") this.resultUsage = maximum(this.resultUsage, normalizeUsage("claude", event.usage));
+    if (event.type === "result") this.resultUsage = mergeClaudeUsage(this.resultUsage, normalizeUsage("claude", event.usage));
     if (event.type === "assistant" && jsonObject(event.message)) {
       // Assistant output_tokens is a message-start placeholder, not completed output.
       this.message(event.message.id, event.message.usage, false);
@@ -123,7 +126,7 @@ export class RuntimeFacts {
     const usage = normalizeUsage("claude", value);
     if (!usage) return;
     if (!output) delete usage.outputTokens;
-    const merged = maximum(this.messages.get(id), usage);
+    const merged = mergeClaudeUsage(this.messages.get(id), usage);
     if (merged) this.messages.set(id, merged);
   }
 
@@ -136,7 +139,7 @@ export class RuntimeFacts {
         if (report[key] !== undefined) sums[key] = (sums[key] ?? 0) + report[key];
       }
       // Result counters supersede step reports; crash results can be zeroed or incomplete.
-      usage = maximum(compact(sums), this.resultUsage);
+      usage = mergeClaudeUsage(compact(sums), this.resultUsage);
     }
     return {
       invocationId: this.invocationId, engine: this.engine, ...(this.sessionId ? { sessionId: this.sessionId } : {}),

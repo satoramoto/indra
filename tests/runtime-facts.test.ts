@@ -123,6 +123,29 @@ describe("invocation facts", () => {
     expect(facts.finish("failed").usage).toEqual({ inputTokens: 52, uncachedInputTokens: 32, cachedInputTokens: 12, cacheWriteInputTokens: 8, outputTokens: 9 });
   });
 
+  it.each(["message", "result", "message-and-result"])("recomputes Claude input totals after partial %s updates", (source) => {
+    const facts = new RuntimeFacts("claude");
+    const initial = { input_tokens: 100, cache_read_input_tokens: 50, cache_creation_input_tokens: 10 };
+    if (source === "result") facts.observe({ type: "result", session_id: id, usage: initial });
+    else facts.observe({ ...start, event: { type: "message_start", message: { ...step.message, usage: initial } } });
+    const update = source === "message"
+      ? { ...delta(9), event: { type: "message_delta", usage: { input_tokens: 120 } } }
+      : { type: "result", session_id: id, usage: { input_tokens: 120 } };
+    facts.observe(update); facts.observe(update);
+    expect(facts.finish("failed").usage).toEqual({ inputTokens: 180, uncachedInputTokens: 120, cachedInputTokens: 50, cacheWriteInputTokens: 10 });
+  });
+
+  it("derives Claude totals only when all input components are known and their sum is safe", () => {
+    const facts = new RuntimeFacts("claude");
+    const report = (usage: object) => facts.observe({ type: "result", session_id: id, usage });
+    report({ input_tokens: 100 }); report({ cache_read_input_tokens: 50 });
+    expect(facts.finish("failed").usage).toEqual({ uncachedInputTokens: 100, cachedInputTokens: 50 });
+    report({ cache_creation_input_tokens: 10 });
+    expect(facts.finish("failed").usage?.inputTokens).toBe(160);
+    report({ input_tokens: Number.MAX_SAFE_INTEGER });
+    expect(facts.finish("failed").usage).toEqual({ uncachedInputTokens: Number.MAX_SAFE_INTEGER, cachedInputTokens: 50, cacheWriteInputTokens: 10 });
+  });
+
   it("uses only the current Claude turn on resume, ignoring lifetime model totals, replayed users and subagents", () => {
     const facts = new RuntimeFacts("claude", `claude:${id}`);
     facts.observe({ type: "user", message: step.message });
