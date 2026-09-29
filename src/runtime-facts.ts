@@ -121,6 +121,25 @@ export class RuntimeFacts {
     }
   }
 
+  /**
+   * One entry of a headed session's log: a Claude transcript line (`<config>/projects/<dir>/<session>.jsonl`) or a Codex
+   * rollout line (`$CODEX_HOME/sessions/…/rollout-*.jsonl`). Transcript assistant usage is final, output included;
+   * subagent (sidechain) entries are skipped as in the stream. Rollout token counts are session totals.
+   */
+  observeLog(entry: unknown): void {
+    if (!jsonObject(entry)) return;
+    if (this.engine === "codex") {
+      if (entry.type === "session_meta" && jsonObject(entry.payload)) this.sessionId ??= sessionHandle("codex", entry.payload.id);
+      if (entry.type === "event_msg" && jsonObject(entry.payload) && entry.payload.type === "token_count" && jsonObject(entry.payload.info)) {
+        this.cumulative = compact({ ...this.cumulative, ...normalizeUsage("codex", entry.payload.info.total_token_usage) });
+      }
+      return;
+    }
+    if (entry.isSidechain === true) return;
+    this.sessionId ??= sessionHandle("claude", entry.sessionId);
+    if (entry.type === "assistant" && jsonObject(entry.message)) this.message(entry.message.id, entry.message.usage, true);
+  }
+
   private message(id: unknown, value: unknown, output: boolean): void {
     if (typeof id !== "string" || !id || id.length > 200) return;
     const usage = normalizeUsage("claude", value);

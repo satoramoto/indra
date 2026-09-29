@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -61,8 +61,20 @@ describe("tmux host", () => {
     await host.start();
     const launch = fake.calls.find((args) => args.includes("new-session"))!;
     const command = launch.slice(launch.indexOf("/usr/bin/env"));
-    expect(command.slice(0, command.indexOf(process.execPath))).toEqual(["/usr/bin/env", "-u", "OP_SERVICE_ACCOUNT_TOKEN", "-u", "OP_SESSION_owner"]);
+    expect(command.slice(0, command.indexOf(process.execPath))).toEqual(["/usr/bin/env", "-u", "OP_SERVICE_ACCOUNT_TOKEN", "-u", "OP_SESSION_owner", "INDRA_SEAT_PANE=1"]);
     expect(launch.join(" ")).not.toContain("ops_old");
+  });
+
+  it("marks the hosted pane for headed sessions and passes the owner's INDRA_HEADLESS through", async () => {
+    vi.stubEnv("INDRA_HEADLESS", "1");
+    try {
+      const dir = await fixture(); const fake = new FakeTmux(); const host = new TmuxHost(dir, fake, dir, 15_000, { kind: "seat", seatId: "seat-004" });
+      fake.onStart = async (nonce) => { await writeFile(host.readyFile(nonce), JSON.stringify({ nonce })); };
+      await host.start();
+      const launch = fake.calls.find((args) => args.includes("new-session"))!;
+      const command = launch.slice(launch.indexOf("/usr/bin/env"), launch.indexOf(process.execPath));
+      expect(command).toEqual(expect.arrayContaining(["INDRA_SEAT_PANE=1", "INDRA_HEADLESS=1"]));
+    } finally { vi.unstubAllEnvs(); }
   });
 
   it("withholds attach target when pane no longer matches", async () => {
