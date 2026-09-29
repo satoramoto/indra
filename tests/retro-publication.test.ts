@@ -2,9 +2,11 @@ import { describe, expect, it, vi } from "vitest";
 import type { CeremonyContext } from "../src/planning-bridge.js";
 import { advanceCeremony, startCeremony, type HumanApproval } from "../src/ceremony.js";
 import type { PlanningGoal, PlanningStore } from "../src/planning.js";
-import { RetroPublication, retroRuntimeName, type RetroPublicationRecord } from "../src/retro-publication.js";
+import { createCeremonyAdapters, RetroPublication, retroRuntimeName, type RetroPublicationRecord } from "../src/retro-publication.js";
 import { buildRetroSnapshot, renderSprintRetro, type SprintRetroDraft } from "../src/sprint-retro.js";
-import type { RetroArchive, RetroPr } from "../src/sprint.js";
+import { SprintGitHub, type RetroArchive, type RetroPr } from "../src/sprint.js";
+import { SeatRuntime } from "../src/seat-runtime.js";
+import * as mattermost from "../src/planning-mattermost.js";
 
 const at = (second: number) => `2026-01-01T00:00:${String(second).padStart(2, "0")}.000Z`;
 function goalAtRetro(): PlanningGoal {
@@ -22,11 +24,12 @@ function goalAtRetro(): PlanningGoal {
 }
 async function fixture() {
   const goal = goalAtRetro();
-  const state = { planningGoals: [goal], teams: [{ id: goal.teamId, project: { github: "test/project" }, externalIdentities: { mattermost: { homeChannelId: "home" } } }] };
+  const state = { planningGoals: [goal], teams: [{ id: goal.teamId, project: { github: "test/project" }, seats: [{ id: goal.seatId }], externalIdentities: { mattermost: { homeChannelId: "home" } } }] };
   const records = new Map<string, object>();
   const deliveries = new Map<string, { id: string; message: string; mergePost?: string }>();
   let lostPost = false;
   const context: CeremonyContext = { goal, runtime: { message: vi.fn() }, store: {
+    checkout: "/nonexistent-retro-test-state", runtimeDir: "/nonexistent-retro-test-state.runtime",
     read: async () => structuredClone(state), readRuntimeFile: async (name: string) => structuredClone(records.get(name)),
     saveRuntime: async (name: string, value: object) => { records.set(name, structuredClone(value)); },
   } as unknown as PlanningStore,
@@ -47,15 +50,90 @@ async function fixture() {
   const pr: RetroPr = { url: "https://github.com/test/project/pull/3", headSha: "c".repeat(40), state: "OPEN", reviewed: true, checksPassed: true };
   const archive: RetroArchive = {
     ensureRetroPr: vi.fn(async () => pr.url), inspectRetroPr: vi.fn(async () => structuredClone(pr)),
+    reviewRetroPr: vi.fn(async (_github, _goalId, _markdown, _url, _head, review) => { await review("/managed/review"); }),
     mergeRetroPr: vi.fn(async () => { pr.state = "MERGED"; pr.mergedSha = "d".repeat(40); return { merged: true as const, sha: pr.mergedSha }; }),
   };
-  const restart = () => new RetroPublication(archive, draft);
+  const services = {
+    thread: vi.fn(async () => ({ ownUserId: "chick", posts: [...deliveries.values()].map((post) => ({ ...post, user_id: "chick", channel_id: "home", root_id: "root", create_at: Date.now() })) })),
+    review: vi.fn(async () => ({ summary: "Reviewed archive", findings: [] })),
+  };
+  const restart = () => new RetroPublication(archive, draft, services);
   const record = () => records.get(retroRuntimeName(goal.id)) as RetroPublicationRecord;
   const owner = (): HumanApproval => ({ source: "owner-command", command: "planning merge", at: new Date().toISOString() });
-  return { context, state, draft, archive, pr, records, deliveries, restart, record, owner, losePost: () => { lostPost = true; } };
+  return { context, state, draft, archive, pr, records, deliveries, services, restart, record, owner, losePost: () => { lostPost = true; } };
 }
 
 describe("recoverable retro publication", () => {
+  it("wires production review to a new read-only runtime at the archive head without resuming Chick", async () => {
+    const f = await fixture(); await f.restart().poll(f.context); f.pr.reviewed = false;
+    try {
+      vi.spyOn(SprintGitHub.prototype, "ensureRetroPr").mockImplementation(f.archive.ensureRetroPr);
+      vi.spyOn(SprintGitHub.prototype, "inspectRetroPr").mockImplementation(f.archive.inspectRetroPr);
+      vi.spyOn(SprintGitHub.prototype, "reviewRetroPr").mockImplementation(f.archive.reviewRetroPr);
+      vi.spyOn(mattermost, "readChickToken").mockResolvedValue("");
+      vi.spyOn(mattermost.MattermostPlanningChat.prototype, "ownUserId").mockResolvedValue("chick");
+      vi.spyOn(mattermost.MattermostPlanningChat.prototype, "since").mockImplementation(async () => (await f.services.thread()).posts);
+      const reviewer = vi.spyOn(SeatRuntime.prototype, "message").mockImplementation(async function (this: SeatRuntime, prompt, schema, session, options) {
+        expect((this as unknown as { cwd: string }).cwd).toBe("/managed/review");
+        expect((this as unknown as { write?: unknown }).write).toBeUndefined();
+        expect(session).toBeUndefined(); expect(options?.purpose).toBe("review");
+        expect(schema).toMatch(/schemas\/retro-review.json$/);
+        expect(prompt).toContain(f.pr.headSha);
+        return { sessionId: "fresh-review", startedAt: at(10), finishedAt: at(11), response: { summary: "Reviewed", findings: [] } };
+      });
+      const adapters = await createCeremonyAdapters({ store: f.context.store });
+      await adapters.retro!.poll(f.context);
+      expect(reviewer).toHaveBeenCalledTimes(1);
+      expect(f.context.runtime.message).not.toHaveBeenCalled();
+      expect(f.context.recordRun).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "fresh-review" }));
+      expect(f.record().review?.headSha).toBe(f.pr.headSha);
+    } finally { vi.restoreAllMocks(); }
+  });
+
+  it("reviews before CI finishes, saves the result before delivery, and starts fresh for a new head", async () => {
+    const f = await fixture(); f.pr.reviewed = false; f.pr.checksPassed = false;
+    vi.mocked(f.archive.reviewRetroPr).mockImplementationOnce(async (_github, _goal, _markdown, _url, head, review) => {
+      await review("/managed/review");
+      expect(f.record().review?.headSha).toBe(head);
+      throw new Error("Review delivery interrupted");
+    });
+    await f.restart().poll(f.context); await f.restart().poll(f.context);
+    expect(f.services.review).toHaveBeenCalledTimes(1);
+    expect(f.archive.mergeRetroPr).not.toHaveBeenCalled();
+    f.pr.headSha = "f".repeat(40);
+    await f.restart().poll(f.context);
+    expect(f.services.review).toHaveBeenCalledTimes(2);
+    expect(f.record().review?.headSha).toBe(f.pr.headSha);
+  });
+
+  it("resumes an authorized merge that stopped before GitHub received it", async () => {
+    const f = await fixture(); await f.restart().poll(f.context);
+    vi.mocked(f.archive.mergeRetroPr).mockRejectedValueOnce(new Error("Interrupted before merge"));
+    await expect(f.restart().merge(f.context, f.owner())).rejects.toThrow("Interrupted");
+    const approval = structuredClone(f.record().authorization);
+    f.pr.checksPassed = false;
+    expect((await f.restart().poll(f.context)).status).toBe("pending");
+    expect(f.archive.mergeRetroPr).toHaveBeenCalledTimes(1);
+    f.pr.checksPassed = true;
+    expect((await f.restart().poll(f.context)).status).toBe("complete");
+    expect(f.archive.mergeRetroPr).toHaveBeenCalledTimes(2);
+    expect(f.record().authorization).toEqual(approval);
+  });
+
+  it.each(["head", "pr", "post", "closed", "review", "ci"])("does not resume saved authorization when %s no longer matches its gates", async (change) => {
+    const f = await fixture(); await f.restart().poll(f.context);
+    vi.mocked(f.archive.mergeRetroPr).mockRejectedValueOnce(new Error("Interrupted"));
+    await expect(f.restart().merge(f.context, f.owner())).rejects.toThrow("Interrupted");
+    if (change === "head") f.pr.headSha = "f".repeat(40);
+    if (change === "pr") f.pr.url = "https://github.com/test/project/pull/4";
+    if (change === "post") f.record().authorization!.postId = "another-post";
+    if (change === "closed") f.pr.state = "CLOSED";
+    if (change === "review") f.pr.reviewed = false;
+    if (change === "ci") f.pr.checksPassed = false;
+    expect((await f.restart().poll(f.context)).status).toBe("pending");
+    expect(f.archive.mergeRetroPr).toHaveBeenCalledTimes(1);
+  });
+
   it("reuses the frozen draft and accepted thread post when the delivery response is lost", async () => {
     const f = await fixture(); f.losePost();
     expect((await f.restart().poll(f.context)).status).toBe("pending");
@@ -141,7 +219,9 @@ describe("recoverable retro publication", () => {
 
   it("freezes Chick's attribution along with the document and leaves proposals inert", async () => {
     const f = await fixture(); const format = async (_context: CeremonyContext, text: string) => `Chick\n\n${text}`;
-    await new RetroPublication(f.archive, f.draft, format).poll(f.context);
+    const post = f.context.post;
+    f.context.post = (key, message, kind) => post(key, `Chick\n\n${message}`, kind);
+    await new RetroPublication(f.archive, f.draft, { ...f.services, formatPost: format }).poll(f.context);
     expect(f.record().frozen!.markdown).toBe(`Chick\n\n${f.record().frozen!.draft.markdown}`);
     expect(f.context.store.readRuntimeFile).toBeDefined();
     expect(f.state.planningGoals[0]).toEqual(goalAtRetro());

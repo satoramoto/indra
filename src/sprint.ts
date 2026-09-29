@@ -4,6 +4,8 @@ import { stderrExcerpt, type Shell, type ShellResult } from "./developer-seat.js
 import { ensureProjectCheckout } from "./project-checkout.js";
 import { withFileLock } from "./state-commit.js";
 import { GITHUB_REPO } from "./local-state.js";
+import { homedir } from "node:os";
+import { redactSecrets } from "./redact.js";
 
 /** A sprint GitHub problem whose message is ours and safe to post in the goal thread. */
 export class SprintError extends Error { override name = "SprintError"; }
@@ -27,9 +29,14 @@ export interface RetroPr {
   /** A fresh approval from the review account on this exact head, with no outstanding change requests. */
   reviewed: boolean; checksPassed: boolean;
 }
+export interface RetroReview {
+  summary: string;
+  findings: { path: string; line: number; reason: string }[];
+}
 export interface RetroArchive {
   ensureRetroPr(github: string, goalId: string, markdown: string): Promise<string>;
   inspectRetroPr(github: string, goalId: string, markdown: string, prUrl: string): Promise<RetroPr>;
+  reviewRetroPr(github: string, goalId: string, markdown: string, prUrl: string, headSha: string, review: (worktree: string) => Promise<RetroReview>): Promise<void>;
   mergeRetroPr(github: string, goalId: string, markdown: string, prUrl: string, headSha: string): Promise<MergeResult>;
 }
 
@@ -235,6 +242,49 @@ export class SprintGitHub implements RetroArchive {
     const after = await read();
     if (JSON.stringify(after) !== JSON.stringify(pr)) throw new SprintError("Retrospective PR changed during verification; retry.");
     return { url: prUrl, state: pr.state, headSha: pr.headRefOid, mergedSha: pr.mergeCommit?.oid, reviewed: reviewed && !pr.isDraft, checksPassed };
+  }
+
+  /** A fresh read-only reviewer sees the pinned checkout; the host posts its line comments and verdict. */
+  async reviewRetroPr(github: string, goalId: string, markdown: string, prUrl: string, headSha: string, review: (worktree: string) => Promise<RetroReview>): Promise<void> {
+    const endpoint = this.retroRepo(github, goalId, prUrl);
+    if (!SHA.test(headSha)) throw new SprintError("Invalid retrospective review head.");
+    await withFileLock(join(this.runtimeDir, `retro-review-${goalId}.lock`), async () => {
+      const marker = `<!-- indra-retro-review:${goalId}:${headSha} -->`;
+      const reconciled = async () => (await this.retroPages<{ user: { login: string }; commit_id: string; body: string; state: string }>(`${endpoint}/reviews?per_page=100`))
+        .some((item) => item.user?.login === "satori-miyamoto" && item.commit_id === headSha && item.body?.trimEnd().endsWith(marker)
+          && ["APPROVED", "CHANGES_REQUESTED", "DISMISSED"].includes(item.state));
+      if (await reconciled()) return;
+      const before = await this.inspectRetroPr(github, goalId, markdown, prUrl);
+      if (before.state !== "OPEN" || before.headSha !== headSha) throw new SprintError("Retrospective PR changed before review.");
+      const reviewCommand = async (args: string[]) => await this.run("env", [`GH_CONFIG_DIR=${join(homedir(), ".config/gh-yahaha-bot")}`, "gh", ...args]);
+      const account = await reviewCommand(["api", "user", "--jq", ".login"]);
+      if (account.code !== 0 || account.stdout.trim() !== "satori-miyamoto") throw new SprintError("Retrospective review requires the satori-miyamoto account.");
+      const project = await this.retroCheckout(github);
+      const worktrees = join(this.runtimeDir, "worktrees");
+      await mkdir(worktrees, { recursive: true, mode: 0o700 });
+      const temp = await mkdtemp(join(worktrees, `retro-review-${goalId}-`));
+      const worktree = join(temp, "checkout");
+      try {
+        await this.must("git", ["worktree", "add", "--detach", worktree, headSha], project);
+        const result = await review(worktree);
+        if (typeof result?.summary !== "string" || !Array.isArray(result.findings) || result.findings.some((item) => item.path !== retroPath(goalId)
+          || !Number.isSafeInteger(item.line) || item.line < 1 || item.line > markdown.split("\n").length || typeof item.reason !== "string" || !item.reason.trim())) throw new SprintError("Invalid retrospective review findings.");
+        const current = await this.inspectRetroPr(github, goalId, markdown, prUrl);
+        if (current.state !== "OPEN" || current.headSha !== headSha) throw new SprintError("Retrospective PR changed during review.");
+        if (await reconciled()) return;
+        const input = join(temp, "review.json");
+        await writeFile(input, JSON.stringify({ commit_id: headSha, event: result.findings.length ? "REQUEST_CHANGES" : "APPROVE",
+          body: `${redactSecrets(result.summary)}\n\n${marker}`,
+          comments: result.findings.map((item) => ({ path: item.path, line: item.line, side: "RIGHT", body: redactSecrets(item.reason) })),
+        }), { mode: 0o600 });
+        await reviewCommand(["api", endpoint + "/reviews", "--method", "POST", "--input", input]);
+        // A lost response is success only when GitHub contains our submitted verdict at this head.
+        if (!await reconciled()) throw new SprintError("Retrospective review delivery is not confirmed; retry reconciliation.");
+      } finally {
+        const removed = await this.run("git", ["worktree", "remove", "--force", worktree], project);
+        if (removed.code === 0) await rm(temp, { recursive: true, force: true });
+      }
+    });
   }
 
   /** The publication adapter persists human authorization before calling this narrowly scoped merge path. */

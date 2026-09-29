@@ -1,17 +1,21 @@
 import { createHash } from "node:crypto";
 import { readdir } from "node:fs/promises";
-import { ceremonyRuntimeName, type BridgeCeremonyRecord, type CeremonyAdapters, type CeremonyContext, type CeremonyProgress } from "./planning-bridge.js";
+import { ceremonyRuntimeName, type BridgeCeremonyRecord, type CeremonyAdapters, type CeremonyContext, type CeremonyProgress, type Post } from "./planning-bridge.js";
 import { type CeremonyStage, type HumanApproval, type PublishedRetroEvidence, validateCeremony } from "./ceremony.js";
 import type { CeremonyWriteReadiness } from "./ceremony-ports.js";
 import { requireTeamHome, type PlanningStore } from "./planning.js";
 import { processShell, type SeatTaskRecord } from "./developer-seat.js";
 import { seatRecordName } from "./developer-maintenance.js";
-import { retroPath, SprintGitHub, type RetroArchive, type RetroPr } from "./sprint.js";
+import { retroPath, SprintGitHub, type RetroArchive, type RetroPr, type RetroReview } from "./sprint.js";
 import { draftSprintRetro, renderSprintRetro, RetroGenerationError, type RetroGeneration, type RetroInput, type SprintRetroDraft } from "./sprint-retro.js";
 import { loadSeatEngines, SeatRuntime } from "./seat-runtime.js";
 import { seatHarnessDir } from "./harness-home.js";
 import { loadSeatPersonas, personaPost, withPersonaRuntime } from "./seat-persona.js";
 import { AgentRunError } from "./runtime-facts.js";
+import { CHICK_USERNAME, MattermostPlanningChat, readChickToken } from "./planning-mattermost.js";
+import { opCredential } from "./service-account.js";
+import { schemaPathOf } from "./reload.js";
+import { redactSecrets } from "./redact.js";
 
 /** The store still checks the companion schema before writing any ceremony state. */
 export const ceremonyReadiness: CeremonyWriteReadiness = { version: 1, consumers: { planning: 1, developer: 1, release: 1, retro: 1, tui: 1 } };
@@ -27,11 +31,18 @@ export interface RetroPublicationRecord {
   prUrl?: string;
   gate?: { headSha: string; postId: string; announcedAt: string };
   authorization?: { headSha: string; prUrl: string; postId: string; approval: HumanApproval };
+  review?: { headSha: string; result: RetroReview };
   verifiedAt?: string;
   /** Final completion timing, recorded before returning closure proof; the bridge journals closedAt from state. */
   stageTimings?: { stage: CeremonyStage; enteredAt: string | null; throughAt: string | null; elapsedMs: number | null }[];
 }
 export type RetroDraft = (context: CeremonyContext) => Promise<SprintRetroDraft>;
+export interface RetroPublicationServices {
+  /** Fresh GET evidence, independent of the bridge's cached outbox acknowledgements. */
+  thread(context: CeremonyContext): Promise<{ ownUserId: string; posts: (Post & { delete_at?: number })[] }>;
+  review(context: CeremonyContext, worktree: string, pr: RetroPr): Promise<unknown>;
+  formatPost?(context: CeremonyContext, message: string): Promise<string>;
+}
 
 /** Split at line boundaries below Mattermost's message limit. Joining parts preserves every source byte. */
 function parts(markdown: string): string[] {
@@ -50,8 +61,35 @@ function parts(markdown: string): string[] {
  * This adapter returns proof only after publication and a verified archival merge. It never applies proposals.
  */
 export class RetroPublication {
-  constructor(private readonly archive: RetroArchive, private readonly draft: RetroDraft,
-    private readonly formatPost: (context: CeremonyContext, message: string) => Promise<string> = async (_context, message) => message) {}
+  constructor(private readonly archive: RetroArchive, private readonly draft: RetroDraft, private readonly services: RetroPublicationServices) {}
+
+  private async formatPost(context: CeremonyContext, message: string): Promise<string> {
+    return this.services.formatPost ? await this.services.formatPost(context, message) : message;
+  }
+
+  private async verifyPosts(context: CeremonyContext, record: RetroPublicationRecord): Promise<void> {
+    const { frozen, postIds } = record;
+    if (!frozen || !postIds?.length || postIds.length !== frozen.parts.length || new Set(postIds).size !== postIds.length) throw new Error("Retrospective fragments are incomplete.");
+    const { ownUserId, posts } = await this.services.thread(context);
+    for (const [index, id] of postIds.entries()) {
+      const post = posts.find((item) => item.id === id);
+      if (!ownUserId || !post || post.delete_at || post.user_id !== ownUserId || post.channel_id !== context.goal.mattermost.channelId
+        || post.root_id !== context.goal.mattermost.rootPostId || post.message !== await this.formatPost(context, frozen.parts[index])) throw new Error("Retrospective fragment delivery or content is unverified.");
+    }
+  }
+
+  private async review(context: CeremonyContext, record: RetroPublicationRecord, pr: RetroPr): Promise<void> {
+    await this.archive.reviewRetroPr(record.github, context.goal.id, record.frozen!.markdown, pr.url, pr.headSha, async (worktree) => {
+      if (record.review?.headSha === pr.headSha) return record.review.result;
+      const value = await this.services.review(context, worktree, pr) as RetroReview | undefined;
+      if (typeof value?.summary !== "string" || !Array.isArray(value.findings) || value.findings.some((item) => !item || item.path !== retroPath(context.goal.id)
+        || !Number.isSafeInteger(item.line) || item.line < 1 || item.line > record.frozen!.markdown.split("\n").length || typeof item.reason !== "string" || !item.reason.trim())) throw new Error("Invalid archival reviewer response.");
+      const result = { summary: redactSecrets(value.summary), findings: value.findings.map((item) => ({ path: item.path, line: item.line, reason: redactSecrets(item.reason) })) };
+      record.review = { headSha: pr.headSha, result };
+      await this.save(context, record);
+      return result;
+    });
+  }
 
   private async load(context: CeremonyContext): Promise<RetroPublicationRecord> {
     const { goal, store } = context;
@@ -103,9 +141,10 @@ export class RetroPublication {
       for (const [index, message] of frozen.parts.entries()) postIds.push(await context.post(`retro-content:${frozen.sha256}:${index}`, message));
       record.postIds = postIds;
       await this.save(context, record);
+      await this.verifyPosts(context, record);
       record.prUrl = await this.archive.ensureRetroPr(record.github, context.goal.id, frozen.markdown);
       await this.save(context, record);
-      const pr = await this.archive.inspectRetroPr(record.github, context.goal.id, frozen.markdown, record.prUrl);
+      let pr = await this.archive.inspectRetroPr(record.github, context.goal.id, frozen.markdown, record.prUrl);
       if (pr.state === "CLOSED") return pending("The retrospective PR is closed without merging; the owner must resolve it before the goal can close.");
       if (pr.state === "OPEN") {
         const announcedAt = record.gate?.headSha === pr.headSha ? record.gate.announcedAt : new Date().toISOString();
@@ -117,9 +156,19 @@ export class RetroPublication {
         const postId = await context.post(`retro-merge:${pr.headSha}`, `**Retrospective archive: ${context.goal.id}**\n${pr.url}\n\nOnly \`${retroPath(context.goal.id)}\` may change. A fresh review and passing CI are required. React ✅ on this post or use \`planning merge --goal ${context.goal.id}\` (M) to authorize this archive. Earlier plan and release approvals do not apply. Suggested process changes remain proposals for the owner.`, "retro");
         record.gate = { headSha: pr.headSha, postId, announcedAt };
         await this.save(context, record);
-        return pending(!pr.reviewed ? "The retrospective archive needs a fresh review on its current head." : !pr.checksPassed ? "The retrospective archive is waiting for passing CI." : "The retrospective archive is waiting for a new human checkmark or the owner's M.");
+        if (!pr.reviewed) {
+          await this.review(context, record, pr);
+          pr = await this.archive.inspectRetroPr(record.github, context.goal.id, frozen.markdown, record.prUrl);
+        }
+        if (pr.state === "OPEN" && this.authorized(record, pr) && pr.reviewed && pr.checksPassed) {
+          await this.verifyPosts(context, record);
+          await this.archive.mergeRetroPr(record.github, context.goal.id, frozen.markdown, pr.url, pr.headSha);
+          pr = await this.archive.inspectRetroPr(record.github, context.goal.id, frozen.markdown, record.prUrl);
+        }
+        if (pr.state !== "MERGED") return pending(!pr.reviewed ? "The retrospective archive needs a fresh review on its current head." : !pr.checksPassed ? "The retrospective archive is waiting for passing CI." : this.authorized(record, pr) ? "The authorized archival merge is pending; it will be retried." : "The retrospective archive is waiting for a new human checkmark or the owner's M.");
       }
       if (!this.authorized(record, pr) || !pr.reviewed || !pr.checksPassed || !pr.mergedSha) return pending("The archival merge still needs verified human authorization, current-head review and passing CI.");
+      await this.verifyPosts(context, record);
       record.verifiedAt ??= new Date().toISOString();
       record.stageTimings = context.goal.ceremony!.history.map((entry, index, history) => {
         const throughAt = index + 1 < history.length ? history[index + 1].enteredAt : record.verifiedAt!;
@@ -136,7 +185,7 @@ export class RetroPublication {
 
   private authorized(record: RetroPublicationRecord, pr: RetroPr): boolean {
     const authorization = record.authorization;
-    return !!authorization && authorization.prUrl === pr.url && authorization.headSha === pr.headSha && authorization.postId === record.gate?.postId;
+    return !!authorization && authorization.prUrl === pr.url && authorization.headSha === pr.headSha && authorization.postId === record.gate?.postId && record.gate.headSha === pr.headSha;
   }
 
   /** Called only by the bridge after a GET-verified human reaction, or the owner's terminal M. */
@@ -152,6 +201,7 @@ export class RetroPublication {
     if (!Number.isFinite(Date.parse(approval.at)) || Date.parse(approval.at) < Date.parse(record.gate.announcedAt) || Date.parse(approval.at) < Date.parse(release.enteredAt ?? context.goal.createdAt)
       || (approval.source === "owner-command" ? approval.command !== "planning merge" : approval.emoji !== "white_check_mark" || approval.verifiedHuman !== true || approval.postId !== record.gate.postId)) throw new Error("The archive requires a new human checkmark on its own post or the owner's M.");
     if (!pr.reviewed || !pr.checksPassed) throw new Error("The retrospective archive needs a fresh current-head review and passing CI before merging.");
+    await this.verifyPosts(context, record);
     record.authorization = { headSha: pr.headSha, prUrl: pr.url, postId: record.gate.postId, approval };
     await this.save(context, record);
     const result = await this.archive.mergeRetroPr(record.github, context.goal.id, record.frozen.markdown, pr.url, pr.headSha);
@@ -200,6 +250,12 @@ export async function recordedRetroInput(context: CeremonyContext): Promise<Retr
 /** Discovered by cli.ts's existing module extension point; no shared wiring changes are needed. */
 export async function createCeremonyAdapters({ store }: { store: PlanningStore }): Promise<CeremonyAdapters> {
   const profiles = await loadSeatPersonas(import.meta.url);
+  const runtimeFor = async (context: CeremonyContext, cwd: string) => {
+    const state = await store.read();
+    const seats = (state.teams as { seats: { id: string }[] }[]).flatMap((team) => team.seats).map((seat) => seat.id);
+    const engines = await loadSeatEngines(store.runtimeDir, seats);
+    return new SeatRuntime(engines[context.goal.seatId] ?? "codex", cwd, undefined, undefined, undefined, seatHarnessDir(store.runtimeDir, context.goal.seatId));
+  };
   const retro = new RetroPublication(new SprintGitHub(processShell, store.runtimeDir), async (context) => {
     const state = await store.read();
     const seats = (state.teams as { seats: { id: string }[] }[]).flatMap((team) => team.seats).map((seat) => seat.id);
@@ -212,6 +268,20 @@ export async function createCeremonyAdapters({ store }: { store: PlanningStore }
         catch (error) { if (error instanceof AgentRunError) await context.recordSession(error.facts); throw error; }
       } };
     });
-  }, async (context, message) => personaPost(message, profiles[context.goal.seatId]));
+  }, {
+    formatPost: async (context, message) => personaPost(message, profiles[context.goal.seatId]),
+    thread: async (context) => {
+      const chat = new MattermostPlanningChat(await readChickToken(await opCredential(store.checkout)), CHICK_USERNAME);
+      return { ownUserId: await chat.ownUserId(), posts: await chat.since(context.goal.mattermost.channelId, Date.parse(context.goal.createdAt) - 5000) };
+    },
+    review: async (context, cwd, pr) => {
+      const runtime = await runtimeFor(context, cwd);
+      try {
+        const run = await runtime.message(`You are a fresh reviewer in Indra. You did not draft this retrospective. Review ${pr.url} at HEAD ${pr.headSha} against AGENTS.md and the recorded facts in docs/retros/${context.goal.id}.md. Inspect the diff against origin/main. Flag only real bugs or project-rule violations, with the document path, line and a one-line reason; never style or naming. Suggestions must remain owner proposals. You are read-only without network. Do not edit files, commit, push, merge or post. Never include credentials in output. Indra will post your line comments and an approval or changes-requested verdict. Return JSON: summary and findings (path, line, reason; empty when there are none).`, schemaPathOf(import.meta.url, "retro-review.json"), undefined, { purpose: "review" });
+        await context.recordRun(run);
+        return run.response;
+      } catch (error) { if (error instanceof AgentRunError) await context.recordSession(error.facts); throw error; }
+    },
+  });
   return { retro };
 }

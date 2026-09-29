@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":false,"required":["findings","summary"],"properties":{"findings":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["path","line","reason"],"properties":{"path":{"type":"string"},"line":{"type":"integer","minimum":1},"reason":{"type":"string"}}}},"summary":{"type":"string"}}}

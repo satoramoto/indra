@@ -1,6 +1,8 @@
 import { PlanningStore, type PlanningGoal, type SprintIntegration } from "./planning.js";
 import { TmuxHost } from "./tmux-host.js";
 import { LocalReleaseActivationReader, type ReleaseActivation } from "./release-activation.js";
+import { retroRuntimeName, type RetroPublicationRecord } from "./retro-publication.js";
+import { retroPath } from "./sprint.js";
 
 export type SessionEngine = "codex" | "claude" | "unknown";
 /** Persisted handles: unqualified legacy IDs are Codex; only claude:<id> identifies Claude. */
@@ -117,6 +119,7 @@ export interface SessionReadPort { readSessions(): Promise<SessionSnapshot> }
 export interface SessionPlanningReadPort {
   read(): Promise<{ planningGoals?: CeremonyGoal[] }>;
   runtime: PlanningStore["runtime"];
+  readRuntimeFile?: PlanningStore["readRuntimeFile"];
 }
 
 export class LocalSessionReader implements SessionReadPort {
@@ -134,6 +137,14 @@ export class LocalSessionReader implements SessionReadPort {
       const build = goal.integration && ["merged", "reverted"].includes(goal.integration.status)
         ? await this.builds.read(goal.integration).catch((): SprintBuild => ({ status: "unavailable" })) : undefined;
       const loop = projectSprint(goal, build);
+      if (loop.retro?.status === "pending" && this.store.readRuntimeFile) {
+        const publication = await this.store.readRuntimeFile<RetroPublicationRecord>(retroRuntimeName(goal.id)).catch(() => undefined);
+        if (publication?.version === 1 && publication.goalId === goal.id && typeof publication.prUrl === "string"
+          && /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+$/.test(publication.prUrl)
+          && publication.prUrl.startsWith(`https://github.com/${publication.github}/pull/`)) {
+          loop.retro = { status: "pending", path: retroPath(goal.id), prUrl: publication.prUrl };
+        }
+      }
       const context = { id: goal.id, teamId: goal.teamId, seatId: goal.seatId, goal: goal.goal, stage: goal.stage, updatedAt: goal.updatedAt,
         loop, ...(loop.ceremony ? { ceremony: structuredClone(loop.ceremony), retro: structuredClone(loop.retro) } : {}),
         ...(loop.closedAt ? { closedAt: loop.closedAt } : {}), ...(loop.release ? { release: structuredClone(loop.release) } : {}),

@@ -18,6 +18,12 @@ vi.mock("../src/release-activation.js", async (original) => ({
     return rollout.ready ? { version: 1, consumers: { planning: 1, developer: 1, release: 1, retro: 1, tui: 1 } } : undefined;
   },
 }));
+vi.mock("../src/retro-publication.js", async (original) => ({
+  ...await original<typeof import("../src/retro-publication.js")>(),
+  get ceremonyReadiness() {
+    return rollout.ready ? { version: 1, consumers: { planning: 1, developer: 1, release: 1, retro: 1, tui: 1 } } : undefined;
+  },
+}));
 vi.mock("../src/terminal-ui-solid.js", () => ({ runTerminalUi: vi.fn(async () => 0) }));
 
 /** A tmux server with several sessions. `onStart` decides how a new hosted process behaves. */

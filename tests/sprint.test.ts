@@ -18,7 +18,10 @@ class GitHub implements Shell {
   calls: { command: string; args: string[]; cwd: string }[] = [];
   state?: "OPEN" | "CLOSED" | "MERGED";
   checks = [{ name: "checks", bucket: "pass" }];
-  reviews: { id: number; user: { login: string }; state: string; commit_id: string }[] = [];
+  reviews: { id: number; user: { login: string }; state: string; commit_id: string; body?: string; comments?: unknown[] }[] = [];
+  reviewer = "satori-miyamoto";
+  loseReview = false;
+  refuseReview = false;
   files = [{ filename: path, status: "added" }];
   extraPage = false;
   losePush = false;
@@ -39,6 +42,19 @@ class GitHub implements Shell {
       const result = await processShell.run(command, args, cwd);
       if (args.includes("push") && this.losePush) { this.losePush = false; return ok("", 1); }
       return result;
+    }
+    if (command === "env") {
+      expect(args[0]).toMatch(/^GH_CONFIG_DIR=.*\/\.config\/gh-yahaha-bot$/);
+      expect(args[1]).toBe("gh");
+      args = args.slice(2);
+      if (args[0] === "api" && args[1] === "user") return ok(this.reviewer);
+      if (args[0] === "api" && args[1].endsWith("/reviews") && args.includes("POST")) {
+        if (this.refuseReview) return ok("", 1);
+        const review = JSON.parse(await readFile(args[args.indexOf("--input") + 1], "utf8"));
+        this.reviews.push({ id: this.reviews.length + 1, user: { login: this.reviewer }, state: review.event === "APPROVE" ? "APPROVED" : "CHANGES_REQUESTED", ...review });
+        return ok("", this.loseReview ? 1 : 0);
+      }
+      throw new Error("Unexpected reviewer command");
     }
     if (command !== "gh") throw new Error("Unexpected command");
     if (args[0] === "api") {
@@ -80,6 +96,49 @@ async function fixture() {
 }
 
 describe("retrospective-only GitHub archival", () => {
+  it.each([false, true])("posts the fresh review's line comments and verdict, recovering lost responses (findings: %s)", async (findings) => {
+    const { github, shell, runtimeDir } = await fixture();
+    await github.ensureRetroPr("test/project", goal, content);
+    shell.checks[0].bucket = "pending"; shell.loseReview = true;
+    const review = vi.fn(async (cwd: string) => {
+      expect(cwd.startsWith(join(runtimeDir, "worktrees"))).toBe(true);
+      expect(git(cwd, "rev-parse", "HEAD").trim()).toBe(shell.head());
+      expect(await readFile(join(cwd, path), "utf8")).toBe(content);
+      return { summary: "Reviewed the frozen archive", findings: findings ? [{ path, line: 3, reason: "Missing recorded evidence." }] : [] };
+    });
+    await github.reviewRetroPr("test/project", goal, content, url, shell.head(), review);
+    await new SprintGitHub(shell, runtimeDir).reviewRetroPr("test/project", goal, content, url, shell.head(), review);
+    expect(review).toHaveBeenCalledTimes(1);
+    expect(shell.reviews).toHaveLength(1);
+    expect(shell.reviews[0]).toMatchObject({ commit_id: shell.head(), user: { login: "satori-miyamoto" }, state: findings ? "CHANGES_REQUESTED" : "APPROVED",
+      comments: findings ? [{ path, line: 3, side: "RIGHT", body: "Missing recorded evidence." }] : [] });
+    expect((await github.inspectRetroPr("test/project", goal, content, url)).reviewed).toBe(!findings);
+    expect(shell.calls.filter((call) => call.command === "env").every((call) => call.args.includes("user") || call.args.some((arg) => arg.endsWith("/reviews")))).toBe(true);
+  });
+
+  it("fails closed on the wrong review account or an unconfirmed verdict", async () => {
+    const { github, shell } = await fixture(); await github.ensureRetroPr("test/project", goal, content);
+    const review = vi.fn(async () => ({ summary: "Reviewed", findings: [] }));
+    shell.reviewer = "owner";
+    await expect(github.reviewRetroPr("test/project", goal, content, url, shell.head(), review)).rejects.toThrow("satori-miyamoto");
+    expect(review).not.toHaveBeenCalled();
+    shell.reviewer = "satori-miyamoto"; shell.refuseReview = true;
+    await expect(github.reviewRetroPr("test/project", goal, content, url, shell.head(), review)).rejects.toThrow("not confirmed");
+    expect((await github.inspectRetroPr("test/project", goal, content, url)).reviewed).toBe(false);
+  });
+
+  it("does not post a stale review when the PR head changes during the reviewer run", async () => {
+    const { github, shell, source, remote } = await fixture(); await github.ensureRetroPr("test/project", goal, content);
+    const head = shell.head();
+    await expect(github.reviewRetroPr("test/project", goal, content, url, head, async () => {
+      git(source, "fetch", "--quiet", remote, `retro/${goal}`); git(source, "checkout", "--quiet", "--detach", "FETCH_HEAD");
+      git(source, "commit", "--allow-empty", "-qm", "New head"); git(source, "push", "--quiet", remote, `HEAD:refs/heads/retro/${goal}`);
+      git(remote, "update-ref", "refs/pull/1/head", shell.head());
+      return { summary: "Reviewed", findings: [] };
+    })).rejects.toThrow("changed during review");
+    expect(shell.reviews).toHaveLength(0);
+  });
+
   it("commits precisely the frozen document in the managed project and recovers branch/PR publication", async () => {
     const { github, shell, project, remote, runtimeDir } = await fixture();
     shell.losePush = true;
