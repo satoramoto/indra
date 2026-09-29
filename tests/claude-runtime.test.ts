@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { CLAUDE_OUTPUT_LIMIT, CLAUDE_STDERR_LIMIT, ClaudeRuntime } from "../src/claude-runtime.js";
+import { CLAUDE_OUTPUT_LIMIT, CLAUDE_STDERR_LIMIT, ClaudeRuntime, claudeModelArgs } from "../src/claude-runtime.js";
 import { AgentRunError } from "../src/runtime-facts.js";
 
 vi.mock("node:child_process", () => ({ spawn: vi.fn(), execFile: vi.fn() }));
@@ -46,6 +46,15 @@ describe("Claude runtime", () => {
     expect(Date.parse(result.finishedAt)).toBeGreaterThanOrEqual(Date.parse(result.startedAt));
   });
 
+  it("runs a Developer seat on claude-opus-5-5 at medium effort, and the Team Lead at max", async () => {
+    const run = new ClaudeRuntime(dir, undefined, undefined, ["Developer"]).message("Build", schema);
+    await launched();
+    expect(flag("--model")).toBe("claude-opus-5-5"); expect(flag("--effort")).toBe("medium");
+    child.close(); await run;
+    expect(claudeModelArgs(["Team Lead"])).toEqual(["--model", "claude-opus-5-5", "--effort", "max"]);
+    expect(claudeModelArgs(undefined)).toEqual(["--model", "claude-opus-5-5", "--effort", "medium"]);
+  });
+
   it("resumes only the explicit Claude UUID, reapplies the schema, and disables interrupted-turn replay", async () => {
     vi.stubEnv("CLAUDE_CODE_RESUME_INTERRUPTED_TURN", "1");
     vi.stubEnv("ANTHROPIC_API_KEY", "test-only-must-not-forward");
@@ -54,6 +63,7 @@ describe("Claude runtime", () => {
     await launched(); expect(flag("--resume")).toBe(id); expect(args()).toContain("--json-schema");
     const env = vi.mocked(spawn).mock.calls[0][2]?.env;
     expect(env?.CLAUDE_CODE_RESUME_INTERRUPTED_TURN).toBe("0"); expect(env).not.toHaveProperty("ANTHROPIC_API_KEY");
+    expect(env?.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBe("300000");
     expect(env).not.toHaveProperty("OP_SESSION_example");
     child.close(); expect((await run).sessionId).toBe(handle);
   });

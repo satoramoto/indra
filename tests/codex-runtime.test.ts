@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { CodexRuntime } from "../src/codex-runtime.js";
+import { AGENT_PROMPT_LIMIT_BYTES, CodexRuntime } from "../src/codex-runtime.js";
 import { AgentRunError } from "../src/runtime-facts.js";
 import { ensureCodexHome } from "../src/harness-home.js";
 
@@ -202,6 +202,12 @@ describe("Codex invocation facts", () => {
     child.stdout.write("x".repeat(10_000_001));
     child.close(usage.replace('"input_tokens":100', '"input_tokens":200'), null);
     expect((await run).facts).toMatchObject({ status: "interrupted", usage: { inputTokens: 100, outputTokens: 9 } });
+  });
+
+  it("refuses an oversized prompt before launching a process", async () => {
+    const error = await failure(new CodexRuntime("/workspace").message("x".repeat(AGENT_PROMPT_LIMIT_BYTES + 1), "/schema.json"));
+    expect(spawn).not.toHaveBeenCalled();
+    expect(error.message).toContain("byte limit");
   });
 
   it("records an already-aborted invocation without launching a process", async () => {

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { DEVELOPER_CODEX_CONFIG as CODEX_CONFIG, PRODUCT_CODEX_CONFIG, TEAM_LEAD_CODEX_CONFIG, codexConfigForRoles, engineHome, ensureCodexHome, ownerCodexAuth, promoteSeatAuth, seatHarnessDir, writeFileAtomic } from "../src/harness-home.js";
+import { DEVELOPER_CODEX_CONFIG as CODEX_CONFIG, HARNESS_CONTEXT_TOKEN_LIMIT, PRODUCT_CODEX_CONFIG, TEAM_LEAD_CODEX_CONFIG, codexConfigForRoles, engineHome, ensureCodexHome, ownerCodexAuth, promoteSeatAuth, seatHarnessDir, writeFileAtomic } from "../src/harness-home.js";
 import { CodexRuntime } from "../src/codex-runtime.js";
 import { claudePermissionArgs } from "../src/claude-runtime.js";
 
@@ -56,14 +56,15 @@ describe("seat harness homes", () => {
       expect((await lstat(join(home, "auth.json"))).isSymbolicLink()).toBe(true);
       expect(await readlink(join(home, "auth.json"))).toBe(join(owner, ".codex", "auth.json"));
     }
-    // Exactly the owner's seat model and effort; no MCP, hooks, skills or profiles.
-    expect(CODEX_CONFIG).toBe("model = \"gpt-6-sol\"\nmodel_reasoning_effort = \"medium\"\n");
+    // Exactly the owner's seat model and effort, plus the 300k-token auto-compaction cap; no MCP, hooks, skills or profiles.
+    expect(HARNESS_CONTEXT_TOKEN_LIMIT).toBe(300_000);
+    expect(CODEX_CONFIG).toBe("model = \"gpt-6-sol\"\nmodel_reasoning_effort = \"medium\"\nmodel_auto_compact_token_limit = 300000\n");
   });
 
   it("picks the Codex model by the seat's role, falling back to Developer", () => {
-    expect(codexConfigForRoles(["Developer"])).toBe("model = \"gpt-6-sol\"\nmodel_reasoning_effort = \"medium\"\n");
-    expect(codexConfigForRoles(["Team Lead"])).toBe("model = \"gpt-6-astra\"\nmodel_reasoning_effort = \"max\"\n");
-    expect(codexConfigForRoles(["Product"])).toBe("model = \"gpt-6-astra\"\nmodel_reasoning_effort = \"medium\"\n");
+    expect(codexConfigForRoles(["Developer"])).toBe("model = \"gpt-6-sol\"\nmodel_reasoning_effort = \"medium\"\nmodel_auto_compact_token_limit = 300000\n");
+    expect(codexConfigForRoles(["Team Lead"])).toBe("model = \"gpt-6-astra\"\nmodel_reasoning_effort = \"max\"\nmodel_auto_compact_token_limit = 300000\n");
+    expect(codexConfigForRoles(["Product"])).toBe("model = \"gpt-6-astra\"\nmodel_reasoning_effort = \"medium\"\nmodel_auto_compact_token_limit = 300000\n");
     expect(TEAM_LEAD_CODEX_CONFIG).not.toBe(PRODUCT_CODEX_CONFIG);
     for (const roles of [undefined, [], ["Unknown"]]) expect(codexConfigForRoles(roles)).toBe(CODEX_CONFIG);
   });

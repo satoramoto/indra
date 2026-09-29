@@ -86,7 +86,7 @@ class FakeRuntime implements AgentRuntime {
 }
 
 describe("planning bridge", () => {
-  it("persists a goal from old v1, resumes the exact session, and drafts only on a person's memo reaction", async () => {
+  it("persists a goal from old v1, runs every turn in a fresh session, and drafts only on a person's memo reaction", async () => {
     const store = await fixture(false); const chat = new FakeChat(); const runtime = new FakeRuntime();
     const bridge = new PlanningBridge(store, chat, runtime);
     const goal = await bridge.start("Explore project");
@@ -95,7 +95,9 @@ describe("planning bridge", () => {
     expect(runtime.sessions).toEqual([undefined]);
     chat.human("post1", "Start with the README");
     await bridge.poll();
-    expect(runtime.sessions).toEqual([undefined, "session-1"]);
+    // A new clarify turn never gets the previous turn's handle; the prompt carries the brief instead.
+    expect(runtime.sessions).toEqual([undefined, undefined]);
+    expect(runtime.prompts[1]).toContain("Current brief:");
     const replies = chat.posts.length;
     await new PlanningBridge(store, chat, runtime).poll();
     expect(chat.posts.length).toBe(replies);
@@ -122,7 +124,24 @@ describe("planning bridge", () => {
     expect(record.proposalPostIds).toEqual([announcement.id]);
     await new PlanningBridge(store, chat, runtime).poll();
     expect(chat.posts.at(-1)).toBe(announcement);
-    expect(runtime.sessions).toHaveLength(3);
+    // The proposal draft is its own task too: no clarify session is resumed.
+    expect(runtime.sessions).toEqual([undefined, undefined, undefined]);
+  });
+
+  it("re-runs a clarify turn interrupted by a crash, once, in a fresh session", async () => {
+    const store = await fixture(); const chat = new FakeChat(); const runtime = new FakeRuntime();
+    const bridge = new PlanningBridge(store, chat, runtime);
+    const goal = await bridge.start("Explore project");
+    chat.human(goal.mattermost.rootPostId, "Question");
+    const question = chat.posts.at(-1)!;
+    // A crash mid-turn leaves the turn journaled with no result, and the last session's handle behind.
+    const record = await store.runtime(goal.id);
+    await store.saveRuntime(goal.id, { ...record, sessionId: "session-old", turn: { inputKey: question.id, since: question.create_at, drafting: false, startedAt: new Date().toISOString() } } as typeof record);
+    await new PlanningBridge(store, chat, runtime).poll();
+    expect(runtime.sessions).toEqual([undefined, undefined]);
+    expect(chat.posts.filter((post) => post.message === "What matters most?")).toHaveLength(2);
+    await new PlanningBridge(store, chat, runtime).poll();
+    expect(runtime.sessions).toHaveLength(2);
   });
 
   it("clears a failed draft substate, posts once without error details, and drafts again only on a new memo", async () => {

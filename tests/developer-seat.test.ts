@@ -604,6 +604,13 @@ describe("developer seat", () => {
     expect(await readFile(join(store.checkout, "state.json"), "utf8")).not.toContain("failed-run");
   });
 
+  it("says a session timed out, and after how long, in the assignment note", async () => {
+    const { codex, make, assignment } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
+    codex.factory = () => ({ message: async () => { throw new AgentRunError("Codex run timed out after 60 min.", { invocationId: "slow-run", engine: "codex", startedAt: "2026-01-01T00:00:00Z", finishedAt: "2026-01-01T01:00:02Z", status: "timed-out" }); } });
+    await make().tick();
+    expect(await assignment("outcome-1")).toMatchObject({ status: "failed", note: "build: Agent developer session timed out after 60 min." });
+  });
+
   it("fails on an agent error using runtime-neutral wording without recording its output", async () => {
     const { codex, seat, assignment } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
     codex.fail = true;
