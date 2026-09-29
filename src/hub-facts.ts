@@ -5,6 +5,40 @@ import { CLAUDE_MODEL, DEVELOPER_CLAUDE_EFFORT, PRODUCT_CLAUDE_EFFORT, TEAM_LEAD
 import { DEVELOPER_CODEX_MODEL, DEVELOPER_CODEX_REASONING_EFFORT, PRODUCT_CODEX_MODEL, PRODUCT_CODEX_REASONING_EFFORT, TEAM_LEAD_CODEX_MODEL, TEAM_LEAD_CODEX_REASONING_EFFORT } from "./harness-home.js";
 import { parseUsage, sumUsage, type CiState, type SeatStep } from "./hub-format.js";
 import type { RuntimeEngine, TokenUsage } from "./runtime-facts.js";
+import type { PlanningGoal } from "./planning.js";
+import { goalRuntimeFilename, productRuntimeFilename, projectGoalRuntime, teamRuntimeFilename, type GoalRuntimeProjection, type GoalRuntimeRecord, type ProductRuntimeRecord, type SchedulerRuntimeRecord } from "./goal-contract.js";
+
+export interface GoalSeatFacts { goalId: string; title: string; status: string; ownedFiles: string[]; progress?: GoalRuntimeProjection }
+
+/** Only public runtime records with matching durable ownership are usable by the hub. */
+export async function readGoalFacts(store: RuntimeFileReader, goal: PlanningGoal): Promise<GoalSeatFacts> {
+  const facts: GoalSeatFacts = { goalId: goal.id, title: goal.goal, status: goal.goalAssignment?.status ?? "unassigned", ownedFiles: [...(goal.ownedFiles ?? [])] };
+  try {
+    const record = await store.readRuntimeFile<GoalRuntimeRecord>(goalRuntimeFilename(goal.id));
+    if (record?.version === 1 && record.goalId === goal.id && record.teamId === goal.teamId && record.assignment?.seatId === goal.goalAssignment?.seatId) {
+      facts.progress = projectGoalRuntime(record);
+    }
+  } catch { /* Missing or malformed runtime facts are unknown, never invented progress. */ }
+  return facts;
+}
+
+export async function readSchedulerFacts(store: RuntimeFileReader, teamId: string): Promise<SchedulerRuntimeRecord | undefined> {
+  try {
+    const record = await store.readRuntimeFile<SchedulerRuntimeRecord>(teamRuntimeFilename(teamId));
+    if (record?.version !== 1 || record.teamId !== teamId || !Array.isArray(record.approvedQueue) || !Array.isArray(record.activeDispatches)) return;
+    if (record.approvedQueue.some((item) => typeof item.goalId !== "string" || !Array.isArray(item.blockedByGoalIds) || !Array.isArray(item.ownedFiles))) return;
+    return structuredClone(record);
+  } catch { return; }
+}
+
+export async function readProductFacts(store: RuntimeFileReader, teamId: string, seatId: string): Promise<ProductRuntimeRecord | undefined> {
+  try {
+    const record = await store.readRuntimeFile<ProductRuntimeRecord>(productRuntimeFilename(teamId));
+    if (record?.version !== 1 || record.teamId !== teamId || record.seatId !== seatId || !Array.isArray(record.queue)) return;
+    if (record.queue.some((item) => typeof item.proposal?.summary !== "string" || typeof item.proposal.rank !== "number")) return;
+    return structuredClone(record);
+  } catch { return; }
+}
 
 /** Which harness a seat runs, with the model and effort its roles get (see codexConfigForRoles and claudeModelArgs). */
 export interface SeatHarness { engine: RuntimeEngine; model: string; effort: string }

@@ -4,7 +4,7 @@ import { render, useKeyboard, usePaste, useTerminalDimensions } from "@opentui/s
 import { createMemo, createSignal, For, Show, type Accessor } from "solid-js";
 import type { StateInventory } from "./state-domain.js";
 import { attachTmux } from "./tmux-attach.js";
-import { displayText, GOAL_INPUT_LIMIT, sessionSprint, TerminalUiModel, type SessionReadPort, type StateSyncPort, type UiApproval, type UiRetry, type UiRollback, type UiView, type UpdatePort } from "./terminal-ui.js";
+import { displayText, GOAL_INPUT_LIMIT, sessionSprint, TerminalUiModel, TerminalUiWorkflow, type WorkflowEventSource, type SessionReadPort, type StateSyncPort, type UiApproval, type UiRetry, type UiRollback, type UiView, type UpdatePort } from "./terminal-ui.js";
 import { engineLabel } from "./session-snapshot.js";
 import type { GoalStarter, SeatProcessPort } from "./supervisor.js";
 import type { PaneTailSource } from "./pane-tail.js";
@@ -20,7 +20,7 @@ import { isFinishedSprint } from "./finished-sprint.js";
 import { CI_DOT, formatTokens, openableUrl, pipelineSteps, prLabel, sumUsage, totalTokens, usageLine } from "./hub-format.js";
 import {
   assignmentLine, createTicker, elapsedText, harnessText, HUB_STATE, isDeveloper, LinkText, occupancy, PipelineLabels, processColor, SeatRow,
-  seatState, SprintCard, SprintStrip, stateColor, theme, threadActivity, type HubState,
+  seatState, SprintCard, SprintStrip, WorkflowDetail, stateColor, theme, threadActivity, type HubState,
 } from "./hub-view.js";
 
 /** The end of a long goal, as many characters as fit in six wrapped lines, so the cursor stays visible. */
@@ -43,7 +43,6 @@ function confirmText(confirm: UiApproval | UiRollback | UiRetry, width: number):
     propose: ["Request Chick's proposal for ", "y request"],
     approve: ["Approve the proposal for ", "y approve"],
     integrate: ["Open the integration PR into main, for what merged, for sprint ", "y open"],
-    merge: [confirm.mergeKind === "revert" ? "Merge the revert PR on main for sprint " : confirm.mergeKind === "retro" ? "Merge the retro publication PR into main for sprint " : "Merge the release integration PR into main for sprint ", "y merge"],
     revert: ["Roll back sprint ", "y open a revert PR"],
   }[confirm.action];
   return question + displayText(confirm.goalId, 40) + " (" + displayText(confirm.goal, Math.max(10, width - 80)) + ")? " + yes
@@ -135,7 +134,7 @@ export function TerminalApp(props: TerminalAppProps) {
     const hub = seatState(props.model, selected);
     const connected = props.model.sessionResult.connection === "connected";
     // The open goals (a team holds at most one), or else the newest finished one: planning history stays off this screen.
-    const records = [...props.model.sessionsFor(selected.id)].sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""));
+    const records = [...props.model.sessionsFor(selected.id)].filter((session) => !session.workflowModel || selected.roles.includes("Team Lead")).sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""));
     const openRecords = records.filter((session) => !isFinishedSprint(sessionSprint(session).loop));
     const sessions = (openRecords.length ? openRecords : records).slice(0, 2);
     const live = props.model.live[selected.id];
@@ -151,13 +150,14 @@ export function TerminalApp(props: TerminalAppProps) {
           <span style={{ fg: stateColor(hub, pulse()) }}>{HUB_STATE[hub].icon + " " + HUB_STATE[hub].word.toUpperCase()}</span>
         </text>
         <Show when={live}>
-          <text fg={processColor[live!.process]}>Process: {live!.process}{live!.updatePending ? " · update pending (restarts when idle)" : ""}{isDeveloper(selected) ? " (seat runner)" : " (planning bridge)"}  ·  s restart  ·  x stop</text>
+          <text fg={processColor[live!.process]}>Process: {live!.process}{live!.updatePending ? " · update pending (restarts when idle)" : ""}{selected.roles.includes("Team Lead") ? " (scheduler / planning bridge)" : selected.roles.includes("Product") ? " (Product runner)" : " (Developer runner)"}  ·  s restart  ·  x stop</text>
           <Show when={live!.problem}><text fg={stateColor("failed", pulse())} wrapMode="word">⚠ {displayText(live!.problem, 300)}</text></Show>
         </Show>
         <text fg={theme.heading}>🤖 {live?.harness ? `${live.harness.engine === "claude" ? "Claude" : "Codex"} · model ${displayText(live.harness.model, 40)} · effort ${displayText(live.harness.effort, 20)}` : harnessText(undefined)}</text>
-        <Show when={!isDeveloper(selected)}><text fg={theme.accent}>🧮 Planning: {usageLine(leadUsage) + liveNote}</text></Show>
-        <Show when={live && isDeveloper(selected)}>
-          <text fg={theme.regular} wrapMode="word">Assignment: {assignmentLine(live!, 160)}</text>
+        <WorkflowDetail live={live} open={open} />
+        <Show when={selected.roles.includes("Team Lead")}><text fg={theme.accent}>🧮 Planning: {usageLine(leadUsage) + liveNote}</text></Show>
+        <Show when={live && isDeveloper(selected) && !live.goal}>
+          <text fg={theme.regular} wrapMode="word">Historical assignment: {assignmentLine(live!, 160)}</text>
           <Show when={held}>
             <box flexDirection="row" height={1} flexShrink={0}>
               <text flexShrink={0}>{"   "}</text>
@@ -259,6 +259,7 @@ export function TerminalApp(props: TerminalAppProps) {
 
       <box flexShrink={0} flexDirection="column">
         <Show when={newGoalHint()}><text fg={theme.idle} wrapMode="word">{displayText(newGoalHint(), 240)}</text></Show>
+        <Show when={props.model.workflowError}><text fg={theme.error} wrapMode="word">{displayText(props.model.workflowError)}</text></Show>
         <Show when={launchWarning()}><text fg={stateColor("failed", pulse())} wrapMode="word">⚠ {displayText(launchWarning())}</text></Show>
         <Show when={notice()}><text fg={theme.idle} wrapMode="word">{displayText(notice())}</text></Show>
         <Show when={input()}>
@@ -297,6 +298,8 @@ export function openLink(url: string, run: (file: string, args: string[]) => voi
 /** Start the Solid/OpenTUI screen; renderer ownership and terminal cleanup stay in this function. */
 export async function runTerminalUi(state: StateInventory, sessions: SessionReadPort, options: {
   pollMs?: number;
+  /** Host lifetime; every team has its own inbox consumer. Abort closes all sources. */
+  workflowEvents?: WorkflowEventSource;
   /** Opens a seat's live view: `watch` with the pane's input off, `drive` with it on (only a verified headed run). */
   attach?: (target: string, mode?: AttachMode) => Promise<unknown>;
   /** Whether a seat's target is Indra's own verified session with a headed run going, so `D` can drive it. */
@@ -332,7 +335,7 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
   await model.refresh();
   const renderer = await createCliRenderer({ exitOnCtrlC: false, targetFps: 30 });
   const [revision, setRevision] = createSignal(model.revision);
-  model.changed = () => { if (active) setRevision(model.revision); };
+
   let active = true;
   let refreshing = false;
   let attaching = false;
@@ -340,6 +343,8 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
   let syncTimer: ReturnType<typeof setInterval> | undefined;
   let updateTimer: ReturnType<typeof setInterval> | undefined;
   let reloadNow = () => {};
+  const workflow = new TerminalUiWorkflow(model, options.workflowEvents, () => reloadNow());
+  model.changed = () => { if (active) { setRevision(model.revision); void workflow.wake(); } };
   const refresh = async () => {
     if (!active || refreshing || attaching) return;
     refreshing = true;
@@ -375,10 +380,10 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
       renderer.destroy();
       return true;
     };
-    const finish = () => { if (cleanup()) resolve(0); };
+    const finish = () => { if (cleanup()) void workflow.stop().then(() => resolve(0), reject); };
     reloadNow = () => {
       const view = model.view();
-      if (options.reload && cleanup()) options.reload(view).then(resolve, reject);
+      if (options.reload && cleanup()) void workflow.stop().then(() => options.reload!(view)).then(resolve, reject);
     };
     // One screen rebuild per stdin chunk, not per key: a burst of keys otherwise exhausts OpenTUI's native renderables.
     const applyKey = keyInput(model, (current) => { if (active) setRevision(current); });
@@ -401,6 +406,7 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
         const target = model.attachTarget();
         if (!target) return;
         attaching = true;
+        void workflow.setAttached(true);
         const name = model.seat?.displayName ?? "the seat";
         const watching = "Watching " + name + " · " + WATCH_HINT;
         let shown: string | undefined;
@@ -426,23 +432,25 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
           if (active) {
             if (suspended) renderer.resume();
             attaching = false;
+            void workflow.setAttached(false);
             model.revision++;
             setRevision(model.revision);
             void refresh();
           }
         });
       }
+      void workflow.wake();
     };
     render(() => <TerminalApp model={model} revision={revision} onKey={key} paneTail={options.paneTail} transcript={options.transcript} openUrl={openUrl} />, renderer)
       .then(() => {
         if (!active) return;
-        timer = setInterval(() => { void refresh(); }, Math.max(500, options.pollMs ?? 2000));
-        void model.start();
-        if (options.sync) syncTimer = setInterval(() => { if (active && !attaching) void model.syncState(); }, Math.max(5_000, options.syncMs ?? 60_000));
-        if (options.update) updateTimer = setInterval(() => { if (active && !attaching) void model.updateCode(); }, Math.max(5_000, options.updateMs ?? 60_000));
+        if (!options.workflowEvents) timer = setInterval(() => { void refresh(); }, Math.max(500, options.pollMs ?? 2000));
+        void workflow.start().catch(() => { model.workflowError = "Startup reconciliation failed; restart Indra."; model.revision++; model.changed?.(); });
+        if (!options.workflowEvents && options.sync) syncTimer = setInterval(() => { if (active && !attaching) void model.syncState(); }, Math.max(5_000, options.syncMs ?? 60_000));
+        if (!options.workflowEvents && options.update) updateTimer = setInterval(() => { if (active && !attaching) void model.updateCode(); }, Math.max(5_000, options.updateMs ?? 60_000));
         options.signal?.addEventListener("abort", finish, { once: true });
         if (options.signal?.aborted) finish();
       })
-      .catch((error: unknown) => { cleanup(); reject(error); });
+      .catch((error: unknown) => { cleanup(); void workflow.stop().then(() => reject(error), reject); });
   });
 }

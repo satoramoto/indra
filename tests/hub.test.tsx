@@ -253,7 +253,7 @@ describe("the hub on the owner's screen", () => {
           ...titles.map((title, index) => title + " · " + ["in review", "building", "merged", "failed"][index]),
           "👤 George Duke", "🐙 #98", "🟢 CI passed", "🔴 CI failed", "Integration PR: not opened", "↑↓ seat · Enter details"],
         "developer-seat": ["LIVE PANE · George Duke", "George Duke  @georgeduke", "Process: running (seat runner)", "🤖 Codex · model gpt-6-sol · effort medium",
-          `Assignment: ${titles[0]} · in-review`, "🐙 satoramoto/indra#103", "🟡 CI pending", "build ✓", "review ✓", "fix skipped", "ci ●", "merge",
+          `Historical assignment: ${titles[0]} · in-review`, "🐙 satoramoto/indra#103", "🟡 CI pending", "build ✓", "review ✓", "fix skipped", "ci ●", "merge",
           "🟡 CI pending · 3 sessions · ⌛ 47m on this task", "🧮 in 1.25M · cached 1M · out 50k · Σ 1.3M tok", "Latest: Opened PR 103; review requested",
           "SPRINT · goal-hub", "Current stage: implement", "Closure: open", "planning → proposal → [implement] → release → retro", "1/4 tickets merged",
           "a watch · D drive (Ctrl-] back) · t transcript"],

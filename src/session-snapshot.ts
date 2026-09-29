@@ -3,7 +3,7 @@ import { TmuxHost } from "./tmux-host.js";
 import { LocalReleaseActivationReader, type ReleaseActivation } from "./release-activation.js";
 import { retroRuntimeName, type RetroPublicationRecord } from "./retro-publication.js";
 import { retroPath } from "./sprint.js";
-import { readAssignmentFacts, type AssignmentFacts } from "./hub-facts.js";
+import { readAssignmentFacts, readGoalFacts, type AssignmentFacts, type GoalSeatFacts } from "./hub-facts.js";
 import { parseUsage, sumUsage } from "./hub-format.js";
 import type { TokenUsage } from "./runtime-facts.js";
 
@@ -45,6 +45,8 @@ export interface SprintBuild {
   evidence?: ReleaseActivation["evidence"];
 }
 export interface SprintLoop {
+  workflowModel?: "goals-v1";
+  goal?: GoalSeatFacts;
   stage: SprintStage;
   /** The persisted ceremony, including closure, release facts and retro progress, independent of live readiness. */
   ceremony?: CeremonySnapshot;
@@ -94,7 +96,7 @@ export function projectSprint(goal: CeremonyGoal, build?: SprintBuild): SprintLo
     status: published ? "published" : ceremony.stage === "retro" ? "pending" : "not-started",
     ...(published ? { path: published.path, prUrl: published.prUrl, publishedAt: published.publishedAt } : {}),
   } : undefined;
-  return { stage, tickets, ...(ceremony ? { ceremony } : {}), ...(ceremony?.closure ? { closedAt: ceremony.closure.closedAt } : {}),
+  return { stage, tickets, ...(goal.workflowModel ? { workflowModel: goal.workflowModel } : {}), ...(ceremony ? { ceremony } : {}), ...(ceremony?.closure ? { closedAt: ceremony.closure.closedAt } : {}),
     ...(release ? { release: structuredClone(release) } : {}), ...(retro ? { retro } : {}),
     ...(integration ? { integration: { ...integration } } : {}), ...(build ? { build: structuredClone(build) } : {}) };
 }
@@ -107,6 +109,8 @@ export interface SessionSnapshot {
   connection: "connected" | "disconnected" | "error";
   sessions: {
     id: string; teamId: string; seatId: string; status: "idle" | "running" | "error"; engine: SessionEngine;
+    workflowModel?: "goals-v1";
+    goalOwnerSeatId?: string;
     sessionId?: string; goal: string; stage: string; updatedAt?: string; recentActivity: string[];
     ceremony?: CeremonySnapshot;
     closedAt?: string;
@@ -174,11 +178,18 @@ export class LocalSessionReader implements SessionReadPort {
       }
       const thread = goal.mattermost && typeof goal.mattermost.rootPostId === "string" ? { channelId: goal.mattermost.channelId, rootPostId: goal.mattermost.rootPostId } : undefined;
       const context = { id: goal.id, teamId: goal.teamId, seatId: goal.seatId, goal: goal.goal, stage: goal.stage, updatedAt: goal.updatedAt, createdAt: goal.createdAt,
+        ...(goal.workflowModel ? { workflowModel: goal.workflowModel, goalOwnerSeatId: goal.goalAssignment?.seatId } : {}),
         ...(thread ? { mattermost: thread } : {}),
         loop, ...(loop.ceremony ? { ceremony: structuredClone(loop.ceremony), retro: structuredClone(loop.retro) } : {}),
         ...(loop.closedAt ? { closedAt: loop.closedAt } : {}), ...(loop.release ? { release: structuredClone(loop.release) } : {}),
         ...(goal.integration ? { sprint: sprintView(goal) } : {}),
         ...(goal.ceremony ? {} : { migration: legacyMigrationBlocker(goal as PlanningGoal) }) };
+      if (goal.workflowModel === "goals-v1") {
+        loop.goal = reader ? await readGoalFacts({ readRuntimeFile: reader }, goal as PlanningGoal) : { goalId: goal.id, title: goal.goal, status: goal.goalAssignment?.status ?? "unassigned", ownedFiles: [...(goal.ownedFiles ?? [])] };
+        sessions.push({ ...context, status: loop.goal.progress?.failure ? "error" : "idle", engine: "unknown", recentActivity: loop.goal.progress?.failure ? [loop.goal.progress.failure.message] : [],
+          ...(thread ? { mattermost: { ...thread, proposalPostId: thread.rootPostId } } : {}) });
+        continue;
+      }
       let runtime: Awaited<ReturnType<PlanningStore["runtime"]>>;
       try {
         runtime = await this.store.runtime(goal.id);

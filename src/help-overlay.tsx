@@ -35,7 +35,7 @@ export const HELP_SECTIONS: HelpSection[] = [
   { title: "Planning, on Chick's seat", keys: [
     ["n", "start a new planning goal"],
     ["P  A", "request or approve a proposal (asks first)"],
-    ["I  M  V", "integrate, merge or revert a sprint (asks first)"],
+    ["I  V", "integrate historical work or roll back a sprint (asks first)"],
   ] },
   { title: "Indra", keys: [
     ["r", "check for updates now"],

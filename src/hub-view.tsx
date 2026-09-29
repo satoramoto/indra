@@ -118,16 +118,16 @@ export function needsOwner(session: TerminalSession): boolean {
   const loop = sessionSprint(session).loop;
   if (isFinishedSprint(loop)) return false;
   const stage = loop.ceremony?.stage;
-  if (stage === "proposal" && session.stage === "awaiting-review") return true;
-  if (loop.integration?.status === "pr-open" && !!loop.integration.prUrl) return true;
-  if (loop.integration?.status === "merged" && !!loop.integration.revertPrUrl) return true;
-  return stage === "retro" && loop.retro?.status === "pending" && !!loop.retro.prUrl;
+  return stage === "proposal" && session.stage === "awaiting-review";
 }
 
 /** One seat's state for colour, icon and blinking. */
 export function seatState(model: TerminalUiModel, seat: StateSeat): HubState {
   const live = model.live[seat.id];
   if (live?.problem || live?.process === "no credential" || live?.process === "no channel") return "failed";
+  if (live?.goal) return live.goal.progress?.failure || live.goal.status === "failed" ? "failed" : live.goal.status === "running" ? "running" : "waiting";
+  if (live?.product) return live.product.failure ? "failed" : live.product.queue.some((item) => item.status === "posted") ? "needs" : live.product.queue.length ? "waiting" : "idle";
+  if (live?.scheduler) return live.scheduler.failure ? "failed" : live.scheduler.activeDispatches.length ? "running" : live.scheduler.approvedQueue.length ? "waiting" : "idle";
   if (isDeveloper(seat) && live) {
     const status = live.assignment?.status;
     if (status === "failed") return "failed";
@@ -166,7 +166,11 @@ export function seatInfo(model: TerminalUiModel, seat: StateSeat): SeatInfo {
   const open = model.sessionsFor(seat.id).filter((session) => !isFinishedSprint(sessionSprint(session).loop));
   const usage = developer ? model.withLiveUsage(seat.id, facts?.usage, facts?.sessionIds ?? [])
     : model.withLiveUsage(seat.id, sumUsage(open.map((session) => session.usage)), open.map((session) => session.sessionId));
+  const workflow = live?.goal ? `Goal ${live.goal.goalId}: ${live.goal.title} · ${live.goal.status} · ${live.goal.progress?.lanes.length ?? "unknown"} lanes`
+    : live?.product ? `${live.product.queue.filter((entry) => entry.status !== "approved").length} ranked proposals · Product proposes; owner approves`
+    : live?.scheduler ? `${live.scheduler.approvedQueue.length} approved queued · ${live.scheduler.activeDispatches.length} active · ${live.scheduler.approvedQueue.filter((entry) => entry.blockedByGoalIds.length).length} overlap blockers` : undefined;
   const second = live?.problem ? { text: "⚠ " + displayText(live.problem, 300), color: theme.error }
+    : workflow ? { text: displayText(workflow, 300), color: theme.regular }
     : developer ? held ? { text: "", color: theme.regular }
       : { text: (live.retry ? "🙋 " : "💤 ") + assignmentLine(live, 60), color: live.retry ? HUB_STATE.needs.color : theme.muted }
     : { text: status.label, color: status.color };
@@ -177,11 +181,41 @@ export function seatInfo(model: TerminalUiModel, seat: StateSeat): SeatInfo {
     ...(usage ? { usage } : {}),
     ...(facts?.claimedAt ? { claimedAt: facts.claimedAt } : {}),
     ...(facts?.endedAt ? { endedAt: facts.endedAt } : {}),
-    ...(held ? { task: { title: displayText(held.title, 200), status: displayText(held.status, 20), prUrl: held.prUrl, ci: facts?.ci,
+    ...(held && !live?.goal ? { task: { title: displayText(held.title, 200), status: displayText(held.status, 20), prUrl: held.prUrl, ci: facts?.ci,
       steps: pipelineSteps({ status: held.status, step: facts?.step, fixRounds: facts?.fixRounds }) } } : {}),
     second,
     activity: developer ? threadActivity(live, 200) : activityLine(model, seat, 200),
   };
+}
+
+/** Shared records, displayed on the actual seat page; old outcome records remain separate. */
+export function WorkflowDetail(props: { live?: SeatLive; open?: (url: string) => void }) {
+  return <>
+    <Show when={props.live?.goal}>{(goal) => <box flexDirection="column" flexShrink={0}>
+      <text fg={theme.heading} wrapMode="word">Current goal: {displayText(goal().goalId)} · {displayText(goal().title)} · {displayText(goal().status)}</text>
+      <text fg={theme.muted} wrapMode="word">Owned files: {displayText(goal().ownedFiles.join(", "), 2000)}</text>
+      <Show when={goal().progress} fallback={<text fg={theme.idle}>Lane progress unavailable.</text>}>
+        <For each={goal().progress?.lanes}>{(lane) => <box flexDirection="row" flexShrink={0}>
+          <text fg={theme.regular}>{displayText(lane.id)} · {lane.status} · CI {lane.ci} · </text>
+          <LinkText url={lane.prUrl ?? undefined} label={lane.prUrl ? prLabel(lane.prUrl) ?? "PR" : "PR not opened"} open={props.open} />
+        </box>}</For>
+        <Show when={goal().progress?.failure}><text fg={theme.error} wrapMode="word">{displayText(goal().progress?.failure?.message)}</text></Show>
+        <For each={goal().progress?.decisions}>{(text) => <text wrapMode="word" fg={theme.regular}>Decision: {displayText(text)}</text>}</For>
+        <For each={goal().progress?.followUps}>{(text) => <text wrapMode="word" fg={theme.muted}>Follow-up: {displayText(text)}</text>}</For>
+      </Show>
+    </box>}</Show>
+    <Show when={props.live?.scheduler}>{(scheduler) => <box flexDirection="column" flexShrink={0}>
+      <text fg={theme.heading}>Scheduler · approved queue and active goals</text>
+      <For each={[...scheduler().approvedQueue].sort((a, b) => a.rank - b.rank)}>{(goal) => <text fg={theme.regular} wrapMode="word">{goal.rank}. {displayText(goal.goalId)} · {goal.blockedByGoalIds.length ? "overlap blocked by " + displayText(goal.blockedByGoalIds.join(", ")) : "waiting for an idle Developer"}</text>}</For>
+      <For each={scheduler().activeDispatches}>{(goal) => <text fg={theme.regular}>{displayText(goal.goalId)} → {displayText(goal.seatId)} · {goal.status}</text>}</For>
+      <Show when={scheduler().failure}><text fg={theme.error} wrapMode="word">{displayText(scheduler().failure?.message)}</text></Show>
+    </box>}</Show>
+    <Show when={props.live?.product}>{(product) => <box flexDirection="column" flexShrink={0}>
+      <text fg={theme.heading}>Product · ranked proposed queue</text>
+      <For each={[...product().queue].filter((item) => item.status !== "approved").sort((a, b) => a.proposal.rank - b.proposal.rank)}>{(item) => <text fg={theme.regular} wrapMode="word">{item.proposal.rank}. {displayText(item.proposal.summary)} · {item.status === "posted" ? "awaiting owner approval" : "proposed"}</text>}</For>
+      <Show when={product().failure}><text fg={theme.error} wrapMode="word">{displayText(product().failure?.message)}</text></Show>
+    </box>}</Show>
+  </>;
 }
 
 const pad = (text: string, width: number) => { const chars = Array.from(text); return chars.length >= width ? chars.slice(0, width).join("") : text + " ".repeat(width - chars.length); };
@@ -241,7 +275,7 @@ const buildStatus: Record<SprintBuild["status"], string> = {
   "reload-pending": "Pending reload: available build contains the integration; running build does not.",
   "update-pending": "Update pending: running and available builds do not contain the integration.",
   unavailable: "Build evidence unavailable; release is not confirmed.",
-  "revert-open": "Revert PR open; awaiting human merge confirmation.",
+  "revert-open": "Revert PR open; awaiting bot review and green CI.",
   reverted: "Reverted on main; running revert build is unverified.",
 };
 
@@ -250,7 +284,7 @@ export function releaseDetail(loop: SprintLoop): string {
   if (!loop.ceremony) return "Release completion is not recorded.";
   if (["planning", "proposal", "implement"].includes(loop.ceremony.stage)) return "Waiting for implementation to finish.";
   if (!loop.integration || loop.integration.status === "collecting") return "Release waiting: integration PR has not opened.";
-  if (loop.integration.status === "pr-open") return "Release waiting: integration PR needs the owner's merge and green CI.";
+  if (loop.integration.status === "pr-open") return "Release waiting: integration PR needs current-head bot approval and green CI.";
   if (loop.build?.status === "running") return "Build is running; waiting for the recorded transition to retro.";
   return "Release waiting: " + (loop.build?.reason || (loop.build ? buildStatus[loop.build.status] : "running application and bridge evidence is unavailable."));
 }
@@ -264,12 +298,13 @@ function publishedRetro(loop: SprintLoop) {
 export function retroDetail(loop: SprintLoop): string {
   const kind = loop.ceremony?.closure?.evidence.kind;
   if (kind === "release-reverted") return "No retro: the release was reverted before it ran.";
+  if (kind === "remodel-closure") return "No retro fabricated: historical goal closed for the remodel.";
   if (kind === "legacy-migration") return "No retro: finished before the ceremony; closed by legacy migration.";
   const published = publishedRetro(loop);
   if (published) return `Published ${published.publishedAt}.`;
   if (loop.retro?.status === "published") return "Publication recorded; waiting for goal closure.";
   if (loop.ceremony?.stage !== "retro") return "Waiting for the released build to be confirmed running.";
-  if (loop.retro?.prUrl) return "Retro waiting: PR needs the owner's merge, green CI and publication.";
+  if (loop.retro?.prUrl) return "Retro waiting: PR needs current-head bot approval, green CI and verified publication.";
   return "Retro waiting: Chick's draft and publication PR have not been recorded.";
 }
 
@@ -330,7 +365,7 @@ export function SprintCard(props: { sprint: TerminalSprint; model: TerminalUiMod
     <text wrapMode="word">
       <span style={{ fg: theme.accent }}>Current stage: {stage() ?? "not recorded"}</span>
       <span style={{ fg: closedAt() ? theme.running : theme.idle }}>{" · Closure: " + (closedAt() ? "closed " + displayText(closedAt()) + " · completed sprint history" : "open")}</span>
-      <span style={{ fg: theme.muted }}>{" · " + merged() + "/" + loop().tickets.length + " merged"}</span>
+      <span style={{ fg: theme.muted }}>{loop().workflowModel ? " · whole-goal ownership" : " · " + merged() + "/" + loop().tickets.length + " merged"}</span>
     </text>
     <StageCycle loop={loop()} pulse={props.pulse} />
     <Show when={!stage()}><text fg={theme.idle} wrapMode="word">Persisted ceremony unavailable; awaiting migration before ceremony actions.</text></Show>
@@ -339,7 +374,9 @@ export function SprintCard(props: { sprint: TerminalSprint; model: TerminalUiMod
     <text fg={theme.accent}>{"🧮 Sprint total: " + usageLine(loop().usage) + " · ⌛ " + formatElapsed(elapsedSince(started(), closedAt() ? Date.parse(closedAt()!) : props.now())) + " since planning"}</text>
     <Show when={stage() === "planning"}><text fg={theme.regular}>🗣 Clarifying the goal.</text></Show>
     <text fg={props.sprint.planningStage === "awaiting-review" && stage() === "proposal" ? stateColor("needs", props.pulse()) : theme.regular} wrapMode="word">📝 {proposalDetail(props.sprint)}</text>
-    <Show when={loop().tickets.length} fallback={<text fg={theme.muted}>No tickets assigned yet.</text>}>
+    <Show when={loop().goal}><WorkflowDetail live={{ process: "running", goal: loop().goal }} open={props.open} /></Show>
+    <Show when={!loop().workflowModel}><text fg={theme.muted}>Historical outcome assignments</text></Show>
+    <Show when={loop().tickets.length} fallback={<text fg={theme.muted}>{loop().workflowModel ? "One Developer owns this goal after scheduling." : "No tickets assigned yet."}</text>}>
       <For each={loop().tickets}>{(ticket) => {
         const state = ticketState(ticket);
         const steps = pipelineSteps({ status: ticket.status, step: ticket.facts?.step, fixRounds: ticket.facts?.fixRounds });
@@ -385,6 +422,7 @@ export function SprintStrip(props: { sprint: TerminalSprint; team?: StateTeam; s
   const detail = () => {
     const current = stage();
     if (!current || current === "planning" || current === "proposal") return "📝 " + proposalDetail(props.sprint);
+    if (current === "implement" && loop().workflowModel) return "Goal " + (loop().goal?.status ?? "progress unavailable");
     if (current === "implement") return "🔨 " + loop().tickets.filter((ticket) => ticket.status === "merged").length + "/" + loop().tickets.length + " tickets merged";
     if (current === "release") return "🚀 " + releaseDetail(loop());
     return "📜 " + retroDetail(loop());

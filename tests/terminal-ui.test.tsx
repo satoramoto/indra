@@ -3,7 +3,7 @@ import type { ScrollBoxRenderable } from "@opentui/core";
 import { createSignal } from "solid-js";
 import { describe, expect, it, vi } from "vitest";
 import { StateInventory, type StateSnapshot } from "../src/state-domain.js";
-import { GOAL_INPUT_LIMIT, TerminalUiModel, sessionSprint, type SessionReadResult, type StateSyncPort, type TerminalSession, type UpdatePort } from "../src/terminal-ui.js";
+import { GOAL_INPUT_LIMIT, TerminalUiModel, TerminalUiWorkflow, sessionSprint, type SessionReadResult, type StateSyncPort, type TerminalSession, type UpdatePort } from "../src/terminal-ui.js";
 import type { UpdateResult } from "../src/self-update.js";
 import type { StateSyncResult } from "../src/state-commit.js";
 import { TerminalApp } from "../src/terminal-ui-solid.js";
@@ -451,11 +451,13 @@ describe("terminal UI", () => {
     model.input = { value: "half a goal" };
     calls.length = 0;
     await model.updateCode();
+    expect(calls).toEqual([]);
+    expect(model.reloadWanted).toBe(false);
+    expect(model.readyToReload()).toBe(false);
+    model.key("escape");
+    await model.flushWorkflowEvents();
     expect(calls).toEqual(["check"]);
     expect(model.reloadWanted).toBe(true);
-    expect(model.readyToReload()).toBe(false);
-    expect(model.updateLine()?.text).toBe("Indra abc1234 · update pending · reloads when idle");
-    model.key("escape");
     expect(model.readyToReload()).toBe(true);
     expect(model.view()).toEqual({ page: "seat", teamId: "team-001", seatId: "seat-003" });
   });
@@ -714,7 +716,7 @@ describe("terminal UI", () => {
     } finally { setup.renderer.destroy(); }
   });
 
-  it("opens, merges and rolls back a sprint with I, M and V, each after a y/n confirmation", async () => {
+  it("opens and rolls back a sprint with I and V, while M never offers a merge", async () => {
     const calls: string[] = [];
     let sprint: TerminalSession["sprint"] = "collecting";
     const goals: GoalStarter = { start: async () => "unused", approve: async () => "unused", propose: async () => "unused", sprint: async (action, goalId) => { calls.push(`${action} ${goalId}`); return `ran ${action}`; } };
@@ -729,7 +731,7 @@ describe("terminal UI", () => {
     model.key("down");
     model.key("return");
     expect(model.key("m", "M")).toBe("none");
-    expect(model.notice).toContain("No sprint has an eligible release, revert or retro PR open");
+    expect(model.confirm).toBeUndefined();
     model.key("i", "I");
     expect(model.confirm).toEqual({ action: "integrate", goalId: "goal-1", goal: "Plan the next cycle" });
     const [revision] = createSignal(model.revision);
@@ -749,8 +751,8 @@ describe("terminal UI", () => {
     sprint = "pr-open";
     await model.refresh();
     model.key("m", "M");
-    expect(model.confirm).toEqual({ action: "merge", goalId: "goal-1", goal: "Plan the next cycle", mergeKind: "release", prUrl });
-    expect(model.key("y", "y")).toBe("sprint");
+    expect(model.confirm).toBeUndefined();
+    expect(model.key("y", "y")).toBe("none");
     await model.sprintConfirmed();
     sprint = "merged";
     await model.refresh();
@@ -762,11 +764,11 @@ describe("terminal UI", () => {
     sprint = "revert-open";
     await model.refresh();
     model.key("m", "M");
-    expect(model.confirm).toMatchObject({ action: "merge", mergeKind: "revert", prUrl: "https://github.com/example/indra/pull/81" });
-    expect(model.key("y", "y")).toBe("sprint");
+    expect(model.confirm).toBeUndefined();
+    expect(model.key("y", "y")).toBe("none");
     await model.sprintConfirmed();
-    expect(calls).toEqual(["integrate goal-1", "merge goal-1", "rollback goal-1", "merge goal-1"]);
-    expect(model.notice).toBe("ran merge");
+    expect(calls).toEqual(["integrate goal-1", "rollback goal-1"]);
+    expect(model.ceremonyKeys()).toEqual([]);
   });
 
   it("requests Chick's proposal for the newest clarifying goal with P and a y/n confirmation", async () => {
@@ -953,15 +955,15 @@ describe("persisted ceremony and allowed actions", () => {
     const working = ceremonySession("implement");
     working.loop!.tickets.push({ id: "other", title: "Still reviewing", seatId: "seat-003", status: "in review" });
     await check(working, []);
-    await check(ceremonySession("release"), ["M merge release"]);
+    await check(ceremonySession("release"), []);
     const updating = ceremonySession("release"); updating.loop!.integration!.status = "merged";
     updating.loop!.build = { status: "unavailable", reason: "Build failed." };
     await check(updating, ["V revert"]);
     await check(ceremonySession("retro"), ["V revert"]);
     const publishing = ceremonySession("retro"); publishing.loop!.retro!.prUrl = "https://github.com/example/indra/pull/201";
-    await check(publishing, ["M merge retro", "V revert"]);
+    await check(publishing, ["V revert"]);
     publishing.loop!.integration!.revertPrUrl = "https://github.com/example/indra/pull/202";
-    await check(publishing, ["M merge revert"]);
+    await check(publishing, []);
     await check(closeSession(ceremonySession("retro")), ["V revert"]);
     const legacy = ceremonySession("release"); delete legacy.loop!.ceremony;
     await check(legacy, []);
@@ -1096,21 +1098,20 @@ describe("persisted ceremony and allowed actions", () => {
     expect(fixture.model.notice).toContain("confirm again");
   });
 
-  it("does not redirect a release confirmation to a revert or a replacement retro PR", async () => {
-    const fixture = await ceremonyHarness([ceremonySession("release")]);
-    fixture.model.key("m", "M"); expect(fixture.model.key("y", "y")).toBe("sprint");
-    const reverted = ceremonySession("release"); reverted.loop!.integration!.status = "merged";
-    reverted.loop!.integration!.revertPrUrl = "https://github.com/example/indra/pull/202";
-    fixture.sessions([reverted]); await fixture.model.sprintConfirmed();
-    expect(fixture.goals.sprint).not.toHaveBeenCalled();
-    expect(fixture.model.notice).toContain("confirm again");
+  it("never offers M or a second A for release, revert or retro", async () => {
+    const release = ceremonySession("release");
+    const revert = ceremonySession("release"); revert.loop!.integration!.status = "merged"; revert.loop!.integration!.revertPrUrl = "https://github.com/example/indra/pull/202";
     const retro = ceremonySession("retro"); retro.loop!.retro!.prUrl = "https://github.com/example/indra/pull/201";
-    fixture.sessions([retro]); await fixture.model.refresh();
-    fixture.model.key("m", "M"); expect(fixture.model.key("y", "y")).toBe("sprint");
-    retro.loop!.retro!.prUrl = "https://github.com/example/indra/pull/203";
-    fixture.sessions([retro]); await fixture.model.sprintConfirmed();
-    expect(fixture.goals.sprint).not.toHaveBeenCalled();
-    expect(fixture.model.ceremonyKeys()).toContain("M merge retro");
+    const fixture = await ceremonyHarness([]);
+    for (const session of [release, revert, retro]) {
+      fixture.sessions([session]); await fixture.model.refresh();
+      for (const key of ["M", "A"]) {
+        fixture.model.key(key.toLowerCase(), key); expect(fixture.model.confirm).toBeUndefined();
+        expect(fixture.model.key("y", "y")).toBe("none");
+        await fixture.model.sprintConfirmed(); await fixture.model.approveConfirmed();
+      }
+    }
+    expect(fixture.goals.sprint).not.toHaveBeenCalled(); expect(fixture.goals.approve).not.toHaveBeenCalled();
   });
 
   it("refuses actions when the current state cannot be read", async () => {
@@ -1124,18 +1125,18 @@ describe("persisted ceremony and allowed actions", () => {
   });
 
   it("refreshes after backend refusal and dispatches an in-flight confirmation only once", async () => {
-    const fixture = await ceremonyHarness([ceremonySession("release")]);
+    const fixture = await ceremonyHarness([ceremonySession("implement")]);
     let reject = (_error: Error) => {};
     vi.mocked(fixture.goals.sprint!).mockImplementation(() => new Promise((_resolve, fail) => { reject = fail; }));
-    fixture.model.key("m", "M"); fixture.model.key("y", "y");
+    fixture.model.key("i", "I"); fixture.model.key("y", "y");
     const pending = fixture.model.sprintConfirmed();
     await vi.waitFor(() => expect(fixture.goals.sprint).toHaveBeenCalledOnce());
-    fixture.model.key("m", "M"); expect(fixture.model.confirm).toBeUndefined();
+    fixture.model.key("i", "I"); expect(fixture.model.confirm).toBeUndefined();
     await fixture.model.sprintConfirmed();
     const changed = ceremonySession("release"); changed.loop!.integration!.status = "merged";
-    fixture.sessions([changed]); reject(new Error("The merge target changed; confirm again."));
+    fixture.sessions([changed]); reject(new Error("The integration target changed; confirm again."));
     await pending;
-    expect(fixture.model.notice).toContain("Could not merge sprint goal-ceremony: The merge target changed");
+    expect(fixture.model.notice).toContain("Could not integrate sprint goal-ceremony: The integration target changed");
     expect(fixture.model.ceremonyKeys()).toEqual(["V revert"]);
     expect(fixture.goals.sprint).toHaveBeenCalledOnce();
   });
@@ -1167,25 +1168,25 @@ describe("persisted ceremony and allowed actions", () => {
     } finally { setup.renderer.destroy(); }
   });
 
-  it("names the retro PR in M's confirmation, then drops the closed sprint from the list while its records keep the evidence", async () => {
+  it("observes automatic retro closure and retains the recorded release and archive evidence", async () => {
     const retro = ceremonySession("retro"); retro.loop!.retro!.prUrl = "https://github.com/example/indra/pull/201";
     const fixture = await ceremonyHarness([retro]);
     const closed = closeSession(retro);
     // Today's live process failure must not erase the recorded released build.
     closed.loop!.build = { status: "unavailable", reason: "Current process evidence is unavailable." };
-    vi.mocked(fixture.goals.sprint!).mockImplementation(async () => { fixture.sessions([closed]); return "Retro published; goal closed."; });
     fixture.model.key("m", "M");
     const [revision, setRevision] = createSignal(fixture.model.revision);
     const setup = await testRender(() => <TerminalApp model={fixture.model} revision={revision} onKey={() => {}} />, { width: 100, height: 32 });
     try {
       await setup.renderOnce();
       const before = setup.captureCharFrame();
-      expect(compactFrame(before)).toContain(compactFrame("Merge the retro publication PR into main for sprint goal-ceremony"));
-      expect(before).toContain(retro.loop!.retro!.prUrl);
+      expect(before).not.toContain("y merge");
+      expect(fixture.model.confirm).toBeUndefined();
       expect(fixture.goals.sprint).not.toHaveBeenCalled();
-      expect(fixture.model.key("y", "y")).toBe("sprint");
-      await fixture.model.sprintConfirmed();
-      expect(fixture.goals.sprint).toHaveBeenCalledExactlyOnceWith("merge", "goal-ceremony");
+      expect(fixture.model.key("y", "y")).toBe("none");
+      fixture.sessions([closed]);
+      await fixture.model.workflowEvent({ kind: "goal-closed", id: "closed", goalId: closed.id, teamId: closed.teamId, at: "2026-01-06T00:00:00Z" });
+      expect(fixture.goals.sprint).not.toHaveBeenCalled();
       expect(fixture.model.newGoalBlocked()).toBeUndefined();
       setRevision(fixture.model.revision); await setup.renderOnce();
       // Closed means finished (#59): the sprint card leaves the list.
@@ -1281,7 +1282,7 @@ describe("visible sprint loop", () => {
     ["running", "Running build contains the integration commit."],
     ["reload-pending", "Pending reload:"], ["update-pending", "Update pending:"],
     ["unavailable", "Build evidence unavailable; release is not confirmed."],
-    ["revert-open", "Revert PR open; awaiting human merge confirmation."],
+    ["revert-open", "Revert PR open; awaiting bot review and green CI."],
     ["reverted", "Reverted on main; running revert build is unverified."],
   ])("renders %s build evidence explicitly", async (status, message) => {
     const fixture = harness(); fixture.state(homed);
