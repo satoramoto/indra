@@ -67,7 +67,7 @@ describe("local state checkout", () => {
     Object.assign(value.teams[0].externalIdentities.mattermost, { homeChannelId: "home" });
     expect(() => parseState(value)).not.toThrow();
     const entry = goal.ceremony.history[2];
-    if (entry.stage !== "implement" || entry.evidence.approval.source !== "reaction") throw new Error("Expected approval");
+    if (entry.stage !== "implement" || entry.evidence.kind !== "approval" || entry.evidence.approval.source !== "reaction") throw new Error("Expected approval");
     entry.evidence.approval.userId = "external-user-1";
     expect(() => parseState(value)).toThrow("cannot supply human approval");
     entry.evidence.approval.userId = "person";

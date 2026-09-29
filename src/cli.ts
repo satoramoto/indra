@@ -7,7 +7,8 @@ import { LocalStateRepository, StateDataError } from "./local-state.js";
 import { MattermostClient, MattermostInventory } from "./mattermost.js";
 import { printState } from "./state-cli.js";
 import { StateInventory } from "./state-domain.js";
-import { botTeamHome, PlanningStore } from "./planning.js";
+import { botTeamHome, PlanningStore, teamProject } from "./planning.js";
+import { mergedWithCeremony } from "./project-checkout.js";
 import { PlanningBridge, type CeremonyAdapters, type PlanningChat } from "./planning-bridge.js";
 import { assertCeremonyReady, type CeremonyWriteReadiness } from "./ceremony-ports.js";
 import type { ReleaseActivationOptions, ReleaseActivationReadPort } from "./release-activation.js";
@@ -313,6 +314,15 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       await syncStateSchema(options.checkout).then((result) => { if (result.outcome !== "unchanged") console.log(result.message); });
       const updater = new SelfUpdater(defaultAppDir, undefined, undefined, `${resolve(options.checkout)}.runtime`);
       const store = createPlanningStore(options.checkout);
+      // After the schema sync, so the checkout's schema accepts migrated ceremonies. Conflicts also show on the team screen.
+      // A merged legacy sprint whose merge commit already has the ceremony was released by it and stays open for its retro.
+      const releasedWithCeremony = async (goal: { teamId: string }, sha: string) => {
+        const github = teamProject(await store.read(), goal.teamId);
+        return github ? await mergedWithCeremony(processShell, store.runtimeDir, github, sha) : undefined;
+      };
+      await store.migrateLegacyGoals(undefined, releasedWithCeremony).then((results) => {
+        for (const result of results) console.log(result.status === "migrated" ? `Legacy goal ${result.goalId}: ${result.summary}.` : `Legacy goal ${result.goalId} was not migrated: ${result.reason}`);
+      }, (error: unknown) => console.log(`Legacy goals were not migrated: ${error instanceof Error ? error.message : String(error)}`));
       return await runTerminalUi(new StateInventory(new LocalStateRepository(options.checkout)), new LocalSessionReader(options.checkout), {
         processes: new Supervisor(options.checkout, undefined, undefined, undefined, store, (force) => stageServiceToken(options.checkout, { force })),
         goals: new CliGoalStarter(options.checkout),

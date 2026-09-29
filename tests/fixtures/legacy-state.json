@@ -1,0 +1,80 @@
+{
+  "$schema": "./schema/v1/state.schema.json",
+  "schemaVersion": 1,
+  "teams": [
+    {
+      "id": "team-001",
+      "slug": "yahaha",
+      "displayName": "Yahaha",
+      "project": {"github": "satoramoto/indra"},
+      "externalIdentities": {"mattermost": {"teamId": "q8zdnxac938kfkst6uiyfi6fpo", "homeChannelId": "o9rogqxy7br1zkrcami681sray"}},
+      "seats": [{"id": "seat-001", "displayName": "Chick Corea", "roles": ["Team Lead"], "externalIdentities": {"mattermost": {"userId": "tn51f1b9ri8cdc4s4irducmzdc", "username": "chickcorea"}}}, {"id": "seat-002", "displayName": "George Duke", "roles": ["Developer"], "externalIdentities": {"mattermost": {"userId": "pu3r46ww4ff73gpz5y7uz975zy", "username": "georgeduke"}}}, {"id": "seat-003", "displayName": "Aaron Magner", "roles": ["Developer"], "externalIdentities": {"mattermost": {"userId": "wgo4mf4j7py3jkgqbxm7bs8oqw", "username": "aaronmagner"}}}, {"id": "seat-004", "displayName": "Corey Henry", "roles": ["Developer"], "externalIdentities": {"mattermost": {"userId": "j4gqwmdigjnbmpyxo7c81bp7ca", "username": "coreyhenry"}}}, {"id": "seat-005", "displayName": "Jordan Rudess", "roles": ["Developer"], "externalIdentities": {"mattermost": {"userId": "xmkmacij8pyajkphpftcmufjgc", "username": "jordanrudess"}}}]
+    }
+  ],
+  "sprints": [],
+  "planningGoals": [
+    {
+      "id": "goal-855701cc",
+      "teamId": "team-001",
+      "seatId": "seat-001",
+      "participantSeatIds": [],
+      "goal": "Check-in sprint, no product work",
+      "projectRefs": ["satoramoto/indra"],
+      "stage": "approved",
+      "createdAt": "2026-09-28T16:39:06.370Z",
+      "updatedAt": "2026-09-28T16:50:32.626Z",
+      "mattermost": {"channelId": "o9rogqxy7br1zkrcami681sray", "rootPostId": "ao8er4y4xtr6pgkx968zfiqfyh"},
+      "brief": {"summary": "Check-in sprint, no product work", "decisions": [], "openQuestions": []},
+      "proposal": {"id": "proposal-d4510a0a", "createdAt": "2026-09-28T16:43:38.044Z", "summary": "Proposal for goal-855701cc", "outcomes": [{"id": "outcome-1", "title": "George Duke's check-in PR merged", "description": "Outcome outcome-1", "seatId": "seat-002"}, {"id": "outcome-2", "title": "Aaron Magner's check-in PR merged", "description": "Outcome outcome-2", "seatId": "seat-003"}, {"id": "outcome-3", "title": "Corey Henry's check-in PR merged", "description": "Outcome outcome-3", "seatId": "seat-004"}, {"id": "outcome-4", "title": "Jordan Rudess's check-in PR merged", "description": "Outcome outcome-4", "seatId": "seat-005"}], "risks": [], "openQuestions": []},
+      "assignments": [{"outcomeId": "outcome-1", "seatId": "seat-002", "status": "merged", "updatedAt": "2026-09-29T00:46:37.223Z", "prUrl": "https://github.com/satoramoto/indra/pull/20"}, {"outcomeId": "outcome-2", "seatId": "seat-003", "status": "merged", "updatedAt": "2026-09-29T00:46:38.063Z", "prUrl": "https://github.com/satoramoto/indra/pull/21"}, {"outcomeId": "outcome-3", "seatId": "seat-004", "status": "merged", "updatedAt": "2026-09-29T00:46:39.067Z", "prUrl": "https://github.com/satoramoto/indra/pull/22"}, {"outcomeId": "outcome-4", "seatId": "seat-005", "status": "merged", "updatedAt": "2026-09-29T00:46:40.035Z", "prUrl": "https://github.com/satoramoto/indra/pull/23"}]
+    },
+    {
+      "id": "goal-ca9dd9ed",
+      "teamId": "team-001",
+      "seatId": "seat-001",
+      "participantSeatIds": [],
+      "goal": "Dogfood sprint: the team fixes Indra's own rough edges",
+      "projectRefs": ["satoramoto/indra"],
+      "stage": "approved",
+      "createdAt": "2026-09-28T19:21:05.088Z",
+      "updatedAt": "2026-09-28T20:06:27.701Z",
+      "mattermost": {"channelId": "o9rogqxy7br1zkrcami681sray", "rootPostId": "qfh7ryk8r3g778xritqb9ofkja"},
+      "brief": {"summary": "Dogfood sprint: the team fixes Indra's own rough edges", "decisions": [], "openQuestions": []},
+      "proposal": {"id": "proposal-167c9cc1", "createdAt": "2026-09-28T19:26:13.528Z", "summary": "Proposal for goal-ca9dd9ed", "outcomes": [{"id": "outcome-1", "title": "Re-queue failed assignments from the terminal UI", "description": "Outcome outcome-1", "seatId": "seat-002"}, {"id": "outcome-2", "title": "Post review findings once across restarts", "description": "Outcome outcome-2", "seatId": "seat-003"}, {"id": "outcome-3", "title": "Recover unfinished merges before retrying", "description": "Outcome outcome-3", "seatId": "seat-004"}, {"id": "outcome-4", "title": "Require small proposals with separate file ownership", "description": "Outcome outcome-4", "seatId": "seat-005"}], "risks": [], "openQuestions": []},
+      "assignments": [{"outcomeId": "outcome-1", "seatId": "seat-002", "status": "merged", "updatedAt": "2026-09-28T19:48:43.020Z", "prUrl": "https://github.com/satoramoto/indra/pull/30"}, {"outcomeId": "outcome-2", "seatId": "seat-003", "status": "merged", "updatedAt": "2026-09-28T19:44:18.222Z", "prUrl": "https://github.com/satoramoto/indra/pull/29"}, {"outcomeId": "outcome-3", "seatId": "seat-004", "status": "merged", "updatedAt": "2026-09-28T19:57:18.422Z", "prUrl": "https://github.com/satoramoto/indra/pull/31"}, {"outcomeId": "outcome-4", "seatId": "seat-005", "status": "merged", "updatedAt": "2026-09-28T19:36:50.017Z", "prUrl": "https://github.com/satoramoto/indra/pull/28"}],
+      "integration": {"branch": "sprint/goal-ca9dd9ed", "baseSha": "b360942b0f6351b9c2ec712d9a45bae08c6f2be2", "status": "merged", "prUrl": "https://github.com/satoramoto/indra/pull/32", "mergedSha": "baca998cb037b5cd6f0ce8ffb3bd9a9998e391b5"}
+    },
+    {
+      "id": "goal-df104a26",
+      "teamId": "team-001",
+      "seatId": "seat-001",
+      "participantSeatIds": [],
+      "goal": "Sprint, one small outcome per Developer, files named, no overlap between seats",
+      "projectRefs": ["satoramoto/indra"],
+      "stage": "approved",
+      "createdAt": "2026-09-28T22:23:35.016Z",
+      "updatedAt": "2026-09-29T00:45:48.248Z",
+      "mattermost": {"channelId": "o9rogqxy7br1zkrcami681sray", "rootPostId": "bfi8484sqtdbueoa9n9o3ibz7w"},
+      "brief": {"summary": "Sprint, one small outcome per Developer, files named, no overlap between seats", "decisions": [], "openQuestions": []},
+      "proposal": {"id": "proposal-d540dee5", "createdAt": "2026-09-28T22:52:03.933Z", "summary": "Proposal for goal-df104a26", "outcomes": [{"id": "outcome-1", "title": "Make the sprint loop visible", "description": "Outcome outcome-1", "seatId": "seat-002"}, {"id": "outcome-2", "title": "Finalize merged assignments and retire resume records", "description": "Outcome outcome-2", "seatId": "seat-003"}, {"id": "outcome-3", "title": "Select Claude Code for each seat", "description": "Outcome outcome-3", "seatId": "seat-005"}, {"id": "outcome-4", "title": "Give Yahaha seats personas from the repository", "description": "Outcome outcome-4", "seatId": "seat-004"}], "risks": [], "openQuestions": []},
+      "assignments": [{"outcomeId": "outcome-1", "seatId": "seat-002", "status": "merged", "updatedAt": "2026-09-28T23:28:24.974Z", "prUrl": "https://github.com/satoramoto/indra/pull/39"}, {"outcomeId": "outcome-2", "seatId": "seat-003", "status": "merged", "updatedAt": "2026-09-28T23:26:12.723Z", "prUrl": "https://github.com/satoramoto/indra/pull/37"}, {"outcomeId": "outcome-3", "seatId": "seat-005", "status": "merged", "updatedAt": "2026-09-28T23:53:51.698Z", "prUrl": "https://github.com/satoramoto/indra/pull/38"}, {"outcomeId": "outcome-4", "seatId": "seat-004", "status": "merged", "updatedAt": "2026-09-28T23:49:52.889Z", "prUrl": "https://github.com/satoramoto/indra/pull/43"}],
+      "integration": {"branch": "sprint/goal-df104a26", "baseSha": "417dc2af848fda07cc49a24d00563042b87c9a59", "status": "merged", "prUrl": "https://github.com/satoramoto/indra/pull/46", "mergedSha": "d368f068605ad08d8b4847d6e08595c47c4e4119"}
+    },
+    {
+      "id": "goal-88dd199e",
+      "teamId": "team-001",
+      "seatId": "seat-001",
+      "participantSeatIds": [],
+      "goal": "Enforce the full sprint ceremony: planning -> proposal -> implement -> release -> retro",
+      "projectRefs": ["satoramoto/indra"],
+      "stage": "approved",
+      "createdAt": "2026-09-29T01:25:09.751Z",
+      "updatedAt": "2026-09-29T04:56:50.801Z",
+      "mattermost": {"channelId": "o9rogqxy7br1zkrcami681sray", "rootPostId": "cu79yt356inkpnqphdboad9xjr"},
+      "brief": {"summary": "Enforce the full sprint ceremony: planning -> proposal -> implement -> release -> retro", "decisions": [], "openQuestions": []},
+      "proposal": {"id": "proposal-cbb41009", "createdAt": "2026-09-29T01:36:25.787Z", "summary": "Proposal for goal-88dd199e", "outcomes": [{"id": "outcome-1", "title": "Persist the ordered ceremony and team lock", "description": "Outcome outcome-1", "seatId": "seat-002"}, {"id": "outcome-2", "title": "Wire stage gates and recoverable thread posts", "description": "Outcome outcome-2", "seatId": "seat-003"}, {"id": "outcome-3", "title": "Preserve facts from every agent session", "description": "Outcome outcome-3", "seatId": "seat-004"}, {"id": "outcome-4", "title": "Confirm the released build is running", "description": "Outcome outcome-4", "seatId": "seat-005"}, {"id": "outcome-5", "title": "Record implementation attempts and retries", "description": "Outcome outcome-5", "seatId": "seat-004"}, {"id": "outcome-6", "title": "Draft the retro from recorded facts", "description": "Outcome outcome-6", "seatId": "seat-002"}, {"id": "outcome-7", "title": "Show ceremony progress and allowed actions", "description": "Outcome outcome-7", "seatId": "seat-005"}, {"id": "outcome-8", "title": "Publish the retro and close the goal", "description": "Outcome outcome-8", "seatId": "seat-003"}], "risks": [], "openQuestions": []},
+      "assignments": [{"outcomeId": "outcome-1", "seatId": "seat-002", "status": "merged", "updatedAt": "2026-09-29T03:37:54.788Z", "prUrl": "https://github.com/satoramoto/indra/pull/57"}, {"outcomeId": "outcome-2", "seatId": "seat-003", "status": "merged", "updatedAt": "2026-09-29T04:10:20.632Z", "prUrl": "https://github.com/satoramoto/indra/pull/58"}, {"outcomeId": "outcome-3", "seatId": "seat-004", "status": "merged", "updatedAt": "2026-09-29T03:40:05.930Z", "prUrl": "https://github.com/satoramoto/indra/pull/55"}, {"outcomeId": "outcome-4", "seatId": "seat-005", "status": "merged", "updatedAt": "2026-09-29T03:34:36.773Z", "prUrl": "https://github.com/satoramoto/indra/pull/56"}, {"outcomeId": "outcome-5", "seatId": "seat-004", "status": "merged", "updatedAt": "2026-09-29T04:22:37.068Z", "prUrl": "https://github.com/satoramoto/indra/pull/62"}, {"outcomeId": "outcome-6", "seatId": "seat-002", "status": "merged", "updatedAt": "2026-09-29T04:09:47.820Z", "prUrl": "https://github.com/satoramoto/indra/pull/61"}, {"outcomeId": "outcome-7", "seatId": "seat-005", "status": "merged", "updatedAt": "2026-09-29T04:09:09.277Z", "prUrl": "https://github.com/satoramoto/indra/pull/60"}, {"outcomeId": "outcome-8", "seatId": "seat-003", "status": "merged", "updatedAt": "2026-09-29T04:56:45.438Z", "prUrl": "https://github.com/satoramoto/indra/pull/63"}],
+      "integration": {"branch": "sprint/goal-88dd199e", "baseSha": "78f8cc2cda1c115f236d114032d7a0e2ff20ef0c", "status": "pr-open", "prUrl": "https://github.com/satoramoto/indra/pull/64"}
+    }
+  ]
+}

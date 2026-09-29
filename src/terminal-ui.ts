@@ -425,9 +425,9 @@ export class TerminalUiModel {
     } finally { this.starting = false; this.bump(); }
   }
 
-  /** Legacy records without closure also hold the team's lock; an integration merge alone never closes it. */
+  /** Every goal the team list shows holds the team's lock, and only those: an integration merge alone never closes one. */
   openGoals(): TerminalSession[] {
-    return this.sessionResult.sessions.filter((session) => session.teamId === this.teamId && !sessionSprint(session).loop.closedAt);
+    return this.sessionResult.sessions.filter((session) => session.teamId === this.teamId && !isFinishedSprint(sessionSprint(session).loop));
   }
 
   newGoalBlocked(submitting = false): string | undefined {
@@ -436,7 +436,7 @@ export class TerminalUiModel {
     const missing = missingTeamHome(this.team);
     if (missing.length) return "Cannot start a planning goal: " + missingTeamMessage(this.team.displayName, missing);
     const open = this.openGoals();
-    if (open.length) return "New goal blocked by open goal " + open.map((session) => `${session.id} (${sessionSprint(session).loop.ceremony?.stage ?? "ceremony not recorded"}): ${displayText(session.goal, 80)}`).join("; ") + ". Close it after retro publication.";
+    if (open.length) return "New goal blocked by open goal " + open.map((session) => `${session.id} (${sessionSprint(session).loop.ceremony?.stage ?? `ceremony not recorded${session.migration ? `; legacy goal ${displayText(session.migration, 200)}` : ""}`}): ${displayText(session.goal, 80)}`).join("; ") + ". Close it after retro publication.";
     if (this.starting && !submitting) return "A planning goal is starting; wait for it to finish.";
     if (this.ceremonyPending) return "A ceremony action is in progress; wait for it to finish.";
     return undefined;

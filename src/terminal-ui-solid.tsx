@@ -78,8 +78,17 @@ function releaseDetail(loop: SprintLoop): string {
   return "Release waiting: " + (loop.build?.reason || (loop.build ? buildStatus[loop.build.status] : "running application and bridge evidence is unavailable."));
 }
 
+/** The closure's retro evidence; a reverted release or a migrated legacy goal closes without one. */
+function publishedRetro(loop: SprintLoop) {
+  const evidence = loop.ceremony?.closure?.evidence;
+  return evidence && (evidence.kind === undefined || evidence.kind === "retro-published") ? evidence : undefined;
+}
+
 function retroDetail(loop: SprintLoop): string {
-  const published = loop.ceremony?.closure?.evidence;
+  const kind = loop.ceremony?.closure?.evidence.kind;
+  if (kind === "release-reverted") return "No retro: the release was reverted before it ran.";
+  if (kind === "legacy-migration") return "No retro: finished before the ceremony; closed by legacy migration.";
+  const published = publishedRetro(loop);
   if (published) return `Published ${published.publishedAt}.`;
   if (loop.retro?.status === "published") return "Publication recorded; waiting for goal closure.";
   if (loop.ceremony?.stage !== "retro") return "Waiting for the released build to be confirmed running.";
@@ -91,7 +100,7 @@ function SprintCard(props: { sprint: TerminalSprint; model: TerminalUiModel }) {
   const loop = () => props.sprint.loop;
   const stage = () => loop().ceremony?.stage;
   const closedAt = () => loop().ceremony?.closure?.closedAt ?? loop().closedAt;
-  const retro = () => loop().ceremony?.closure?.evidence ?? loop().retro;
+  const retro = () => publishedRetro(loop()) ?? loop().retro;
   const proposal = () => {
     if (!stage()) return "Proposal progress: " + (props.sprint.planningStage ?? "not recorded") + ".";
     if (stage() === "planning") return "Waiting for a proposal request.";
