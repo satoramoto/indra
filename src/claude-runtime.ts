@@ -2,7 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { claudePermissionArgs } from "./claude-permissions.js";
 import { CLARIFY_TIMEOUT_MS, type RecordedAgentResult, type AgentRuntime, type MessageOptions, type WriteAccess } from "./codex-runtime.js";
-import { childEnv } from "./op-env.js";
+import { agentEnv } from "./op-env.js";
 import { RuntimeEventStream, RuntimeFacts, RuntimeStop, recordedError } from "./runtime-facts.js";
 
 export { claudePermissionArgs };
@@ -55,9 +55,7 @@ export class ClaudeRuntime implements AgentRuntime {
       if (signal?.aborted) { reject(new RuntimeStop("Claude run cancelled.", "interrupted")); return; }
       let child: ChildProcessWithoutNullStreams;
       try {
-        // Authentication belongs to the logged-in CLI, never an injected API key. Never replay interrupted turns.
-        const env = Object.fromEntries(Object.entries(childEnv()).filter(([key]) => !/token|password|passwd|secret|api_?key/i.test(key)));
-        child = spawn("claude", args, { cwd: this.cwd, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32", env: { ...env, CLAUDE_CODE_RESUME_INTERRUPTED_TURN: "0" } });
+        child = spawn("claude", args, { cwd: this.cwd, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32", env: agentEnv("claude") });
       } catch { reject(new RuntimeStop("Claude could not be started; check the executable and working directory.")); return; }
       let settled = false; let stdoutBytes = 0; let stderrBytes = 0;
       let failure: RuntimeStop | undefined;

@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { codexProgress } from "./codex-progress.js";
 import { ensureCodexHome } from "./harness-home.js";
-import { childEnv } from "./op-env.js";
+import { agentEnv } from "./op-env.js";
 import { RuntimeEventStream, RuntimeFacts, RuntimeStop, jsonObject, recordedError, type RuntimeSessionFacts, type TokenUsage } from "./runtime-facts.js";
 
 export interface AgentResult { sessionId: string; response: unknown; usage?: unknown; startedAt: string; finishedAt: string; facts?: RuntimeSessionFacts }
@@ -59,7 +59,8 @@ export class CodexRuntime implements AgentRuntime {
     try {
       if (signal?.aborted) throw new RuntimeStop("Codex run cancelled.", "interrupted");
       if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new RuntimeStop("Codex timeout must be a positive number of milliseconds.");
-      const env = this.home ? { ...childEnv(), CODEX_HOME: await ensureCodexHome(this.home) } : childEnv();
+      const env = agentEnv("codex");
+      if (this.home) env.CODEX_HOME = await ensureCodexHome(this.home);
       const sandbox = sandboxArgs(this.write);
       const args = sessionId ? ["exec", "resume", sessionId, "--json", "-c", "sandbox_mode=\"read-only\"", "-"] : ["exec", "--json", ...sandbox, "--output-schema", schemaPath, "-"];
       if (signal?.aborted) throw new RuntimeStop("Codex run cancelled.", "interrupted");

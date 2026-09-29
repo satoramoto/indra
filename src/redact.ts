@@ -1,4 +1,11 @@
-const KEY = String.raw`[A-Za-z0-9_-]*(?:token|password|passwd|secret|api[_-]?key)[A-Za-z0-9_-]*`;
+const SECRET_WORDS = "token|password|passwd|secret";
+const KEY = String.raw`[A-Za-z0-9_-]*(?:${SECRET_WORDS}|api[_-]?key)[A-Za-z0-9_-]*`;
+const ENV_SECRET_NAME = new RegExp(`${SECRET_WORDS}|api_?key`, "i");
+
+/** Claude's existing credential-name filter; unlike free text, environment names do not match `api-key`. */
+export function isSecretEnvName(name: string): boolean {
+  return ENV_SECRET_NAME.test(name);
+}
 
 /** Removes anything token-shaped from free text before it is logged or stored. */
 export function redactSecrets(text: string): string {

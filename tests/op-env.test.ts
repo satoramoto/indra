@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { chmod, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { captureOpEnvironment, childEnv, opEnv, opRead, releaseOpEnvironment, ServiceAccountRejectedError } from "../src/op-env.js";
+import { execFileSync } from "node:child_process";
+import { agentEnv, captureOpEnvironment, childEnv, envServiceToken, opEnv, opRead, opVariablesIn, releaseOpEnvironment, ServiceAccountRejectedError, stateRepoToken } from "../src/op-env.js";
 
 /** A fake `op` on PATH that fails with whatever FAKE_OP_ERROR says. */
 const FAKE_OP = `#!/bin/sh
@@ -39,6 +40,77 @@ async function envDumpingOp(): Promise<string> {
 function parseEnv(text: string): Record<string, string> {
   return Object.fromEntries(text.split("\n").filter(Boolean).map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
 }
+
+describe("child environments", () => {
+  const reserved = {
+    OP_SERVICE_ACCOUNT_TOKEN: "fixture-service",
+    OP_SESSION_owner: "fixture-session",
+    OP_LOAD_DESKTOP_APP_SETTINGS: "true",
+    OP_FUTURE_VARIABLE: "fixture-future",
+    INDRA_STATE_GITHUB_TOKEN: "fixture-state",
+  };
+  const common = { PATH: "/bin", HOME: "/fixture-home", EMPTY: "", UNDEFINED: undefined, OPEN: "kept", OP: "kept" };
+  const ordinary = { ...common, INDRA_STATE_GITHUB_TOKEN_SUFFIX: "kept" };
+  const credentialNames = { ANTHROPIC_API_KEY: "fixture-only", OPENAI_APIKEY: "fixture-only", DB_PASSWORD: "fixture-only", DB_PASSWD: "fixture-only", clientSecret: "fixture-only", access_token: "fixture-only", MAX_TOKENS: "100" };
+
+  it("copies ordinary values exactly without mutating or forwarding reserved variables", () => {
+    const env = { ...ordinary, ...reserved, ...credentialNames };
+    const copy = childEnv(env);
+    expect(copy).toEqual({ ...ordinary, ...credentialNames });
+    expect(env).toEqual({ ...ordinary, ...reserved, ...credentialNames });
+    copy.PATH = "/changed";
+    expect(env.PATH).toBe("/bin");
+  });
+
+  it("applies overrides before filtering and does not mutate either input", () => {
+    const overrides = { ...reserved, PATH: "/override", GIT_TERMINAL_PROMPT: "0" };
+    expect(childEnv(ordinary, { overrides })).toEqual({ ...ordinary, PATH: "/override", GIT_TERMINAL_PROMPT: "0" });
+    expect(overrides).toEqual({ ...reserved, PATH: "/override", GIT_TERMINAL_PROMPT: "0" });
+    expect(ordinary.PATH).toBe("/bin");
+    expect(childEnv(ordinary, { overrides: credentialNames, stripSecretNames: true })).toEqual(common);
+  });
+
+  it("keeps the distinct Codex and Claude policies, including replay and API-key spelling", () => {
+    const env = { ...ordinary, ...reserved, ...credentialNames, "API-KEY": "fixture-only", CLAUDE_CODE_RESUME_INTERRUPTED_TURN: "1" };
+    expect(agentEnv("codex", env)).toEqual({ ...ordinary, ...credentialNames, "API-KEY": "fixture-only", CLAUDE_CODE_RESUME_INTERRUPTED_TURN: "1" });
+    expect(agentEnv("claude", env)).toEqual({ ...common, "API-KEY": "fixture-only", CLAUDE_CODE_RESUME_INTERRUPTED_TURN: "0" });
+    expect(env.CLAUDE_CODE_RESUME_INTERRUPTED_TURN).toBe("1");
+    expect(agentEnv("claude", {})).toEqual({ CLAUDE_CODE_RESUME_INTERRUPTED_TURN: "0" });
+    expect(agentEnv("codex", {})).toEqual({});
+  });
+
+  it("keeps reserved credentials out of an actual ordinary child even when overrides contain them", () => {
+    const env = childEnv({ ...ordinary, ...reserved }, { overrides: reserved });
+    const names = JSON.parse(execFileSync(process.execPath, ["-e", "process.stdout.write(JSON.stringify(Object.keys(process.env)))"], { env, encoding: "utf8" })) as string[];
+    for (const name of Object.keys(reserved)) expect(names).not.toContain(name);
+    expect(names).toEqual(expect.arrayContaining(["PATH", "HOME", "EMPTY", "OPEN", "OP", "INDRA_STATE_GITHUB_TOKEN_SUFFIX"]));
+  });
+
+  it("captures credentials idempotently and routes each only to its exception", () => {
+    const env = { ...ordinary, ...reserved, OP_SERVICE_ACCOUNT_TOKEN: " fixture-service ", INDRA_STATE_GITHUB_TOKEN: " fixture-state " };
+    captureOpEnvironment(env); captureOpEnvironment(env);
+    expect(env).toEqual(ordinary);
+    expect(envServiceToken()).toBe("fixture-service"); expect(stateRepoToken()).toBe("fixture-state");
+    Object.assign(process.env, reserved);
+    for (const name of Object.keys(reserved)) {
+      expect(childEnv()).not.toHaveProperty(name);
+      expect(agentEnv("codex")).not.toHaveProperty(name);
+      expect(agentEnv("claude")).not.toHaveProperty(name);
+    }
+    const op = opEnv("fixture-staged");
+    expect(op).toMatchObject({ OP_SERVICE_ACCOUNT_TOKEN: "fixture-staged", OP_SESSION_owner: "fixture-session", OP_FUTURE_VARIABLE: "fixture-future", OP_LOAD_DESKTOP_APP_SETTINGS: "false" });
+    expect(op).not.toHaveProperty("INDRA_STATE_GITHUB_TOKEN");
+    expect(stateRepoToken()).toBe("fixture-state");
+    releaseOpEnvironment();
+    expect(envServiceToken()).toBeUndefined(); expect(stateRepoToken()).toBeUndefined();
+    expect(opEnv()).not.toHaveProperty("OP_SERVICE_ACCOUNT_TOKEN");
+  });
+
+  it("identifies every reserved tmux variable without treating unset entries as values", () => {
+    const output = [...Object.keys(reserved).map((name) => `${name}=fixture-only`), "-OP_UNSET", "PATH=/bin", "OP=kept", "INDRA_STATE_GITHUB_TOKEN_SUFFIX=kept"].join("\n");
+    expect(opVariablesIn(output)).toEqual(Object.keys(reserved));
+  });
+});
 
 describe("op desktop app integration", () => {
   const disabled = { OP_BIOMETRIC_UNLOCK_ENABLED: "false", OP_LOAD_DESKTOP_APP_SETTINGS: "false" };

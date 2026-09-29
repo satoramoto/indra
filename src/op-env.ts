@@ -8,6 +8,8 @@
  */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { isSecretEnvName } from "./redact.js";
+import type { RuntimeEngine } from "./runtime-facts.js";
 
 const execFileAsync = promisify(execFile);
 const OP_VARIABLE = /^OP_/;
@@ -39,9 +41,25 @@ export function stateRepoToken(): string | undefined {
   return captured[STATE_TOKEN_VARIABLE]?.trim() || undefined;
 }
 
+export interface ChildEnvOptions {
+  /** Applied before filtering, so overrides cannot forward a captured credential. */
+  overrides?: NodeJS.ProcessEnv;
+  /** Claude also excludes credential-shaped names; ordinary children and Codex retain their existing policy. */
+  stripSecretNames?: boolean;
+}
+
 /** A copy of `env` without any `OP_*` variable or the state repository token, for every child process that is not `op`. */
-export function childEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  return Object.fromEntries(Object.entries(env).filter(([name]) => !CAPTURED_VARIABLE.test(name)));
+export function childEnv(env: NodeJS.ProcessEnv = process.env, options: ChildEnvOptions = {}): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries({ ...env, ...options.overrides }).filter(([name]) =>
+    !CAPTURED_VARIABLE.test(name) && (!options.stripSecretNames || !isSecretEnvName(name))));
+}
+
+/** Provider-specific child policy: Claude uses its logged-in CLI and never replays interrupted turns. */
+export function agentEnv(engine: RuntimeEngine, env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return childEnv(env, engine === "claude" ? {
+    stripSecretNames: true,
+    overrides: { CLAUDE_CODE_RESUME_INTERRUPTED_TURN: "0" },
+  } : {});
 }
 
 /**
