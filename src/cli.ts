@@ -33,8 +33,10 @@ import type { UiView } from "./terminal-ui.js";
 import { LocalSessionReader } from "./session-snapshot.js";
 import { CliGoalStarter, Supervisor } from "./supervisor.js";
 import { TmuxPaneTail } from "./pane-tail.js";
-import { attachTmux } from "./tmux-attach.js";
+import { attachTmux, parseOwnedTmuxTarget } from "./tmux-attach.js";
 import { verifyOwnedSession } from "./tmux-attach-owned.js";
+import { headedMarkerFile, useHeadedMarker } from "./headed-session.js";
+import { LiveUsageReader } from "./live-usage.js";
 import { LocalTranscriptSource, TranscriptLocator } from "./session-transcript.js";
 import { checkConsistency, printConsistency, type TeamMemberReader } from "./consistency.js";
 
@@ -291,6 +293,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
     }
     if (options.mode === "seat") {
       recordRunningBuild(`${options.checkout}.runtime`, import.meta.url);
+      if (options.readyNonce) useHeadedMarker(headedMarkerFile(options.checkout, options.readyNonce));
       try {
         const store = createPlanningStore(options.checkout);
         const seat = await loadDeveloperSeat(store, options.seatId);
@@ -335,7 +338,13 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         goals: new CliGoalStarter(options.checkout),
         paneTail: new TmuxPaneTail(options.checkout),
         // Watching a seat sets up keys, scrolling and the status line only on this checkout's verified sessions.
-        attach: (target) => attachTmux(target, undefined, (socket, session) => verifyOwnedSession(options.checkout, socket, session)),
+        // Driving leaves the pane's input on, only for a verified session with a headed run going.
+        attach: (target, mode) => attachTmux(target, undefined, (socket, session) => verifyOwnedSession(options.checkout, socket, session), mode),
+        driveCheck: async (target) => {
+          const { socket, session } = parseOwnedTmuxTarget(target);
+          return (await verifyOwnedSession(options.checkout, socket, session))?.headed === true;
+        },
+        liveUsage: new LiveUsageReader(options.checkout),
         transcript: new LocalTranscriptSource(new TranscriptLocator(options.checkout)),
         launchCheck: () => checkLaunch(options.checkout, new SystemTmux(), new TmuxHost(options.checkout).socket),
         sync: store,
@@ -428,6 +437,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         }
       }
       recordRunningBuild(`${options.checkout}.runtime`, import.meta.url);
+      if (options.readyNonce) useHeadedMarker(headedMarkerFile(options.checkout, options.readyNonce));
       const chat = services.chat(await hostedToken(options.checkout, options.readyNonce, readChickToken));
       await joinTeamHome(options.checkout, options.readyNonce, store, chat, CHICK_USERNAME);
       const bridge = await createPlanningBridge(store, chat, services.runtime(process.cwd()));

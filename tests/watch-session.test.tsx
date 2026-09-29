@@ -4,7 +4,10 @@ import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { attachTmux } from "../src/tmux-attach.js";
-import { hostedProcessOfSession, UNSAFE_MOUSE, verifyOwnedSession, watchSetup } from "../src/tmux-attach-owned.js";
+import { attachSetup, hostedProcessOfSession, UNSAFE_MOUSE, verifyOwnedSession, watchSetup } from "../src/tmux-attach-owned.js";
+import { headedMarkerFile } from "../src/headed-session.js";
+import type { SeatLive } from "../src/supervisor.js";
+import { driveWarning } from "../src/watch-keys.js";
 import { TmuxHost, type HostedProcess, type TmuxRunner } from "../src/tmux-host.js";
 import { enterUiSession, insideUiSession, isUiInvocation, uiSessionCommand, uiSessionPlan, UI_SOCKET } from "../src/ui-session.js";
 import { StateInventory, type StateSnapshot } from "../src/state-domain.js";
@@ -65,6 +68,69 @@ describe("watching a seat", () => {
     expect(calls.at(-1)?.args).toEqual(["-L", "indra-abc", "attach-session", "-r", "-t", "=chick-123"]);
   });
 
+  it("drive leaves the verified pane's input on while the owner is attached, then switches it off again; watch turns it off", async () => {
+    const socket = "indra-0123456789ab"; const session = "dev-seat-002-0123456789ab";
+    const headed = async () => ({ paneId: "%7", headed: true });
+    const drive = recorder();
+    expect(await attachTmux(`${socket}:${session}`, drive.run, headed, "drive")).toBe("drive");
+    const attachAt = drive.calls.findIndex((call) => call.args.includes("attach-session"));
+    expect(drive.calls.slice(1, attachAt).map((call) => call.args)).toEqual(attachSetup(socket, session, "%7", "drive"));
+    expect(drive.calls[attachAt - 1]!.args).toEqual(["-L", socket, "select-pane", "-e", "-t", "%7"]);
+    expect(drive.calls.some((call) => call.args.includes("select-pane") && call.args.includes("-d") && drive.calls.indexOf(call) < attachAt)).toBe(false);
+    expect(drive.calls[attachAt]).toEqual({ args: ["-L", socket, "attach-session", "-t", "=" + session], stdio: "inherit" });
+    expect(drive.calls.slice(attachAt + 1).map((call) => call.args)).toEqual([["-L", socket, "select-pane", "-d", "-t", "%7"]]);
+    // A driver's PgUp reaches the agent CLI, and the status line says the owner is driving.
+    const setup = drive.calls.slice(1, attachAt).map((call) => call.args);
+    expect(setup).toContainEqual(["-L", socket, "unbind-key", "-q", "-n", "PPage"]);
+    expect(setup.find((args) => args[5] === "status-left")?.[6]).toContain("DRIVING");
+    expect(setup.find((args) => args[5] === "status-right")?.[6]).toContain("Ctrl-] back to Indra");
+    for (const args of setup) expect(args.slice(0, 2)).toEqual(["-L", socket]);
+
+    const watch = recorder();
+    expect(await attachTmux(`${socket}:${session}`, watch.run, headed)).toBe("watch");
+    const selects = watch.calls.filter((call) => call.args.includes("select-pane")).map((call) => call.args);
+    expect(selects).toEqual([["-L", socket, "select-pane", "-d", "-t", "%7"]]);
+    expect(watch.calls.at(-1)?.args).toEqual(["-L", socket, "attach-session", "-t", "=" + session]);
+  });
+
+  it("drives only a verified session: unverified ones attach read-only and untouched, and one without a headed run is watched", async () => {
+    for (const verify of [undefined, async () => undefined]) {
+      const { calls, run } = recorder();
+      expect(await attachTmux("indra-abc:chick-123", run, verify, "drive")).toBe("read-only");
+      expect(calls.map((call) => call.args)).toEqual([
+        ["-L", "indra-abc", "has-session", "-t", "=chick-123"],
+        ["-L", "indra-abc", "attach-session", "-r", "-t", "=chick-123"],
+      ]);
+    }
+    const idle = recorder();
+    expect(await attachTmux("indra-0123456789ab:chick-0123456789ab", idle.run, async () => ({ paneId: "%3", headed: false }), "drive")).toBe("watch");
+    expect(idle.calls.slice(1, -1).map((call) => call.args)).toEqual(watchSetup("indra-0123456789ab", "chick-0123456789ab", "%3"));
+    expect(idle.calls.some((call) => call.args.includes("-e"))).toBe(false);
+    // A drive setup that fails part-way attaches read-only and switches the pane's input back off.
+    const failing = recorder((args) => args.includes("status-style") ? 1 : 0);
+    expect(await attachTmux("indra-abc:chick-123", failing.run, async () => ({ paneId: "%1", headed: true }), "drive")).toBe("read-only");
+    expect(failing.calls.some((call) => call.args.includes("-e"))).toBe(false);
+    expect(failing.calls.at(-2)?.args).toEqual(["-L", "indra-abc", "attach-session", "-r", "-t", "=chick-123"]);
+    expect(failing.calls.at(-1)?.args).toEqual(["-L", "indra-abc", "select-pane", "-d", "-t", "%1"]);
+  });
+
+  it("D asks to drive only from a seat with a live session; a stays watch", async () => {
+    const model = await seatPage();
+    model.page = "team";
+    expect(model.key("D", "D")).toBe("none");
+    expect(model.notice).toBe("Open a seat first to drive its live session.");
+    model.page = "seat";
+    expect(model.key("D", "D")).toBe("none");
+    expect(model.notice).toBe("No live session to drive for this seat; its process is not running under Indra.");
+    model.live = { "seat-002": { process: "running", attach: { kind: "tmux", target: "indra-0123456789ab:dev-seat-002-0123456789ab" } } as SeatLive };
+    expect(model.key("D", "D")).toBe("drive");
+    expect(model.key("a", "a")).toBe("attach");
+    expect(driveWarning("George Duke")).toBe("You're driving George Duke's live session. Ctrl-] returns to Indra.");
+    const help = JSON.stringify(HELP_SECTIONS);
+    expect(help).toContain("drive the seat's live agent session");
+    expect(help).toContain("While driving a seat");
+  });
+
   it("maps only Indra's session names to hosted processes", () => {
     expect(hostedProcessOfSession("chick-0123456789ab")).toEqual({ kind: "bridge" });
     expect(hostedProcessOfSession("dev-seat-002-0123456789ab")).toEqual({ kind: "seat", seatId: "seat-002" });
@@ -112,8 +178,13 @@ describe("owned session check", () => {
     const bridge = await hosted(dir, fake, { kind: "bridge" });
     const seat = await hosted(dir, fake, { kind: "seat", seatId: "seat-002" });
     fake.calls = [];
-    expect(await verifyOwnedSession(dir, bridge.host.socket, bridge.host.session, fake, dir)).toEqual({ paneId: bridge.record.paneId });
-    expect(await verifyOwnedSession(dir, seat.host.socket, seat.host.session, fake, dir)).toEqual({ paneId: seat.record.paneId });
+    expect(await verifyOwnedSession(dir, bridge.host.socket, bridge.host.session, fake, dir)).toEqual({ paneId: bridge.record.paneId, headed: false });
+    expect(await verifyOwnedSession(dir, seat.host.socket, seat.host.session, fake, dir)).toEqual({ paneId: seat.record.paneId, headed: false });
+    // A headed run is recognised only by the marker named after the verified record's nonce, and only while its process lives.
+    await writeFile(headedMarkerFile(dir, seat.record.readyNonce), JSON.stringify({ pid: 4242, engine: "claude", startedAt: "x" }));
+    expect(await verifyOwnedSession(dir, seat.host.socket, seat.host.session, fake, dir, (pid) => pid === 4242)).toEqual({ paneId: seat.record.paneId, headed: true });
+    expect(await verifyOwnedSession(dir, seat.host.socket, seat.host.session, fake, dir, () => false)).toEqual({ paneId: seat.record.paneId, headed: false });
+    expect(await verifyOwnedSession(dir, bridge.host.socket, bridge.host.session, fake, dir, () => true)).toEqual({ paneId: bridge.record.paneId, headed: false });
     // Another socket, another checkout's suffix, a seat without a record, or a foreign name are never verified.
     expect(await verifyOwnedSession(dir, "indra-ffffffffffff", bridge.host.session, fake, dir)).toBeUndefined();
     expect(await verifyOwnedSession(dir, bridge.host.socket, "chick-ffffffffffff", fake, dir)).toBeUndefined();
@@ -192,7 +263,7 @@ describe("help and transcript overlays", () => {
   it("? shows every key in plain words, including how to leave a watched seat and scroll, and Esc, q or ? closes it", async () => {
     const model = await seatPage();
     const footer = await frame(model);
-    expect(footer).toContain("a watch (Ctrl-] back) · t transcript");
+    expect(footer).toContain("a watch · D drive (Ctrl-] back) · t transcript");
     expect(footer).toContain("? help");
     expect(model.key("?", "?")).toBe("none");
     expect(model.overlay).toBe("help");

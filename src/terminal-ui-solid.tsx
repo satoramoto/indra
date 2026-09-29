@@ -15,7 +15,9 @@ import { keyInput } from "./key-batch.js";
 import { HelpOverlay } from "./help-overlay.js";
 import { TranscriptView } from "./transcript-view.js";
 import type { TranscriptSource } from "./session-transcript.js";
-import { RETURN_KEY, WATCH_HINT, WATCH_HINT_MS } from "./watch-keys.js";
+import { driveFallback, driveWarning, RETURN_KEY, WATCH_HINT, WATCH_HINT_MS } from "./watch-keys.js";
+import type { AttachMode } from "./tmux-attach-owned.js";
+import type { LiveUsagePort } from "./live-usage.js";
 import { isFinishedSprint } from "./finished-sprint.js";
 import { CI_DOT, formatTokens, openableUrl, pipelineSteps, prLabel, sumUsage, totalTokens, usageLine } from "./hub-format.js";
 import {
@@ -156,7 +158,8 @@ export function TerminalApp(props: TerminalAppProps) {
     const live = props.model.live[selected.id];
     const held = live?.assignment;
     const facts = held?.facts;
-    const leadUsage = sumUsage(sessions.map((session) => session.usage));
+    const leadUsage = props.model.withLiveUsage(selected.id, sumUsage(sessions.map((session) => session.usage)), sessions.map((session) => session.sessionId));
+    const liveNote = props.model.liveUsage[selected.id] ? " · includes the run in progress" : "";
     return (
       <box flexDirection="column" flexShrink={0} paddingLeft={1} paddingRight={1} backgroundColor={theme.panel} border borderColor={theme.border} title=" 🪑 SEAT DETAIL " titleColor={theme.accent}>
         <text>
@@ -169,7 +172,7 @@ export function TerminalApp(props: TerminalAppProps) {
           <Show when={live!.problem}><text fg={stateColor("failed", pulse())} wrapMode="word">⚠ {displayText(live!.problem, 300)}</text></Show>
         </Show>
         <text fg={theme.heading}>🤖 {live?.harness ? `${live.harness.engine === "claude" ? "Claude" : "Codex"} · model ${displayText(live.harness.model, 40)} · effort ${displayText(live.harness.effort, 20)}` : harnessText(undefined)}</text>
-        <Show when={!isDeveloper(selected)}><text fg={theme.accent}>🧮 Planning: {usageLine(leadUsage)}</text></Show>
+        <Show when={!isDeveloper(selected)}><text fg={theme.accent}>🧮 Planning: {usageLine(leadUsage) + liveNote}</text></Show>
         <Show when={live && isDeveloper(selected)}>
           <text fg={theme.regular} wrapMode="word">Assignment: {assignmentLine(live!, 160)}</text>
           <Show when={held}>
@@ -179,7 +182,7 @@ export function TerminalApp(props: TerminalAppProps) {
               <text flexShrink={0} fg={theme.muted}>{(facts?.ci ? " · " + CI_DOT[facts.ci] + " CI " + facts.ci : "") + " · " + (facts?.sessions ?? 0) + " sessions · ⌛ " + elapsedText(facts ?? {}, now()) + " on this task"}</text>
             </box>
             <PipelineLabels steps={pipelineSteps({ status: held!.status, step: facts?.step, fixRounds: facts?.fixRounds })} pulse={pulse} />
-            <text fg={theme.accent}>🧮 {usageLine(facts?.usage)}</text>
+            <text fg={theme.accent}>🧮 {usageLine(props.model.withLiveUsage(selected.id, facts?.usage, facts?.sessionIds ?? [])) + liveNote}</text>
           </Show>
           <Show when={live!.retry}><text fg={stateColor("needs", pulse())}>🙋 T retries {displayText(live!.retry?.goalId, 40)}/{displayText(live!.retry?.outcomeId, 40)}: {displayText(live!.retry?.title, 120)} (confirm first)</text></Show>
           <text fg={theme.muted}>💬 {threadActivity(live!, 300)}{live!.activity ? "  (" + displayText(live!.activity.at) + ")" : ""}</text>
@@ -199,7 +202,7 @@ export function TerminalApp(props: TerminalAppProps) {
               <text fg={stateColor("needs", pulse())}>🙋 A approves it here, or react :white_check_mark: on its proposal post</text>
             </Show>
             <text fg={connected && session.attach ? theme.running : theme.muted}>
-              Live view: {connected && session.attach ? "a watch · " + RETURN_KEY + " back" : "not available"}
+              Live view: {connected && session.attach ? "a watch · D drive · " + RETURN_KEY + " back" : "not available"}
             </text>
             <Show when={session.recentActivity.length} fallback={<text fg={theme.muted}>No runtime activity recorded.</text>}>
               <For each={session.recentActivity.slice(0, 3)}>{(activity) => <text fg={theme.regular}>• {displayText(activity, 160)}</text>}</For>
@@ -214,7 +217,7 @@ export function TerminalApp(props: TerminalAppProps) {
   };
 
   const keyLine = () => input() ? (newGoalBlocked() ? "Start blocked · Esc cancel" : "Enter start · Esc cancel") + " · " + displayText(team()?.project?.github, 80) + " · home channel"
-    : [page() === "teams" ? "↑↓ choose team · Enter open" : page() === "team" ? "↑↓ seat · Enter details · T retry · s restart · x stop · b teams" : `a watch (${RETURN_KEY} back) · t transcript · T retry · s restart · x stop · b team`,
+    : [page() === "teams" ? "↑↓ choose team · Enter open" : page() === "team" ? "↑↓ seat · Enter details · T retry · s restart · x stop · b teams" : `a watch · D drive (${RETURN_KEY} back) · t transcript · T retry · s restart · x stop · b team`,
       ...ceremonyKeys(), ...(newGoalBlocked() ? [] : ["n new goal"]), "q quit"].join(" · ");
 
   return (
@@ -314,7 +317,12 @@ export function openLink(url: string, run: (file: string, args: string[]) => voi
 /** Start the Solid/OpenTUI screen; renderer ownership and terminal cleanup stay in this function. */
 export async function runTerminalUi(state: StateInventory, sessions: SessionReadPort, options: {
   pollMs?: number;
-  attach?: (target: string) => Promise<void>;
+  /** Opens a seat's live view: `watch` with the pane's input off, `drive` with it on (only a verified headed run). */
+  attach?: (target: string, mode?: AttachMode) => Promise<unknown>;
+  /** Whether a seat's target is Indra's own verified session with a headed run going, so `D` can drive it. */
+  driveCheck?: (target: string) => Promise<boolean>;
+  /** Reads the running token totals of the headed runs still going. */
+  liveUsage?: LiveUsagePort;
   signal?: AbortSignal;
   /** Hosts and controls the bridge and seat runners; they keep running after the UI quits. */
   processes?: SeatProcessPort;
@@ -339,6 +347,7 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
   if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error("The terminal UI needs an interactive TTY. Use --once for redirected output.");
   const model = new TerminalUiModel(state, sessions, options.processes, options.goals, options.sync, options.update);
   model.launchCheck = options.launchCheck;
+  model.liveUsagePort = options.liveUsage;
   if (options.view) model.restore(options.view);
   await model.refresh();
   const renderer = await createCliRenderer({ exitOnCtrlC: false, targetFps: 30 });
@@ -408,21 +417,30 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
       else if (action === "sprint") void model.sprintConfirmed();
       else if (action === "retry") void model.retryConfirmed();
       else if (action === "stop" || action === "restart") void model.control(action);
-      else if (action === "attach") {
+      else if (action === "attach" || action === "drive") {
         const target = model.attachTarget();
         if (!target) return;
         attaching = true;
-        // Say how to get back before the screen switches to the seat.
-        model.notice = "Watching " + (model.seat?.displayName ?? "the seat") + " · " + WATCH_HINT;
-        model.revision++;
-        setRevision(model.revision);
+        const name = model.seat?.displayName ?? "the seat";
+        const watching = "Watching " + name + " · " + WATCH_HINT;
+        let shown: string | undefined;
         let suspended = false;
-        void new Promise((wait) => setTimeout(wait, WATCH_HINT_MS)).then(() => {
+        // Drive only a verified seat with a headed run going; the attach checks again and watches if that changed.
+        void (action === "drive" ? (options.driveCheck ?? (async () => false))(target).catch(() => false) : Promise.resolve(false)).then((headed) => {
           if (!active) return;
-          suspended = true;
-          renderer.suspend();
-          return (options.attach ?? attachTmux)(target);
-        }).then(() => { if (model.notice?.startsWith("Watching ")) model.notice = undefined; }, (error: unknown) => {
+          const mode: AttachMode = action === "drive" && headed ? "drive" : "watch";
+          // Say how to get back before the screen switches to the seat.
+          shown = mode === "drive" ? driveWarning(name) : action === "drive" ? driveFallback(name) : watching;
+          model.notice = shown;
+          model.revision++;
+          setRevision(model.revision);
+          return new Promise((wait) => setTimeout(wait, WATCH_HINT_MS)).then(() => {
+            if (!active) return;
+            suspended = true;
+            renderer.suspend();
+            return (options.attach ?? ((to: string, how?: AttachMode) => attachTmux(to, undefined, undefined, how)))(target, mode);
+          });
+        }).then(() => { if (model.notice === shown && !shown?.startsWith(name + " is not in a headed run")) model.notice = undefined; }, (error: unknown) => {
           model.notice = error instanceof Error ? error.message : "Could not open this seat's live view.";
         }).finally(() => {
           if (active) {

@@ -168,7 +168,10 @@ export function seatInfo(model: TerminalUiModel, seat: StateSeat): SeatInfo {
   const facts = held?.facts;
   const status = occupancy(model, seat);
   // A Developer's cost is its current assignment's; the lead's is its planning runs on open goals.
-  const usage = developer ? facts?.usage : sumUsage(model.sessionsFor(seat.id).filter((session) => !isFinishedSprint(sessionSprint(session).loop)).map((session) => session.usage));
+  // Both add the headed run still going, from its session log.
+  const open = model.sessionsFor(seat.id).filter((session) => !isFinishedSprint(sessionSprint(session).loop));
+  const usage = developer ? model.withLiveUsage(seat.id, facts?.usage, facts?.sessionIds ?? [])
+    : model.withLiveUsage(seat.id, sumUsage(open.map((session) => session.usage)), open.map((session) => session.sessionId));
   const second = live?.problem ? { text: "⚠ " + displayText(live.problem, 300), color: theme.error }
     : developer ? held ? { text: "", color: theme.regular }
       : { text: (live.retry ? "🙋 " : "💤 ") + assignmentLine(live, 60), color: live.retry ? HUB_STATE.needs.color : theme.muted }
@@ -198,12 +201,12 @@ const elapsedText = (info: { claimedAt?: string; endedAt?: string }, now: number
 /** Two rows per seat: who and how it runs, then what it is doing. */
 export function SeatRow(props: { model: TerminalUiModel; seat: StateSeat; revision: Accessor<number>; pulse: Accessor<boolean>; now: Accessor<number>; width: Accessor<number>; open?: (url: string) => void; burn?: TokenBurn; truecolor?: boolean }) {
   const info = createMemo(() => { props.revision(); return seatInfo(props.model, props.seat); });
-  // The last hour of token burn in eight 7.5-minute buckets: recorded sessions where the seat has them, else the rises
-  // in its running total the hub has seen.
+  // The last hour of token burn in eight 7.5-minute buckets: recorded sessions from before the hub opened, then the
+  // rises it sees in the seat's running total, the headed run in progress included.
   const spark = createMemo(() => {
     const current = info(); const now = props.now();
     props.burn?.observe(props.seat.id, totalTokens(current.usage), now);
-    return sparkline(burnBuckets(current.burn.length ? current.burn : props.burn?.live(props.seat.id) ?? [], now, 8));
+    return sparkline(burnBuckets(props.burn ? props.burn.series(props.seat.id, current.burn) : current.burn, now, 8));
   });
   const selected = createMemo(() => { props.revision(); return props.model.seatId === props.seat.id; });
   // The second row's own text comes first; the latest activity gets what is left of the row.

@@ -124,7 +124,7 @@ describe("recorded facts", () => {
     expect(assignmentFacts(record, ledger)).toMatchObject({ ci: "passed", endedAt: "2026-01-01T02:00:00Z" });
     // A record from before the ledger still reports its own sessions' usage.
     expect(assignmentFacts({ ...record, sessions: [{ role: "developer", sessionId: "x", startedAt: "", finishedAt: "", usage: { inputTokens: 5, outputTokens: 1 } }] }, undefined))
-      .toEqual({ step: "ci", fixRounds: 1, usage: { inputTokens: 5, outputTokens: 1 }, sessions: 1 });
+      .toEqual({ step: "ci", fixRounds: 1, usage: { inputTokens: 5, outputTokens: 1 }, sessions: 1, sessionIds: ["x"] });
     expect(assignmentFacts(undefined, undefined)).toBeUndefined();
   });
 
@@ -261,10 +261,10 @@ describe("the hub on the owner's screen", () => {
           `Assignment: ${titles[0]} · in-review`, "🐙 satoramoto/indra#103", "🟡 CI pending", "build ✓", "review ✓", "fix skipped", "ci ●", "merge",
           "🟡 CI pending · 3 sessions · ⌛ 47m on this task", "🧮 in 1.25M · cached 1M · out 50k · Σ 1.3M tok", "Latest: Opened PR 103; review requested",
           "SPRINT · goal-hub", "Current stage: implement", "Closure: open", "planning → proposal → [implement] → release → retro", "1/4 tickets merged",
-          "a watch (Ctrl-] back) · t transcript"],
+          "a watch · D drive (Ctrl-] back) · t transcript"],
         "lead-seat": ["LIVE PANE · Chick Corea", "Chick Corea  @chickcorea", "Process: running (planning bridge)", "🤖 Claude · model claude-opus-5-5 · effort max",
           "🧮 Planning: in 2.1M · cached 1.68M · out 84k · Σ 2.18M tok", "IDLE SESSION · Claude Code", "Planning goal: Make the terminal UI the owner's all-day hub",
-          "Claude Code session: claude:0e5f9f3e-1111-4222-8333-944445555666", "4 runs", "Live view: a watch · Ctrl-] back", "Current stage: implement", "💬 goal thread", "📝 proposal post"],
+          "Claude Code session: claude:0e5f9f3e-1111-4222-8333-944445555666", "4 runs", "Live view: a watch · D drive · Ctrl-] back", "Current stage: implement", "💬 goal thread", "📝 proposal post"],
         teams: ["👥 Yahaha  (yahaha)", "5 stable seats", "🐙 satoramoto/indra", "↑↓ choose team · Enter open"],
       };
       // Word wrapping inside a box is fine; cutting a key field short is not. Compare without spaces and box edges.

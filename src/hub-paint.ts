@@ -139,11 +139,13 @@ export function sparkline(values: readonly number[]): string {
 }
 
 /**
- * Live token burn per seat, from the running totals the hub already shows: each rise between two looks is burn at the
- * later look. A fall (a new assignment starting from zero) resets the baseline. Kept in memory for the window only.
+ * Live token burn per seat, from the running totals the hub already shows (recorded sessions plus the headed run in
+ * progress): each rise between two looks is burn at the later look. A fall (a new assignment starting from zero)
+ * resets the baseline. Kept in memory for the window only.
  */
 export class TokenBurn {
   private readonly last = new Map<string, number>();
+  private readonly first = new Map<string, number>();
   private readonly points = new Map<string, { at: number; tokens: number }[]>();
   constructor(private readonly windowMs = 3_600_000) {}
 
@@ -151,6 +153,7 @@ export class TokenBurn {
     if (total === undefined || !Number.isFinite(total)) return;
     const previous = this.last.get(key);
     this.last.set(key, total);
+    if (!this.first.has(key)) this.first.set(key, at);
     if (previous === undefined || total <= previous) return;
     const kept = (this.points.get(key) ?? []).filter((point) => point.at > at - this.windowMs);
     kept.push({ at, tokens: total - previous });
@@ -158,4 +161,13 @@ export class TokenBurn {
   }
 
   live(key: string): { at: number; tokens: number }[] { return this.points.get(key) ?? []; }
+
+  /**
+   * The burn to draw: recorded sessions that finished before the hub first looked at this seat, then the rises it has
+   * seen since. A session finishing while the hub watches is already in the rises, so it is never counted twice.
+   */
+  series(key: string, recorded: readonly { at: number; tokens: number }[]): { at: number; tokens: number }[] {
+    const since = this.first.get(key) ?? Infinity;
+    return [...recorded.filter((point) => point.at < since), ...this.live(key)];
+  }
 }

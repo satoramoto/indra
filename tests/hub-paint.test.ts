@@ -92,4 +92,15 @@ describe("token sparkline", () => {
     expect(burn.live("seat")).toEqual([{ at: ago(20), tokens: 600 }, { at: ago(5), tokens: 300 }]);
     expect(burn.live("other")).toEqual([]);
   });
+
+  it("draws recorded sessions from before the hub looked, then only the rises it saw", () => {
+    const burn = new TokenBurn();
+    const recorded = [{ at: ago(40), tokens: 700 }, { at: ago(10), tokens: 300 }];
+    expect(burn.series("seat", recorded)).toEqual(recorded);
+    burn.observe("seat", 1000, ago(30));
+    // The session recorded 10 minutes ago finished while the hub watched: it is the rise, not an extra point.
+    burn.observe("seat", 1300, ago(10));
+    expect(burn.series("seat", recorded)).toEqual([{ at: ago(40), tokens: 700 }, { at: ago(10), tokens: 300 }]);
+    expect(burn.series("seat", recorded).reduce((sum, point) => sum + point.tokens, 0)).toBe(1000);
+  });
 });
