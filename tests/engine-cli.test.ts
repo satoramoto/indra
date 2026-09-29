@@ -205,19 +205,24 @@ describe("every CLI runtime/chat construction path", () => {
     expect(fakes.token).not.toHaveBeenCalled(); expect(fakes.calls).toEqual([]); expect(fakes.posts).toEqual([]);
   });
 
-  it("discovers optional adapters without changing the CLI's seat runtime", async () => {
+  it("forwards every optional workflow adapter without changing the CLI's seat runtime", async () => {
     const store = new PlanningStore(checkout);
     const runtime = new (fakeRuntime("codex"))("/project");
     const release = { poll: vi.fn(async () => ({ status: "pending" as const, reason: "Waiting for reload" })) };
+    const hooks = {
+      integrationReview: vi.fn(async () => {}), grooming: vi.fn(async () => {}), closedSprint: vi.fn(async () => {}),
+      automaticGate: vi.fn(async () => undefined), releaseEvent: vi.fn(async () => {}),
+    } satisfies CeremonyAdapters;
     const factory = vi.fn(async (services: { store: PlanningStore; runtime: AgentRuntime }) => {
       expect(services.store).toBe(store);
       expect(services.runtime).toBe(runtime);
-      return { release };
+      return { release, ...hooks };
     });
     await createPlanningBridge(store, {} as PlanningChat, runtime, { "./release-activation.ts": { createCeremonyAdapters: factory } });
     expect(factory).toHaveBeenCalledOnce();
-    expect(fakes.adapters).toEqual([{ release }]);
+    expect(fakes.adapters).toEqual([{ release, ...hooks }]);
     expect(release.poll).not.toHaveBeenCalled();
+    for (const hook of Object.values(hooks)) expect(hook).not.toHaveBeenCalled();
   });
 
   it("leaves absent adapters pending and rejects duplicate ownership", async () => {
@@ -227,18 +232,6 @@ describe("every CLI runtime/chat construction path", () => {
     expect(fakes.adapters).toEqual([{}]);
     const module = { createCeremonyAdapters: () => ({ release: { poll: async () => ({ status: "pending" as const, reason: "Reload" }) } }) };
     await expect(createPlanningBridge(store, {} as PlanningChat, runtime, { a: module, b: module })).rejects.toThrow("Multiple ceremony adapters");
-  });
-
-  it("passes every optional workflow hook through composition without executing it", async () => {
-    const hooks = {
-      grooming: vi.fn(async () => {}), closedSprint: vi.fn(async () => {}), releaseEvent: vi.fn(async () => {}),
-      automaticGate: vi.fn(async () => undefined), integrationReview: vi.fn(async () => {}),
-      release: { poll: vi.fn(async () => ({ status: "pending" as const, reason: "No running build" })) },
-    };
-    const store = new PlanningStore(checkout); const runtime = new (fakeRuntime("codex"))("/project");
-    await createPlanningBridge(store, {} as PlanningChat, runtime, { workflow: { createCeremonyAdapters: () => hooks } });
-    expect(fakes.adapters).toEqual([hooks]);
-    for (const hook of [hooks.grooming, hooks.closedSprint, hooks.releaseEvent, hooks.automaticGate, hooks.integrationReview, hooks.release.poll]) expect(hook).not.toHaveBeenCalled();
   });
 
   it("gives next-sprint adapters a deferred checked bridge start and refuses eager starts", async () => {
@@ -252,6 +245,14 @@ describe("every CLI runtime/chat construction path", () => {
     } } });
     expect(fakes.actions).toEqual([]); await start!("Next candidate");
     expect(fakes.actions).toEqual(["start"]);
+  });
+
+  it.each(["integrationReview", "grooming", "closedSprint", "automaticGate", "releaseEvent"] as const)("rejects duplicate %s hooks before constructing the bridge", async (key) => {
+    const store = new PlanningStore(checkout);
+    const runtime = new (fakeRuntime("codex"))("/project");
+    const module = { createCeremonyAdapters: () => ({ [key]: vi.fn(async () => undefined) }) };
+    await expect(createPlanningBridge(store, {} as PlanningChat, runtime, { a: module, b: module })).rejects.toThrow(`Multiple ceremony adapters provide ${key}.`);
+    expect(fakes.adapters).toEqual([]);
   });
 
   it("refuses incomplete rollout declarations before any posting or model invocation", () => {
