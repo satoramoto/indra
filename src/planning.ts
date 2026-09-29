@@ -5,8 +5,23 @@ import { parseState } from "./local-state.js";
 import { StateCommitError, StateGit, withFileLock, type StateSyncResult } from "./state-commit.js";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
-import { assertTeamAvailable, migrateLegacyCeremony, openGoalConflicts, startCeremony, validateCeremony, validateCeremonyMutation, type CeremonyRecord, type LegacyEvidence, type LegacyMigration, type TeamGoalConflict } from "./ceremony.js";
+import { assertTeamAvailable, migrateLegacyCeremony, openGoalConflicts, startCeremony, validateCeremony, validateCeremonyMutation, type CeremonyRecord, type LegacyMigration, type TeamGoalConflict } from "./ceremony.js";
 import { assertCeremonyReady, type CeremonyWriteReadiness } from "./ceremony-ports.js";
+
+/** What start-up migration did with one pre-ceremony goal. */
+export type LegacyGoalMigration = { goalId: string } & ({ status: "migrated"; summary: string } | { status: "conflict"; reason: string });
+/** "closed at release (legacy migration)" or "entered release", for commit subjects and the start-up report. */
+export function legacyMigrationSummary(ceremony: CeremonyRecord): string {
+  return ceremony.closure ? `closed at ${ceremony.stage} (legacy migration)` : `entered ${ceremony.stage}`;
+}
+/** Why a goal still has no ceremony: the conflict its recorded evidence shows, or that start-up has not migrated it yet. */
+export function legacyMigrationBlocker(goal: PlanningGoal, at = new Date().toISOString()): string | undefined {
+  if (goal.ceremony) return undefined;
+  try {
+    const result = migrateLegacyCeremony(goal, at);
+    return result.status === "conflict" ? `evidence conflicts: ${result.reason} Fix it in indra-state; Indra will not guess.` : "not migrated yet; restart Indra to migrate it.";
+  } catch (error) { return `evidence conflicts: ${error instanceof Error ? error.message : String(error)}`; }
+}
 
 export interface PlanningGoal {
   id: string; teamId: string; seatId: string; participantSeatIds: string[]; goal: string; projectRefs: string[];
@@ -127,13 +142,14 @@ export function validatePlanningDocument(state: PlanningDocument): void {
       if (goal.mattermost.channelId !== home.channelId || !goal.projectRefs.includes(home.github)) throw new Error("Ceremony goal home channel and project must come from its team in state.");
       const botIds = new Set((team.seats as SeatRecord[]).map((seat) => seat.externalIdentities?.mattermost?.userId).filter(Boolean));
       for (const entry of goal.ceremony.history) {
-        if (entry.stage !== "implement" && entry.stage !== "retro") continue;
-        const approval = entry.evidence.approval;
+        const approval = entry.stage === "retro" ? entry.evidence.approval : entry.stage === "implement" && entry.evidence.kind === "approval" ? entry.evidence.approval : undefined;
+        if (!approval) continue;
         if (approval.source === "reaction" && botIds.has(approval.userId)) throw new Error("A team seat's reaction cannot supply human approval.");
       }
       const project = teamProject(state, goal.teamId);
       const prs = goal.ceremony.history.flatMap((entry) => entry.stage === "release" ? entry.evidence.outcomes.map((item) => item.prUrl) : entry.stage === "retro" ? [entry.evidence.prUrl] : []);
-      if (goal.ceremony.closure) prs.push(goal.ceremony.closure.evidence.prUrl);
+      const closure = goal.ceremony.closure?.evidence;
+      if (closure) prs.push(...[closure.prUrl, "revertPrUrl" in closure ? closure.revertPrUrl : undefined].filter((url): url is string => !!url));
       if (prs.some((url) => !project || !url.startsWith(`https://github.com/${project}/pull/`))) throw new Error("Ceremony PR evidence must belong to the team's project in state.");
     }
   }
@@ -206,16 +222,29 @@ export class PlanningStore {
       state.planningGoals = [...(state.planningGoals ?? []), { ...structuredClone(goal), ceremony: startCeremony(goal.createdAt) }];
     }, `Start planning goal ${goal.id}`);
   }
-  async migrateGoal(id: string, evidence: LegacyEvidence, at: string): Promise<LegacyMigration> {
+  /**
+   * Gives every goal without a ceremony the one its recorded state proves (see `migrateLegacyCeremony`), one state
+   * commit per goal through the normal write path. Goals whose evidence conflicts, or whose write fails, are left
+   * unchanged and reported. Running it again changes nothing.
+   */
+  async migrateLegacyGoals(at = new Date().toISOString()): Promise<LegacyGoalMigration[]> {
+    const legacy = ((await this.read()).planningGoals ?? []).filter((goal) => !goal.ceremony).map((goal) => goal.id);
+    if (!legacy.length) return [];
     assertCeremonyReady(this.ceremonyWrites);
-    let result: LegacyMigration | undefined;
-    await this.update((state) => {
-      const goal = state.planningGoals?.find((item) => item.id === id);
-      if (!goal) throw new Error(`Unknown planning goal ${id}.`);
-      result = migrateLegacyCeremony(goal, evidence, at);
-      if (result.status === "ready") goal.ceremony = result.ceremony;
-    }, `Migrate ceremony for goal ${id}`);
-    return result!;
+    const results: LegacyGoalMigration[] = [];
+    for (const id of legacy) {
+      let result: LegacyMigration | undefined;
+      try {
+        await this.update((state) => {
+          const goal = state.planningGoals?.find((item) => item.id === id);
+          if (!goal || goal.ceremony) return;
+          result = migrateLegacyCeremony(goal, at);
+          if (result.status === "ready") goal.ceremony = result.ceremony;
+        }, () => `Migrate legacy goal ${id} into the ceremony: ${result?.status === "ready" ? legacyMigrationSummary(result.ceremony) : "unchanged"}`);
+      } catch (error) { result = { status: "conflict", reason: `its migration could not be written: ${error instanceof Error ? error.message : String(error)}` }; }
+      if (result) results.push({ goalId: id, ...(result.status === "ready" ? { status: "migrated", summary: legacyMigrationSummary(result.ceremony) } : { status: "conflict", reason: result.reason }) });
+    }
+    return results;
   }
   async teamConflicts(): Promise<TeamGoalConflict[]> { return openGoalConflicts((await this.read()).planningGoals ?? []); }
   /**

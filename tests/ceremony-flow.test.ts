@@ -305,7 +305,7 @@ describe("ordered gates and evidence", () => {
     await expect(bridge.start("Next")).rejects.toThrow(goal.id);
     archived = true;
     await restart().poll();
-    expect((await store.read()).planningGoals![0].ceremony?.closure?.evidence.path).toBe(`docs/retros/${goal.id}.md`);
+    expect((await store.read()).planningGoals![0].ceremony?.closure?.evidence).toMatchObject({ kind: "retro-published", path: `docs/retros/${goal.id}.md` });
     expect(stages(chat)).toEqual(["planning", "proposal", "implement", "release", "retro"]);
     expect(chat.posts.filter((post) => post.message === "Recorded sprint retrospective")).toHaveLength(1);
     // Closure must not disable the existing human gate for a later sprint revert.
@@ -316,6 +316,26 @@ describe("ordered gates and evidence", () => {
     await restart().poll();
     expect((await store.read()).planningGoals![0].integration!.status).toBe("reverted");
     expect((await store.read()).planningGoals![0].ceremony?.closure).toBeDefined();
+    await restart().start("Next");
+    expect((await store.read()).planningGoals).toHaveLength(2);
+  });
+
+  it("closes a sprint whose integration is reverted during release, before the new build runs", async () => {
+    const { store, bridge, restart, goal, chat } = await implemented();
+    await bridge.merge(goal.id);
+    await bridge.poll();
+    expect((await store.read()).planningGoals![0].ceremony?.stage).toBe("release");
+    await store.update((state) => { state.planningGoals![0].integration!.revertPrUrl = "https://github.com/test/project/pull/13"; }, "Owner opens a revert during release");
+    await restart().poll();
+    const revert = (await store.runtime(goal.id)).mergePosts!.find((item) => item.kind === "revert")!;
+    chat.react(revert.id);
+    await restart().poll();
+    await restart().poll();
+    const saved = (await store.read()).planningGoals![0];
+    expect(saved.integration!.status).toBe("reverted");
+    expect(saved.ceremony?.stage).toBe("release");
+    expect(saved.ceremony?.closure?.evidence).toEqual({ kind: "release-reverted", prUrl: saved.integration!.prUrl, mergedSha: saved.integration!.mergedSha, revertPrUrl: "https://github.com/test/project/pull/13" });
+    expect(chat.posts.filter((post) => post.message.startsWith(`**Goal ${goal.id} closed: release reverted**`))).toHaveLength(1);
     await restart().start("Next");
     expect((await store.read()).planningGoals).toHaveLength(2);
   });
@@ -474,7 +494,9 @@ describe("owner-authorized partial release", () => {
     expect(github.calls.filter((line) => line.includes("pr create"))).toHaveLength(1);
     await expect(store.update((state) => { state.planningGoals![0].assignments![1].status = "running"; }, "Stale seat attempts claim")).rejects.toThrow();
     const unapproved = structuredClone(saved);
-    delete unapproved.ceremony!.history.find((entry) => entry.stage === "release")!.evidence.partialApproval;
+    const unapprovedRelease = unapproved.ceremony!.history.find((entry) => entry.stage === "release")!;
+    if (unapprovedRelease.evidence.kind !== "implementation") throw new Error("Expected native implementation evidence");
+    delete unapprovedRelease.evidence.partialApproval;
     expect(() => validateCeremony(unapproved)).toThrow("Invalid ceremony");
   });
 

@@ -313,6 +313,10 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       await syncStateSchema(options.checkout).then((result) => { if (result.outcome !== "unchanged") console.log(result.message); });
       const updater = new SelfUpdater(defaultAppDir, undefined, undefined, `${resolve(options.checkout)}.runtime`);
       const store = createPlanningStore(options.checkout);
+      // After the schema sync, so the checkout's schema accepts migrated ceremonies. Conflicts also show on the team screen.
+      await store.migrateLegacyGoals().then((results) => {
+        for (const result of results) console.log(result.status === "migrated" ? `Legacy goal ${result.goalId}: ${result.summary}.` : `Legacy goal ${result.goalId} was not migrated: ${result.reason}`);
+      }, (error: unknown) => console.log(`Legacy goals were not migrated: ${error instanceof Error ? error.message : String(error)}`));
       return await runTerminalUi(new StateInventory(new LocalStateRepository(options.checkout)), new LocalSessionReader(options.checkout), {
         processes: new Supervisor(options.checkout, undefined, undefined, undefined, store, (force) => stageServiceToken(options.checkout, { force })),
         goals: new CliGoalStarter(options.checkout),

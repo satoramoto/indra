@@ -1,4 +1,4 @@
-import { PlanningStore, type PlanningGoal, type SprintIntegration } from "./planning.js";
+import { legacyMigrationBlocker, PlanningStore, type PlanningGoal, type SprintIntegration } from "./planning.js";
 import { TmuxHost } from "./tmux-host.js";
 import { LocalReleaseActivationReader, type ReleaseActivation } from "./release-activation.js";
 import { retroRuntimeName, type RetroPublicationRecord } from "./retro-publication.js";
@@ -22,7 +22,8 @@ export interface CeremonySnapshot {
   stage: CeremonyStage;
   history: { stage: CeremonyStage; enteredAt: string | null; evidence?: unknown }[];
   migratedAt?: string;
-  closure?: { closedAt: string; evidence: { path: string; prUrl: string; publishedAt: string } };
+  /** A published retro, a release reverted before it ran, or a finished pre-ceremony goal closed by migration. */
+  closure?: { closedAt: string; evidence: { kind?: string; path?: string; prUrl?: string; publishedAt?: string } };
 }
 /** The durable release entry is separate from today's live process evidence. */
 export interface RecordedReleaseSnapshot { kind: "release-running"; prUrl: string; mergedSha: string; buildSha: string; runningSha: string; runningAt: string }
@@ -79,7 +80,9 @@ export function projectSprint(goal: CeremonyGoal, build?: SprintBuild): SprintLo
   } else stage = "Build";
   const ceremony = goal.ceremony && structuredClone(goal.ceremony);
   const release = ceremony?.history.find((entry) => entry.stage === "retro")?.evidence as RecordedReleaseSnapshot | undefined;
-  const published = ceremony?.closure?.evidence;
+  const closed = ceremony?.closure?.evidence;
+  // A reverted release or a migrated legacy goal closes without a retro.
+  const published = closed && (closed.kind === undefined || closed.kind === "retro-published") ? closed : undefined;
   const retro: RetroSnapshot | undefined = ceremony ? {
     status: published ? "published" : ceremony.stage === "retro" ? "pending" : "not-started",
     ...(published ? { path: published.path, prUrl: published.prUrl, publishedAt: published.publishedAt } : {}),
@@ -106,6 +109,8 @@ export interface SessionSnapshot {
     /** The sprint's integration status; `revert-open` is a merged sprint whose revert PR is open. */
     sprint?: SprintView;
     loop?: SprintLoop;
+    /** Only for a goal without a ceremony: why start-up migration has not given it one. */
+    migration?: string;
   }[];
 }
 export type SprintView = "collecting" | "pr-open" | "merged" | "revert-open" | "reverted";
@@ -148,7 +153,8 @@ export class LocalSessionReader implements SessionReadPort {
       const context = { id: goal.id, teamId: goal.teamId, seatId: goal.seatId, goal: goal.goal, stage: goal.stage, updatedAt: goal.updatedAt,
         loop, ...(loop.ceremony ? { ceremony: structuredClone(loop.ceremony), retro: structuredClone(loop.retro) } : {}),
         ...(loop.closedAt ? { closedAt: loop.closedAt } : {}), ...(loop.release ? { release: structuredClone(loop.release) } : {}),
-        ...(goal.integration ? { sprint: sprintView(goal) } : {}) };
+        ...(goal.integration ? { sprint: sprintView(goal) } : {}),
+        ...(goal.ceremony ? {} : { migration: legacyMigrationBlocker(goal as PlanningGoal) }) };
       let runtime: Awaited<ReturnType<PlanningStore["runtime"]>>;
       try {
         runtime = await this.store.runtime(goal.id);

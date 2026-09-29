@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { withFileLock } from "./state-commit.js";
-import { advanceCeremony, closeCeremony, type CeremonyStage, type HumanApproval, type ImplementationEvidence, type PublishedRetroEvidence, type RunningReleaseEvidence } from "./ceremony.js";
+import { advanceCeremony, closeCeremony, closeRevertedRelease, type CeremonyStage, type HumanApproval, type ImplementationEvidence, type PublishedRetroEvidence, type RunningReleaseEvidence } from "./ceremony.js";
 import type { CeremonyRuntimeRecord } from "./ceremony-ports.js";
 import { randomUUID } from "node:crypto";
 import type { AgentRuntime } from "./codex-runtime.js";
@@ -117,12 +117,17 @@ function approvalMessage(goal: PlanningGoal, seats: Map<string, string>): string
   const titles = new Map(goal.proposal!.outcomes.map((item) => [item.id, item.title]));
   return `**Proposal ${goal.proposal!.id} approved**\n${(goal.assignments ?? []).map((item) => `- ${titles.get(item.outcomeId) ?? item.outcomeId} → ${seatLabel(seats, item.seatId)}`).join("\n")}\n\nRecorded in indra-state as ${goal.id}. Each outcome is queued for its Developer seat.${goal.integration ? ` Their PRs target \`${goal.integration.branch}\`; once every outcome merges, Chick opens one PR from it into main.` : ""}`;
 }
+/** The owner-authorized omissions recorded when release began; migrated legacy goals record none. */
+function ownerOmissions(goal: PlanningGoal): ImplementationEvidence["omissions"] {
+  const release = goal.ceremony?.history.find((entry) => entry.stage === "release");
+  return release?.stage === "release" && release.evidence.kind === "implementation" ? release.evidence.omissions : undefined;
+}
 function outcomeLines(goal: PlanningGoal, seats: Map<string, string>): { merged: string[]; missed: string[] } {
   const titles = new Map(goal.proposal!.outcomes.map((item) => [item.id, item.title]));
   const merged: string[] = []; const missed: string[] = [];
   for (const item of goal.assignments ?? []) {
     const head = `**${titles.get(item.outcomeId) ?? item.outcomeId}** → ${seatLabel(seats, item.seatId)}`;
-    const omitted = goal.ceremony?.history.find((entry) => entry.stage === "release")?.evidence.omissions?.find((entry) => entry.outcomeId === item.outcomeId);
+    const omitted = ownerOmissions(goal)?.find((entry) => entry.outcomeId === item.outcomeId);
     if (omitted) { missed.push(`- ${head}: omitted by owner (${omitted.reason})`); continue; }
     if (item.status === "merged") merged.push(`- ${head}: ${item.prUrl ?? "merged"}`);
     else missed.push(`- ${head}: ${item.status === "failed" ? `failed${item.note ? ` (${item.note})` : ""}` : `skipped (${item.status})`}${item.prUrl ? ` ${item.prUrl}` : ""}`);
@@ -135,7 +140,7 @@ function sprintSummary(goal: PlanningGoal, seats: Map<string, string>): string {
   return `Sprint integration for planning goal ${goal.id}.\n\n**Goal:** ${goal.goal}\n\n**Outcomes**\n${merged.join("\n") || "- none"}${missed.length ? `\n\n**Failed or skipped**\n${missed.join("\n")}` : ""}\n\nMerging this PR lands the whole sprint on main; \`planning rollback --goal ${goal.id}\` reverts it as a unit.`;
 }
 function integrationMessage(goal: PlanningGoal, prUrl: string): string {
-  const omissions = goal.ceremony?.history.find((entry) => entry.stage === "release")?.evidence.omissions;
+  const omissions = ownerOmissions(goal);
   const partial = omissions?.length ? `\n\n**Owner-authorized omissions**\n${omissions.map((item) => `- ${item.outcomeId}: ${item.reason}`).join("\n")}` : "";
   return `**Sprint ${goal.id} is ready: ${prUrl}**\nThis PR takes \`${sprintBranch(goal.id)}\` into main. To merge the sprint once its CI is green, a person reacts :${APPROVE_EMOJI}: on this post (or the owner presses M in Chick's detail).${partial}`;
 }
@@ -314,14 +319,15 @@ export class PlanningBridge {
     const seats = teamSeats(await this.store.read(), goal.teamId);
     for (const entry of goal.ceremony.history) {
       const key = `stage:${goal.id}:${entry.stage}`;
-      if (entry.stage !== "planning") {
+      // Stages recorded by legacy migration happened before the ceremony and were never announced; don't announce them late.
+      if (entry.stage !== "planning" && entry.enteredAt !== null) {
         const detail = entry.stage === "proposal" ? "Chick is preparing the draft for the owner's plan approval."
           : entry.stage === "implement" ? approvalMessage(goal, seats)
           : entry.stage === "release" ? "Implementation is frozen. The integration PR, human merge approval and running build verification complete this stage."
           : "The released build is verified running. Chick's retrospective must be published and archived before this goal closes.";
         await this.postIntent(goal, metadata, key, `**Stage: ${entry.stage}**\n${detail}`, entry.enteredAt ? Date.parse(entry.enteredAt) : Date.parse(goal.createdAt));
       }
-      if (entry.stage === "implement") {
+      if (entry.stage === "implement" && entry.evidence.kind === "approval") {
         const approval = entry.evidence.approval;
         const input = approval.source === "owner-command" ? ownerApprovalKey(goal.id) : reactionKey({ post_id: approval.postId, user_id: approval.userId, emoji_name: approval.emoji, create_at: Date.parse(approval.at) });
         if (!metadata.processedPostIds.includes(input)) { metadata.processedPostIds.push(input); await this.store.saveRuntime(goal.id, metadata); }
@@ -332,7 +338,9 @@ export class PlanningBridge {
         if (!record.deliveredStages.includes(key)) record.deliveredStages.push(key);
       });
     }
-    if (goal.ceremony.closure) await this.postIntent(goal, metadata, `closed:${goal.id}`, `**Goal ${goal.id} closed**\nThe retrospective is published and archived: ${goal.ceremony.closure.evidence.prUrl}`, Date.parse(goal.ceremony.closure.closedAt));
+    const closure = goal.ceremony.closure;
+    if (closure?.evidence.kind === "retro-published") await this.postIntent(goal, metadata, `closed:${goal.id}`, `**Goal ${goal.id} closed**\nThe retrospective is published and archived: ${closure.evidence.prUrl}`, Date.parse(closure.closedAt));
+    if (closure?.evidence.kind === "release-reverted") await this.postIntent(goal, metadata, `closed:${goal.id}`, `**Goal ${goal.id} closed: release reverted**\nThe sprint's integration ${closure.evidence.prUrl} was reverted on main by ${closure.evidence.revertPrUrl} before its release was verified running, so there is no release to retro.`, Date.parse(closure.closedAt));
   }
 
   private async ensureProposalAnnouncement(goal: PlanningGoal, metadata: BridgeRecord): Promise<void> {
@@ -362,6 +370,19 @@ export class PlanningBridge {
     let goal = (await this.store.read()).planningGoals!.find((item) => item.id === id)!;
     if (!goal.ceremony || goal.ceremony.closure) return;
     const metadata = await this.metadata(id);
+    // The revert PR merged through the human merge gate before the release was verified running: nothing ran to retro on.
+    if (goal.ceremony.stage === "release" && goal.integration?.status === "reverted") {
+      await this.store.update((state) => {
+        const found = state.planningGoals!.find((item) => item.id === id)!;
+        if (found.ceremony?.stage !== "release" || found.ceremony.closure || found.integration?.status !== "reverted") return;
+        found.ceremony = closeRevertedRelease(found, new Date().toISOString());
+        found.updatedAt = found.ceremony.closure!.closedAt;
+      }, `Close goal ${id}: its release was reverted before it ran`);
+      delete metadata.waiting;
+      await this.store.saveRuntime(id, metadata);
+      await this.announceStages((await this.store.read()).planningGoals!.find((item) => item.id === id)!, metadata);
+      return;
+    }
     if (goal.ceremony.stage === "release" && goal.integration?.status === "merged") {
       const progress = await this.adapters.release?.poll({ ...this.context(goal), mergeApproval: metadata.mergeApproval }) ?? { status: "pending" as const, reason: "Waiting for the running-build verification adapter." };
       Object.assign(metadata, await this.metadata(id));

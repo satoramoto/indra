@@ -1021,9 +1021,12 @@ describe("persisted ceremony and allowed actions", () => {
     fixture.model.key("n"); expect(fixture.model.input).toEqual({ value: "" });
     fixture.model.key("escape");
     const legacy = ceremonySession("retro", "goal-legacy"); delete legacy.loop!.ceremony;
+    legacy.migration = "evidence conflicts: its integration is merged, but outcome outcome-1 is running.";
     fixture.sessions([closed, legacy]); await fixture.model.refresh();
     fixture.model.key("n"); expect(fixture.model.input).toBeUndefined();
-    expect(fixture.model.notice).toContain("goal-legacy (ceremony not recorded)");
+    expect(fixture.model.notice).toContain("goal-legacy (ceremony not recorded; legacy goal evidence conflicts: its integration is merged, but outcome outcome-1 is running.)");
+    // The goal that blocks is the one the team list still shows.
+    expect(fixture.model.sprintsForTeam().map((sprint) => sprint.id)).toEqual(["goal-legacy"]);
     expect(fixture.goals.start).not.toHaveBeenCalled();
   });
 

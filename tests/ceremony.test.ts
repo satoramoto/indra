@@ -293,7 +293,7 @@ describe("legacy migration", () => {
     await expect(persistence.update((doc) => prepare(doc.planningGoals![0], "implement"), "Approve without evidence")).rejects.toThrow("migration");
     expect(await readFile(join(persistence.checkout, "state.json"), "utf8")).toBe(before);
     expect(git(persistence.checkout, "rev-list", "--count", "HEAD").trim()).toBe("1");
-    await persistence.migrateGoal(item.id, {}, at(2));
+    await persistence.migrateLegacyGoals(at(2));
     await persistence.update((doc) => {
       const goal = doc.planningGoals![0]; prepare(goal, "implement");
       goal.ceremony = advanceCeremony(goal, transition("implement"));
@@ -335,10 +335,10 @@ describe("legacy migration", () => {
     expect(await readFile(join(persistence.checkout, "state.json"), "utf8")).toBe(before);
     expect(git(persistence.checkout, "rev-list", "--count", "HEAD").trim()).toBe("1");
   });
-  it("validates supplied migration history against the original record and keeps unknown times unknown", async () => {
+  it("validates a migration against the original record and keeps unknown times unknown", async () => {
     const item = staged("retro"); delete item.ceremony;
     const persistence = await store([item]);
-    const result = migrateLegacyCeremony(item, { approval: plan, implementation, release: running }, at(10));
+    const result = migrateLegacyCeremony(item, at(10));
     if (result.status !== "ready") throw new Error("Expected migration");
     for (const mutate of [
       (goal: PlanningGoal) => { goal.proposal!.summary = "Replace the approved plan"; },
@@ -351,20 +351,23 @@ describe("legacy migration", () => {
       }, "Rewrite legacy history")).rejects.toThrow();
     }
     expect((await persistence.read()).planningGoals![0]).toEqual(item);
-    await persistence.migrateGoal(item.id, { approval: plan, implementation, release: running }, at(10));
+    await persistence.migrateLegacyGoals(at(10));
     expect((await persistence.read()).planningGoals![0]).toEqual({ ...item, ceremony: result.ceremony });
   });
-  it("leaves an approved/merged legacy goal unknown without verified history", () => {
+  it("closes an approved, merged legacy goal at release without claiming a human approval, running build or retro", () => {
     const item = staged("retro"); delete item.ceremony;
     const before = structuredClone(item);
-    expect(migrateLegacyCeremony(item, {}, at(10))).toEqual({ status: "unknown", missing: ["approval"] });
-    expect(migrateLegacyCeremony(item, { release: running, retro }, at(10))).toEqual({ status: "unknown", missing: ["approval", "implementation"] });
+    const migrated = migrateLegacyCeremony(item, at(10));
+    if (migrated.status !== "ready") throw new Error("Expected migration");
+    expect(migrated.ceremony.stage).toBe("release");
+    expect(migrated.ceremony.history.map((entry) => entry.stage === "implement" || entry.stage === "release" ? entry.evidence.kind : entry.stage)).toEqual(["planning", "proposal", "legacy-approval", "legacy-implementation"]);
+    expect(migrated.ceremony.closure).toEqual({ closedAt: at(10), evidence: { kind: "legacy-migration", integration: "merged", prUrl: running.prUrl, mergedSha: running.mergedSha } });
     expect(item).toEqual(before);
   });
   it("migrates legacy planning/proposal facts without inventing historical entry times", () => {
     for (const stage of ["planning", "proposal"] as const) {
       const item = staged(stage); delete item.ceremony;
-      const migrated = migrateLegacyCeremony(item, {}, at(10));
+      const migrated = migrateLegacyCeremony(item, at(10));
       expect(migrated.status).toBe("ready");
       if (migrated.status !== "ready") throw new Error("Expected migration");
       expect(migrated.ceremony.stage).toBe(stage);
@@ -373,40 +376,25 @@ describe("legacy migration", () => {
       expect(migrated.ceremony.closure).toBeUndefined();
     }
   });
-  it("uses supplied evidence through running release and retro, retaining unknown times", () => {
-    const item = staged("retro"); delete item.ceremony;
-    for (const [evidence, expected] of [[{ approval: plan }, "implement"], [{ approval: plan, implementation }, "release"], [{ approval: plan, implementation, release: running }, "retro"]] as const) {
-      const migrated = migrateLegacyCeremony(item, evidence, at(10));
-      expect(migrated.status).toBe("ready");
-      if (migrated.status !== "ready") throw new Error("Expected migration");
-      expect(migrated.ceremony.stage).toBe(expected);
-      expect(migrated.ceremony.history.slice(1).every((entry) => entry.enteredAt === null)).toBe(true);
-      expect(migrated.ceremony.closure).toBeUndefined();
-    }
-    const migrated = migrateLegacyCeremony(item, { approval: plan, implementation, release: running, retro }, at(10));
-    expect(migrated.status === "ready" && migrated.ceremony.closure?.closedAt).toBe(at(10));
-    const lateApproval: ApprovalEvidence = { ...plan, approval: { source: "owner-command", command: "planning approve", at: at(8) } };
-    expect(() => migrateLegacyCeremony(item, { approval: lateApproval, implementation, release: running }, at(10))).toThrow("chronological");
-  });
   it("allows later transitions after migration while keeping old times unknown", () => {
     const item = staged("proposal"); delete item.ceremony;
-    const result = migrateLegacyCeremony(item, {}, at(2));
+    const result = migrateLegacyCeremony(item, at(2));
     if (result.status !== "ready") throw new Error("Expected migration");
     item.ceremony = result.ceremony; prepare(item, "implement");
     item.ceremony = advanceCeremony(item, transition("implement"));
     expect(item.ceremony.history[1].enteredAt).toBeNull();
     expect(item.ceremony.history[2].enteredAt).toBe(at(3));
   });
-  it("reports conflicting legacy goals without closing them, and blocks creation until resolved", async () => {
+  it("resolves open-goal conflicts only as far as the evidence proves, and blocks creation until then", async () => {
     const first = staged("retro"); delete first.ceremony;
     const second = goal("goal-two");
     const persistence = await store([first, second]);
     expect(await persistence.teamConflicts()).toEqual([{ teamId: "team-one", goalIds: ["goal-one", "goal-two"] }]);
     await expect(persistence.createGoal(goal("goal-three"))).rejects.toThrow("goal-one, goal-two");
-    expect(await persistence.migrateGoal(first.id, {}, at(10))).toEqual({ status: "unknown", missing: ["approval"] });
-    expect(git(persistence.checkout, "rev-list", "--count", "HEAD").trim()).toBe("1");
-    await persistence.migrateGoal(second.id, {}, at(10));
-    expect(openGoalConflicts((await persistence.read()).planningGoals!)).toEqual([{ teamId: "team-one", goalIds: ["goal-one", "goal-two"] }]);
-    expect((await persistence.read()).planningGoals?.every((item) => !item.ceremony?.closure)).toBe(true);
+    await persistence.migrateLegacyGoals(at(10));
+    expect(git(persistence.checkout, "rev-list", "--count", "HEAD").trim()).toBe("3");
+    expect(openGoalConflicts((await persistence.read()).planningGoals!)).toEqual([]);
+    expect((await persistence.read()).planningGoals?.map((item) => [item.id, item.ceremony?.stage, !!item.ceremony?.closure])).toEqual([["goal-one", "release", true], ["goal-two", "planning", false]]);
+    await expect(persistence.createGoal(goal("goal-three"))).rejects.toThrow("unclosed goals: goal-two.");
   });
 });

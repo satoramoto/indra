@@ -27,16 +27,38 @@ export interface PublishedRetroEvidence {
   kind: "retro-published"; path: string; prUrl: string; baseBranch: "main"; mergedSha: string; postId: string;
   publishedAt: string; factsOnly: true; suggestions: "owner-proposals-only";
 }
+/**
+ * Migration-only proof, taken from what a pre-ceremony goal recorded in state: it reached `approved` (only the human
+ * approval code set that stage) with one assignment per proposed outcome. Who approved, and when, stays unknown.
+ */
+export interface LegacyApprovalEvidence { kind: "legacy-approval"; proposalId: string }
+/** Migration-only proof: the recorded merged PR of each outcome; `unmerged` lists outcomes that failed. Merge SHAs, reviews and CI stay unknown. */
+export interface LegacyImplementationEvidence {
+  kind: "legacy-implementation";
+  outcomes: { outcomeId: string; seatId: string; prUrl: string }[];
+  unmerged?: { outcomeId: string; seatId: string }[];
+}
+/** Closes a goal whose integration PR was reverted on main before its release was verified running: there is no release to retro. */
+export interface RevertedReleaseEvidence { kind: "release-reverted"; prUrl: string; mergedSha: string; revertPrUrl: string }
+/**
+ * Closes a pre-ceremony goal that had already finished: its integration merged or was reverted, or it had none and
+ * every assignment merged. Recorded only by migration, at the migration time; no retro or timings are implied.
+ */
+export interface LegacyClosureEvidence {
+  kind: "legacy-migration"; integration: "none" | "merged" | "reverted";
+  prUrl?: string; mergedSha?: string; revertPrUrl?: string;
+}
+export type ClosureEvidence = PublishedRetroEvidence | RevertedReleaseEvidence | LegacyClosureEvidence;
 export type CeremonyEntry =
   | { stage: "planning" | "proposal"; enteredAt: string | null }
-  | { stage: "implement"; enteredAt: string | null; evidence: ApprovalEvidence }
-  | { stage: "release"; enteredAt: string | null; evidence: ImplementationEvidence }
+  | { stage: "implement"; enteredAt: string | null; evidence: ApprovalEvidence | LegacyApprovalEvidence }
+  | { stage: "release"; enteredAt: string | null; evidence: ImplementationEvidence | LegacyImplementationEvidence }
   | { stage: "retro"; enteredAt: string | null; evidence: RunningReleaseEvidence };
 export interface CeremonyRecord {
   version: 1; stage: CeremonyStage; history: CeremonyEntry[];
   /** Only migration may record unknown entry times. Never substitute updatedAt for missing history. */
   migratedAt?: string;
-  closure?: { closedAt: string; evidence: PublishedRetroEvidence };
+  closure?: { closedAt: string; evidence: ClosureEvidence };
 }
 export type CeremonyTransition =
   | { to: "proposal"; at: string }
@@ -52,6 +74,7 @@ const sha = ref("ceremonySha");
 const id = ref("ceremonyId");
 const approval = ref("ceremonyHumanApproval");
 const entryTime = { anyOf: [time, { type: "null" }] };
+const closedBy = (kinds: string[]) => ({ required: ["closure"], properties: { closure: { properties: { evidence: { properties: { kind: { enum: kinds } } } } } } });
 
 /** Additive v1 schema contract. The fixture is the exact companion schema to land in indra-state before activation. */
 export const CEREMONY_SCHEMA_DEFS = {
@@ -80,15 +103,25 @@ export const CEREMONY_SCHEMA_DEFS = {
   ceremonyRetro: object({ kind: { const: "retro-published" }, path: { type: "string", pattern: "^docs/retros/[a-z][a-z0-9-]+\\.md$" },
     prUrl: ref("ceremonyPr"), baseBranch: { const: "main" }, mergedSha: sha, postId: text, publishedAt: time,
     factsOnly: { const: true }, suggestions: { const: "owner-proposals-only" } }),
+  ceremonyLegacyApproval: object({ kind: { const: "legacy-approval" }, proposalId: id }),
+  ceremonyLegacyImplementation: object({ kind: { const: "legacy-implementation" },
+    outcomes: { type: "array", minItems: 1, items: object({ outcomeId: id, seatId: id, prUrl: ref("ceremonyPr") }) },
+    unmerged: { type: "array", minItems: 1, items: object({ outcomeId: id, seatId: id }) },
+  }, ["kind", "outcomes"]),
+  ceremonyRevertedRelease: object({ kind: { const: "release-reverted" }, prUrl: ref("ceremonyPr"), mergedSha: sha, revertPrUrl: ref("ceremonyPr") }),
+  ceremonyLegacyClosure: object({ kind: { const: "legacy-migration" }, integration: { enum: ["none", "merged", "reverted"] },
+    prUrl: ref("ceremonyPr"), mergedSha: sha, revertPrUrl: ref("ceremonyPr") }, ["kind", "integration"]),
   ceremonyEntry: { oneOf: [
     object({ stage: { enum: ["planning", "proposal"] }, enteredAt: entryTime }),
     object({ stage: { const: "implement" }, enteredAt: entryTime, evidence: ref("ceremonyApproval") }),
+    object({ stage: { const: "implement" }, enteredAt: { type: "null" }, evidence: ref("ceremonyLegacyApproval") }),
     object({ stage: { const: "release" }, enteredAt: entryTime, evidence: ref("ceremonyImplementation") }),
+    object({ stage: { const: "release" }, enteredAt: { type: "null" }, evidence: ref("ceremonyLegacyImplementation") }),
     object({ stage: { const: "retro" }, enteredAt: entryTime, evidence: ref("ceremonyRelease") }),
   ] },
   ceremony: { ...object({ version: { const: 1 }, stage: { enum: [...CEREMONY_STAGES] },
     history: { type: "array", minItems: 1, maxItems: 5, items: ref("ceremonyEntry") }, migratedAt: time,
-    closure: object({ closedAt: time, evidence: ref("ceremonyRetro") }),
+    closure: object({ closedAt: time, evidence: { oneOf: [ref("ceremonyRetro"), ref("ceremonyRevertedRelease"), ref("ceremonyLegacyClosure")] } }),
   }, ["version", "stage", "history"]), allOf: [
     ...CEREMONY_STAGES.map((stage, index) => ({
       if: { properties: { stage: { const: stage } } },
@@ -96,7 +129,9 @@ export const CEREMONY_SCHEMA_DEFS = {
         prefixItems: CEREMONY_STAGES.slice(0, index + 1).map((name) => ({ properties: { stage: { const: name } } })),
       } } },
     })),
-    { if: { required: ["closure"] }, then: { properties: { stage: { const: "retro" } } } },
+    { if: closedBy(["retro-published"]), then: { properties: { stage: { const: "retro" } } } },
+    { if: closedBy(["release-reverted", "legacy-migration"]), then: { properties: { stage: { const: "release" } } } },
+    { if: closedBy(["legacy-migration"]), then: { required: ["migratedAt"] } },
     { if: { not: { required: ["migratedAt"] } }, then: { properties: { history: { items: { properties: { enteredAt: time } } } } } },
   ] },
 };
@@ -140,6 +175,34 @@ function validateImplementation(goal: PlanningGoal, evidence: ImplementationEvid
     requireThat(outcome?.seatId === item.seatId && assignment?.seatId === item.seatId && assignment.status === "failed", "Only terminal, unmerged outcomes may be explicitly omitted by the owner.");
   }
 }
+function assignmentsMatchOutcomes(goal: PlanningGoal): boolean {
+  const outcomes = goal.proposal?.outcomes ?? [];
+  return outcomes.length > 0 && goal.assignments?.length === outcomes.length && outcomes.every((outcome) => goal.assignments?.some((assignment) => assignment.outcomeId === outcome.id && assignment.seatId === outcome.seatId));
+}
+function validateLegacyApproval(goal: PlanningGoal, evidence: LegacyApprovalEvidence): void {
+  requireThat(goal.stage === "approved" && goal.proposal?.id === evidence.proposalId && assignmentsMatchOutcomes(goal), "Legacy approval requires the approved proposal with one assignment per outcome, on its proposed seat.");
+}
+function validateLegacyImplementation(goal: PlanningGoal, evidence: LegacyImplementationEvidence): void {
+  const outcomes = goal.proposal?.outcomes ?? [];
+  const accounted = [...evidence.outcomes, ...(evidence.unmerged ?? [])];
+  requireThat(outcomes.length > 0 && accounted.length === outcomes.length && new Set(accounted.map((item) => item.outcomeId)).size === outcomes.length, "Legacy implementation evidence must cover every outcome exactly once.");
+  for (const item of accounted) {
+    const assignment = goal.assignments?.find((assignment) => assignment.outcomeId === item.outcomeId);
+    const merged = "prUrl" in item;
+    requireThat(assignment?.seatId === item.seatId && (merged ? assignment.status === "merged" && assignment.prUrl === item.prUrl : assignment.status === "failed"), "Legacy implementation evidence must match each recorded merged or failed assignment.");
+  }
+}
+/** Legacy closure stays valid if the integration is rolled back later: a merged record may since have been reverted. */
+function validateLegacyClosure(goal: PlanningGoal, evidence: LegacyClosureEvidence): void {
+  const integration = goal.integration;
+  if (evidence.integration === "none") {
+    requireThat(!integration && !evidence.prUrl && !evidence.mergedSha && !evidence.revertPrUrl && goal.assignments?.every((item) => item.status === "merged"), "A legacy goal without an integration closes only when every assignment merged.");
+    return;
+  }
+  requireThat(integration && evidence.prUrl && evidence.mergedSha && integration.prUrl === evidence.prUrl && integration.mergedSha === evidence.mergedSha, "Legacy closure must reference the goal's recorded integration PR and merge commit.");
+  if (evidence.integration === "merged") requireThat(!evidence.revertPrUrl && (integration.status === "merged" || integration.status === "reverted"), "Legacy closure requires a merged integration.");
+  else requireThat(integration.status === "reverted" && integration.revertPrUrl === evidence.revertPrUrl, "Legacy closure requires the recorded reverted integration.");
+}
 function validateRelease(goal: PlanningGoal, evidence: RunningReleaseEvidence): void {
   // A later owner-approved rollback does not erase the fact that this release ran.
   requireThat((goal.integration?.status === "merged" || goal.integration?.status === "reverted") && goal.integration.prUrl === evidence.prUrl && goal.integration.mergedSha === evidence.mergedSha, "Release evidence must reference the merged integration PR.");
@@ -160,13 +223,19 @@ export function validateCeremony(goal: PlanningGoal, ceremony: CeremonyRecord = 
     const prior = previous;
     requireThat(entry.enteredAt !== null || ceremony.migratedAt !== undefined, "Only legacy migration may leave stage history unknown.");
     if (entry.enteredAt !== null) { notBefore(entry.enteredAt, previous); previous = entry.enteredAt; }
-    if (entry.stage === "implement") {
+    if (entry.stage === "implement" && entry.evidence.kind === "legacy-approval") {
+      requireThat(entry.enteredAt === null && ceremony.migratedAt, "Legacy approval evidence is recorded only by migration.");
+      validateLegacyApproval(goal, entry.evidence);
+    } else if (entry.stage === "implement" && entry.evidence.kind === "approval") {
       validateApproval(goal, entry.evidence);
       notBefore(entry.evidence.approval.at, prior);
       if (entry.enteredAt) notBefore(entry.enteredAt, entry.evidence.approval.at);
       else if (ceremony.migratedAt) { notBefore(ceremony.migratedAt, entry.evidence.approval.at); previous = entry.evidence.approval.at; }
     }
-    if (entry.stage === "release") {
+    if (entry.stage === "release" && entry.evidence.kind === "legacy-implementation") {
+      requireThat(entry.enteredAt === null && ceremony.migratedAt, "Legacy implementation evidence is recorded only by migration.");
+      validateLegacyImplementation(goal, entry.evidence);
+    } else if (entry.stage === "release" && entry.evidence.kind === "implementation") {
       validateImplementation(goal, entry.evidence);
       if (entry.evidence.partialApproval) {
         const implementation = ceremony.history.find((item) => item.stage === "implement");
@@ -182,14 +251,24 @@ export function validateCeremony(goal: PlanningGoal, ceremony: CeremonyRecord = 
     }
   }
   if (ceremony.migratedAt) notBefore(ceremony.migratedAt, goal.createdAt);
-  if (ceremony.closure) {
+  const closure = ceremony.closure;
+  if (closure?.evidence.kind === "retro-published") {
     requireThat(ceremony.stage === "retro", "A goal can close only after retro.");
-    requireThat(ceremony.closure.evidence.path === `docs/retros/${goal.id}.md`, "Published retro must reference this goal's document.");
-    notBefore(ceremony.closure.evidence.publishedAt, previous);
+    requireThat(closure.evidence.path === `docs/retros/${goal.id}.md`, "Published retro must reference this goal's document.");
+    notBefore(closure.evidence.publishedAt, previous);
     const release = ceremony.history.find((entry) => entry.stage === "retro");
-    if (release?.stage === "retro") notBefore(ceremony.closure.evidence.publishedAt, release.evidence.runningAt);
-    notBefore(ceremony.closure.closedAt, ceremony.closure.evidence.publishedAt);
-  }
+    if (release?.stage === "retro") notBefore(closure.evidence.publishedAt, release.evidence.runningAt);
+    notBefore(closure.closedAt, closure.evidence.publishedAt);
+  } else if (closure?.evidence.kind === "release-reverted") {
+    requireThat(ceremony.stage === "release", "A reverted release closes from release, before any running release.");
+    const integration = goal.integration;
+    requireThat(integration?.status === "reverted" && integration.prUrl === closure.evidence.prUrl && integration.mergedSha === closure.evidence.mergedSha && integration.revertPrUrl === closure.evidence.revertPrUrl, "A reverted release closure must reference the recorded reverted integration.");
+    notBefore(closure.closedAt, previous);
+    notBefore(closure.closedAt, ceremony.migratedAt);
+  } else if (closure?.evidence.kind === "legacy-migration") {
+    requireThat(ceremony.stage === "release" && ceremony.migratedAt && closure.closedAt === ceremony.migratedAt, "Legacy closure is recorded only by migration, at release.");
+    validateLegacyClosure(goal, closure.evidence);
+  } else requireThat(!closure, "Unknown closure evidence.");
 }
 
 export function startCeremony(at: string): CeremonyRecord {
@@ -220,6 +299,20 @@ export function closeCeremony(goal: PlanningGoal, at: string, evidence: Publishe
   return next;
 }
 
+/**
+ * Closes a goal still in release whose integration PR was reverted on main (through the human merge gate for the
+ * revert PR) before a running release was verified. Nothing ran to retro on, so the goal closes as reverted.
+ */
+export function closeRevertedRelease(goal: PlanningGoal, at: string): CeremonyRecord {
+  requireThat(goal.ceremony && !goal.ceremony.closure && goal.ceremony.stage === "release", "Only an open goal in release closes as a reverted release.");
+  const integration = goal.integration;
+  requireThat(integration?.status === "reverted" && integration.prUrl && integration.mergedSha && integration.revertPrUrl, "A reverted release requires the recorded reverted integration.");
+  const evidence: RevertedReleaseEvidence = { kind: "release-reverted", prUrl: integration.prUrl, mergedSha: integration.mergedSha, revertPrUrl: integration.revertPrUrl };
+  const next = { ...structuredClone(goal.ceremony), closure: { closedAt: at, evidence } };
+  validateCeremony(goal, next);
+  return next;
+}
+
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 /** Store-level guard: legacy workflow changes need migration; durable history cannot be erased or rewritten. */
 export function validateCeremonyMutation(before: PlanningGoal, after: PlanningGoal | undefined): void {
@@ -229,15 +322,7 @@ export function validateCeremonyMutation(before: PlanningGoal, after: PlanningGo
     const next = after.ceremony;
     if (!next) return;
     requireThat(next.migratedAt, "Existing goals require explicit evidence-based migration.");
-    validateCeremony(before, next);
-    const evidence: LegacyEvidence = {};
-    for (const entry of next.history) {
-      if (entry.stage === "implement") evidence.approval = entry.evidence;
-      if (entry.stage === "release") evidence.implementation = entry.evidence;
-      if (entry.stage === "retro") evidence.release = entry.evidence;
-    }
-    if (next.closure) evidence.retro = next.closure.evidence;
-    const migration = migrateLegacyCeremony(before, evidence, next.migratedAt);
+    const migration = migrateLegacyCeremony(before, next.migratedAt);
     requireThat(migration.status === "ready" && same(migration.ceremony, next), "Migration must preserve known history and leave unproven history unknown.");
     return;
   }
@@ -249,33 +334,65 @@ export function validateCeremonyMutation(before: PlanningGoal, after: PlanningGo
   requireThat(next.history.length >= old.history.length && next.history.length <= old.history.length + 1 && old.history.every((entry, i) => same(entry, next.history[i])), "Ceremony history is append-only, one stage at a time.");
   if (old.closure) requireThat(same(old, next), "A closed ceremony is immutable.");
   if (old.stage === "release" && next.stage === "retro") requireThat(after.integration?.status === "merged", "A running release requires a merged integration PR that has not been reverted.");
-  if (next.closure && !old.closure) requireThat(old.stage === "retro" && next.stage === "retro", "Entering retro and closing it are separate steps.");
+  if (next.closure && !old.closure) {
+    const kind = next.closure.evidence.kind;
+    if (kind === "retro-published") requireThat(old.stage === "retro" && next.stage === "retro", "Entering retro and closing it are separate steps.");
+    else requireThat(kind === "release-reverted" && old.stage === "release" && next.stage === "release", "Only migration records a legacy closure.");
+  }
 }
 
-export interface LegacyEvidence { approval?: ApprovalEvidence; implementation?: ImplementationEvidence; release?: RunningReleaseEvidence; retro?: PublishedRetroEvidence }
-export type LegacyMigration = { status: "ready"; ceremony: CeremonyRecord } | { status: "unknown"; missing: string[] };
-/** Legacy flags never establish human approval, a running build, or publication of a retro. */
-export function migrateLegacyCeremony(goal: PlanningGoal, evidence: LegacyEvidence, at: string): LegacyMigration {
+export type LegacyMigration = { status: "ready"; ceremony: CeremonyRecord } | { status: "conflict"; reason: string };
+/**
+ * Derives a pre-ceremony goal's ceremony from what state recorded, and nothing else. Each stage it enters is proven by
+ * the goal's own facts; every entry time after planning stays unknown, and no retro is implied:
+ * - clarifying → planning; drafting or awaiting-review → proposal;
+ * - approved with one assignment per outcome → implement, while the sprint is collecting or has no integration yet;
+ * - every assignment merged or failed (one merged at least) with an integration PR → release;
+ * - finished goals close at release, marked as a legacy migration: a merged integration with no revert PR open, a
+ *   reverted integration, or no integration at all with every assignment merged.
+ * Evidence that does not fit these shapes is reported as a conflict and the goal is left untouched.
+ */
+export function migrateLegacyCeremony(goal: PlanningGoal, at: string): LegacyMigration {
   requireThat(!goal.ceremony, "Goal already has a ceremony.");
-  const missing: string[] = [];
-  if ((goal.stage === "approved" || evidence.implementation || evidence.release || evidence.retro) && !evidence.approval) missing.push("approval");
-  if ((evidence.release || evidence.retro) && !evidence.implementation) missing.push("implementation");
-  if (evidence.retro && !evidence.release) missing.push("running release");
-  if (missing.length) return { status: "unknown", missing };
+  const conflict = (reason: string): LegacyMigration => ({ status: "conflict", reason });
   const history: CeremonyEntry[] = [{ stage: "planning", enteredAt: goal.createdAt }];
-  if (goal.stage !== "clarifying" || evidence.approval) history.push({ stage: "proposal", enteredAt: null });
-  if (evidence.approval) history.push({ stage: "implement", enteredAt: null, evidence: structuredClone(evidence.approval) });
-  if (evidence.implementation) history.push({ stage: "release", enteredAt: null, evidence: structuredClone(evidence.implementation) });
-  if (evidence.release) history.push({ stage: "retro", enteredAt: null, evidence: structuredClone(evidence.release) });
-  const ceremony: CeremonyRecord = { version: 1, stage: history.at(-1)!.stage, history, migratedAt: at,
-    ...(evidence.retro ? { closure: { closedAt: at, evidence: structuredClone(evidence.retro) } } : {}),
+  const done = (closure?: LegacyClosureEvidence): LegacyMigration => {
+    const ceremony: CeremonyRecord = { version: 1, stage: history.at(-1)!.stage, history, migratedAt: at, ...(closure ? { closure: { closedAt: at, evidence: closure } } : {}) };
+    try { validateCeremony(goal, ceremony); }
+    catch (error) { if (error instanceof CeremonyError) return conflict(error.message); throw error; }
+    return { status: "ready", ceremony };
   };
-  validateCeremony(goal, ceremony);
-  return { status: "ready", ceremony };
+  if (goal.stage === "clarifying") return done();
+  history.push({ stage: "proposal", enteredAt: null });
+  if (goal.stage !== "approved") return done();
+  if (!goal.proposal || !assignmentsMatchOutcomes(goal)) return conflict("it is approved, but its assignments do not match its proposed outcomes one to one.");
+  history.push({ stage: "implement", enteredAt: null, evidence: { kind: "legacy-approval", proposalId: goal.proposal.id } });
+  const assignments = goal.assignments!;
+  const merged = assignments.filter((item) => item.status === "merged");
+  if (merged.some((item) => !item.prUrl)) return conflict("an assignment is merged but has no recorded PR.");
+  const failed = assignments.filter((item) => item.status === "failed");
+  const release = (): void => { history.push({ stage: "release", enteredAt: null, evidence: { kind: "legacy-implementation",
+    outcomes: merged.map((item) => ({ outcomeId: item.outcomeId, seatId: item.seatId, prUrl: item.prUrl! })),
+    ...(failed.length ? { unmerged: failed.map((item) => ({ outcomeId: item.outcomeId, seatId: item.seatId })) } : {}) } }); };
+  const integration = goal.integration;
+  if (!integration) {
+    if (merged.length < assignments.length) return done();
+    release();
+    return done({ kind: "legacy-migration", integration: "none" });
+  }
+  if (integration.status === "collecting") return done();
+  const unsettled = assignments.filter((item) => item.status !== "merged" && item.status !== "failed");
+  if (unsettled.length || !merged.length) return conflict(`its integration is ${integration.status}, but ${unsettled.length ? `outcome ${unsettled.map((item) => `${item.outcomeId} is ${item.status}`).join(", ")}` : "no outcome merged"}.`);
+  release();
+  const recorded = { prUrl: integration.prUrl, mergedSha: integration.mergedSha };
+  if (integration.status === "reverted") return done({ kind: "legacy-migration", integration: "reverted", ...recorded, revertPrUrl: integration.revertPrUrl });
+  if (integration.status === "merged" && !integration.revertPrUrl) return done({ kind: "legacy-migration", integration: "merged", ...recorded });
+  // An open integration PR, or a merged one with its revert PR open, still needs the owner: it enters release.
+  return done();
 }
 
 export interface TeamGoalConflict { teamId: string; goalIds: string[] }
-/** Legacy goals are unclosed, even when their integration PR merged or was reverted. No record is silently closed. */
+/** A goal without a ceremony is unclosed until migration records one; migration closes only goals whose evidence proves them finished. */
 export function openGoalConflicts(goals: PlanningGoal[]): TeamGoalConflict[] {
   const byTeam = new Map<string, string[]>();
   for (const goal of goals) if (!goal.ceremony?.closure) byTeam.set(goal.teamId, [...(byTeam.get(goal.teamId) ?? []), goal.id]);
