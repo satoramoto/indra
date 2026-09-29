@@ -12,7 +12,9 @@ import { CHICK_USERNAME, MattermostAccessError, MattermostPlanningChat, readBotT
 import { opCredential, stageServiceToken } from "./service-account.js";
 import { captureOpEnvironment } from "./op-env.js";
 import { DeveloperSeat, loadDeveloperSeat, processShell } from "./developer-seat.js";
-import { CodexRuntime, DEVELOPER_SESSION_TIMEOUT_MS } from "./codex-runtime.js";
+import { DEVELOPER_SESSION_TIMEOUT_MS, type WriteAccess } from "./codex-runtime.js";
+import { loadSeatEngines, SeatRuntime } from "./seat-runtime.js";
+import { loadSeatPersonas, withPersonaChat, withPersonaRuntime } from "./seat-persona.js";
 import { defaultAppDir, signalReady, TmuxHost, turnLockFile } from "./tmux-host.js";
 import { withFileLock } from "./state-commit.js";
 import { readBuildStamp } from "./build-stamp.js";
@@ -134,6 +136,24 @@ const GOAL_ACTIONS = ["approve", "propose", "integrate", "merge", "rollback"] as
 type GoalAction = typeof GOAL_ACTIONS[number];
 const isGoalAction = (action: string | undefined): action is GoalAction => (GOAL_ACTIONS as readonly (string | undefined)[]).includes(action);
 
+/** All model and posting paths use the seat from state, local engine selection and optional Indra profiles. */
+async function seatServices(store: PlanningStore, username: string, seatId?: string) {
+  const state = await store.read();
+  const teams = state.teams as { slug: string; seats: { id: string; externalIdentities: { mattermost: { username: string } } }[] }[];
+  const seats = teams.flatMap((team) => team.seats);
+  const candidates = seatId === undefined ? teams.find((team) => team.slug === "yahaha")?.seats ?? [] : seats.filter((item) => item.id === seatId);
+  const seat = candidates.find((item) => item.externalIdentities.mattermost.username === username);
+  if (!seat) throw new StateDataError("The bot's seat is not present in state.");
+  const [engines, profiles] = await Promise.all([loadSeatEngines(store.runtimeDir, seats.map((item) => item.id)), loadSeatPersonas(import.meta.url)])
+    .catch((error: Error) => { throw new StateDataError(error.message); });
+  const profile = Object.hasOwn(profiles, seat.id) ? profiles[seat.id] : undefined;
+  const engine = Object.hasOwn(engines, seat.id) ? engines[seat.id] : "codex";
+  return {
+    chat: (token: string) => withPersonaChat(new MattermostPlanningChat(token, username), profile),
+    runtime: (cwd: string, timeoutMs?: number, write?: WriteAccess) => withPersonaRuntime(new SeatRuntime(engine, cwd, timeoutMs, write), profile),
+  };
+}
+
 type Options = { mode: "help" } | { mode: "seat"; seatId: string; checkout: string; readyNonce?: string } | { mode: "state"; checkout: string; once: boolean } | { mode: "ui"; checkout: string } | { mode: "mattermost"; slug: string } | { mode: "mattermost"; checkout: string; once: boolean } | { mode: "planning"; action: "start" | "serve" | "host" | "status" | GoalAction; checkout: string; goal?: string; participants: string[]; readyNonce?: string };
 
 const usage = "Usage: npm start -- [--state PATH] [--once] | --ui [--state PATH] | --mattermost [--state PATH] [--once] | --mattermost --team SLUG | planning start --goal TEXT [--participant SEAT_ID] [--state PATH] | planning propose|approve|integrate|merge|rollback --goal GOAL_ID [--state PATH] | planning serve|host|status [--state PATH] | seat run --seat SEAT_ID [--state PATH]\nPlanning serves only Chick's Yahaha thread, in the team's home channel and project from state. Reply in the thread to clarify; react :memo: on Chick's goal post to request a draft, and :white_check_mark: on the proposal post to approve it.\nEach approved goal is a sprint on branch sprint/GOAL_ID; its seats' PRs target that branch, and one integration PR takes it into main. integrate opens that PR for what merged, merge merges the open integration or revert PR once CI is green, and rollback opens a PR on main reverting the merged sprint.";
@@ -217,10 +237,11 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       try {
         const store = new PlanningStore(options.checkout);
         const seat = await loadDeveloperSeat(store, options.seatId);
-        const chat = new MattermostPlanningChat(await hostedToken(options.checkout, options.readyNonce, (tokenOptions) => readBotToken(seat.username, tokenOptions)), seat.username);
+        const services = await seatServices(store, seat.username, seat.id);
+        const chat = services.chat(await hostedToken(options.checkout, options.readyNonce, (tokenOptions) => readBotToken(seat.username, tokenOptions)));
         await joinTeamHome(options.checkout, options.readyNonce, store, chat, seat.username);
         if (options.readyNonce) await signalReady(options.checkout, options.readyNonce);
-        const runner = new DeveloperSeat(store, seat, chat, processShell, (cwd, write) => new CodexRuntime(cwd, DEVELOPER_SESSION_TIMEOUT_MS, write), (line) => console.log(`[${new Date().toISOString()}] ${line}`));
+        const runner = new DeveloperSeat(store, seat, chat, processShell, (cwd, write) => services.runtime(cwd, DEVELOPER_SESSION_TIMEOUT_MS, write), (line) => console.log(`[${new Date().toISOString()}] ${line}`));
         console.log(`Developer seat ${seat.id} (@${seat.username}) running. Stop with Ctrl-C.`);
         while (true) {
           // Each step holds the turn lock, so the supervisor only restarts this runner for an update between steps.
@@ -293,12 +314,13 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
           return 1;
         }
       }
+      const services = await seatServices(store, CHICK_USERNAME);
       if (options.action === "approve") {
         // Run by the terminal UI: like a hosted process, it reads Chick's token only with the staged service account token.
         try {
-          const chat = new MattermostPlanningChat(await readChickToken({ ...await opCredential(options.checkout), headless: true }), CHICK_USERNAME);
+          const chat = services.chat(await readChickToken({ ...await opCredential(options.checkout), headless: true }));
           await joinTeamHome(options.checkout, undefined, store, chat, CHICK_USERNAME);
-          const { goal, alreadyApproved } = await new PlanningBridge(store, chat, new CodexRuntime(process.cwd())).approve(options.goal!);
+          const { goal, alreadyApproved } = await new PlanningBridge(store, chat, services.runtime(process.cwd())).approve(options.goal!);
           console.log(alreadyApproved ? `Goal ${goal.id} was already approved; no new assignments.` : `Approved goal ${goal.id}: ${goal.assignments?.length ?? 0} outcome(s) queued for Developer seats.`);
           return 0;
         } catch (error) {
@@ -309,9 +331,9 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       if (options.action === "integrate" || options.action === "merge" || options.action === "rollback") {
         // Run by the terminal UI, like approve: Chick's token only with the staged service account token.
         try {
-          const chat = new MattermostPlanningChat(await readChickToken({ ...await opCredential(options.checkout), headless: true }), CHICK_USERNAME);
+          const chat = services.chat(await readChickToken({ ...await opCredential(options.checkout), headless: true }));
           await joinTeamHome(options.checkout, undefined, store, chat, CHICK_USERNAME);
-          const bridge = new PlanningBridge(store, chat, new CodexRuntime(process.cwd()));
+          const bridge = new PlanningBridge(store, chat, services.runtime(process.cwd()));
           console.log(await (options.action === "integrate" ? bridge.integrate(options.goal!) : options.action === "merge" ? bridge.merge(options.goal!) : bridge.rollback(options.goal!)));
           return 0;
         } catch (error) {
@@ -321,9 +343,9 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       }
       if (options.action === "start") {
         try {
-          const chat = new MattermostPlanningChat(await hostedToken(options.checkout, options.readyNonce, readChickToken), CHICK_USERNAME);
+          const chat = services.chat(await hostedToken(options.checkout, options.readyNonce, readChickToken));
           await joinTeamHome(options.checkout, undefined, store, chat, CHICK_USERNAME);
-          const goal = await new PlanningBridge(store, chat, new CodexRuntime(process.cwd())).start(options.goal!, options.participants);
+          const goal = await new PlanningBridge(store, chat, services.runtime(process.cwd())).start(options.goal!, options.participants);
           console.log(`Planning goal ${goal.id}: ${SERVER}/yahaha/pl/${goal.mattermost.rootPostId}`);
           return 0;
         } catch (error) {
@@ -332,13 +354,13 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         }
       }
       recordRunningBuild(`${options.checkout}.runtime`, import.meta.url);
-      const chat = new MattermostPlanningChat(await hostedToken(options.checkout, options.readyNonce, readChickToken), CHICK_USERNAME);
+      const chat = services.chat(await hostedToken(options.checkout, options.readyNonce, readChickToken));
       await joinTeamHome(options.checkout, options.readyNonce, store, chat, CHICK_USERNAME);
-      const bridge =new PlanningBridge(store, chat, new CodexRuntime(process.cwd()));
+      const bridge =new PlanningBridge(store, chat, services.runtime(process.cwd()));
       console.log("Chick planning bridge running. Stop with Ctrl-C.");
       let ready = false;
       while (true) {
-        // A poll finishes its Codex turns and saves pending deliveries before it releases the turn lock.
+        // A poll finishes its model turns and saves pending deliveries before it releases the turn lock.
         await withFileLock(turnLockFile(options.checkout, { kind: "bridge" }), () => bridge.poll(), 24 * 60 * 60_000);
         if (!ready && options.readyNonce) {
           await signalReady(options.checkout, options.readyNonce);

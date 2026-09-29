@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { git, stateCheckout } from "./state-checkout.js";
 import { PlanningStore } from "../src/planning.js";
@@ -58,6 +58,7 @@ class FakeShell implements Shell {
   inspectCode?: number;
   abortCode = 0;
   comments: { body: string }[] = [];
+  maintenancePR: unknown = { merged: false };
   async retain(worktree: string, branch: string, gitDir: string) {
     await mkdir(worktree, { recursive: true });
     await mkdir(gitDir, { recursive: true });
@@ -85,6 +86,7 @@ class FakeShell implements Shell {
       if (!this.abortCode) this.unfinishedMerge = false;
       return { code: this.abortCode, stdout: "", stderr: "" };
     }
+    if (line.startsWith("gh api repos/satoramoto/indra/pulls/9 --method GET")) return { code: 0, stdout: JSON.stringify(this.maintenancePR), stderr: "" };
     if (line.startsWith("gh api") && args.includes("--paginate")) return { code: 0, stdout: JSON.stringify([this.comments]), stderr: "" };
     if (line.startsWith("gh pr comment")) this.comments.push({ body: args.at(-1)! });
     if (line.startsWith("gh pr merge") && this.draft) return { code: 1, stdout: "", stderr: "GraphQL: Pull Request is still a draft (mergePullRequest)" };
@@ -396,11 +398,11 @@ describe("developer seat", () => {
     expect(await seat.tick()).toBe("idle");
   });
 
-  it("fails on a Codex error without recording its output", async () => {
+  it("fails on an agent error using runtime-neutral wording without recording its output", async () => {
     const { codex, seat, assignment } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
     codex.fail = true;
     await seat.tick();
-    expect(await assignment("outcome-1")).toMatchObject({ status: "failed", note: "build: Codex developer session failed." });
+    expect(await assignment("outcome-1")).toMatchObject({ status: "failed", note: "build: Agent developer session failed." });
   });
 
   it("rejects assignments on unapproved goals and leaves other seats' work alone", async () => {
@@ -576,7 +578,7 @@ describe("developer seat", () => {
     expect(codex.runs[0].cwd).toBe(record.worktree);
     expect(shell.calls.some((call) => call.startsWith("git worktree add"))).toBe(false);
     expect(await readFile(join(record.worktree, "retained.txt"), "utf8")).toBe("unfinished work");
-    expect(await assignment("outcome-1")).toMatchObject({ status: "failed", note: "build: Codex developer session failed." });
+    expect(await assignment("outcome-1")).toMatchObject({ status: "failed", note: "build: Agent developer session failed." });
   });
 
   it.each(["worktree", "branch", "remote branch"])("starts a collision-free re-queue when runtime is absent but a retained %s exists", async (retained) => {
@@ -602,7 +604,7 @@ describe("developer seat", () => {
     else shell.refs.add(`refs/heads/${BRANCH}`);
     codex.fail = true;
     await make().tick();
-    expect(await assignment("outcome-1")).toMatchObject({ status: "failed", prUrl: oldPR, note: "build: Codex developer session failed." });
+    expect(await assignment("outcome-1")).toMatchObject({ status: "failed", prUrl: oldPR, note: "build: Agent developer session failed." });
     const attempt = (await store.readRuntimeFile<SeatTaskRecord>(RECORD))!;
     expect(attempt.branch).not.toBe(BRANCH);
     expect(attempt.retainedPrUrl).toBe(oldPR);
@@ -689,5 +691,62 @@ describe("developer seat", () => {
     expect(codex.runs).toHaveLength(0);
     await seat.tick();
     expect((await assignment("outcome-2")).status).toBe("merged");
+  });
+
+  it.each([false, true])("reconciles a failed merged assignment without execution or checkouts (persistence failure: %s)", async (persistenceFailure) => {
+    const { store, shell, codex, chat, seat, assignment } = await setup([
+      { ...reviewing(), status: "failed", note: "ci: interrupted" }, queued("outcome-2", "2026-01-02T00:00:00Z"),
+    ], SPRINT);
+    const record = await retainRecord(store, shell);
+    await rm(record.worktree, { recursive: true });
+    await rm(join(store.runtimeDir, "projects"), { recursive: true });
+    shell.maintenancePR = {
+      html_url: PR, number: 9, state: "closed", merged: true, merged_at: "2026-01-02T00:00:00Z",
+      base: { ref: SPRINT.branch, repo: { full_name: "satoramoto/indra" } }, head: { ref: BRANCH, repo: { full_name: "satoramoto/indra" } },
+    };
+    if (persistenceFailure) vi.spyOn(store, "update").mockRejectedValueOnce(new Error("state unavailable"));
+    expect(await seat.tick()).toBe("worked");
+    expect(await assignment("outcome-1")).toMatchObject({ status: persistenceFailure ? "failed" : "merged", prUrl: PR });
+    expect((await assignment("outcome-1")).note).toBe(persistenceFailure ? "ci: interrupted" : undefined);
+    expect((await assignment("outcome-2")).status).toBe("queued");
+    expect(shell.calls).toEqual([`gh api repos/satoramoto/indra/pulls/9 --method GET @${store.checkout}`]);
+    expect(codex.runs).toHaveLength(0);
+    expect(chat.messages).toHaveLength(0);
+  });
+
+  it.each(["runtime-save", "post", "activity-save", "cleanup", "post-commit"])("never regresses a durably merged assignment after %s failure", async (failure) => {
+    const { store, shell, codex, chat, seat, assignment } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
+    codex.findings = [];
+    const save = store.saveRuntime.bind(store);
+    vi.spyOn(store, "saveRuntime").mockImplementation(async (name, runtime) => {
+      if (failure === "runtime-save" && name === RECORD && (runtime as SeatTaskRecord).step === "done") throw new Error("runtime save failed");
+      if (failure === "activity-save" && "message" in runtime && String(runtime.message).startsWith("Merged")) throw new Error("activity save failed");
+      await save(name, runtime);
+    });
+    const post = chat.post.bind(chat);
+    vi.spyOn(chat, "post").mockImplementation(async (...args) => {
+      if (failure === "post" && args[1].startsWith("Merged")) throw new Error("post failed");
+      return post(...args);
+    });
+    const run = shell.run.bind(shell);
+    vi.spyOn(shell, "run").mockImplementation(async (...args) => {
+      if (failure === "cleanup" && args[0] === "gh" && args[1].includes("DELETE")) throw new Error("cleanup failed");
+      return run(...args);
+    });
+    const update = store.update.bind(store);
+    let rejected = false;
+    vi.spyOn(store, "update").mockImplementation(async (...args) => {
+      await update(...args);
+      if (failure === "post-commit" && !rejected && String(args[1]).endsWith(" merged")) { rejected = true; throw new Error("commit cleanup failed"); }
+    });
+    await seat.tick();
+    expect(await assignment("outcome-1")).toMatchObject({ status: "merged", prUrl: PR });
+    expect((await assignment("outcome-1")).note).toBeUndefined();
+    expect(JSON.parse(git(store.checkout, "show", "HEAD:state.json")).planningGoals[0].assignments[0].status).toBe("merged");
+    expect(chat.messages.some((message) => message.startsWith("Failed"))).toBe(false);
+    const calls = [...shell.calls]; const sessions = codex.runs.length;
+    expect(await seat.tick()).toBe("idle");
+    expect(shell.calls).toEqual(calls);
+    expect(codex.runs).toHaveLength(sessions);
   });
 });
