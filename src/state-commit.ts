@@ -1,4 +1,5 @@
 import { execFile, spawn } from "node:child_process";
+import { childEnv } from "./op-env.js";
 import { link, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -22,7 +23,7 @@ export class StateCommitError extends Error {
   }
 }
 
-const gitEnv = () => ({ ...process.env, GIT_TERMINAL_PROMPT: "0" });
+const gitEnv = () => ({ ...childEnv(), GIT_TERMINAL_PROMPT: "0" });
 
 function alive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return true; // Unknown holder (lock just created): wait for it.

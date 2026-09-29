@@ -24,7 +24,7 @@ Every PR gets one review, posted on the PR itself as line comments plus a verdic
 
 Reviewers flag only these, each with the file, the line and a one-line reason:
 
-- **Credentials:** no token, password or API key in command arguments, environment variables, the `indra-state` repository, logs or error messages. Credentials come from 1Password at run time.
+- **Credentials:** no token, password or API key in command arguments, environment variables, the `indra-state` repository, logs or error messages. Credentials come from 1Password at run time. One exception: the owner may supply the 1Password service account token as `OP_SERVICE_ACCOUNT_TOKEN` in the environment of `npm start`. Indra never sets it, logs it, or passes it (or any other `OP_*` variable) to a child process other than `op`; tmux panes, seat runners, Codex and Claude agents, `git`, `gh` and `npm` run without it. It is written only to the 0600 staged file under `<state-checkout>.runtime`.
 - **Mattermost inventory:** the `--mattermost` mode sends only `GET` requests and refuses redirects. It never writes to Mattermost.
 - **Mattermost writes:** Chick's bridge and the Developer seat runners write only their own posts, plus one exception: each may add its own bot to its team's Mattermost team and home channel from `indra-state`, with its own token and only after a `GET` shows it is not a member. Nothing adds other users or joins other channels.
 - **State writes:** anything written to `state.json` stays valid against the v1 schema and Indra's reference checks. Runtime metadata (session IDs, delivery cursors, usage) stays in `<state-checkout>.runtime`, not in Git.

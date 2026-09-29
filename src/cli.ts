@@ -9,7 +9,8 @@ import { StateInventory } from "./state-domain.js";
 import { botTeamHome, PlanningStore } from "./planning.js";
 import { PlanningBridge } from "./planning-bridge.js";
 import { CHICK_USERNAME, MattermostAccessError, MattermostPlanningChat, readBotToken, readChickToken, type BotTokenOptions } from "./planning-mattermost.js";
-import { readServiceToken, stageServiceToken } from "./service-account.js";
+import { opCredential, stageServiceToken } from "./service-account.js";
+import { captureOpEnvironment } from "./op-env.js";
 import { DeveloperSeat, loadDeveloperSeat, processShell } from "./developer-seat.js";
 import { DEVELOPER_SESSION_TIMEOUT_MS, type WriteAccess } from "./codex-runtime.js";
 import { loadSeatEngines, SeatRuntime } from "./seat-runtime.js";
@@ -89,12 +90,12 @@ export async function interactive(inventory: Inventory, read: Read, write: Write
 }
 
 /**
- * Reads a process's bot token with the service account token the control plane staged, if any.
+ * Reads a process's bot token with the owner's OP_SERVICE_ACCOUNT_TOKEN or else the staged service account token, if any.
  * A hosted process (one with a ready nonce) never falls back to a desktop prompt; when its token is missing,
  * it tells the tmux host "no credential" before failing.
  */
 export async function hostedToken(checkout: string, readyNonce: string | undefined, read: (options: BotTokenOptions) => Promise<string>, lingerMs = 5000): Promise<string> {
-  try { return await read({ serviceToken: await readServiceToken(checkout), headless: !!readyNonce }); }
+  try { return await read({ ...await opCredential(checkout), headless: !!readyNonce }); }
   catch (error) {
     if (readyNonce) {
       await signalReady(checkout, readyNonce, "no-credential").catch(() => {});
@@ -223,6 +224,8 @@ export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_
 }
 
 export async function main(args: string[] = process.argv.slice(2)): Promise<number> {
+  // OP_SERVICE_ACCOUNT_TOKEN and other OP_* variables go to `op` only; no other child process inherits them.
+  captureOpEnvironment();
   try {
     const options = parseOptions(args);
     if (options.mode === "help") {
@@ -258,7 +261,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       recordRunningBuild(`${options.checkout}.runtime`, import.meta.url);
       const updater = new SelfUpdater(defaultAppDir, undefined, undefined, `${resolve(options.checkout)}.runtime`);
       return await runTerminalUi(new StateInventory(new LocalStateRepository(options.checkout)), new LocalSessionReader(options.checkout), {
-        processes: new Supervisor(options.checkout, undefined, undefined, undefined, undefined, () => stageServiceToken(options.checkout)),
+        processes: new Supervisor(options.checkout, undefined, undefined, undefined, undefined, (force) => stageServiceToken(options.checkout, { force })),
         goals: new CliGoalStarter(options.checkout),
         paneTail: new TmuxPaneTail(options.checkout),
         sync: new PlanningStore(options.checkout),
@@ -315,7 +318,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       if (options.action === "approve") {
         // Run by the terminal UI: like a hosted process, it reads Chick's token only with the staged service account token.
         try {
-          const chat = services.chat(await readChickToken({ serviceToken: await readServiceToken(options.checkout), headless: true }));
+          const chat = services.chat(await readChickToken({ ...await opCredential(options.checkout), headless: true }));
           await joinTeamHome(options.checkout, undefined, store, chat, CHICK_USERNAME);
           const { goal, alreadyApproved } = await new PlanningBridge(store, chat, services.runtime(process.cwd())).approve(options.goal!);
           console.log(alreadyApproved ? `Goal ${goal.id} was already approved; no new assignments.` : `Approved goal ${goal.id}: ${goal.assignments?.length ?? 0} outcome(s) queued for Developer seats.`);
@@ -328,7 +331,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       if (options.action === "integrate" || options.action === "merge" || options.action === "rollback") {
         // Run by the terminal UI, like approve: Chick's token only with the staged service account token.
         try {
-          const chat = services.chat(await readChickToken({ serviceToken: await readServiceToken(options.checkout), headless: true }));
+          const chat = services.chat(await readChickToken({ ...await opCredential(options.checkout), headless: true }));
           await joinTeamHome(options.checkout, undefined, store, chat, CHICK_USERNAME);
           const bridge = new PlanningBridge(store, chat, services.runtime(process.cwd()));
           console.log(await (options.action === "integrate" ? bridge.integrate(options.goal!) : options.action === "merge" ? bridge.merge(options.goal!) : bridge.rollback(options.goal!)));
@@ -366,7 +369,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         await new Promise((resolve) => setTimeout(resolve, 3000));
       }
     }
-    const adapter = new MattermostInventory(new MattermostClient(SERVER, await readToken()));
+    const adapter = new MattermostInventory(new MattermostClient(SERVER, await readToken("checkout" in options ? await opCredential(options.checkout) : {})));
     const inventory = new Inventory(adapter, adapter);
     if ("slug" in options) {
       const slug = options.slug;

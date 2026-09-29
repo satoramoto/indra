@@ -3,6 +3,7 @@ import { readFile, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { CLARIFY_TIMEOUT_MS, type AgentResult, type AgentRuntime, type MessageOptions, type WriteAccess } from "./codex-runtime.js";
+import { childEnv } from "./op-env.js";
 
 /** Persisted handles are engine-qualified; bare legacy handles still belong to Codex. */
 export const CLAUDE_SESSION_PREFIX = "claude:";
@@ -112,7 +113,7 @@ export class ClaudeRuntime implements AgentRuntime {
       let child: ChildProcessWithoutNullStreams;
       try {
         // Authentication belongs to the logged-in CLI, never an injected API key. Never replay interrupted turns.
-        const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/token|password|passwd|secret|api_?key/i.test(key)));
+        const env = Object.fromEntries(Object.entries(childEnv()).filter(([key]) => !/token|password|passwd|secret|api_?key/i.test(key)));
         child = spawn("claude", args, { cwd: this.cwd, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32", env: { ...env, CLAUDE_CODE_RESUME_INTERRUPTED_TURN: "0" } });
       } catch { reject(new Error("Claude could not be started; check the executable and working directory.")); return; }
       let settled = false; let output = ""; let stdoutBytes = 0; let stderrBytes = 0;

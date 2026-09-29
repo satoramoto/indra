@@ -29,7 +29,7 @@ function fakeRuntime(engine: string) {
 vi.mock("../src/codex-runtime.js", async (original) => ({ ...await original<typeof import("../src/codex-runtime.js")>(), CodexRuntime: fakeRuntime("codex") }));
 vi.mock("../src/claude-runtime.js", async (original) => ({ ...await original<typeof import("../src/claude-runtime.js")>(), ClaudeRuntime: fakeRuntime("claude") }));
 vi.mock("../src/seat-persona.js", async (original) => ({ ...await original<typeof import("../src/seat-persona.js")>(), loadSeatPersonas: vi.fn(async () => ({})) }));
-vi.mock("../src/service-account.js", () => ({ readServiceToken: vi.fn(async () => undefined), stageServiceToken: vi.fn() }));
+vi.mock("../src/service-account.js", () => ({ opCredential: vi.fn(async () => ({})), stageServiceToken: vi.fn() }));
 vi.mock("../src/self-update.js", () => ({ recordRunningBuild: vi.fn(), SelfUpdater: vi.fn() }));
 vi.mock("../src/state-commit.js", async (original) => ({ ...await original<typeof import("../src/state-commit.js")>(), withFileLock: async (_path: string, run: () => Promise<unknown>) => run() }));
 vi.mock("../src/planning-mattermost.js", async (original) => ({

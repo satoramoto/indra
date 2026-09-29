@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { childEnv } from "./op-env.js";
 import { randomUUID } from "node:crypto";
 import { lstat, realpath } from "node:fs/promises";
 import { join } from "node:path";
@@ -433,7 +434,7 @@ export function stderrExcerpt(stderr: string, max = 120): string {
 /** Runs commands without a shell; output is kept in memory only. */
 export const processShell: Shell = {
   run: (command, args, cwd) => new Promise((done) => {
-    execFile(command, args, { cwd, encoding: "utf8", maxBuffer: 20_000_000, timeout: 2 * 60 * 60_000 }, (error, stdout, stderr) => {
+    execFile(command, args, { cwd, encoding: "utf8", maxBuffer: 20_000_000, timeout: 2 * 60 * 60_000, env: childEnv() },(error, stdout, stderr) => {
       const code = error ? (typeof (error as { code?: unknown }).code === "number" ? (error as { code: number }).code : 1) : 0;
       done({ code, stdout, stderr });
     });

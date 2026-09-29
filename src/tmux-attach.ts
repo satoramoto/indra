@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { childEnv } from "./op-env.js";
 
 export function parseOwnedTmuxTarget(target: string): { socket: string; session: string } {
   const match = /^([a-z0-9-]+):([a-z0-9-]+)$/.exec(target);
@@ -10,7 +11,7 @@ export type TmuxCommand = (args: string[], stdio: "ignore" | "inherit") => Promi
 
 function tmux(args: string[], stdio: "ignore" | "inherit"): Promise<number> {
   return new Promise((resolve, reject) => {
-    const child = spawn("tmux", args, { stdio, shell: false });
+    const child = spawn("tmux", args, { stdio, shell: false, env: childEnv() });
     child.once("error", (error) => reject(error));
     child.once("exit", (code) => resolve(code ?? 1));
   });

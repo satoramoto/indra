@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { childEnv } from "./op-env.js";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { access, lstat, mkdir, readdir, readFile, readlink, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
@@ -60,7 +61,7 @@ export class SelfUpdater {
 
   private exec(command: string, args: string[]): Promise<string> {
     return new Promise((resolve, reject) => {
-      execFile(command, args, { cwd: this.appDir, encoding: "utf8", env: { ...process.env, GIT_TERMINAL_PROMPT: "0" }, timeout: this.timeoutMs, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
+      execFile(command, args, { cwd: this.appDir, encoding: "utf8", env: { ...childEnv(), GIT_TERMINAL_PROMPT: "0" }, timeout: this.timeoutMs, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
         if (!error) { resolve(stdout.trim()); return; }
         const lines = `${stderr}\n${stdout}`.split("\n").map((line) => line.trim()).filter(Boolean);
         reject(new Error(`${command} ${args[0]} failed: ${lines.find((line) => /error/i.test(line)) ?? lines.at(-1) ?? error.message}`));

@@ -5,6 +5,7 @@ import { PlanningStore, type PlanningGoal, type SprintIntegration } from "./plan
 import { TmuxHost } from "./tmux-host.js";
 import { readBuildStamp, readStampIn, type BuildStamp } from "./build-stamp.js";
 import { appRootOf } from "./reload.js";
+import { childEnv } from "./op-env.js";
 
 export type SessionEngine = "codex" | "claude" | "unknown";
 /** Persisted handles: unqualified legacy IDs are Codex; only claude:<id> identifies Claude. */
@@ -75,7 +76,7 @@ export class LocalSprintBuildReader implements SprintBuildReadPort {
     const key = `${ancestor}:${build.sha}`;
     if (this.ancestry.has(key)) return this.ancestry.get(key);
     const result = await new Promise<boolean | undefined>((resolve) => {
-      execFile("git", ["merge-base", "--is-ancestor", ancestor, build.sha], { cwd: this.appDir, timeout: 2000, maxBuffer: 4096 }, (error) => {
+      execFile("git", ["merge-base", "--is-ancestor", ancestor, build.sha], { cwd: this.appDir, timeout: 2000, maxBuffer: 4096, env: childEnv() }, (error) => {
         resolve(!error ? true : error.code === 1 ? false : undefined);
       });
     });

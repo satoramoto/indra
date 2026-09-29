@@ -103,17 +103,26 @@ describe("seat process supervisor", () => {
     expect(tmux.launches()).toHaveLength(4);
   });
 
-  it("stages the service account credential once before hosting, and retries it on restart after a failure", async () => {
+  it("stages the service account credential once before hosting, and asks again on restart, forcing it after no credential", async () => {
     const { dir, tmux } = await fixture();
     const order: string[] = [];
     tmux.onStart = async (session, nonce) => { order.push(session.split("-")[0]); await signalReady(dir, nonce); };
-    let staged = 0;
-    const ok = new Supervisor(dir, tmux, dir, 1000, undefined, async () => { staged++; order.push("stage"); });
+    const forced: boolean[] = [];
+    const ok = new Supervisor(dir, tmux, dir, 1000, undefined, async (force) => { forced.push(force); order.push("stage"); });
     expect(await ok.ensureAll()).toEqual([]);
     await ok.ensureAll();
-    await ok.restart("seat-002");
-    expect(staged).toBe(1);
+    expect(forced).toEqual([false]);
     expect(order[0]).toBe("stage");
+    // A restart stages again, which keeps a non-empty staged token and replaces a missing one.
+    await ok.restart("seat-002");
+    expect(forced).toEqual([false, false]);
+    // A seat that exited for no credential gets a freshly read token.
+    tmux.onStart = async (session, nonce) => { await signalReady(dir, nonce, session.startsWith("dev-seat-003") ? "no-credential" : undefined); };
+    await ok.restart("seat-003");
+    tmux.sessions.delete([...tmux.sessions.keys()].find((name) => name.startsWith("dev-seat-003"))!);
+    expect((await ok.read())["seat-003"].process).toBe("no credential");
+    await ok.restart("seat-003");
+    expect(forced).toEqual([false, false, false, true]);
 
     const fresh = await fixture();
     let attempts = 0;
@@ -122,7 +131,7 @@ describe("seat process supervisor", () => {
     expect(fresh.tmux.launches()).toHaveLength(3);
     await failing.restart("seat-002");
     expect(attempts).toBe(2);
-    await failing.restart("seat-002");
+    await failing.ensureAll();
     expect(attempts).toBe(2);
   });
 

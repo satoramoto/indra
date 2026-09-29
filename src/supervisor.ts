@@ -4,6 +4,7 @@ import { developerSeats, PlanningStore, type PlanningDocument } from "./planning
 import { defaultAppDir, hostedProcessFor, NoChannelError, NoCredentialError, SystemTmux, TmuxHost, turnLockFile, type HostRecord, type TmuxRunner } from "./tmux-host.js";
 import { readBuildStamp } from "./build-stamp.js";
 import { withFileLock } from "./state-commit.js";
+import { childEnv } from "./op-env.js";
 
 /** `no channel`: the seat's bot could not join its team's Mattermost team or home channel. */
 export type ProcessState = "running" | "stopped" | "no credential" | "no channel";
@@ -86,16 +87,22 @@ export class Supervisor implements SeatProcessPort {
     private readonly appDir = defaultAppDir,
     private readonly readinessTimeoutMs = 15_000,
     private readonly store = new PlanningStore(checkout),
-    /** Hands the 1Password service account token to hosted processes; runs once, before the first process starts. */
-    private readonly stageCredential?: () => Promise<void>,
+    /**
+     * Hands the 1Password service account token to hosted processes: before the first process starts, and again on
+     * each restart, where it keeps an already staged token unless `force` is set.
+     */
+    private readonly stageCredential?: (force: boolean) => Promise<void>,
   ) {}
 
   private staged = false;
 
-  /** Stages the credential until it succeeds once; a failure is reported and the processes show "no credential". */
-  private async credential(): Promise<string | undefined> {
-    if (this.staged || !this.stageCredential) return undefined;
-    try { await this.stageCredential(); this.staged = true; return undefined; }
+  /**
+   * Stages the credential until it succeeds once; a failure is reported and the processes show "no credential".
+   * A restart (`again`) always asks again, so a missing or empty staged token is replaced; `force` re-reads a kept one.
+   */
+  private async credential(again = false, force = false): Promise<string | undefined> {
+    if (!this.stageCredential || (this.staged && !again)) return undefined;
+    try { await this.stageCredential(force); this.staged = true; return undefined; }
     catch (error) { return error instanceof Error ? error.message : String(error); }
   }
 
@@ -222,7 +229,9 @@ export class Supervisor implements SeatProcessPort {
 
   async restart(seatId: string): Promise<void> {
     const host = this.host(await this.seat(seatId));
-    const credentialProblem = await this.credential();
+    // A seat that exited for a missing credential may hold a revoked token: read a fresh one.
+    const noCredential = (await this.processState(host)).process === "no credential";
+    const credentialProblem = await this.credential(true, noCredential);
     await host.stop();
     try { await host.start(); }
     catch (error) { if (!shownOnSeat(error)) throw error; }
@@ -263,7 +272,7 @@ export class CliGoalStarter implements GoalStarter {
 function runCli(appDir: string, cliArgs: string[], timeoutMs: number): Promise<string> {
   const args = ["--experimental-ffi", "--use-system-ca", join(appDir, "dist", "cli.js"), ...cliArgs];
   return new Promise((done, fail) => {
-    execFile(process.execPath, args, { cwd: appDir, encoding: "utf8", timeout: timeoutMs }, (error, stdout, stderr) => {
+    execFile(process.execPath, args, { cwd: appDir, encoding: "utf8", timeout: timeoutMs, env: childEnv() },(error, stdout, stderr) => {
       const last = (text: string) => text.trim().split("\n").at(-1) ?? "";
       if (error) fail(new Error(last(stderr) || `planning ${cliArgs[1]} failed.`));
       else done(last(stdout));
