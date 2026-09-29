@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { claudePermissionArgs } from "./claude-permissions.js";
+import { claudeProgress } from "./claude-progress.js";
 import { CLARIFY_TIMEOUT_MS, type RecordedAgentResult, type AgentRuntime, type MessageOptions, type WriteAccess } from "./codex-runtime.js";
 import { childEnv } from "./op-env.js";
 import { RuntimeEventStream, RuntimeFacts, RuntimeStop, recordedError } from "./runtime-facts.js";
@@ -59,7 +60,7 @@ export class ClaudeRuntime implements AgentRuntime {
         const env = Object.fromEntries(Object.entries(childEnv()).filter(([key]) => !/token|password|passwd|secret|api_?key/i.test(key)));
         child = spawn("claude", args, { cwd: this.cwd, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32", env: { ...env, CLAUDE_CODE_RESUME_INTERRUPTED_TURN: "0" } });
       } catch { reject(new RuntimeStop("Claude could not be started; check the executable and working directory.")); return; }
-      let settled = false; let stdoutBytes = 0; let stderrBytes = 0;
+      let settled = false; let stdoutBytes = 0; let stderrBytes = 0; const progress = claudeProgress({ cwd: this.cwd });
       let failure: RuntimeStop | undefined;
       let killTimer: ReturnType<typeof setTimeout> | undefined;
       const stop = (kind: NodeJS.Signals) => {
@@ -91,7 +92,7 @@ export class ClaudeRuntime implements AgentRuntime {
         if (settled || stdoutBytes > CLAUDE_OUTPUT_LIMIT) return;
         stdoutBytes += Buffer.byteLength(part);
         if (stdoutBytes > CLAUDE_OUTPUT_LIMIT) cancel("Claude stdout exceeded the output limit.");
-        else stream.push(part);
+        else { stream.push(part); progress.push(part); }
       });
       // Never echo provider diagnostics: they can contain prompt text, credentials or tool output.
       child.stderr.on("data", (part: string) => {
