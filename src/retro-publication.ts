@@ -204,6 +204,14 @@ export class RetroPublication {
           await context.releaseEvent?.({ key: `retro-review-finished:${pr.headSha}`, kind: "review-finished", at: new Date().toISOString(), gate: "retro", prUrl: pr.url, headSha: pr.headSha });
           pr = await this.archive.inspectRetroPr(record.github, context.goal.id, frozen.markdown, record.prUrl);
         }
+        if (pr.state === "OPEN" && record.authorization?.approval.source === "automatic") {
+          try { await this.checkPolicy(context, record.authorization.approval); }
+          catch {
+            // A revoked pending write needs a new authorization; keep receipts for merges already accepted.
+            delete record.authorization;
+            await this.save(context, record);
+          }
+        }
         if (pr.state === "OPEN" && !this.authorized(record, pr) && pr.headSha === record.gate.headSha && pr.reviewed && pr.checksPassed && context.automaticGate) {
           const approval = await context.automaticGate({ kind: "retro", pr, postId: record.gate.postId });
           if (approval) {

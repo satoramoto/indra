@@ -102,6 +102,56 @@ describe("recoverable retro publication", () => {
     expect(await f.restart().poll(f.context)).toMatchObject({ status: "complete", evidence: { authorization: { approval: { source: "owner-command" } } } });
   });
 
+  it.each([false, true])("requests new archival authorization after auto mode is toggled, polling while disabled: %s", async (pollWhileDisabled) => {
+    const f = await fixture();
+    const policy: StandingPolicy = { revisions: [{ revision: 1, source: "owner-command", enabled: true, at: at(0) }] };
+    f.state.teams[0].standingPolicy = policy;
+    const request = vi.fn<NonNullable<CeremonyContext["automaticGate"]>>(async (gate) => {
+      const current = policy.revisions.at(-1)!;
+      if (!current.enabled) return;
+      if (gate.kind !== "retro") throw new Error("Wrong gate");
+      return { source: "automatic", policyRevision: current.revision, at: new Date().toISOString(), target: { kind: "retro", goalId: f.context.goal.id, prUrl: gate.pr.url, headSha: gate.pr.headSha, checksPassed: true, reviewApproved: true, reviewer: "satori-miyamoto", reviewedHeadSha: gate.pr.headSha } };
+    });
+    f.context.automaticGate = request;
+    vi.mocked(f.archive.mergeRetroPr).mockRejectedValueOnce(new Error("Interrupted"));
+    expect((await f.restart().poll(f.context)).status).toBe("pending");
+    expect(f.record().authorization?.approval).toMatchObject({ source: "automatic", policyRevision: 1 });
+    expect(f.archive.mergeRetroPr).toHaveBeenCalledTimes(1);
+    f.context.goal = structuredClone(f.state.planningGoals[0]);
+    policy.revisions.push({ revision: 2, source: "owner-command", enabled: false, at: new Date().toISOString() });
+    if (pollWhileDisabled) {
+      expect((await f.restart().poll(f.context)).status).toBe("pending");
+      expect(f.record().authorization).toBeUndefined();
+      expect(f.archive.mergeRetroPr).toHaveBeenCalledTimes(1);
+      expect(f.pr.state).toBe("OPEN");
+    }
+    request.mockClear();
+    policy.revisions.push({ revision: 3, source: "owner-command", enabled: true, at: new Date().toISOString() });
+    expect(await f.restart().poll(f.context)).toMatchObject({ status: "complete", evidence: { authorization: { headSha: f.pr.headSha, approval: { source: "automatic", policyRevision: 3 } } } });
+    expect(request).toHaveBeenCalledExactlyOnceWith({ kind: "retro", pr: expect.objectContaining({ headSha: f.pr.headSha, state: "OPEN", reviewed: true, checksPassed: true }), postId: f.record().gate!.postId });
+    expect(f.state.planningGoals[0].automaticApprovals?.map((approval) => approval.policyRevision)).toEqual([1, 3]);
+    expect(f.archive.mergeRetroPr).toHaveBeenCalledTimes(2);
+  });
+
+  it("reconciles an automatic archive merge accepted before revocation when its response was lost", async () => {
+    const f = await fixture();
+    const policy: StandingPolicy = { revisions: [{ revision: 1, source: "owner-command", enabled: true, at: at(0) }] };
+    f.state.teams[0].standingPolicy = policy;
+    f.context.automaticGate = async () => undefined;
+    await f.restart().poll(f.context);
+    vi.mocked(f.archive.mergeRetroPr).mockImplementationOnce(async () => {
+      f.pr.state = "MERGED"; f.pr.mergedSha = "d".repeat(40);
+      throw new Error("Response lost");
+    });
+    await expect(f.restart().merge(f.context, { source: "automatic", policyRevision: 1, at: new Date().toISOString(), target: { kind: "retro", goalId: f.context.goal.id, prUrl: f.pr.url, headSha: f.pr.headSha, checksPassed: true, reviewApproved: true, reviewer: "satori-miyamoto", reviewedHeadSha: f.pr.headSha } })).rejects.toThrow("Response lost");
+    f.context.goal = structuredClone(f.state.planningGoals[0]);
+    policy.revisions.push({ revision: 2, source: "owner-command", enabled: false, at: new Date().toISOString() });
+    delete f.context.automaticGate;
+    expect(await f.restart().poll(f.context)).toMatchObject({ status: "complete", evidence: { authorization: { approval: { source: "automatic", policyRevision: 1 } } } });
+    expect(f.archive.mergeRetroPr).toHaveBeenCalledTimes(1);
+    expect(f.state.planningGoals[0].automaticApprovals).toHaveLength(1);
+  });
+
   it("wires production review to a new read-only runtime at the archive head without resuming Chick", async () => {
     const f = await fixture(); await f.restart().poll(f.context); f.pr.reviewed = false;
     try {
