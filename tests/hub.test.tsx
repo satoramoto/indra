@@ -234,8 +234,8 @@ describe("the hub on the owner's screen", () => {
   ])("fits the %s screen in 96×42 with every key field whole", async (name, view) => {
     const model = await hubModel();
     model.restore({ ...view, teamId: "team-001" });
-    const paneTail = { capture: async (_seat: unknown, size: { lines: number }) => ({ status: "ok" as const, lines: Array.from({ length: 20 }, (_, index) => `15:${String(index).padStart(2, "0")} ⚙ step ${index}`).slice(-size.lines) }) };
-    const setup = await testRender(() => <TerminalApp model={model} revision={() => model.revision} onKey={() => {}} paneTail={paneTail} pulse={() => false} now={() => NOW} />, { width: HUB_GRID.columns, height: HUB_GRID.rows });
+    const session = { capture: async (_seat: unknown, size: { rows: number }) => ({ status: "ok" as const, lines: Array.from({ length: 20 }, (_, index) => [{ text: `15:${String(index).padStart(2, "0")} ⚙ step ${index}`, style: {} }]).slice(-size.rows) }) };
+    const setup = await testRender(() => <TerminalApp model={model} revision={() => model.revision} onKey={() => {}} session={session} pulse={() => false} now={() => NOW} />, { width: HUB_GRID.columns, height: HUB_GRID.rows });
     try {
       await setup.renderOnce();
       await new Promise((resolve) => setTimeout(resolve, 20));
@@ -243,28 +243,37 @@ describe("the hub on the owner's screen", () => {
       const frame = setup.captureCharFrame();
       await keep(name, frame);
       const scroll = setup.renderer.root.findDescendantById(view.page === "seat" ? "detail-scroll" : "team-scroll") as ScrollBoxRenderable | undefined;
-      // Nothing to scroll: the content is no taller than the screen gives it.
-      if (scroll) expect(scroll.scrollHeight, frame).toBeLessThanOrEqual(scroll.height);
+      // Nothing to scroll on the team screens: the content is no taller than the screen gives it. On a seat screen the
+      // live session takes most rows and the details are their own scrolling panel: every field is reachable by scrolling it.
+      const frames = [frame];
+      if (scroll && view.page === "seat") {
+        for (let page = 0; page < 10 && scroll.scrollTop + scroll.viewport.height < scroll.scrollHeight; page++) {
+          scroll.scrollBy(1, "viewport");
+          await setup.renderOnce();
+          frames.push(setup.captureCharFrame());
+        }
+      } else if (scroll) expect(scroll.scrollHeight, frame).toBeLessThanOrEqual(scroll.height);
       const expected: Record<string, string[]> = {
         team: [...names, "Developer", "Team Lead", "NO CREDENTIAL", "Codex gpt-6-sol·medium", "Claude opus-5-5·max", "Claude opus-5-5·medium", "⌛ 47m", "⌛ 12m", "🧮 Σ1.3M",
           "🐙 #103", "🟡", "The 1Password service account token is missing; run npm start again.", "Keep the hub inside a 96 by 42 terminal · failed · T retry",
           "SPRINT · goal-hub", "Current stage: implement", "Closure: open", "planning → proposal → [implement] → release → retro", "1/4 merged",
           "💬 goal thread", "📝 proposal post", "🧮 Sprint total: in 6.25M · cached 5M · out 250k · Σ 6.5M tok · ⌛ 3h20m since planning",
           ...titles.map((title, index) => title + " · " + ["in review", "building", "merged", "failed"][index]),
-          "👤 George Duke", "🐙 #98", "🟢 CI passed", "🔴 CI failed", "Integration PR: not opened", "↑↓ seat · Enter details"],
-        "developer-seat": ["LIVE PANE · George Duke", "George Duke  @georgeduke", "Process: running (seat runner)", "🤖 Codex · model gpt-6-sol · effort medium",
+          "👤 George Duke", "🐙 #98", "🟢 CI passed", "🔴 CI failed", "Integration PR: not opened", "↑↓ choose seat · Enter open seat"],
+        "developer-seat": ["LIVE · George Duke · progress · click or i to drive", "SEATS", ...names, "George Duke  @georgeduke", "Process: running (seat runner)", "🤖 Codex · model gpt-6-sol · effort medium",
           `Assignment: ${titles[0]} · in-review`, "🐙 satoramoto/indra#103", "🟡 CI pending", "build ✓", "review ✓", "fix skipped", "ci ●", "merge",
-          "🟡 CI pending · 3 sessions · ⌛ 47m on this task", "🧮 in 1.25M · cached 1M · out 50k · Σ 1.3M tok", "Latest: Opened PR 103; review requested",
+          "🟡 CI pending", "3 sessions · ⌛ 47m on this task", "🧮 in 1.25M · cached 1M · out 50k · Σ 1.3M tok", "Latest: Opened PR 103; review requested",
           "SPRINT · goal-hub", "Current stage: implement", "Closure: open", "planning → proposal → [implement] → release → retro", "1/4 tickets merged",
-          "a watch · D drive (Ctrl-] back) · t transcript"],
-        "lead-seat": ["LIVE PANE · Chick Corea", "Chick Corea  @chickcorea", "Process: running (planning bridge)", "🤖 Claude · model claude-opus-5-5 · effort max",
+          "Tab next panel · i drive session · t transcript"],
+        "lead-seat": ["LIVE · Chick Corea · progress · click or i to drive", "Chick Corea  @chickcorea", "Process: running (planning bridge)", "🤖 Claude · model claude-opus-5-5 · effort max",
           "🧮 Planning: in 2.1M · cached 1.68M · out 84k · Σ 2.18M tok", "IDLE SESSION · Claude Code", "Planning goal: Make the terminal UI the owner's all-day hub",
-          "Claude Code session: claude:0e5f9f3e-1111-4222-8333-944445555666", "4 runs", "Live view: a watch · D drive · Ctrl-] back", "Current stage: implement", "💬 goal thread", "📝 proposal post"],
+          "Claude Code session: claude:0e5f9f3e-1111-4222-8333-944445555666", "4 runs", "Live session: shown above · i or a click on it drives", "Current stage: implement", "💬 goal thread", "📝 proposal post"],
         teams: ["👥 Yahaha  (yahaha)", "5 stable seats", "🐙 satoramoto/indra", "↑↓ choose team · Enter open"],
       };
       // Word wrapping inside a box is fine; cutting a key field short is not. Compare without spaces and box edges.
-      const compact = (text: string) => text.replace(/[\s│]/g, "");
-      for (const text of expected[name]) expect(compact(frame), text + "\n" + frame).toContain(compact(text));
+      const compact = (text: string) => text.replace(view.page === "seat" ? /[\s│█▀▄]/g : /[\s│]/g, "");
+      for (const text of expected[name]) expect(frames.map(compact).join("\n"), text + "\n" + frames.join("\n")).toContain(compact(text));
+      for (const shown of frames) expect(shown).not.toMatch(/tmux|Ctrl-\]|Ctrl-b/);
       expect(frame.split("\n").length - 1).toBe(HUB_GRID.rows);
     } finally { setup.renderer.destroy(); }
   });

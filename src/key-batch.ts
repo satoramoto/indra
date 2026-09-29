@@ -20,10 +20,10 @@ export function oncePerTask(publish: () => void): () => void {
 }
 
 /** The terminal UI's key path: every key reaches the model at once, and `publish` gets its revision once per task. */
-export function keyInput<Action>(model: { key(name: string, text?: string): Action; readonly revision: number }, publish: (revision: number) => void): (name: string, text?: string) => Action {
+export function keyInput<Action, Mods = undefined>(model: { key(name: string, text?: string, mods?: Mods): Action; readonly revision: number }, publish: (revision: number) => void): (name: string, text?: string, mods?: Mods) => Action {
   const publishKeys = oncePerTask(() => publish(model.revision));
-  return (name, text) => {
-    const action = model.key(name, text);
+  return (name, text, mods) => {
+    const action = model.key(name, text, mods);
     publishKeys();
     return action;
   };

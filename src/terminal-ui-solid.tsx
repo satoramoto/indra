@@ -3,18 +3,18 @@ import { createCliRenderer, type ScrollBoxRenderable } from "@opentui/core";
 import { render, useKeyboard, usePaste, useTerminalDimensions } from "@opentui/solid";
 import { createMemo, createSignal, For, Show, type Accessor } from "solid-js";
 import type { StateInventory } from "./state-domain.js";
-import { attachTmux } from "./tmux-attach.js";
-import { displayText, GOAL_INPUT_LIMIT, sessionSprint, TerminalUiModel, type SessionReadPort, type StateSyncPort, type UiApproval, type UiRetry, type UiRollback, type UiView, type UpdatePort } from "./terminal-ui.js";
+import type { MouseEvent } from "@opentui/core";
+import { displayText, GOAL_INPUT_LIMIT, sessionSprint, TerminalUiModel, type FocusRegion, type KeyMods, type SessionReadPort, type StateSyncPort, type UiApproval, type UiRetry, type UiRollback, type UiView, type UpdatePort } from "./terminal-ui.js";
 import { engineLabel } from "./session-snapshot.js";
 import type { GoalStarter, SeatProcessPort } from "./supervisor.js";
-import type { PaneTailSource } from "./pane-tail.js";
-import { PaneTailPanel } from "./pane-tail-panel.js";
+import type { SessionPort } from "./session-mirror.js";
+import { SessionDriver } from "./session-drive.js";
+import { SessionPane, sessionPaneRows, type PaneMode } from "./session-pane.js";
+import { shortcutContext, shortcutsFor, type Shortcut } from "./shortcuts.js";
 import { keyInput } from "./key-batch.js";
 import { HelpOverlay } from "./help-overlay.js";
 import { TranscriptView } from "./transcript-view.js";
 import type { TranscriptSource } from "./session-transcript.js";
-import { driveFallback, driveWarning, RETURN_KEY, WATCH_HINT, WATCH_HINT_MS } from "./watch-keys.js";
-import type { AttachMode } from "./tmux-attach-owned.js";
 import type { LiveUsagePort } from "./live-usage.js";
 import { isFinishedSprint } from "./finished-sprint.js";
 import { CI_DOT, formatTokens, openableUrl, pipelineSteps, prLabel, sumUsage, totalTokens, usageLine } from "./hub-format.js";
@@ -50,17 +50,23 @@ function confirmText(confirm: UiApproval | UiRollback | UiRetry, width: number):
     + (confirm.prUrl ? "\nPR: " + displayText(confirm.prUrl, 2000) : "");
 }
 
-/** Pane lines on the seat screen: what is left of a 42-row screen after the seat card, sprint strip and footer. */
-export function seatPaneLines(height: number): number {
-  return Math.max(6, Math.min(15, height - 28));
-}
+/** Columns of the seat list on the seat screen. */
+export const SEAT_LIST_WIDTH = 22;
 
 export interface TerminalAppProps {
   model: TerminalUiModel;
   revision: Accessor<number>;
-  onKey: (name: string, ctrl?: boolean, text?: string) => void;
-  /** Reads the selected seat's live pane while its detail is visible. */
-  paneTail?: PaneTailSource;
+  onKey: (name: string, ctrl?: boolean, text?: string, mods?: KeyMods) => void;
+  /** A click on the seat screen: on a part of it (and a seat in the seat list), or outside every part. */
+  onFocus?: (region: FocusRegion | undefined, seatId?: string) => void;
+  /** The mouse wheel over the session pane: positive scrolls back. */
+  onSessionScroll?: (lines: number) => void;
+  /** A bracketed paste while driving a session. */
+  onDrivePaste?: (text: string) => void;
+  /** Mirrors the selected seat's live session while the seat screen is visible. */
+  session?: Pick<SessionPort, "capture">;
+  /** The session mirror's refresh interval; tests shorten it. */
+  mirrorMs?: number;
   /** Reads the selected seat's engine session log while the transcript (`t`) is open. */
   transcript?: TranscriptSource;
   /** Opens a clicked link (a PR or a Mattermost post); without it links are still OSC 8 hyperlinks. */
@@ -118,14 +124,49 @@ export function TerminalApp(props: TerminalAppProps) {
 
   let teamScroll: ScrollBoxRenderable | undefined;
   let detailScroll: ScrollBoxRenderable | undefined;
+  let sprintScroll: ScrollBoxRenderable | undefined;
   useKeyboard((key) => {
-    if (!props.model.input && !props.model.confirm && !props.model.overlay && (key.name === "pageup" || key.name === "pagedown")) {
-      const target = page() === "seat" ? detailScroll : page() === "team" ? teamScroll : undefined;
-      target?.scrollBy(key.name === "pageup" ? -1 : 1, "viewport");
-    } else props.onKey(key.name, key.ctrl, key.sequence);
+    const model = props.model;
+    const mods: KeyMods = { ctrl: key.ctrl, shift: key.shift, meta: key.meta || key.option };
+    // While driving (or connecting to) the session, every key goes to the model, which forwards it.
+    const free = !model.input && !model.confirm && !model.overlay && !(model.page === "seat" && model.focus === "session");
+    const scroller = !free ? undefined : page() === "team" ? teamScroll : page() === "seat" ? (model.focus === "sprints" ? sprintScroll : model.focus === "details" ? detailScroll : undefined) : undefined;
+    const lines = key.name === "pageup" || key.name === "pagedown" ? "viewport" : "absolute";
+    const direction = key.name === "pageup" || key.name === "up" ? -1 : 1;
+    if (scroller && (key.name === "pageup" || key.name === "pagedown" || (page() === "seat" && (key.name === "up" || key.name === "down")))) {
+      if (lines === "viewport") scroller.scrollBy(direction, "viewport");
+      else scroller.scrollBy(direction);
+    } else props.onKey(key.name, key.ctrl, key.sequence, mods);
   });
-  // A bracketed paste arrives as one event; only the goal input takes text, so a paste elsewhere is ignored.
-  usePaste((event) => { if (props.model.input) props.onKey("paste", false, new TextDecoder().decode(event.bytes)); });
+  // A bracketed paste arrives as one event: it goes to the goal input, or to a session the owner drives; elsewhere it is ignored.
+  usePaste((event) => {
+    const text = new TextDecoder().decode(event.bytes);
+    if (props.model.input) props.onKey("paste", false, text);
+    else if (props.model.drivingOn()) props.onDrivePaste?.(text);
+  });
+  const focus = (region: FocusRegion | undefined, seatId?: string) => (event: MouseEvent) => {
+    if (region) event.stopPropagation();
+    if (props.onFocus) props.onFocus(region, seatId);
+    else props.model.focusAt(region, seatId);
+  };
+  const focusedRegion = createMemo(() => { props.revision(); return page() === "seat" ? props.model.focus : undefined; });
+  const regionBorder = (region: FocusRegion) => focusedRegion() === region ? theme.accent : theme.border;
+  const paneMode = createMemo<PaneMode>(() => {
+    props.revision();
+    const model = props.model;
+    if (model.focus !== "session") return "watching";
+    if (model.drivingOn()) return "driving";
+    return model.driving ? "connecting" : "focused";
+  });
+  const shortcuts = createMemo<Shortcut[]>(() => {
+    props.revision();
+    const context = shortcutContext(props.model);
+    const extra: Shortcut[] = [
+      ...props.model.ceremonyKeys().map((label): Shortcut => [label.split(" ")[0]!, label.split(" ").slice(1).join(" ")]),
+      ...(props.model.newGoalBlocked() || context === "teams" ? [] : [["n", "new goal"] as Shortcut]),
+    ];
+    return shortcutsFor(context, extra);
+  });
 
   const seatDetail = () => {
     props.revision();
@@ -144,7 +185,7 @@ export function TerminalApp(props: TerminalAppProps) {
     const leadUsage = props.model.withLiveUsage(selected.id, sumUsage(sessions.map((session) => session.usage)), sessions.map((session) => session.sessionId));
     const liveNote = props.model.liveUsage[selected.id] ? " · includes the run in progress" : "";
     return (
-      <box flexDirection="column" flexShrink={0} paddingLeft={1} paddingRight={1} backgroundColor={theme.panel} border borderColor={theme.border} title=" 🪑 SEAT DETAIL " titleColor={theme.accent}>
+      <box flexDirection="column" flexShrink={0} paddingLeft={1} paddingRight={1} backgroundColor={theme.panel}>
         <text>
           <span style={{ fg: theme.heading }}>{displayText(selected.displayName)}  @{displayText(selected.handle)}</span>
           <span style={{ fg: theme.muted }}>{" · Role: " + displayText(selected.roles.join(", ") || "none") + " · "}</span>
@@ -162,8 +203,9 @@ export function TerminalApp(props: TerminalAppProps) {
             <box flexDirection="row" height={1} flexShrink={0}>
               <text flexShrink={0}>{"   "}</text>
               <LinkText url={held?.prUrl} label={held?.prUrl ? "🐙 " + (prLabel(held?.prUrl, true) ?? "PR") : "PR not opened"} open={open} />
-              <text flexShrink={0} fg={theme.muted}>{(facts?.ci ? " · " + CI_DOT[facts.ci] + " CI " + facts.ci : "") + " · " + (facts?.sessions ?? 0) + " sessions · ⌛ " + elapsedText(facts ?? {}, now()) + " on this task"}</text>
+              <text flexShrink={0} fg={theme.muted}>{facts?.ci ? " · " + CI_DOT[facts.ci] + " CI " + facts.ci : ""}</text>
             </box>
+            <text fg={theme.muted}>{"   " + (facts?.sessions ?? 0) + " sessions · ⌛ " + elapsedText(facts ?? {}, now()) + " on this task"}</text>
             <PipelineLabels steps={pipelineSteps({ status: held!.status, step: facts?.step, fixRounds: facts?.fixRounds })} pulse={pulse} />
             <text fg={theme.accent}>🧮 {usageLine(props.model.withLiveUsage(selected.id, facts?.usage, facts?.sessionIds ?? [])) + liveNote}</text>
           </Show>
@@ -185,7 +227,7 @@ export function TerminalApp(props: TerminalAppProps) {
               <text fg={stateColor("needs", pulse())}>🙋 A approves it here, or react :white_check_mark: on its proposal post</text>
             </Show>
             <text fg={connected && session.attach ? theme.running : theme.muted}>
-              Live view: {connected && session.attach ? "a watch · D drive · " + RETURN_KEY + " back" : "not available"}
+              Live session: {connected && session.attach ? "shown above · i or a click on it drives" : "not available"}
             </text>
             <Show when={session.recentActivity.length} fallback={<text fg={theme.muted}>No runtime activity recorded.</text>}>
               <For each={session.recentActivity.slice(0, 3)}>{(activity) => <text fg={theme.regular}>• {displayText(activity, 160)}</text>}</For>
@@ -199,12 +241,14 @@ export function TerminalApp(props: TerminalAppProps) {
     );
   };
 
-  const keyLine = () => input() ? (newGoalBlocked() ? "Start blocked · Esc cancel" : "Enter start · Esc cancel") + " · " + displayText(team()?.project?.github, 80) + " · home channel"
-    : [page() === "teams" ? "↑↓ choose team · Enter open" : page() === "team" ? "↑↓ seat · Enter details · T retry · s restart · x stop · b teams" : `a watch · D drive (${RETURN_KEY} back) · t transcript · T retry · s restart · x stop · b team`,
-      ...ceremonyKeys(), ...(newGoalBlocked() ? [] : ["n new goal"]), "q quit"].join(" · ");
+  const inputLine = () => (newGoalBlocked() ? "Start blocked" : "Goes to") + " · " + displayText(team()?.project?.github, 80) + " · home channel";
+  const paneWidth = () => Math.max(20, dimensions().width - 2 - SEAT_LIST_WIDTH - 2);
+  const paneRows = () => sessionPaneRows(dimensions().height);
+  const mirrored = () => { props.revision(); return page() === "seat" && !props.model.overlay ? seat() : undefined; };
 
   return (
-    <box width="100%" height="100%" flexDirection="column" backgroundColor={theme.background} paddingLeft={1} paddingRight={1}>
+    <box width="100%" height="100%" flexDirection="column" backgroundColor={theme.background}>
+    <box flexGrow={1} flexDirection="column" paddingLeft={1} paddingRight={1} onMouseDown={focus(undefined)}>
       <box flexShrink={0} flexDirection="column">
         <box flexDirection="row" height={1} backgroundColor={theme.bar}>
           <text fg={theme.barText} flexGrow={1}>{" 💠 INDRA  ›  " + (page() === "teams" ? "Teams" : displayText(team()?.displayName, 30)) + (page() === "seat" && seat() ? "  ›  " + displayText(seat()?.displayName, 30) : "")}</text>
@@ -248,13 +292,35 @@ export function TerminalApp(props: TerminalAppProps) {
       </Show>
 
       <Show when={page() === "seat"}>
-        <scrollbox id="detail-scroll" ref={detailScroll} flexGrow={1} scrollY>
-          <Show when={props.paneTail && seat()}>
-            <PaneTailPanel source={props.paneTail!} seat={seat} width={() => dimensions().width - 6} lines={() => seatPaneLines(dimensions().height)} />
-          </Show>
-          {seatDetail()}
-          <For each={sprints()}>{(sprint) => <SprintStrip sprint={sprint} team={team()} session={sessionOf(sprint.id)} pulse={pulse} open={open} />}</For>
-        </scrollbox>
+        <box flexGrow={1} flexDirection="row">
+          <scrollbox id="seat-list" width={SEAT_LIST_WIDTH} flexShrink={0} scrollY border borderColor={regionBorder("seats")} title=" SEATS " titleColor={theme.accent} onMouseDown={focus("seats")}>
+            <For each={team()?.seats ?? []}>{(item) => {
+              const selected = () => { props.revision(); return props.model.seatId === item.id; };
+              const state = () => { props.revision(); return seatState(props.model, item); };
+              return (
+                <box height={1} flexShrink={0} backgroundColor={selected() ? theme.selected : undefined} onMouseDown={focus("seats", item.id)}>
+                  <text>
+                    <span style={{ fg: stateColor(state(), pulse()) }}>{HUB_STATE[state()].icon + " "}</span>
+                    <span style={{ fg: selected() ? theme.accent : theme.regular }}>{displayText(item.displayName, SEAT_LIST_WIDTH - 6)}</span>
+                  </text>
+                </box>
+              );
+            }}</For>
+          </scrollbox>
+          <box flexGrow={1} flexDirection="column">
+            <Show when={props.session && seat()}>
+              <SessionPane source={props.session!} seat={mirrored} rows={paneRows} width={paneWidth} scroll={() => { props.revision(); return props.model.sessionScroll; }} mode={paneMode}
+                onFocus={() => (props.onFocus ?? ((region: FocusRegion | undefined) => props.model.focusAt(region)))("session")}
+                onScroll={(lines) => props.onSessionScroll ? props.onSessionScroll(lines) : props.model.scrollSession(lines)} intervalMs={props.mirrorMs} />
+            </Show>
+            <scrollbox id="detail-scroll" ref={detailScroll} flexGrow={2} scrollY border borderColor={regionBorder("details")} title=" 🪑 SEAT DETAIL " titleColor={theme.accent} onMouseDown={focus("details")}>
+              {seatDetail()}
+            </scrollbox>
+            <scrollbox id="sprint-scroll" ref={sprintScroll} flexGrow={1} scrollY border borderColor={regionBorder("sprints")} title=" SPRINTS " titleColor={theme.accent} onMouseDown={focus("sprints")}>
+              <For each={sprints()} fallback={<text fg={theme.muted}>No open sprint.</text>}>{(sprint) => <SprintStrip sprint={sprint} team={team()} session={sessionOf(sprint.id)} pulse={pulse} open={open} />}</For>
+            </scrollbox>
+          </box>
+        </box>
       </Show>
 
       <box flexShrink={0} flexDirection="column">
@@ -262,6 +328,7 @@ export function TerminalApp(props: TerminalAppProps) {
         <Show when={launchWarning()}><text fg={stateColor("failed", pulse())} wrapMode="word">⚠ {displayText(launchWarning())}</text></Show>
         <Show when={notice()}><text fg={theme.idle} wrapMode="word">{displayText(notice())}</text></Show>
         <Show when={input()}>
+          <text fg={theme.muted}>{inputLine()}</text>
           <text fg={theme.heading} wrapMode="char">
             New planning goal: {goalInputTail(input()?.value ?? "", dimensions().width)}▏
           </text>
@@ -272,13 +339,31 @@ export function TerminalApp(props: TerminalAppProps) {
         <Show when={confirm()}>
           <text fg={stateColor("needs", pulse())} wrapMode="word">{confirmText(confirm()!, dimensions().width)}{confirm()?.action === "retry" ? " · n/Esc cancel" : " · any other key cancels"}</text>
         </Show>
-        <text fg={theme.accent} wrapMode="word">{keyLine()}</text>
-        <text fg={theme.muted}>? help  ·  {paused() ? "Auto-update paused  ·  U resumes" : "Auto-update  ·  U pauses"}  ·  r checks now  ·  R rolls back  ·  q quits, seats keep running</text>
+        <Show when={!props.model.drivingOn() && (page() === "teams" || page() === "team")}>
+          <text fg={theme.muted}>{paused() ? "Auto-update paused · U resumes" : "Auto-update on · U pauses"} · r checks now · R rolls back · q quits, seats keep running</text>
+        </Show>
       </box>
       <Show when={overlay() === "help"}><HelpOverlay /></Show>
       <Show when={overlay() === "transcript" && seat()}>
         <TranscriptView source={props.transcript} seat={seat()!} recordedHandle={() => props.model.selectedSession()?.sessionId} />
       </Show>
+    </box>
+      <ShortcutBar shortcuts={shortcuts} driving={() => paneMode() === "driving"} />
+    </box>
+  );
+}
+
+/** The always-visible bar of the keys that apply right now; it turns the driving colour while the owner drives. */
+export function ShortcutBar(props: { shortcuts: Accessor<Shortcut[]>; driving: Accessor<boolean> }) {
+  return (
+    <box id="shortcut-bar" flexShrink={0} flexDirection="row" flexWrap="wrap" paddingLeft={1} paddingRight={1} backgroundColor={props.driving() ? "#7C2D12" : theme.bar}>
+      <For each={props.shortcuts()}>{([key, meaning], index) => (
+        <text flexShrink={0}>
+          <span style={{ fg: theme.barText }}>{index() ? " · " : ""}</span>
+          <span style={{ fg: props.driving() ? "#FDBA74" : theme.accent }}>{key ? key + " " : ""}</span>
+          <span style={{ fg: theme.barText }}>{meaning}</span>
+        </text>
+      )}</For>
     </box>
   );
 }
@@ -297,10 +382,11 @@ export function openLink(url: string, run: (file: string, args: string[]) => voi
 /** Start the Solid/OpenTUI screen; renderer ownership and terminal cleanup stay in this function. */
 export async function runTerminalUi(state: StateInventory, sessions: SessionReadPort, options: {
   pollMs?: number;
-  /** Opens a seat's live view: `watch` with the pane's input off, `drive` with it on (only a verified headed run). */
-  attach?: (target: string, mode?: AttachMode) => Promise<unknown>;
-  /** Whether a seat's target is Indra's own verified session with a headed run going, so `D` can drive it. */
-  driveCheck?: (target: string) => Promise<boolean>;
+  /**
+   * Mirrors the selected seat's live session in the seat screen, and drives it (verified pane, headed run only) while
+   * the owner has focused the session pane.
+   */
+  session?: SessionPort;
   /** Reads the running token totals of the headed runs still going. */
   liveUsage?: LiveUsagePort;
   signal?: AbortSignal;
@@ -317,8 +403,6 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
   view?: UiView;
   /** Saves the view and returns the exit code that asks the launcher to start the UI again. */
   reload?: (view: UiView) => Promise<number>;
-  /** Reads the selected seat's live pane while its detail is visible. */
-  paneTail?: PaneTailSource;
   /** Returns a warning when Indra was launched under ttyd or its seats' tmux server cannot be verified. */
   launchCheck?: () => Promise<string | undefined>;
   /** Reads the selected seat's engine session log for the transcript view (`t`). */
@@ -335,18 +419,21 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
   model.changed = () => { if (active) setRevision(model.revision); };
   let active = true;
   let refreshing = false;
-  let attaching = false;
+  const publish = () => { if (active) { model.revision++; setRevision(model.revision); } };
+  const driver = options.session ? new SessionDriver(model, options.session, publish) : undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
   let syncTimer: ReturnType<typeof setInterval> | undefined;
   let updateTimer: ReturnType<typeof setInterval> | undefined;
   let reloadNow = () => {};
   const refresh = async () => {
-    if (!active || refreshing || attaching) return;
+    if (!active || refreshing) return;
     refreshing = true;
     try {
       if (await model.refresh() && active) setRevision(model.revision);
+      // A refresh can end driving (the seat left the state); the pane's input then goes back off.
+      driver?.sync();
       // A new build (self-update or `npm run dev`) reloads the UI once nothing is in flight.
-      if (await model.checkBuild() && model.readyToReload() && active && !attaching) reloadNow();
+      if (await model.checkBuild() && model.readyToReload() && active && !model.driving) reloadNow();
     }
     catch (error) {
       if (active) {
@@ -358,7 +445,7 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
     finally { refreshing = false; }
   };
   const openUrl = (url: string) => {
-    if (!active || attaching) return;
+    if (!active) return;
     const opened = openLink(url);
     model.notice = opened ? "Opened " + opened : "Not opened: that link is not a GitHub PR or an Indra Mattermost page.";
     model.revision++;
@@ -372,6 +459,8 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
       if (syncTimer) clearInterval(syncTimer);
       if (updateTimer) clearInterval(updateTimer);
       options.signal?.removeEventListener("abort", finish);
+      // Quitting while driving switches the pane's input back off; the seat keeps running.
+      void driver?.release();
       renderer.destroy();
       return true;
     };
@@ -382,11 +471,14 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
     };
     // One screen rebuild per stdin chunk, not per key: a burst of keys otherwise exhausts OpenTUI's native renderables.
     const applyKey = keyInput(model, (current) => { if (active) setRevision(current); });
-    const key = (name: string, ctrl?: boolean, text?: string) => {
-      if (!active || attaching) return;
-      if (ctrl && name === "c") { finish(); return; }
-      const action = applyKey(name, text);
-      if (action === "quit") finish();
+    const key = (name: string, ctrl?: boolean, text?: string, mods: KeyMods = {}) => {
+      if (!active) return;
+      // Ctrl-C quits Indra, except while driving, when it goes to the session like every other key.
+      if (ctrl && name === "c" && !(model.page === "seat" && model.focus === "session" && model.driving)) { finish(); return; }
+      const action = applyKey(name, text, { ...mods, ctrl });
+      if (action === "forward") driver?.key(name, text, { ...mods, ctrl });
+      else if (action === "drive" || action === "release") driver?.sync();
+      else if (action === "quit") finish();
       else if (action === "refresh") { void refresh(); void model.updateCode(); }
       else if (action === "pause") void model.togglePause();
       else if (action === "ask-rollback") void model.askRollback();
@@ -397,49 +489,22 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
       else if (action === "sprint") void model.sprintConfirmed();
       else if (action === "retry") void model.retryConfirmed();
       else if (action === "stop" || action === "restart") void model.control(action);
-      else if (action === "attach" || action === "drive") {
-        const target = model.attachTarget();
-        if (!target) return;
-        attaching = true;
-        const name = model.seat?.displayName ?? "the seat";
-        const watching = "Watching " + name + " · " + WATCH_HINT;
-        let shown: string | undefined;
-        let suspended = false;
-        // Drive only a verified seat with a headed run going; the attach checks again and watches if that changed.
-        void (action === "drive" ? (options.driveCheck ?? (async () => false))(target).catch(() => false) : Promise.resolve(false)).then((headed) => {
-          if (!active) return;
-          const mode: AttachMode = action === "drive" && headed ? "drive" : "watch";
-          // Say how to get back before the screen switches to the seat.
-          shown = mode === "drive" ? driveWarning(name) : action === "drive" ? driveFallback(name) : watching;
-          model.notice = shown;
-          model.revision++;
-          setRevision(model.revision);
-          return new Promise((wait) => setTimeout(wait, WATCH_HINT_MS)).then(() => {
-            if (!active) return;
-            suspended = true;
-            renderer.suspend();
-            return (options.attach ?? ((to: string, how?: AttachMode) => attachTmux(to, undefined, undefined, how)))(target, mode);
-          });
-        }).then(() => { if (model.notice === shown && !shown?.startsWith(name + " is not in a headed run")) model.notice = undefined; }, (error: unknown) => {
-          model.notice = error instanceof Error ? error.message : "Could not open this seat's live view.";
-        }).finally(() => {
-          if (active) {
-            if (suspended) renderer.resume();
-            attaching = false;
-            model.revision++;
-            setRevision(model.revision);
-            void refresh();
-          }
-        });
-      }
     };
-    render(() => <TerminalApp model={model} revision={revision} onKey={key} paneTail={options.paneTail} transcript={options.transcript} openUrl={openUrl} />, renderer)
+    const onFocus = (region: FocusRegion | undefined, seatId?: string) => {
+      if (!active) return;
+      model.focusAt(region, seatId);
+      publish();
+      driver?.sync();
+    };
+    const onSessionScroll = (lines: number) => { if (active) { model.scrollSession(lines); publish(); } };
+    const onDrivePaste = (text: string) => { if (active) driver?.paste(text); };
+    render(() => <TerminalApp model={model} revision={revision} onKey={key} onFocus={onFocus} onSessionScroll={onSessionScroll} onDrivePaste={onDrivePaste} session={options.session} transcript={options.transcript} openUrl={openUrl} />, renderer)
       .then(() => {
         if (!active) return;
         timer = setInterval(() => { void refresh(); }, Math.max(500, options.pollMs ?? 2000));
         void model.start();
-        if (options.sync) syncTimer = setInterval(() => { if (active && !attaching) void model.syncState(); }, Math.max(5_000, options.syncMs ?? 60_000));
-        if (options.update) updateTimer = setInterval(() => { if (active && !attaching) void model.updateCode(); }, Math.max(5_000, options.updateMs ?? 60_000));
+        if (options.sync) syncTimer = setInterval(() => { if (active) void model.syncState(); }, Math.max(5_000, options.syncMs ?? 60_000));
+        if (options.update) updateTimer = setInterval(() => { if (active) void model.updateCode(); }, Math.max(5_000, options.updateMs ?? 60_000));
         options.signal?.addEventListener("abort", finish, { once: true });
         if (options.signal?.aborted) finish();
       })
