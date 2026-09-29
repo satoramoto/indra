@@ -1,5 +1,5 @@
 import { createCliRenderer, type ScrollBoxRenderable } from "@opentui/core";
-import { render, useKeyboard, useTerminalDimensions } from "@opentui/solid";
+import { render, useKeyboard, usePaste, useTerminalDimensions } from "@opentui/solid";
 import { createMemo, createSignal, For, Show, type Accessor } from "solid-js";
 import type { StateInventory, StateSeat } from "./state-domain.js";
 import { attachTmux } from "./tmux-attach.js";
@@ -8,6 +8,7 @@ import { engineLabel, SPRINT_STAGES, type SprintBuild } from "./session-snapshot
 import type { GoalStarter, SeatLive, SeatProcessPort } from "./supervisor.js";
 import type { PaneTailSource } from "./pane-tail.js";
 import { PaneTailPanel, paneTailLines } from "./pane-tail-panel.js";
+import { keyInput } from "./key-batch.js";
 
 const theme = {
   background: "#111827", panel: "#1F2937", selected: "#243B53",
@@ -166,6 +167,8 @@ export function TerminalApp(props: TerminalAppProps) {
       target?.scrollBy(key.name === "pageup" ? -1 : 1, "viewport");
     } else props.onKey(key.name, key.ctrl, key.sequence);
   });
+  // A bracketed paste arrives as one event; only the goal input takes text, so a paste elsewhere is ignored.
+  usePaste((event) => { if (props.model.input) props.onKey("paste", false, new TextDecoder().decode(event.bytes)); });
   const paneTail = (panelWidth: () => number) => (
     <Show when={props.paneTail && seat()}>
       <PaneTailPanel source={props.paneTail!} seat={seat} width={panelWidth} lines={() => paneTailLines(dimensions().height)} />
@@ -394,11 +397,12 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
       const view = model.view();
       if (options.reload && cleanup()) options.reload(view).then(resolve, reject);
     };
+    // One screen rebuild per stdin chunk, not per key: a burst of keys otherwise exhausts OpenTUI's native renderables.
+    const applyKey = keyInput(model, (current) => { if (active) setRevision(current); });
     const key = (name: string, ctrl?: boolean, text?: string) => {
       if (!active || attaching) return;
       if (ctrl && name === "c") { finish(); return; }
-      const action = model.key(name, text);
-      setRevision(model.revision);
+      const action = applyKey(name, text);
       if (action === "quit") finish();
       else if (action === "refresh") { void refresh(); void model.updateCode(); }
       else if (action === "pause") void model.togglePause();
