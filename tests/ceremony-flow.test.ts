@@ -50,6 +50,8 @@ class GitHub implements Shell {
   merged = false;
   open = false;
   branch = "";
+  reviewDecision = "";
+  reviews = [{ author: { login: "reviewer" }, state: "APPROVED", submittedAt: "2026-01-01T00:00:00Z" }];
   beforeProof?: () => Promise<void>;
   async run(command: string, args: string[]) {
     const line = `${command} ${args.join(" ")}`; this.calls.push(line);
@@ -59,7 +61,7 @@ class GitHub implements Shell {
     if (args[0] === "pr" && args[1] === "create") { this.open = true; stdout = "https://github.com/test/project/pull/1"; }
     if (args[0] === "pr" && args[1] === "merge") this.merged = true;
     if (args[0] === "pr" && args[1] === "view") stdout = JSON.stringify({ state: this.merged ? "MERGED" : "OPEN", mergeCommit: this.merged ? { oid: mergeSha } : null });
-    if (args.includes("state,baseRefName,mergeCommit,reviewDecision")) { await this.beforeProof?.(); stdout = JSON.stringify({ state: "MERGED", baseRefName: this.branch, mergeCommit: { oid: mainSha }, reviewDecision: "APPROVED" }); }
+    if (args.some((arg) => arg.startsWith("state,baseRefName,mergeCommit,reviewDecision"))) { await this.beforeProof?.(); stdout = JSON.stringify({ state: "MERGED", baseRefName: this.branch, mergeCommit: { oid: mainSha }, reviewDecision: this.reviewDecision, ...(args.some((arg) => arg.split(",").includes("reviews")) ? { reviews: this.reviews } : {}) }); }
     return { code: 0, stdout, stderr: "" };
   }
 }
@@ -246,6 +248,36 @@ describe("ordered gates and evidence", () => {
     expect(saved.ceremony?.closure).toBeUndefined();
     expect(stages(chat)).toEqual(["planning", "proposal", "implement", "release"]);
     await expect(bridge.start("Next")).rejects.toThrow(goal.id);
+  });
+
+  it.each([
+    { name: "approval without a branch rule", states: ["APPROVED"], decision: "", accepted: true },
+    { name: "required review approved", states: ["APPROVED"], decision: "APPROVED", accepted: true },
+    { name: "no approval", states: [], decision: "", accepted: false },
+    { name: "dismissed approval", states: ["DISMISSED"], decision: "", accepted: false },
+    { name: "changes requested after approval", states: ["APPROVED", "CHANGES_REQUESTED"], decision: "", accepted: false },
+    { name: "approval after changes addressed", states: ["CHANGES_REQUESTED", "APPROVED"], decision: "", accepted: true },
+    { name: "comment after approval", states: ["APPROVED", "COMMENTED"], decision: "", accepted: true },
+    { name: "comment after changes requested", states: ["APPROVED", "CHANGES_REQUESTED", "COMMENTED"], decision: "", accepted: false },
+    { name: "required review still pending", states: ["APPROVED"], decision: "REVIEW_REQUIRED", accepted: false },
+    { name: "another reviewer still requests changes", states: ["CHANGES_REQUESTED", "APPROVED"], decision: "", accepted: false, separateReviewers: true },
+    { name: "aggregate approval with outstanding changes", states: ["CHANGES_REQUESTED", "APPROVED"], decision: "APPROVED", accepted: false, separateReviewers: true },
+  ])("verifies implementation reviews before release: $name", async ({ states, decision, accepted, separateReviewers }) => {
+    const { store, github, bridge, goal } = await proposed();
+    await bridge.approve(goal.id);
+    await store.update((state) => {
+      Object.assign(state.planningGoals![0].assignments![0], { status: "merged", prUrl: "https://github.com/test/project/pull/11" });
+    }, "Seat merges its outcome");
+    github.reviewDecision = decision;
+    github.reviews = states.map((state, index) => ({ author: { login: separateReviewers ? `reviewer-${index}` : "reviewer" }, state, submittedAt: `2026-01-01T00:00:0${index}Z` })).reverse();
+    if (accepted) {
+      await expect(bridge.integrate(goal.id)).resolves.toContain("https://github.com/test/project/pull/1");
+      expect((await store.read()).planningGoals![0].ceremony?.stage).toBe("release");
+    } else {
+      await expect(bridge.integrate(goal.id)).rejects.toThrow("review and green CI");
+      expect((await store.read()).planningGoals![0].ceremony?.stage).toBe("implement");
+      expect(github.open).toBe(false);
+    }
   });
 
   it("requires verified running evidence before retro, and publication plus archival before closure", async () => {

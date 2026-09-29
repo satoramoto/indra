@@ -485,11 +485,18 @@ export class PlanningBridge {
     for (const assignment of goal.assignments ?? []) {
       if (assignment.status !== "merged") continue;
       if (!assignment.prUrl) throw new Error("Implementation evidence is incomplete.");
-      const view = await this.shell.run("gh", ["pr", "view", assignment.prUrl, "--json", "state,baseRefName,mergeCommit,reviewDecision"], this.store.checkout);
+      const view = await this.shell.run("gh", ["pr", "view", assignment.prUrl, "--json", "state,baseRefName,mergeCommit,reviewDecision,reviews"], this.store.checkout);
       if (view.code !== 0) throw new Error(`Cannot verify implementation PR for ${assignment.outcomeId}.`);
-      const proof = JSON.parse(view.stdout) as { state?: string; baseRefName?: string; mergeCommit?: { oid?: string }; reviewDecision?: string };
+      const proof = JSON.parse(view.stdout) as { state?: string; baseRefName?: string; mergeCommit?: { oid?: string }; reviewDecision?: string | null; reviews?: { author?: { login?: string }; state?: string; submittedAt?: string }[] };
+      // Repositories without required-review rules may omit reviewDecision even for approved PRs.
+      const verdicts = new Map<string, string>();
+      const reviews = (proof.reviews ?? []).filter((review) => review.author?.login && ["APPROVED", "CHANGES_REQUESTED", "DISMISSED"].includes(review.state ?? "") && Number.isFinite(Date.parse(review.submittedAt ?? "")))
+        .sort((a, b) => Date.parse(a.submittedAt!) - Date.parse(b.submittedAt!));
+      for (const review of reviews) verdicts.set(review.author!.login!, review.state!);
+      const decisions = new Set(verdicts.values());
+      const reviewApproved = !decisions.has("CHANGES_REQUESTED") && (proof.reviewDecision === "APPROVED" || (!proof.reviewDecision && decisions.has("APPROVED")));
       const checks = await this.shell.run("gh", ["pr", "checks", assignment.prUrl], this.store.checkout);
-      if (proof.state !== "MERGED" || proof.baseRefName !== goal.integration!.branch || !/^[0-9a-f]{40}$/.test(proof.mergeCommit?.oid ?? "") || proof.reviewDecision !== "APPROVED" || checks.code !== 0) throw new Error(`Implementation PR for ${assignment.outcomeId} needs verified sprint base, merge, review and green CI.`);
+      if (proof.state !== "MERGED" || proof.baseRefName !== goal.integration!.branch || !/^[0-9a-f]{40}$/.test(proof.mergeCommit?.oid ?? "") || !reviewApproved || checks.code !== 0) throw new Error(`Implementation PR for ${assignment.outcomeId} needs verified sprint base, merge, review and green CI.`);
       outcomes.push({ outcomeId: assignment.outcomeId, seatId: assignment.seatId, prUrl: assignment.prUrl, baseBranch: proof.baseRefName, mergedSha: proof.mergeCommit!.oid!, reviewApproved: true, checksPassed: true });
     }
     return { kind: "implementation", outcomes };
