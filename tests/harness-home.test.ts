@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, stat, unlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -129,7 +129,7 @@ describe("seat auth promotion and config writes", () => {
     await writeFile(join(owner, ".codex", "auth.json"), JSON.stringify({ last_refresh: "2026-01-01T00:00:00Z" }));
     await utimes(ownerAuth(), new Date("2026-01-01"), new Date("2026-01-01"));
     await unlink(join(home, "auth.json"));
-    await writeFile(join(home, "auth.json"), JSON.stringify({ last_refresh: "2026-09-01T00:00:00Z", fake: "rotated" }));
+    await writeFile(join(home, "auth.json"), JSON.stringify({ last_refresh: "2026-09-01T00:00:00Z", fake: "rotated", tokens: { refresh_token: "fake-refresh" } }));
     expect(await promoteSeatAuth(home, ownerAuth())).toBe("promoted");
     expect(JSON.parse(await readFile(ownerAuth(), "utf8"))).toMatchObject({ fake: "rotated" });
     expect(await mode(ownerAuth())).toBe(0o600);
@@ -142,11 +142,34 @@ describe("seat auth promotion and config writes", () => {
     const home = await ensureCodexHome(seatHome(), ownerAuth());
     await writeFile(ownerAuth(), JSON.stringify({ last_refresh: "2026-09-01T00:00:00Z", fake: "owner" }));
     await unlink(join(home, "auth.json"));
-    await writeFile(join(home, "auth.json"), JSON.stringify({ last_refresh: "2026-01-01T00:00:00Z", fake: "stale" }));
+    await writeFile(join(home, "auth.json"), JSON.stringify({ last_refresh: "2026-01-01T00:00:00Z", fake: "stale", tokens: { refresh_token: "fake-old" } }));
     await utimes(join(home, "auth.json"), new Date("2026-01-01"), new Date("2026-01-01"));
     await ensureCodexHome(home, ownerAuth());
     expect(JSON.parse(await readFile(ownerAuth(), "utf8"))).toMatchObject({ fake: "owner" });
     expect(await readlink(join(home, "auth.json"))).toBe(ownerAuth());
+  });
+
+  it.each([
+    ["an empty seat file", ""],
+    ["a corrupt seat file", "{\"tokens\": {"],
+    ["valid JSON without tokens", JSON.stringify({ last_refresh: "2030-01-01T00:00:00Z" })],
+  ])("discards %s and leaves the owner's file untouched", async (_name, content) => {
+    const home = await ensureCodexHome(seatHome(), ownerAuth());
+    const ownerBefore = await readFile(ownerAuth(), "utf8");
+    await unlink(join(home, "auth.json"));
+    await writeFile(join(home, "auth.json"), content);
+    expect(await promoteSeatAuth(home, ownerAuth())).toBe("discarded");
+    expect(await readFile(ownerAuth(), "utf8")).toBe(ownerBefore);
+  });
+
+  it("discards an invalid seat file when the owner's file is unreadable, leaving the owner's untouched", async () => {
+    const home = await ensureCodexHome(seatHome(), ownerAuth());
+    await unlink(join(home, "auth.json"));
+    await writeFile(join(home, "auth.json"), "not json");
+    await chmod(ownerAuth(), 0o000);
+    try { expect(await promoteSeatAuth(home, ownerAuth())).toBe("discarded"); }
+    finally { await chmod(ownerAuth(), 0o600); }
+    expect(await readFile(ownerAuth(), "utf8")).toBe("{\"test\":\"not-a-real-login\"}");
   });
 
   it("leaves the symlink alone", async () => {

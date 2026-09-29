@@ -5,7 +5,7 @@
  * engine needs to authenticate, and the sessions the engine writes there.
  */
 import { randomUUID } from "node:crypto";
-import { chmod, copyFile, lstat, mkdir, readFile, readlink, rename, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, readFile, readlink, rename, symlink, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { SeatEngine } from "./seat-runtime.js";
@@ -41,27 +41,37 @@ export async function writeFileAtomic(path: string, content: string, mode = 0o60
   catch (error) { await unlink(temp).catch(() => undefined); throw error; }
 }
 
-/** When a login was last refreshed: the later of its `last_refresh` field and the file's mtime. Contents never leave this function. */
-async function refreshedAt(path: string): Promise<number> {
-  const mtime = (await stat(path)).mtimeMs;
-  try {
-    const parsed = Date.parse(String((JSON.parse(await readFile(path, "utf8")) as { last_refresh?: unknown }).last_refresh));
-    return Number.isNaN(parsed) ? mtime : Math.max(parsed, mtime);
-  } catch { return mtime; }
+const nonEmpty = (value: unknown) => typeof value === "string" && value.length > 0;
+
+/**
+ * Reads a Codex `auth.json` (0.156.1 `AuthDotJson`) and returns only whether it holds a usable login (a `tokens`
+ * object with a refresh token, or an API key) and its `last_refresh` time. Contents never leave this function.
+ */
+async function loginInfo(path: string): Promise<{ usable: boolean; refreshedAt: number | undefined }> {
+  let parsed: unknown;
+  try { parsed = JSON.parse(await readFile(path, "utf8")); } catch { return { usable: false, refreshedAt: undefined }; }
+  if (!parsed || typeof parsed !== "object") return { usable: false, refreshedAt: undefined };
+  const login = parsed as { tokens?: { refresh_token?: unknown } | null; OPENAI_API_KEY?: unknown; last_refresh?: unknown };
+  const usable = (!!login.tokens && typeof login.tokens === "object" && nonEmpty(login.tokens.refresh_token)) || nonEmpty(login.OPENAI_API_KEY);
+  const time = typeof login.last_refresh === "string" ? Date.parse(login.last_refresh) : NaN;
+  return { usable, refreshedAt: Number.isNaN(time) ? undefined : time };
 }
 
 /**
  * Codex 0.156 writes `auth.json` in place (open with truncate), which follows our symlink, so a refresh reaches the
  * owner's login. Defensively, if a regular file ever appears at the seat's `auth.json` (a logout and login, or a future
- * temp-and-rename writer), it may hold a newer, rotated token: when it is newer than the owner's, it atomically replaces
- * the owner's `auth.json` by rename; an older one is discarded. The caller then restores the symlink. Never logs contents.
+ * temp-and-rename writer), it may hold a newer, rotated token: when it is a usable login strictly newer by `last_refresh`,
+ * it atomically replaces the owner's `auth.json` by rename; an invalid, empty or not-newer one is discarded. The caller then restores the symlink. Never logs contents.
  */
 export async function promoteSeatAuth(home: string, auth = ownerCodexAuth()): Promise<"promoted" | "discarded" | "none"> {
   const seat = join(home, "auth.json");
   const info = await lstat(seat).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; throw error; });
   if (!info?.isFile()) return "none";
-  const ownerAt = await refreshedAt(auth).catch(() => -Infinity);
-  if (await refreshedAt(seat) <= ownerAt) { await unlink(seat); return "discarded"; }
+  // Promote only a usable login strictly newer by `last_refresh`. Discard only a file proven invalid or not newer;
+  // if promotion itself fails, the file stays for the next call to retry.
+  const seatLogin = await loginInfo(seat);
+  const ownerAt = (await loginInfo(auth)).refreshedAt ?? -Infinity;
+  if (!seatLogin.usable || seatLogin.refreshedAt === undefined || seatLogin.refreshedAt <= ownerAt) { await unlink(seat); return "discarded"; }
   await mkdir(dirname(auth), { recursive: true, mode: 0o700 });
   await chmod(seat, 0o600);
   try { await rename(seat, auth); }
