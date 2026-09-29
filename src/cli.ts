@@ -20,7 +20,8 @@ import { DEVELOPER_SESSION_TIMEOUT_MS, type AgentRuntime, type WriteAccess } fro
 import { loadSeatEngines, SeatRuntime } from "./seat-runtime.js";
 import { seatHarnessDir } from "./harness-home.js";
 import { loadSeatPersonas, withPersonaChat, withPersonaRuntime } from "./seat-persona.js";
-import { defaultAppDir, signalReady, TmuxHost, turnLockFile } from "./tmux-host.js";
+import { defaultAppDir, signalReady, SystemTmux, TmuxHost, turnLockFile } from "./tmux-host.js";
+import { checkLaunch } from "./launch-check.js";
 import { withFileLock } from "./state-commit.js";
 import { syncStateSchema } from "./state-schema.js";
 import { readBuildStamp } from "./build-stamp.js";
@@ -327,6 +328,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         processes: new Supervisor(options.checkout, undefined, undefined, undefined, store, (force) => stageServiceToken(options.checkout, { force })),
         goals: new CliGoalStarter(options.checkout),
         paneTail: new TmuxPaneTail(options.checkout),
+        launchCheck: () => checkLaunch(options.checkout, new SystemTmux(), new TmuxHost(options.checkout).socket),
         sync: store,
         update: {
           running: await readBuildStamp(defaultAppDir),
