@@ -132,6 +132,28 @@ describe("ordered ceremony", () => {
       expect(() => advanceCeremony(item, { to: "release", at: at(4), evidence: { ...implementation, outcomes } })).toThrow();
     }
   });
+  it("keeps approval and release valid after an idle Developer seat takes over a queued outcome", () => {
+    const item = staged("implement");
+    const value = document([item]);
+    (value.teams as { seats: unknown[] }[])[0].seats.push({ id: "seat-three", displayName: "seat-three", roles: ["Developer"], externalIdentities: { mattermost: { userId: "seat-three", username: "seat-three" } } });
+    item.assignments![0].seatId = "seat-three";
+    expect(() => validateCeremony(item)).not.toThrow();
+    expect(() => parseState(value)).not.toThrow();
+    // The proposal keeps its seat; only a Developer on the team may take the work.
+    expect(item.proposal!.outcomes[0].seatId).toBe("seat-two");
+    item.assignments![0].seatId = "seat-one";
+    expect(() => parseState(value)).toThrow("proposed seat");
+    item.assignments![0].seatId = "seat-three";
+    prepare(item, "release");
+    const evidence = { ...implementation, outcomes: [{ ...implementation.outcomes[0], seatId: "seat-three" }] };
+    expect(() => advanceCeremony(item, { to: "release", at: at(4), evidence })).not.toThrow();
+    expect(() => advanceCeremony(item, transition("release"))).toThrow("every assigned PR");
+  });
+  it("approves only assignments on their proposed seats", () => {
+    const item = staged("proposal"); prepare(item, "implement");
+    item.assignments![0].seatId = "seat-one";
+    expect(() => advanceCeremony(item, transition("implement"))).toThrow("proposed seat");
+  });
   it("does not confuse a merge or successful build with a running release", () => {
     const item = staged("release");
     expect(() => advanceCeremony(item, transition("retro"))).toThrow("merged integration PR");
