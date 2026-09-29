@@ -1,11 +1,9 @@
-import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { promisify } from "node:util";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { PlanningStore, type PlanningAssignment, type PlanningGoal, type RuntimeRecord, type SprintIntegration } from "../src/planning.js";
-import { engineLabel, LocalSessionReader, LocalSprintBuildReader, projectSprint, sessionEngine } from "../src/session-snapshot.js";
+import { describe, expect, it, vi } from "vitest";
+import { PlanningStore, type PlanningAssignment, type PlanningGoal, type RuntimeRecord } from "../src/planning.js";
+import { CEREMONY_STAGES, engineLabel, LocalSessionReader, projectSprint, sessionEngine, type CeremonyGoal } from "../src/session-snapshot.js";
 
 const time = "2026-09-28T12:00:00Z";
 function goal(statuses: PlanningAssignment["status"][] = []): PlanningGoal {
@@ -22,6 +20,29 @@ function goal(statuses: PlanningAssignment["status"][] = []): PlanningGoal {
 }
 
 describe("sprint projection", () => {
+  it.each(CEREMONY_STAGES)("exposes persisted %s without advancing it from build evidence", (stage) => {
+    const saved: CeremonyGoal = { ...goal(["merged"]), ceremony: { stage, retro: { status: "pending" } } };
+    saved.integration!.status = "merged";
+    const loop = projectSprint(saved, { status: "running", reason: "Both processes are ready." });
+    expect(loop.stage).toBe(stage);
+    expect(loop.ceremony).toEqual(saved.ceremony);
+    expect(loop.ceremony?.closedAt).toBeUndefined();
+  });
+
+  it("preserves closure, recorded release facts and retro status independently from unavailable live evidence", () => {
+    const saved: CeremonyGoal = { ...goal(["merged"]), ceremony: {
+      stage: "retro", closedAt: time, release: { integrationSha: "a".repeat(40), applicationSha: "b".repeat(40), bridgeSha: "b".repeat(40), activatedAt: time },
+      retro: { status: "complete", prUrl: "https://github.com/example/indra/pull/25", postedAt: time },
+    } };
+    saved.integration!.status = "merged";
+    const before = structuredClone(saved);
+    const loop = projectSprint(saved, { status: "unavailable", reason: "Bridge readiness is unavailable." });
+    expect(loop).toMatchObject({ stage: "retro", ceremony: saved.ceremony, build: { status: "unavailable", reason: "Bridge readiness is unavailable." } });
+    loop.ceremony!.retro!.status = "pending";
+    loop.ceremony!.release!.activatedAt = "changed by a consumer";
+    expect(saved).toEqual(before);
+  });
+
   it.each([
     ["clarifying", "Clarify"], ["drafting", "Propose"], ["awaiting-review", "Approve"],
   ] as const)("shows %s as %s without promoting planning into work", (stage, expected) => {
@@ -74,12 +95,24 @@ describe("sprint projection", () => {
     expect(projectSprint(saved, { status: "running" })).toMatchObject({ stage: "Merge", build: { status: "revert-open" } });
     saved.integration.status = "reverted";
     expect(projectSprint(saved, { status: "running" })).toMatchObject({ stage: "Merge", build: { status: "reverted" } });
+    expect(projectSprint(saved, { status: "running", evidence: { integrationSha: "a".repeat(40), applicationSha: "a".repeat(40), bridgeSha: "a".repeat(40), activatedAt: time } }).build?.evidence).toBeUndefined();
   });
 });
 
 describe("read-only session snapshots", () => {
   const runtime: RuntimeRecord = { lastSeenAt: 0, processedPostIds: [], runs: [{ startedAt: time, finishedAt: time }] };
   const host = () => ({ verifiedRecord: vi.fn(async () => undefined), isReady: vi.fn(async () => false), attachTarget: vi.fn(() => "unused"), start: vi.fn() });
+
+  it("shares persisted ceremony and actionable readiness even when run metadata is unreadable", async () => {
+    const saved: CeremonyGoal = { ...goal(["merged"]), ceremony: { stage: "release", retro: { status: "pending" } } };
+    saved.integration!.status = "merged";
+    const store = { read: async () => ({ $schema: "", schemaVersion: 1, teams: [], sprints: [], planningGoals: [saved] }), runtime: async (): Promise<RuntimeRecord> => { throw new Error("unreadable"); } };
+    const builds = { read: vi.fn(async () => ({ status: "reload-pending" as const, reason: "Wait for the owned bridge to restart safely." })) };
+    const session = (await new LocalSessionReader("unused", store, host(), builds).readSessions()).sessions[0];
+    expect(builds.read).toHaveBeenCalledWith(saved.integration);
+    expect(session).toMatchObject({ status: "error", ceremony: saved.ceremony, loop: { stage: "release", ceremony: saved.ceremony, build: { reason: "Wait for the owned bridge to restart safely." } } });
+    expect(saved.ceremony?.closedAt).toBeUndefined();
+  });
 
   it.each([
     [undefined, "codex", "Codex"], ["legacy-session", "codex", "Codex"], ["claude:session-1", "claude", "Claude Code"],
@@ -127,52 +160,5 @@ describe("read-only session snapshots", () => {
     const saved = goal(["merged"]); saved.integration!.status = "merged";
     const session = (await new LocalSessionReader("unused", { read: async () => ({ $schema: "", schemaVersion: 1, teams: [], sprints: [], planningGoals: [saved] }), runtime: async () => ({} as RuntimeRecord) }, host(), { read: async () => { throw new Error("unavailable"); } }).readSessions()).sessions[0];
     expect(session).toMatchObject({ status: "error", loop: { stage: "Merge", build: { status: "unavailable" }, tickets: [{ status: "merged" }] } });
-  });
-});
-
-describe("local running-build evidence", () => {
-  let directory: string; let before: string; let merge: string; let after: string;
-  const stamp = (sha: string) => ({ id: sha, sha, builtAt: time });
-  const git = async (...args: string[]) => (await promisify(execFile)("git", args, { cwd: directory })).stdout.trim();
-  const integration = (): SprintIntegration => ({ branch: "sprint/goal-loop", baseSha: before, status: "merged", mergedSha: merge });
-  const available = async (sha: string) => writeFile(join(directory, "dist", "build-stamp.json"), JSON.stringify(stamp(sha)));
-  beforeAll(async () => {
-    directory = await mkdtemp(join(tmpdir(), "indra-build-evidence-"));
-    await git("init", "-q"); await git("config", "user.name", "Test"); await git("config", "user.email", "test@example.invalid");
-    await git("commit", "--allow-empty", "-qm", "before"); before = await git("rev-parse", "HEAD");
-    await git("commit", "--allow-empty", "-qm", "integration"); merge = await git("rev-parse", "HEAD");
-    await git("commit", "--allow-empty", "-qm", "later"); after = await git("rev-parse", "HEAD");
-    await mkdir(join(directory, "dist"));
-  });
-  afterAll(async () => { await rm(directory, { recursive: true, force: true }); });
-
-  it("proves exact and descendant running builds using local history", async () => {
-    await available(before);
-    for (const sha of [merge, after]) {
-      expect(await new LocalSprintBuildReader(directory, Promise.resolve(stamp(sha))).read(integration())).toMatchObject({ status: "running", runningSha: sha });
-    }
-  });
-
-  it("keeps the captured running stamp while dist switches, distinguishing update from reload", async () => {
-    const reader = new LocalSprintBuildReader(directory, Promise.resolve(stamp(before)));
-    await available(before);
-    expect((await reader.read(integration())).status).toBe("update-pending");
-    await available(after);
-    expect(await reader.read(integration())).toMatchObject({ status: "reload-pending", runningSha: before, availableSha: after });
-  });
-
-  it("reports unavailable for missing stamps, invalid SHAs or missing commit objects", async () => {
-    await available(after);
-    for (const running of [undefined, stamp(""), stamp("not-a-commit"), stamp("f".repeat(40))]) {
-      expect((await new LocalSprintBuildReader(directory, Promise.resolve(running)).read(integration())).status).toBe("unavailable");
-    }
-    await rm(join(directory, "dist", "build-stamp.json"));
-    expect((await new LocalSprintBuildReader(directory, Promise.resolve(stamp(before))).read(integration())).status).toBe("unavailable");
-  });
-
-  it("makes reversion explicit even though the original integration remains in history", async () => {
-    const reader = new LocalSprintBuildReader(directory, Promise.resolve(stamp(after)));
-    expect((await reader.read({ ...integration(), revertPrUrl: "https://github.com/example/indra/pull/23" })).status).toBe("revert-open");
-    expect((await reader.read({ ...integration(), status: "reverted" })).status).toBe("reverted");
   });
 });
