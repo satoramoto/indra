@@ -124,6 +124,7 @@ export class ClaudeRuntime implements AgentRuntime {
         child = spawn("claude", args, { cwd: this.cwd, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32", env: { ...env, CLAUDE_CODE_RESUME_INTERRUPTED_TURN: "0" } });
       } catch { reject(new RuntimeStop("Claude could not be started; check the executable and working directory.")); return; }
       let settled = false; let stdoutBytes = 0; let stderrBytes = 0;
+      let failure: RuntimeStop | undefined;
       let killTimer: ReturnType<typeof setTimeout> | undefined;
       const stop = (kind: NodeJS.Signals) => {
         try {
@@ -139,10 +140,11 @@ export class ClaudeRuntime implements AgentRuntime {
         if (error) reject(error); else resolveOutput();
       };
       const cancel = (message: string, status: "failed" | "interrupted" | "timed-out" = "failed") => {
-        if (settled) return;
+        if (settled || failure) return;
+        failure = new RuntimeStop(message, status);
         // Keep escalation alive even if the parent exits first; its owned descendants can outlive it.
         killTimer = setTimeout(() => stop("SIGKILL"), 1000);
-        finish(new RuntimeStop(message, status));
+        // Continue bounded collection through shutdown; close fires after the stdout pipe has drained.
         stop("SIGTERM");
       };
       const abort = () => cancel("Claude run cancelled.", "interrupted");
@@ -150,21 +152,21 @@ export class ClaudeRuntime implements AgentRuntime {
       signal?.addEventListener("abort", abort, { once: true });
       child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
       child.stdout.on("data", (part: string) => {
-        if (settled) return;
+        if (settled || stdoutBytes > CLAUDE_OUTPUT_LIMIT) return;
         stdoutBytes += Buffer.byteLength(part);
         if (stdoutBytes > CLAUDE_OUTPUT_LIMIT) cancel("Claude stdout exceeded the output limit.");
         else stream.push(part);
       });
       // Never echo provider diagnostics: they can contain prompt text, credentials or tool output.
       child.stderr.on("data", (part: string) => {
-        if (settled) return;
+        if (settled || stderrBytes > CLAUDE_STDERR_LIMIT) return;
         stderrBytes += Buffer.byteLength(part);
         if (stderrBytes > CLAUDE_STDERR_LIMIT) cancel("Claude stderr exceeded the output limit.");
       });
-      child.on("error", (error: NodeJS.ErrnoException) => finish(new RuntimeStop(error.code === "ENOENT" ? "Claude executable not found; install Claude Code and sign in before selecting it for a seat." : "Claude process failed; diagnostics withheld.")));
+      child.on("error", (error: NodeJS.ErrnoException) => cancel(error.code === "ENOENT" ? "Claude executable not found; install Claude Code and sign in before selecting it for a seat." : "Claude process failed; diagnostics withheld."));
       child.on("close", (code) => {
         if (process.platform === "win32" || !child.pid) clearTimeout(killTimer);
-        finish(code === 0 ? undefined : new RuntimeStop(`Claude run failed (${code ?? "cancelled"}); diagnostics withheld.`, code === null ? "interrupted" : "failed"));
+        finish(failure ?? (code === 0 ? undefined : new RuntimeStop(`Claude run failed (${code ?? "cancelled"}); diagnostics withheld.`, code === null ? "interrupted" : "failed")));
       });
       child.stdin.on("error", () => cancel("Claude could not read the prompt; diagnostics withheld."));
       child.stdin.end(prompt);

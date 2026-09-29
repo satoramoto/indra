@@ -17,6 +17,7 @@ const answer = '{"type":"item.completed","item":{"id":"item_3","type":"agent_mes
 const usage = '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":9}}';
 class Process extends EventEmitter {
   stdin = new PassThrough(); stdout = new PassThrough(); stderr = new PassThrough();
+  kill = vi.fn((_signal?: NodeJS.Signals) => true);
   input = "";
   constructor() { super(); this.stdin.on("data", (part) => { this.input += String(part); }); }
   close(output = started + answer + usage, code: number | null = 0) { this.stdout.write(output); this.emit("close", code); }
@@ -25,7 +26,10 @@ let child: Process;
 beforeEach(() => {
   child = new Process();
   vi.mocked(spawn).mockImplementation((_command, _args, options) => {
-    options?.signal?.addEventListener("abort", () => child.emit("error", Object.assign(new Error("private abort diagnostic"), { name: "AbortError" })), { once: true });
+    options?.signal?.addEventListener("abort", () => {
+      child.kill("SIGTERM");
+      child.emit("error", Object.assign(new Error("private abort diagnostic"), { name: "AbortError" }));
+    }, { once: true });
     return child as unknown as ReturnType<typeof spawn>;
   });
 });
@@ -99,6 +103,7 @@ describe("Codex invocation facts", () => {
     const run = failure(new CodexRuntime("/workspace", 60_000).message("Task", "/schema.json", undefined, { timeoutMs: 100 }));
     child.stdout.write(started + usage);
     await vi.advanceTimersByTimeAsync(100);
+    child.close("", null);
     const error = await run;
     expect(error.message).toContain("timed out");
     expect(error.facts).toMatchObject({ status: "timed-out", sessionId: id, usage: { inputTokens: 100, outputTokens: 9 } });
@@ -108,10 +113,54 @@ describe("Codex invocation facts", () => {
   it("records active cancellation and removes the caller's abort listener", async () => {
     const controller = new AbortController(); const remove = vi.spyOn(controller.signal, "removeEventListener");
     const run = failure(new CodexRuntime("/workspace").message("Task", "/schema.json", undefined, { signal: controller.signal }));
-    child.stdout.write(started); controller.abort();
+    child.stdout.write(started); controller.abort(); child.close("", null);
     const error = await run;
     expect(error.facts).toMatchObject({ status: "interrupted", sessionId: id });
     expect(error.facts.usage).toBeUndefined(); expect(remove).toHaveBeenCalledWith("abort", expect.any(Function));
+  });
+
+  it.each(["interrupted", "timed-out", "stdin-error", "process-error"] as const)("drains buffered and shutdown usage before recording %s", async (reason) => {
+    vi.useFakeTimers();
+    const controller = new AbortController(); let settled = false;
+    const run = failure(new CodexRuntime("/workspace").message("Task", "/schema.json", undefined, { timeoutMs: 500, signal: controller.signal }));
+    void run.then(() => { settled = true; });
+    child.stdout.write(started + usage.slice(0, 40));
+    if (reason === "interrupted") controller.abort();
+    else if (reason === "timed-out") await vi.advanceTimersByTimeAsync(500);
+    else if (reason === "stdin-error") child.stdin.emit("error", new Error("private stdin diagnostic"));
+    else child.emit("error", new Error("private process diagnostic"));
+    child.emit("exit", 0);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(settled).toBe(false);
+    // Complete a frame buffered before shutdown, then repeat the cumulative report without a newline.
+    child.close(usage.slice(40) + "\n" + usage);
+    const error = await run;
+    expect(error.facts).toMatchObject({ engine: "codex", status: reason.endsWith("error") ? "failed" : reason, sessionId: id, usage: { inputTokens: 100, outputTokens: 9 }, finishedAt: new Date().toISOString() });
+    expect(JSON.stringify(error)).not.toContain("private");
+  });
+
+  it("escalates a timeout and drains output before recording the forced exit", async () => {
+    vi.useFakeTimers();
+    const run = failure(new CodexRuntime("/workspace").message("Task", "/schema.json", undefined, { timeoutMs: 100 }));
+    child.stdout.write(started);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+    child.close(usage, null);
+    const error = await run;
+    expect(error.facts).toMatchObject({ status: "timed-out", usage: { inputTokens: 100, outputTokens: 9 } });
+    expect(Date.parse(error.facts.finishedAt) - Date.parse(error.facts.startedAt)).toBe(1100);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("continues enforcing the stdout limit during cancellation", async () => {
+    const controller = new AbortController();
+    const run = failure(new CodexRuntime("/workspace").message("Task", "/schema.json", undefined, { signal: controller.signal }));
+    child.stdout.write(started + usage + "\n"); controller.abort();
+    child.stdout.write("x".repeat(10_000_001));
+    child.close(usage.replace('"input_tokens":100', '"input_tokens":200'), null);
+    expect((await run).facts).toMatchObject({ status: "interrupted", usage: { inputTokens: 100, outputTokens: 9 } });
   });
 
   it("records an already-aborted invocation without launching a process", async () => {
@@ -124,6 +173,7 @@ describe("Codex invocation facts", () => {
     const run = failure(new CodexRuntime("/workspace").message("Task", "/schema.json"));
     child.stdout.write(started + usage + "\n");
     child[stream].write("x".repeat(stream === "stdout" ? 10_000_001 : 100_001));
+    child.close("", null);
     const error = await run;
     expect(error.message).toContain(`${stream} exceeded`); expect(error.facts.usage?.inputTokens).toBe(100);
   });
@@ -131,6 +181,7 @@ describe("Codex invocation facts", () => {
   it("records spawn errors without leaking paths, prompts or process diagnostics", async () => {
     const run = failure(new CodexRuntime("/workspace").message("Task", "/schema.json"));
     child.emit("error", Object.assign(new Error("private diagnostic"), { code: "ENOENT" }));
+    child.close("", -2);
     const error = await run;
     expect(error.message).toContain("executable not found"); expect(error.message).not.toContain("private");
     expect(error.facts.status).toBe("failed"); expect(error.facts.sessionId).toBeUndefined();

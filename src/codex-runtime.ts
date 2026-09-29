@@ -52,6 +52,7 @@ export class CodexRuntime implements AgentRuntime {
     const timeoutMs = options.timeoutMs ?? this.timeoutMs; const signal = options.signal;
     let stop: RuntimeStop | undefined;
     const controller = new AbortController(); let timeout: ReturnType<typeof setTimeout> | undefined;
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
     const abort = () => { stop ??= new RuntimeStop("Codex run cancelled.", "interrupted"); controller.abort(); };
     let progress: ReturnType<typeof codexProgress> | undefined;
     try {
@@ -64,27 +65,29 @@ export class CodexRuntime implements AgentRuntime {
       timeout = setTimeout(() => { stop ??= new RuntimeStop(`Codex run timed out after ${minutes(timeoutMs)}.`, "timed-out"); controller.abort(); }, timeoutMs);
       signal?.addEventListener("abort", abort, { once: true });
       const child = spawn("codex", args, { cwd: this.cwd, stdio: ["pipe", "pipe", "pipe"], signal: controller.signal, env });
+      controller.signal.addEventListener("abort", () => { killTimer = setTimeout(() => child.kill("SIGKILL"), 1000); }, { once: true });
       let stdoutBytes = 0; let stderrBytes = 0; let stderrTail = ""; let missingRollout = false;
       child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
       progress = codexProgress({ purpose: options.purpose, cwd: this.cwd });
       const limit = (name: string) => { stop ??= new RuntimeStop(`Codex ${name} exceeded the output limit.`); controller.abort(); };
       child.stdout.on("data", (part: string) => {
-        if (stop) return;
+        if (stdoutBytes > 10_000_000) return;
         stdoutBytes += Buffer.byteLength(part);
         if (stdoutBytes > 10_000_000) { limit("stdout"); return; }
-        stream.push(part); progress?.push(part);
+        stream.push(part); if (!stop) progress?.push(part);
       });
       child.stderr.on("data", (part: string) => {
-        if (stop) return;
+        if (stderrBytes > 100_000) return;
         stderrBytes += Buffer.byteLength(part);
         missingRollout ||= /no rollout found/i.test(stderrTail + part);
         stderrTail = part.slice(-32);
         if (stderrBytes > 100_000) limit("stderr");
       });
-      const code = await new Promise<number | null>((resolve, reject) => {
-        child.on("error", (error: NodeJS.ErrnoException) => reject(stop ?? new RuntimeStop(error.code === "ENOENT" ? "Codex executable not found; install Codex and sign in before selecting it for a seat." : "Codex process failed; diagnostics withheld.")));
+      const code = await new Promise<number | null>((resolve) => {
+        // AbortError can precede the final stdout frames. Only close establishes that the pipes drained.
+        child.on("error", (error: NodeJS.ErrnoException) => { stop ??= new RuntimeStop(error.code === "ENOENT" ? "Codex executable not found; install Codex and sign in before selecting it for a seat." : "Codex process failed; diagnostics withheld."); });
         child.on("close", resolve);
-        child.stdin.on("error", () => { stop ??= new RuntimeStop("Codex could not read the prompt; diagnostics withheld."); controller.abort(); reject(stop); });
+        child.stdin.on("error", () => { stop ??= new RuntimeStop("Codex could not read the prompt; diagnostics withheld."); controller.abort(); });
         child.stdin.end(prompt);
       });
       stream.end();
@@ -101,6 +104,7 @@ export class CodexRuntime implements AgentRuntime {
       throw recordedError(stop ?? error, evidence);
     } finally {
       clearTimeout(timeout);
+      clearTimeout(killTimer);
       signal?.removeEventListener("abort", abort);
       progress?.end();
       if (this.home) await ensureCodexHome(this.home).catch(() => undefined);
