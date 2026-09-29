@@ -13,6 +13,8 @@ import { LocalStateRepository } from "../src/local-state.js";
 import { type AgentRuntime, type AgentResult } from "../src/codex-runtime.js";
 import { type Shell } from "../src/developer-seat.js";
 import { validateCeremony } from "../src/ceremony.js";
+import { createCeremonyAdapters } from "../src/auto-mode-adapter.js";
+import { OwnerSettingsCommands } from "../src/owner-settings.js";
 import { git, stateCheckout } from "./state-checkout.js";
 
 const roots: string[] = [];
@@ -93,7 +95,7 @@ class Services implements Shell, RetroArchive {
 }
 async function fixture() {
   const checkout = await stateCheckout("indra-ceremony-e2e-", { $schema: "./schema/v1/state.schema.json", schemaVersion: 1, sprints: [], planningGoals: [], teams: [{
-    id: "team-one", slug: "yahaha", displayName: "Yahaha", project: { github: "test/project" }, externalIdentities: { mattermost: { teamId: "team", homeChannelId: "home" } }, seats: [
+    id: "team-one", slug: "yahaha", displayName: "Yahaha", mission: "Make delivery dependable", project: { github: "test/project" }, externalIdentities: { mattermost: { teamId: "team", homeChannelId: "home" } }, seats: [
       { id: "seat-lead", displayName: "Chick", roles: ["Team Lead"], externalIdentities: { mattermost: { userId: "chick", username: "chickcorea" } } },
       { id: "seat-dev", displayName: "Developer", roles: ["Developer"], externalIdentities: { mattermost: { userId: "developer", username: "developer" } } },
     ],
@@ -103,7 +105,9 @@ async function fixture() {
   await copyFile(resolve("schema/v1/state.schema.json"), join(checkout, "schema/v1/state.schema.json"));
   const store = new PlanningStore(checkout, undefined, ceremonyReadiness);
   const chat = new Chat(); const agent = new Agent(); const services = new Services();
+  const automatic = await createCeremonyAdapters({ chat });
   const adapters = (): CeremonyAdapters => ({
+    ...automatic,
     implementation: async ({ goal }) => ({ status: "complete", evidence: { kind: "implementation", outcomes: goal.assignments!.map((assignment) => ({ outcomeId: assignment.outcomeId, seatId: assignment.seatId, prUrl: assignment.prUrl!, baseBranch: goal.integration!.branch, mergedSha: "a".repeat(40), checksPassed: true, reviewApproved: true })) } }),
     release: { poll: async ({ goal, mergeApproval }) => !services.running ? { status: "pending", reason: "Build not running yet" } : { status: "complete", evidence: {
       kind: "release-running", prUrl: goal.integration!.prUrl!, mergedSha: releaseSha, mergePostId: mergeApproval!.postId, approval: mergeApproval!.approval,
@@ -118,12 +122,19 @@ async function fixture() {
   const current = async () => (await store.read()).planningGoals![0];
   return { checkout, store, chat, agent, services, restart, current };
 }
-async function releasePending() {
-  const f = await fixture(); const goal = await f.restart().start("Ship the complete ceremony");
+async function releasePending(automatic = false) {
+  const f = await fixture();
+  if (automatic) {
+    const owner = new OwnerSettingsCommands(f.store);
+    await owner.chooseScope("team-one", { kind: "mission" }); await owner.enable("team-one");
+  }
+  const goal = await f.restart().start("Ship the complete ceremony");
   await PlanningBridge.requestProposal(f.store, goal.id); await f.restart().poll();
-  await f.restart().approve(goal.id);
+  if (!automatic) await f.restart().approve(goal.id);
   await f.store.update((state) => { Object.assign(state.planningGoals![0].assignments![0], { status: "merged", prUrl: "https://github.com/test/project/pull/1" }); }, "Record reviewed implementation merge");
-  await f.restart().poll(); await f.restart().merge(goal.id); await f.restart().poll();
+  await f.restart().poll();
+  if (!automatic) await f.restart().merge(goal.id);
+  await f.restart().poll();
   return { ...f, goal };
 }
 
@@ -198,8 +209,8 @@ describe("complete persisted sprint ceremony", () => {
     expect(f.services.publications).toBe(1);
   });
 
-  it.each(["owner", "reaction"])("keeps one open sprint through verified release and retro, then closes through %s approval", async (route) => {
-    const f = await releasePending();
+  it.each(["owner", "reaction", "automatic"])("keeps one open sprint through verified release and retro, then closes through %s approval", async (route) => {
+    const f = await releasePending(route === "automatic");
     expect((await f.current()).ceremony!.stage).toBe("release");
     expect(f.agent.retroCalls).toBe(0);
     await expect(f.restart().start("Next goal")).rejects.toThrow("open goal");
@@ -217,13 +228,21 @@ describe("complete persisted sprint ceremony", () => {
     expect(f.services.reviews).toBe(1);
     await expect(f.restart().merge(f.goal.id)).rejects.toThrow("passing CI");
     f.services.archive!.checksPassed = true;
-    await f.restart().poll(); expect((await f.current()).ceremony!.closure).toBeUndefined();
-    if (route === "owner") await f.restart().merge(f.goal.id);
-    else f.chat.react(record!.gate!.postId);
+    if (route !== "automatic") {
+      await f.restart().poll(); expect((await f.current()).ceremony!.closure).toBeUndefined();
+      if (route === "owner") await f.restart().merge(f.goal.id);
+      else f.chat.react(record!.gate!.postId);
+    }
     await f.restart().poll();
     const closed = await f.current(); validateCeremony(closed);
     expect(closed.ceremony!.history.map((entry) => entry.stage)).toEqual(["planning", "proposal", "implement", "release", "retro"]);
     expect(closed.ceremony!.closure?.evidence).toMatchObject({ path: `docs/retros/${f.goal.id}.md`, prUrl: f.services.archive!.url, postId: post.id });
+    if (route === "automatic") {
+      expect(closed.automaticApprovals?.map((approval) => approval.target.kind)).toEqual(["proposal", "integration", "retro"]);
+      expect(closed.ceremony!.history[2]).toMatchObject({ evidence: { kind: "automatic-approval", approval: closed.automaticApprovals![0] } });
+      expect(closed.ceremony!.history[4]).toMatchObject({ evidence: { approval: closed.automaticApprovals![1] } });
+      expect(closed.ceremony!.closure?.evidence).toMatchObject({ authorization: { approval: closed.automaticApprovals![2] } });
+    } else expect(closed.automaticApprovals).toBeUndefined();
     const timing = await f.store.readRuntimeFile<BridgeCeremonyRecord>(ceremonyRuntimeName(f.goal.id));
     expect(timing!.closedAt).toBe(closed.ceremony!.closure!.closedAt);
     expect(timing!.stageEvents).toEqual(closed.ceremony!.history.map((entry) => ({ stage: entry.stage, at: entry.enteredAt })));
