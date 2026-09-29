@@ -4,17 +4,17 @@ This file is the one place that says what must pass. CI on the pull request is t
 
 ## Checks
 
-Run the ones that cover your change. Each command must exit 0. Run `npm ci` first on a fresh checkout or worktree.
+CI on the pull request runs `npm run typecheck`, `npm test` and `npm run build`. Each must exit 0 before merge.
 
-- `npm run typecheck`. This type-checks all of `src` and `tests` with `tsc --noEmit`. Run it after any TypeScript change.
-- `NODE_OPTIONS=--experimental-ffi npx vitest run <file>`, for example `tests/planning.test.ts`. This runs one test file. Run the files that cover the code you changed. The flag is needed for the native OpenTUI renderer, as in the `test` script in package.json.
-- `npm run build`. This builds `dist/cli.js` with Vite. Run it after changes to the CLI entry point, the terminal UI, the Vite config or dependencies. `planning host` and `npm start` need it.
+## Commands
 
-Don't run the whole suite (`npm test`) locally; CI runs it on the PR.
+Each command exits 0 on success. `npm ci` installs dependencies; a fresh checkout or worktree needs it before the others.
 
-## Feedback loop
-
-`npm run test:watch` reruns the affected tests as you save. Read its latest result after your last edit.
+- `npm run typecheck` type-checks all of `src` and `tests` with `tsc --noEmit`. It covers any TypeScript change.
+- `NODE_OPTIONS=--experimental-ffi npx vitest run <file>`, for example `tests/planning.test.ts`, runs one test file. The flag is needed for the native OpenTUI renderer, as in the `test` script in package.json.
+- `npm test` runs every test file once.
+- `npm run test:watch` reruns the affected tests on each save.
+- `npm run build` builds `dist/cli.js` with Vite. It covers the CLI entry point, the terminal UI, the Vite config and dependencies. `planning host` and `npm start` need it.
 
 ## Review
 

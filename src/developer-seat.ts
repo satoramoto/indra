@@ -386,40 +386,54 @@ function prUrlFrom(response: unknown): string {
 
 const pathExists = (path: string) => lstat(path).then(() => true, (error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return false; throw error; });
 
+/*
+ * Seat prompts are contracts, not procedures: the outcome and its acceptance, what to deliver where Indra can find
+ * it, what Indra does afterwards, the hard constraints and the output schema. How to do the work is the agent's call.
+ */
+const CREDENTIALS = "Never put credentials (tokens, passwords, API keys) in commands, files, commits, PR text or output.";
+const outcomeText = (outcome: ApprovedOutcome) => `Outcome ${outcome.id}: ${outcome.title}\n${outcome.description}`;
+
 function buildPrompt(seat: SeatIdentity, goal: PlanningGoal, outcome: ApprovedOutcome, branch: string, base: string): string {
-  return `You are ${seat.displayName}, a Developer seat in Indra, working one approved outcome in this git worktree (branch ${branch}, created from origin/${base}).
-Follow the repository's AGENTS.md: use its feedback loop, run the targeted tests and checks it lists once each, and keep the change to this outcome only.
-When done: commit, push with \`git push -u origin HEAD:refs/heads/${branch}\`, and open a pull request against ${base} with \`gh pr create --base ${base}\`. Do not merge. Never put credentials in commands, files or output.
+  return `You are ${seat.displayName}, a Developer seat in Indra. This git worktree is on branch ${branch}, created from origin/${base}.
+Outcome: the approved outcome below is done, and nothing else. Acceptance: the outcome's description holds, and the change meets the repository's AGENTS.md rules, including the checks it says must pass.
+Deliver: your commits pushed to branch ${branch} (\`git push -u origin HEAD:refs/heads/${branch}\`), and one pull request from ${branch} into ${base} (\`gh pr create --base ${base}\`).
+Afterwards Indra runs a fresh review of the PR and a fix round, waits for CI and merges it into ${base}. Do not merge the PR, and do not mark it ready or draft.
+Constraints: ${CREDENTIALS}
 Return only JSON: prUrl (the PR's https://github.com/... URL) and summary (one or two sentences).
 Goal: ${goal.goal}
-Outcome ${outcome.id}: ${outcome.title}
-${outcome.description}`;
+${outcomeText(outcome)}`;
 }
 
 function reviewPrompt(goal: PlanningGoal, outcome: ApprovedOutcome, prUrl: string): string {
-  return `You are a fresh reviewer in Indra. You did not write this change. Review pull request ${prUrl} (checked out in this worktree) against the repository's AGENTS.md review checklist.
-Flag only real bugs and project-rule violations, never style or naming. You run read-only without network: do not edit files, commit, push, merge or post anything; Indra posts your findings on the PR.
+  return `You are a fresh reviewer in Indra. You did not write this change. Pull request ${prUrl} is checked out in this worktree.
+Outcome: a review of it against the repository's AGENTS.md review checklist. Acceptance: it flags only real bugs and project-rule violations, never style or naming.
+Afterwards Indra posts your findings on the PR, runs a fix round for them, waits for CI and merges.
+Constraints: you run read-only without network. Do not edit files, commit, push, merge or post anything. ${CREDENTIALS}
 Return only JSON: findings (one line per finding, with file and line where possible; empty when there are none) and summary.
 Goal: ${goal.goal}
-Outcome ${outcome.id}: ${outcome.title}
-${outcome.description}`;
+${outcomeText(outcome)}`;
 }
 
 function fixPrompt(outcome: ApprovedOutcome, prUrl: string, branch: string, findings: string[]): string {
-  return `You are a Developer seat in Indra. Address these review findings on ${prUrl} in this worktree (branch ${branch}). Run the targeted tests AGENTS.md lists once, commit, and push with \`git push origin HEAD:refs/heads/${branch}\`. Do not merge.
+  return `You are a Developer seat in Indra. This git worktree is on branch ${branch}, the head of pull request ${prUrl}.
+Outcome: every review finding below is addressed. Acceptance: the change still meets its outcome and the repository's AGENTS.md rules, including the checks it says must pass.
+Deliver: your commits pushed to branch ${branch} (\`git push origin HEAD:refs/heads/${branch}\`), on the same PR.
+Afterwards Indra waits for CI and merges the PR. Do not merge it, and do not mark it ready or draft.
+Constraints: ${CREDENTIALS}
 Return only JSON: prUrl (${prUrl}) and summary.
-Outcome ${outcome.id}: ${outcome.title}
+${outcomeText(outcome)}
 Findings:
 ${findings.map((item) => `- ${item}`).join("\n")}`;
 }
 
 function conflictPrompt(outcome: ApprovedOutcome, prUrl: string, branch: string, base: string): string {
   return `You are a Developer seat in Indra. Merging origin/${base} into this worktree (branch ${branch}, PR ${prUrl}) stopped with conflicts; the merge is in progress.
-Resolve every conflict keeping the intent of both sides: ${base}'s changes and this PR's outcome. Do not rebase, reset, force-push or abort the merge.
-Run the same targeted tests and checks from AGENTS.md that cover this PR's change, once each, then commit the merge with \`git commit --no-edit\`. Do not push or merge; Indra pushes the branch.
+Outcome: every conflict is resolved keeping the intent of both sides: ${base}'s changes and this PR's outcome. Acceptance: the change meets the repository's AGENTS.md rules, including the checks it says must pass.
+Deliver: the merge committed on ${branch} in this worktree, so origin/${base} is an ancestor of HEAD.
+Afterwards Indra pushes the branch, waits for CI and merges the PR. Do not push or merge, and do not mark the PR ready or draft.
+Constraints: do not rebase, reset, force-push or abort the merge. ${CREDENTIALS}
 Return only JSON: prUrl (${prUrl}) and summary.
-Outcome ${outcome.id}: ${outcome.title}
-${outcome.description}`;
+${outcomeText(outcome)}`;
 }
 
 /** A short, single-line excerpt of command stderr with anything token-shaped removed. */
