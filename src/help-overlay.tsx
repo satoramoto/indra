@@ -1,5 +1,4 @@
 import { For } from "solid-js";
-import { RETURN_KEY } from "./watch-keys.js";
 import { PALETTE } from "./hub-style.js";
 
 export interface HelpSection { title: string; keys: [key: string, meaning: string][] }
@@ -11,22 +10,27 @@ export const HELP_SECTIONS: HelpSection[] = [
     ["Enter  →", "open it"],
     ["b  ←  Esc", "go back"],
     ["PgUp PgDn", "scroll the page"],
+    ["mouse wheel", "scrolls whatever is under the pointer"],
   ] },
   { title: "A seat", keys: [
-    ["a", "watch the seat's live process (read-only)"],
-    ["D", "drive the seat's live agent session: your keys reach it (only during a headed run; otherwise it watches)"],
+    ["Tab  Shift-Tab", "move between the seat list, the live session, the details and the sprints"],
+    ["click", "focus that part; the focused part has a bright border"],
+    ["↑ ↓", "in the seat list, show another seat; elsewhere, scroll the focused part"],
+    ["i  or click the session", "drive the seat's live agent session: your keys reach it (only during a headed run; otherwise you watch)"],
     ["t", "read the seat's session transcript as it happens (read-only)"],
     ["s  x", "restart or stop the seat's process"],
     ["T", "retry a failed assignment (asks first)"],
   ] },
-  { title: "While watching a seat", keys: [
-    [RETURN_KEY, "back to Indra"],
-    ["wheel  PgUp", "scroll back; q, Esc or scrolling to the bottom returns to live"],
-    ["typing", "never reaches the run"],
+  { title: "The live session", keys: [
+    ["watching", "the session shows beside the seat list all the time; nothing you type reaches it"],
+    ["↑ ↓ PgUp PgDn  wheel", "scroll back while it is focused; End returns to live"],
   ] },
-  { title: "While driving a seat", keys: [
-    [RETURN_KEY, "back to Indra; the task keeps running and Indra still waits for its result"],
-    ["typing", "goes straight to the live agent session"],
+  { title: "While driving a session", keys: [
+    ["typing", "goes straight to the live agent session, Ctrl-C and a single Esc included"],
+    ["Esc Esc", "stop driving (two quick presses)"],
+    ["Tab", "stop driving and move to the next part"],
+    ["click outside", "stop driving"],
+    ["", "the task keeps running and Indra still waits for its result"],
   ] },
   { title: "In the transcript", keys: [
     ["↑ ↓  PgUp PgDn", "scroll"],
@@ -56,7 +60,7 @@ export function HelpOverlay() {
             <text fg={PALETTE.text}>{section.title.toUpperCase()}</text>
             <For each={section.keys}>{([key, meaning]) => (
               <box flexDirection="row" flexShrink={0}>
-                <text fg={PALETTE.accent} width={20} flexShrink={0}>{"  " + key}</text>
+                <text fg={PALETTE.accent} width={26} flexShrink={0}>{"  " + key}</text>
                 <text fg={PALETTE.dim} wrapMode="word">{meaning}</text>
               </box>
             )}</For>

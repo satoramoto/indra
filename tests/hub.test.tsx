@@ -269,8 +269,8 @@ const SCREENS = [
 async function screen(view: { page: "team" | "seat" | "teams"; seatId?: string }, pulse: () => boolean = () => false) {
   const model = await hubModel();
   model.restore({ ...view, teamId: "team-001" });
-  const paneTail = { capture: async (_seat: unknown, size: { lines: number }) => ({ status: "ok" as const, lines: Array.from({ length: 20 }, (_, index) => `15:${String(index).padStart(2, "0")} $ ✓ npm test step ${index}`).slice(-size.lines) }) };
-  const setup = await testRender(() => <TerminalApp model={model} revision={() => model.revision} onKey={() => {}} paneTail={paneTail} pulse={pulse} now={() => NOW} />, { width: HUB_GRID.columns, height: HUB_GRID.rows });
+  const session = { capture: async (_seat: unknown, size: { rows: number }) => ({ status: "ok" as const, lines: Array.from({ length: 20 }, (_, index) => [{ text: `15:${String(index).padStart(2, "0")} $ ✓ npm test step ${index}`, style: {} }]).slice(-size.rows) }) };
+  const setup = await testRender(() => <TerminalApp model={model} revision={() => model.revision} onKey={() => {}} session={session} pulse={pulse} now={() => NOW} />, { width: HUB_GRID.columns, height: HUB_GRID.rows });
   await setup.renderOnce();
   await new Promise((resolve) => setTimeout(resolve, 20));
   await setup.renderOnce();
@@ -288,8 +288,17 @@ describe("the hub on the owner's screen", () => {
       const frame = setup.captureCharFrame();
       await keep(name, frame);
       const scroll = setup.renderer.root.findDescendantById(view.page === "seat" ? "detail-scroll" : "team-scroll") as ScrollBoxRenderable | undefined;
-      // Nothing to scroll: the content is no taller than the screen gives it.
-      if (scroll) expect(scroll.scrollHeight, frame).toBeLessThanOrEqual(scroll.height);
+      // Nothing to scroll on the team screens: the content is no taller than the screen gives it. On a seat screen the
+      // live session takes most rows and the details are their own scrolling panel: every field is reachable by scrolling it.
+      const frames = [frame];
+      if (scroll && view.page === "seat") {
+        for (let page = 0; page < 10 && scroll.scrollTop + scroll.viewport.height < scroll.scrollHeight; page++) {
+          // A third of a page at a time, so a wrapped field is whole in at least one frame.
+          scroll.scrollBy(Math.max(1, Math.floor(scroll.viewport.height / 3)));
+          await setup.renderOnce();
+          frames.push(setup.captureCharFrame());
+        }
+      } else if (scroll) expect(scroll.scrollHeight, frame).toBeLessThanOrEqual(scroll.height);
       const expected: Record<string, string[]> = {
         team: [...names, "NEEDS YOU · 2", "progress " + "▀".repeat(11) + " ".repeat(13) + "  45%", "The 1Password service account token is missing; run npm start again.", "Keep the hub inside a 96 by 42 terminal · failed · T retry",
           "SPRINT goal-hub", "planning → proposal → [implement] → release → retro", "open · 1/4 merged", "work 1.5M · out 250k · cache 5M · 3h20m since planning",
@@ -297,22 +306,24 @@ describe("the hub on the owner's screen", () => {
           "⎇ #103 ●", "⎇ #98 ●", "⎇ #99 ●", "in review", "building", "merged", "failed", "George Duke", "Aaron Magner",
           "SEATS · Yahaha · 5", "● 2 running", "◆ 1 needs you", "✗ 1 failed", "○ 1 idle",
           "SEAT", "TASK", "STEPS", "MODEL", "WORK", "OUT", "CACHE", "CTX", "TIME", "gpt-6-sol", "opus-5-5", "no credential", "failed · T retry", "idle session",
-          "300k 50k 1M 250k 47m ⎇ #103 ●", "12m", "LATEST", "Opened PR 103; review requested", "context compacted 1m ago · Building the pipeline row", "↑↓ seat · Enter details"],
-        "developer-seat": ["LIVE PANE · George Duke", "SEAT George Duke", "George Duke @georgeduke · Developer · running", "process running (seat runner)",
+          "300k 50k 1M 250k 47m ⎇ #103 ●", "12m", "LATEST", "Opened PR 103; review requested", "context compacted 1m ago · Building the pipeline row"],
+        "developer-seat": ["LIVE · George Duke · progress · click or i to drive", "SEAT George Duke", "George Duke @georgeduke · Developer · running", "process running (seat runner)",
           "harness Codex · model gpt-6-sol · effort medium", "tokens work 300k · out 50k · cache 1M · ctx 250k/300k · includes the run in progress",
           // George Duke's last hour: 400k at 50 minutes ago and 850k at 20 (the 90-minute session is outside the window).
           "burn ⢠⠀⢸⠀ last hour",
           `assignment ${titles[0]} · in-review`, "pr ⎇ satoramoto/indra#103 · ● CI pending · 3 sessions · 47m on this task",
           "steps ■ build → ■ review → ─ fix skipped → ◧ ci → □ merge", "latest Opened PR 103; review requested",
-          "SPRINT goal-hub", "planning → proposal → [implement] → release → retro", "tickets 1/4 tickets merged", "a watch · D drive (Ctrl-] back) · t transcript"],
-        "lead-seat": ["LIVE PANE · Chick Corea", "Chick Corea @chickcorea · Team Lead · idle", "process running (planning bridge)", "harness Claude · model claude-opus-5-5 · effort max",
+          "SPRINTS", "planning → proposal → [implement] → release → retro", "tickets 1/4 tickets merged", "SEATS", ...names],
+        "lead-seat": ["LIVE · Chick Corea · progress · click or i to drive", "Chick Corea @chickcorea · Team Lead · idle", "process running (planning bridge)", "harness Claude · model claude-opus-5-5 · effort max",
           "tokens work 504k · out 84k · cache 1.68M", "session idle session · Claude Code", "goal Make the terminal UI the owner's all-day hub",
-          "Claude Code session: claude:0e5f9f3e-1111-4222-8333-944445555666", "4 runs", "live view a watch · D drive · Ctrl-] back", "[implement]", "⇗ goal thread", "⇗ proposal post"],
-        teams: ["TEAMS", "Yahaha (yahaha)", "5 seats", "⎇ satoramoto/indra", "↑↓ choose team · Enter open"],
+          "Claude Code session: claude:0e5f9f3e-1111-4222-8333-944445555666", "4 runs", "live shown above · i or a click on it drives", "[implement]", "⇗ goal thread", "⇗ proposal post"],
+        teams: ["TEAMS", "Yahaha (yahaha)", "5 seats", "⎇ satoramoto/indra"],
       };
-      // Word wrapping is fine; cutting a key field short is not. Compare without spaces.
-      const compact = (text: string) => text.replace(/\s/g, "");
-      for (const text of expected[name]) expect(compact(frame), text + "\n" + frame).toContain(compact(text));
+      // Word wrapping inside a box is fine; cutting a key field short is not. Compare without spaces and box edges.
+      const compact = (text: string) => text.replace(view.page === "seat" ? /[\s│█▀▄]/g : /\s/g, "");
+      for (const text of expected[name]) expect(frames.map(compact).join("\n"), text + "\n" + frames.join("\n")).toContain(compact(text));
+      for (const shown of frames) expect(shown).not.toMatch(/tmux|Ctrl-\]|Ctrl-b/);
+      for (const shown of frames) expect(shown.match(EMOJI) ?? [], shown).toEqual([]);
       expect(frame.split("\n").length - 1).toBe(HUB_GRID.rows);
       expect(frame.match(EMOJI) ?? [], frame).toEqual([]);
     } finally { setup.renderer.destroy(); }
@@ -393,7 +404,8 @@ describe("the hub on the owner's screen", () => {
           // A pulsing cell is in the needs-you/failed red, or it is the active pipeline step.
           expect(cell.fg === red || cell.char === GLYPH.stage.active, `${cell.char} at ${row}:${column}`).toBe(true);
         }));
-        expect(changed).toContain(GLYPH.stage.active);
+        // The seat screen's pipeline sits below the fold of its scrolling details panel.
+        if (view.page === "team") expect(changed).toContain(GLYPH.stage.active);
         if (view.page === "team") expect(changed).toEqual(expect.arrayContaining([GLYPH.state.needs, GLYPH.state.failed]));
         // The running glyph and the rest of the screen hold still.
         expect(changed).not.toContain(GLYPH.state.running);

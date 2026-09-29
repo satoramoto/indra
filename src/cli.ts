@@ -32,9 +32,7 @@ import { readFile, rm, writeFile, mkdir } from "node:fs/promises";
 import type { UiView } from "./terminal-ui.js";
 import { LocalSessionReader } from "./session-snapshot.js";
 import { CliGoalStarter, Supervisor } from "./supervisor.js";
-import { TmuxPaneTail } from "./pane-tail.js";
-import { attachTmux, parseOwnedTmuxTarget } from "./tmux-attach.js";
-import { verifyOwnedSession } from "./tmux-attach-owned.js";
+import { TmuxSeatSession } from "./session-mirror.js";
 import { headedMarkerFile, useHeadedMarker } from "./headed-session.js";
 import { LiveUsageReader } from "./live-usage.js";
 import { LocalTranscriptSource, TranscriptLocator } from "./session-transcript.js";
@@ -336,14 +334,9 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       return await runTerminalUi(new StateInventory(new LocalStateRepository(options.checkout)), new LocalSessionReader(options.checkout), {
         processes: new Supervisor(options.checkout, undefined, undefined, undefined, store, (force) => stageServiceToken(options.checkout, { force })),
         goals: new CliGoalStarter(options.checkout),
-        paneTail: new TmuxPaneTail(options.checkout),
-        // Watching a seat sets up keys, scrolling and the status line only on this checkout's verified sessions.
-        // Driving leaves the pane's input on, only for a verified session with a headed run going.
-        attach: (target, mode) => attachTmux(target, undefined, (socket, session) => verifyOwnedSession(options.checkout, socket, session), mode),
-        driveCheck: async (target) => {
-          const { socket, session } = parseOwnedTmuxTarget(target);
-          return (await verifyOwnedSession(options.checkout, socket, session))?.headed === true;
-        },
+        // The seat's live session is mirrored inside the UI from this checkout's verified panes only; driving switches
+        // a pane's input on only for a verified session with a headed run going, and only while its pane is focused.
+        session: new TmuxSeatSession(options.checkout),
         liveUsage: new LiveUsageReader(options.checkout),
         transcript: new LocalTranscriptSource(new TranscriptLocator(options.checkout)),
         launchCheck: () => checkLaunch(options.checkout, new SystemTmux(), new TmuxHost(options.checkout).socket),

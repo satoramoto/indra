@@ -647,7 +647,7 @@ export function SprintStrip(props: { sprint: TerminalSprint; team?: StateTeam; s
 /** The labelled pipeline on the seat screen: each stage's glyph and name, lit as it advances. */
 export function PipelineLabels(props: { steps: PipelineStep[]; pulse: Accessor<boolean> }) {
   const mark: Partial<Record<StageState, string>> = { failed: " failed", skipped: " skipped" };
-  return <text flexShrink={0} wrapMode="none">
+  return <text flexShrink={1} flexGrow={1} wrapMode="word">
     <For each={props.steps}>{(step, index) => <>
       <span style={{ fg: theme.dim }}>{index() ? "  " + GLYPH.arrow + "  " : ""}</span>
       <span style={{ fg: stepColor(step.state, props.pulse()) }}>{stepGlyph(step) + " "}</span>
