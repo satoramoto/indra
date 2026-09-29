@@ -1,26 +1,29 @@
 import { execFile } from "node:child_process";
 import { createCliRenderer, type ScrollBoxRenderable } from "@opentui/core";
-import { render, useKeyboard, usePaste, useTerminalDimensions } from "@opentui/solid";
-import { createMemo, createSignal, For, Show, type Accessor } from "solid-js";
+import { render, useKeyboard, usePaste, useRenderer, useTerminalDimensions } from "@opentui/solid";
+import { createMemo, createSignal, For, onCleanup, Show, type Accessor } from "solid-js";
+import { createFrameClock, HeaderBar, IdleSplash } from "./hub-canvas.js";
+import { supportsTruecolor, TokenBurn } from "./hub-paint.js";
 import type { StateInventory } from "./state-domain.js";
-import { attachTmux } from "./tmux-attach.js";
-import { displayText, GOAL_INPUT_LIMIT, sessionSprint, TerminalUiModel, type SessionReadPort, type StateSyncPort, type UiApproval, type UiRetry, type UiRollback, type UiView, type UpdatePort } from "./terminal-ui.js";
+import type { MouseEvent } from "@opentui/core";
+import { displayText, GOAL_INPUT_LIMIT, sessionSprint, TerminalUiModel, type FocusRegion, type KeyMods, type SessionReadPort, type StateSyncPort, type UiApproval, type UiRetry, type UiRollback, type UiView, type UpdatePort } from "./terminal-ui.js";
 import { engineLabel } from "./session-snapshot.js";
 import type { GoalStarter, SeatProcessPort } from "./supervisor.js";
-import type { PaneTailSource } from "./pane-tail.js";
-import { PaneTailPanel } from "./pane-tail-panel.js";
+import type { SessionPort } from "./session-mirror.js";
+import { SessionDriver } from "./session-drive.js";
+import { SessionPane, sessionPaneRows, type PaneMode } from "./session-pane.js";
+import { shortcutContext, shortcutsFor, type Shortcut } from "./shortcuts.js";
 import { keyInput } from "./key-batch.js";
 import { HelpOverlay } from "./help-overlay.js";
 import { TranscriptView } from "./transcript-view.js";
 import type { TranscriptSource } from "./session-transcript.js";
-import { driveFallback, driveWarning, RETURN_KEY, WATCH_HINT, WATCH_HINT_MS } from "./watch-keys.js";
-import type { AttachMode } from "./tmux-attach-owned.js";
 import type { LiveUsagePort } from "./live-usage.js";
 import { isFinishedSprint } from "./finished-sprint.js";
-import { CI_DOT, formatTokens, openableUrl, pipelineSteps, prLabel, sumUsage, totalTokens, usageLine } from "./hub-format.js";
+import { formatTokens, openableUrl, pipelineSteps, sumUsage, workTokens } from "./hub-format.js";
+import { GLYPH } from "./hub-style.js";
 import {
-  assignmentLine, createTicker, elapsedText, harnessText, HUB_STATE, isDeveloper, LinkText, occupancy, PipelineLabels, processColor, SeatRow,
-  seatState, SprintCard, SprintStrip, stateColor, theme, threadActivity, type HubState,
+  ActivitySection, assignmentLine, AttentionSection, burnSparkline, CI_COLOR, clip, seatInfo, createTicker, elapsedText, Field, FieldText, HUB_STATE, isDeveloper, KeyLegend, LinkText, occupancy, pad,
+  PipelineLabels, prText, processColor, SeatHeader, SeatRow, Section, seatState, SprintCard, SprintStrip, stateColor, stateCounts, theme, threadActivity, UsageSpans,
 } from "./hub-view.js";
 
 /** The end of a long goal, as many characters as fit in six wrapped lines, so the cursor stays visible. */
@@ -50,17 +53,23 @@ function confirmText(confirm: UiApproval | UiRollback | UiRetry, width: number):
     + (confirm.prUrl ? "\nPR: " + displayText(confirm.prUrl, 2000) : "");
 }
 
-/** Pane lines on the seat screen: what is left of a 42-row screen after the seat card, sprint strip and footer. */
-export function seatPaneLines(height: number): number {
-  return Math.max(6, Math.min(15, height - 28));
-}
+/** Columns of the seat list on the seat screen. */
+export const SEAT_LIST_WIDTH = 22;
 
 export interface TerminalAppProps {
   model: TerminalUiModel;
   revision: Accessor<number>;
-  onKey: (name: string, ctrl?: boolean, text?: string) => void;
-  /** Reads the selected seat's live pane while its detail is visible. */
-  paneTail?: PaneTailSource;
+  onKey: (name: string, ctrl?: boolean, text?: string, mods?: KeyMods) => void;
+  /** A click on the seat screen: on a part of it (and a seat in the seat list), or outside every part. */
+  onFocus?: (region: FocusRegion | undefined, seatId?: string) => void;
+  /** The mouse wheel over the session pane: positive scrolls back. */
+  onSessionScroll?: (lines: number) => void;
+  /** A bracketed paste while driving a session. */
+  onDrivePaste?: (text: string) => void;
+  /** Mirrors the selected seat's live session while the seat screen is visible. */
+  session?: Pick<SessionPort, "capture">;
+  /** The session mirror's refresh interval; tests shorten it. */
+  mirrorMs?: number;
   /** Reads the selected seat's engine session log while the transcript (`t`) is open. */
   transcript?: TranscriptSource;
   /** Opens a clicked link (a PR or a Mattermost post); without it links are still OSC 8 hyperlinks. */
@@ -68,6 +77,10 @@ export interface TerminalAppProps {
   /** The blink phase and the clock; tests pass their own, the app runs one shared ticker. */
   pulse?: Accessor<boolean>;
   now?: Accessor<number>;
+  /** The animation frame for the header drift and the splash shimmer; the app runs its own clock only while they move. */
+  frame?: Accessor<number>;
+  /** Forces truecolor on or off; by default it is detected, and without it colours snap to the 256-colour palette. */
+  truecolor?: boolean;
 }
 
 export function TerminalApp(props: TerminalAppProps) {
@@ -82,18 +95,26 @@ export function TerminalApp(props: TerminalAppProps) {
   const runtime = createMemo(() => {
     props.revision();
     const connection = props.model.sessionResult.connection;
-    return connection === "connected" ? { text: "🟢 RUNTIME CONNECTED", color: theme.running } : connection === "error" ? { text: "🔴 RUNTIME ERROR", color: theme.error } : { text: "🟡 RUNTIME DISCONNECTED", color: theme.idle };
+    return connection === "connected" ? { text: "runtime connected", color: theme.ok } : connection === "error" ? { text: "runtime error", color: theme.bad } : { text: "runtime disconnected", color: theme.wait };
   });
   const stateSummary = createMemo(() => {
     props.revision();
     return props.model.stateError
-      ? "STATE ERROR · " + displayText(props.model.stateError)
+      ? "State error · " + displayText(props.model.stateError)
       : "State loaded " + (displayText(props.model.refreshedAt) || "pending");
   });
   const notice = createMemo(() => { props.revision(); return props.model.notice; });
   const launchWarning = createMemo(() => { props.revision(); return props.model.launchWarning; });
   const sync = createMemo(() => { props.revision(); return props.model.syncLine(); });
   const update = createMemo(() => { props.revision(); return props.model.updateLine(); });
+  /** The status line: state, sync and update in one dim row while all is well; a failing one gets its own red row. */
+  const statusRows = createMemo(() => {
+    const width = Math.max(20, dimensions().width - 2);
+    const first = stateSummary() + "  " + GLYPH.separator + "  " + (displayText(props.model.sessionResult.message) || "Auto-updating");
+    const parts = [sync(), update()].filter((part): part is { text: string; ok: boolean } => !!part);
+    const quiet = [first, ...parts.filter((part) => part.ok).map((part) => part.text)].join("  " + GLYPH.separator + "  ");
+    return [{ text: clip(displayText(quiet, 2000), width), ok: !props.model.stateError }, ...parts.filter((part) => !part.ok).map((part) => ({ text: displayText(part.text, width), ok: false }))];
+  });
 
   const input = createMemo(() => { props.revision(); return props.model.input ? { ...props.model.input } : undefined; });
   const confirm = createMemo(() => { props.revision(); return props.model.confirm ? { ...props.model.confirm } : undefined; });
@@ -107,30 +128,75 @@ export function TerminalApp(props: TerminalAppProps) {
     return newGoalBlocked() && open.length ? "New goal blocked: " + open.map((goal) => goal.id).join(", ") + " still open." : newGoalBlocked();
   });
   const ceremonyKeys = createMemo(() => { props.revision(); return props.model.ceremonyKeys(); });
+  // Per-cell polish (hub-canvas.tsx): the header drifts while any sprint runs, and the splash shows on an idle team.
+  const sprintRunning = createMemo(() => { props.revision(); return props.model.sessionResult.sessions.some((session) => !isFinishedSprint(sessionSprint(session).loop)); });
+  const splash = createMemo(() => page() === "team" && !!team() && sprints().length === 0);
+  const frame = props.frame ?? createFrameClock(() => sprintRunning() || splash());
+  const renderer = useRenderer();
+  const [detected, setDetected] = createSignal(supportsTruecolor(renderer.capabilities));
+  const onCapabilities = () => setDetected(supportsTruecolor(renderer.capabilities));
+  renderer.on("capabilities", onCapabilities);
+  onCleanup(() => renderer.off("capabilities", onCapabilities));
+  const truecolor = () => props.truecolor ?? detected();
+  const burn = new TokenBurn();
   const overlay = createMemo(() => { props.revision(); return props.model.overlay; });
-  /** Seats per state for the team title: the owner sees at once how many run, wait, need them or failed. */
-  const teamCounts = createMemo(() => {
-    props.revision();
-    const counts = new Map<HubState, number>();
-    for (const item of team()?.seats ?? []) { const state = seatState(props.model, item); counts.set(state, (counts.get(state) ?? 0) + 1); }
-    return (["running", "waiting", "needs", "failed", "idle"] as HubState[]).filter((state) => counts.get(state)).map((state) => HUB_STATE[state].icon + " " + counts.get(state) + " " + HUB_STATE[state].word).join(" · ");
-  });
+  /** Seats per state for the seats title: the owner sees at once how many run, wait, need them or failed. */
+  const teamCounts = createMemo(() => { props.revision(); return stateCounts(props.model, team()?.seats ?? []); });
+  /** Content width inside the page's side padding. */
+  const contentWidth = () => Math.max(20, dimensions().width - 3);
+  /** One column on the right stays free for the scroll bar, so it never covers a row's last character. */
+  const scrollContent = { paddingRight: 1 };
 
   let teamScroll: ScrollBoxRenderable | undefined;
   let detailScroll: ScrollBoxRenderable | undefined;
+  let sprintScroll: ScrollBoxRenderable | undefined;
   useKeyboard((key) => {
-    if (!props.model.input && !props.model.confirm && !props.model.overlay && (key.name === "pageup" || key.name === "pagedown")) {
-      const target = page() === "seat" ? detailScroll : page() === "team" ? teamScroll : undefined;
-      target?.scrollBy(key.name === "pageup" ? -1 : 1, "viewport");
-    } else props.onKey(key.name, key.ctrl, key.sequence);
+    const model = props.model;
+    const mods: KeyMods = { ctrl: key.ctrl, shift: key.shift, meta: key.meta || key.option };
+    // While driving (or connecting to) the session, every key goes to the model, which forwards it.
+    const free = !model.input && !model.confirm && !model.overlay && !(model.page === "seat" && model.focus === "session");
+    const scroller = !free ? undefined : page() === "team" ? teamScroll : page() === "seat" ? (model.focus === "sprints" ? sprintScroll : model.focus === "details" ? detailScroll : undefined) : undefined;
+    const lines = key.name === "pageup" || key.name === "pagedown" ? "viewport" : "absolute";
+    const direction = key.name === "pageup" || key.name === "up" ? -1 : 1;
+    if (scroller && (key.name === "pageup" || key.name === "pagedown" || (page() === "seat" && (key.name === "up" || key.name === "down")))) {
+      if (lines === "viewport") scroller.scrollBy(direction, "viewport");
+      else scroller.scrollBy(direction);
+    } else props.onKey(key.name, key.ctrl, key.sequence, mods);
   });
-  // A bracketed paste arrives as one event; only the goal input takes text, so a paste elsewhere is ignored.
-  usePaste((event) => { if (props.model.input) props.onKey("paste", false, new TextDecoder().decode(event.bytes)); });
+  // A bracketed paste arrives as one event: it goes to the goal input, or to a session the owner drives; elsewhere it is ignored.
+  usePaste((event) => {
+    const text = new TextDecoder().decode(event.bytes);
+    if (props.model.input) props.onKey("paste", false, text);
+    else if (props.model.drivingOn()) props.onDrivePaste?.(text);
+  });
+  const focus = (region: FocusRegion | undefined, seatId?: string) => (event: MouseEvent) => {
+    if (region) event.stopPropagation();
+    if (props.onFocus) props.onFocus(region, seatId);
+    else props.model.focusAt(region, seatId);
+  };
+  const focusedRegion = createMemo(() => { props.revision(); return page() === "seat" ? props.model.focus : undefined; });
+  const regionBorder = (region: FocusRegion) => focusedRegion() === region ? theme.accent : theme.rule;
+  const paneMode = createMemo<PaneMode>(() => {
+    props.revision();
+    const model = props.model;
+    if (model.focus !== "session") return "watching";
+    if (model.drivingOn()) return "driving";
+    return model.driving ? "connecting" : "focused";
+  });
+  const shortcuts = createMemo<Shortcut[]>(() => {
+    props.revision();
+    const context = shortcutContext(props.model);
+    const extra: Shortcut[] = [
+      ...props.model.ceremonyKeys().map((label): Shortcut => [label.split(" ")[0]!, label.split(" ").slice(1).join(" ")]),
+      ...(props.model.newGoalBlocked() || context === "teams" ? [] : [["n", "new goal"] as Shortcut]),
+    ];
+    return shortcutsFor(context, extra);
+  });
 
   const seatDetail = () => {
     props.revision();
     const selected = seat();
-    if (!selected) return <text fg={theme.muted}>Select a seat to inspect its runtime.</text>;
+    if (!selected) return <text fg={theme.dim}>Select a seat to inspect its runtime.</text>;
     const state = occupancy(props.model, selected);
     const hub = seatState(props.model, selected);
     const connected = props.model.sessionResult.connection === "connected";
@@ -142,143 +208,217 @@ export function TerminalApp(props: TerminalAppProps) {
     const held = live?.assignment;
     const facts = held?.facts;
     const leadUsage = props.model.withLiveUsage(selected.id, sumUsage(sessions.map((session) => session.usage)), sessions.map((session) => session.sessionId));
-    const liveNote = props.model.liveUsage[selected.id] ? " · includes the run in progress" : "";
+    const running = props.model.liveUsage[selected.id];
+    const usage = isDeveloper(selected) ? props.model.withLiveUsage(selected.id, facts?.usage, facts?.sessionIds ?? []) : leadUsage;
+    const sep = "  " + GLYPH.separator + "  ";
     return (
-      <box flexDirection="column" flexShrink={0} paddingLeft={1} paddingRight={1} backgroundColor={theme.panel} border borderColor={theme.border} title=" 🪑 SEAT DETAIL " titleColor={theme.accent}>
-        <text>
-          <span style={{ fg: theme.heading }}>{displayText(selected.displayName)}  @{displayText(selected.handle)}</span>
-          <span style={{ fg: theme.muted }}>{" · Role: " + displayText(selected.roles.join(", ") || "none") + " · "}</span>
-          <span style={{ fg: stateColor(hub, pulse()) }}>{HUB_STATE[hub].icon + " " + HUB_STATE[hub].word.toUpperCase()}</span>
+      <box flexDirection="column" flexShrink={0}>
+        <text flexShrink={0}>
+          <span style={{ fg: stateColor(hub, pulse()) }}>{"  " + HUB_STATE[hub].glyph + " "}</span>
+          <span style={{ fg: theme.text }}>{displayText(selected.displayName) + "  @" + displayText(selected.handle)}</span>
+          <span style={{ fg: theme.dim }}>{sep + displayText(selected.roles.join(", ") || "no role") + sep}</span>
+          <span style={{ fg: stateColor(hub, pulse()) }}>{HUB_STATE[hub].word}</span>
         </text>
         <Show when={live}>
-          <text fg={processColor[live!.process]}>Process: {live!.process}{live!.updatePending ? " · update pending (restarts when idle)" : ""}{isDeveloper(selected) ? " (seat runner)" : " (planning bridge)"}  ·  s restart  ·  x stop</text>
-          <Show when={live!.problem}><text fg={stateColor("failed", pulse())} wrapMode="word">⚠ {displayText(live!.problem, 300)}</text></Show>
+          <FieldText label="process" value={live!.process + (live!.updatePending ? " · update pending (restarts when idle)" : "") + (isDeveloper(selected) ? " (seat runner)" : " (planning bridge)") + sep + "s restart" + sep + "x stop"}
+            glyph={live!.process === "running" ? undefined : GLYPH.state.failed} glyphColor={processColor[live!.process]} />
+          <Show when={live!.problem}><FieldText label="problem" value={displayText(live!.problem, 300)} glyph={GLYPH.warn} glyphColor={stateColor("failed", pulse())} /></Show>
         </Show>
-        <text fg={theme.heading}>🤖 {live?.harness ? `${live.harness.engine === "claude" ? "Claude" : "Codex"} · model ${displayText(live.harness.model, 40)} · effort ${displayText(live.harness.effort, 20)}` : harnessText(undefined)}</text>
-        <Show when={!isDeveloper(selected)}><text fg={theme.accent}>🧮 Planning: {usageLine(leadUsage) + liveNote}</text></Show>
+        <FieldText label="harness" value={live?.harness ? `${live.harness.engine === "claude" ? "Claude" : "Codex"} · model ${displayText(live.harness.model, 40)} · effort ${displayText(live.harness.effort, 20)}` : "unknown"} />
+        <Field label="tokens">
+          <text flexShrink={1} flexGrow={1}>
+            <UsageSpans usage={usage} context={running?.context} compactedAt={running?.compactedAt} now={now} />
+            <span style={{ fg: theme.dim }}>{running ? sep + "includes the run in progress" : ""}</span>
+          </text>
+        </Field>
+        <FieldText label="burn" value={burnSparkline(seatInfo(props.model, selected), selected.id, now(), burn) + "  last hour"} color={theme.dim} />
         <Show when={live && isDeveloper(selected)}>
-          <text fg={theme.regular} wrapMode="word">Assignment: {assignmentLine(live!, 160)}</text>
+          <FieldText label="assignment" value={assignmentLine(live!, 160)} />
           <Show when={held}>
-            <box flexDirection="row" height={1} flexShrink={0}>
-              <text flexShrink={0}>{"   "}</text>
-              <LinkText url={held?.prUrl} label={held?.prUrl ? "🐙 " + (prLabel(held?.prUrl, true) ?? "PR") : "PR not opened"} open={open} />
-              <text flexShrink={0} fg={theme.muted}>{(facts?.ci ? " · " + CI_DOT[facts.ci] + " CI " + facts.ci : "") + " · " + (facts?.sessions ?? 0) + " sessions · ⌛ " + elapsedText(facts ?? {}, now()) + " on this task"}</text>
-            </box>
-            <PipelineLabels steps={pipelineSteps({ status: held!.status, step: facts?.step, fixRounds: facts?.fixRounds })} pulse={pulse} />
-            <text fg={theme.accent}>🧮 {usageLine(props.model.withLiveUsage(selected.id, facts?.usage, facts?.sessionIds ?? [])) + liveNote}</text>
+            <Field label="pr">
+              <LinkText url={held?.prUrl} label={held?.prUrl ? prText(held?.prUrl, true) : "not opened"} open={open} />
+              <text flexShrink={1} flexGrow={1} wrapMode="word">
+                <span style={{ fg: theme.dim }}>{facts?.ci ? sep : ""}</span>
+                <span style={{ fg: facts?.ci ? CI_COLOR[facts.ci] : theme.dim }}>{facts?.ci ? GLYPH.ci + " " : ""}</span>
+                <span style={{ fg: theme.dim }}>{(facts?.ci ? "CI " + facts.ci : "") + sep + (facts?.sessions ?? 0) + " sessions" + sep + elapsedText(facts ?? {}, now()) + " on this task"}</span>
+              </text>
+            </Field>
+            <Field label="steps"><PipelineLabels steps={pipelineSteps({ status: held!.status, step: facts?.step, fixRounds: facts?.fixRounds })} pulse={pulse} /></Field>
           </Show>
-          <Show when={live!.retry}><text fg={stateColor("needs", pulse())}>🙋 T retries {displayText(live!.retry?.goalId, 40)}/{displayText(live!.retry?.outcomeId, 40)}: {displayText(live!.retry?.title, 120)} (confirm first)</text></Show>
-          <text fg={theme.muted}>💬 {threadActivity(live!, 300)}{live!.activity ? "  (" + displayText(live!.activity.at) + ")" : ""}</text>
+          <Show when={live!.retry}>
+            <FieldText label="retry" value={`T retries ${displayText(live!.retry?.goalId, 40)}/${displayText(live!.retry?.outcomeId, 40)}: ${displayText(live!.retry?.title, 120)} (confirm first)`}
+              glyph={GLYPH.state.needs} glyphColor={stateColor("needs", pulse())} />
+          </Show>
+          <FieldText label="latest" value={threadActivity(live!, 300) + (live!.activity ? "  (" + displayText(live!.activity.at) + ")" : "")} />
         </Show>
-        <text fg={state.color}>{state.label}</text>
+        <FieldText label="session" value={state.label} color={state.color} />
         <Show when={!connected}>
-          <text fg={theme.idle}>{displayText(props.model.sessionResult.message) || "Session reader unavailable."}</text>
+          <FieldText label="reader" value={displayText(props.model.sessionResult.message) || "Session reader unavailable."} color={theme.wait} />
         </Show>
         <For each={sessions}>{(session) => (
           <box flexDirection="column" flexShrink={0}>
-            <text fg={theme.accent} wrapMode="word">Planning goal: {displayText(session.goal, 160)}</text>
-            <text fg={theme.regular} wrapMode="word">Planning detail: {displayText(session.stage)}  ·  {connected ? "" : "Last "}{engineLabel(session.engine)} session: {displayText(session.sessionId) || "not started"}  ·  {session.runs ?? 0} runs · 🧮 Σ{formatTokens(totalTokens(session.usage))}  ·  updated {displayText(session.updatedAt) || "not reported"}</text>
+            <FieldText label="goal" value={displayText(session.goal, 160)} />
+            <FieldText label="detail" value={displayText(session.stage) + sep + (connected ? "" : "Last ") + engineLabel(session.engine) + " session: " + (displayText(session.sessionId) || "not started")
+              + sep + (session.runs ?? 0) + " runs" + sep + "work " + formatTokens(workTokens(session.usage)) + sep + "updated " + (displayText(session.updatedAt) || "not reported")} />
             <Show when={session.id === props.model.clarifyingGoal()?.id}>
-              <text fg={stateColor("needs", pulse())}>🙋 P requests Chick's proposal here, or react :memo: on the goal post</text>
+              <FieldText label="proposal" value="P requests Chick's proposal here, or react :memo: on the goal post" glyph={GLYPH.state.needs} glyphColor={stateColor("needs", pulse())} />
             </Show>
             <Show when={session.id === props.model.reviewGoal()?.id}>
-              <text fg={stateColor("needs", pulse())}>🙋 A approves it here, or react :white_check_mark: on its proposal post</text>
+              <FieldText label="approval" value="A approves it here, or react :white_check_mark: on its proposal post" glyph={GLYPH.state.needs} glyphColor={stateColor("needs", pulse())} />
             </Show>
-            <text fg={connected && session.attach ? theme.running : theme.muted}>
-              Live view: {connected && session.attach ? "a watch · D drive · " + RETURN_KEY + " back" : "not available"}
-            </text>
-            <Show when={session.recentActivity.length} fallback={<text fg={theme.muted}>No runtime activity recorded.</text>}>
-              <For each={session.recentActivity.slice(0, 3)}>{(activity) => <text fg={theme.regular}>• {displayText(activity, 160)}</text>}</For>
+            <FieldText label="live" value={connected && session.attach ? "shown above · i or a click on it drives" : "not available"} color={connected && session.attach ? theme.text : theme.dim} />
+            <Show when={session.recentActivity.length} fallback={<FieldText label="activity" value="No runtime activity recorded." color={theme.dim} />}>
+              <For each={session.recentActivity.slice(0, 3)}>{(activity, index) => <FieldText label={index() ? "" : "activity"} value={GLYPH.bullet + " " + displayText(activity, 160)} />}</For>
             </Show>
           </box>
         )}</For>
         <Show when={connected && !sessions.some((session) => !!session.sessionId)}>
-          <text fg={theme.muted}>No active runtime session occupies this seat.</text>
+          <FieldText label="" value="No active runtime session occupies this seat." color={theme.dim} />
         </Show>
       </box>
     );
   };
 
-  const keyLine = () => input() ? (newGoalBlocked() ? "Start blocked · Esc cancel" : "Enter start · Esc cancel") + " · " + displayText(team()?.project?.github, 80) + " · home channel"
-    : [page() === "teams" ? "↑↓ choose team · Enter open" : page() === "team" ? "↑↓ seat · Enter details · T retry · s restart · x stop · b teams" : `a watch · D drive (${RETURN_KEY} back) · t transcript · T retry · s restart · x stop · b team`,
-      ...ceremonyKeys(), ...(newGoalBlocked() ? [] : ["n new goal"]), "q quit"].join(" · ");
+  const inputLine = () => (newGoalBlocked() ? "Start blocked" : "Goes to") + " · " + displayText(team()?.project?.github, 80) + " · home channel";
+  const paneWidth = () => Math.max(20, dimensions().width - 2 - SEAT_LIST_WIDTH - 2);
+  const paneRows = () => sessionPaneRows(dimensions().height);
+  const mirrored = () => { props.revision(); return page() === "seat" && !props.model.overlay ? seat() : undefined; };
 
   return (
-    <box width="100%" height="100%" flexDirection="column" backgroundColor={theme.background} paddingLeft={1} paddingRight={1}>
+    <box width="100%" height="100%" flexDirection="column" backgroundColor={theme.background}>
+    <box flexGrow={1} flexDirection="column" paddingLeft={1} paddingRight={1} onMouseDown={focus(undefined)}>
       <box flexShrink={0} flexDirection="column">
-        <box flexDirection="row" height={1} backgroundColor={theme.bar}>
-          <text fg={theme.barText} flexGrow={1}>{" 💠 INDRA  ›  " + (page() === "teams" ? "Teams" : displayText(team()?.displayName, 30)) + (page() === "seat" && seat() ? "  ›  " + displayText(seat()?.displayName, 30) : "")}</text>
-          <text fg={runtime().color} flexShrink={0}>{runtime().text + " "}</text>
-        </box>
-        <text fg={props.model.stateError ? theme.error : theme.muted}>
-          {displayText(stateSummary() + "  ·  " + (displayText(props.model.sessionResult.message) || "Auto-updating"), Math.max(20, dimensions().width - 3))}
-        </text>
-        <Show when={sync()}><text fg={sync()?.ok ? theme.muted : theme.error}>{displayText(sync()?.text, Math.max(20, dimensions().width - 3))}</text></Show>
-        <Show when={update()}><text fg={update()?.ok ? theme.muted : theme.error}>{displayText(update()?.text, Math.max(20, dimensions().width - 3))}</text></Show>
+        <HeaderBar frame={frame} drifting={sprintRunning} truecolor={truecolor()}>
+          <text flexGrow={1}>
+            <span style={{ fg: theme.accent }}>{" INDRA"}</span>
+            <span style={{ fg: theme.text }}>{"  " + GLYPH.crumb + "  " + (page() === "teams" ? "Teams" : displayText(team()?.displayName, 30)) + (page() === "seat" && seat() ? "  " + GLYPH.crumb + "  " + displayText(seat()?.displayName, 30) : "")}</span>
+          </text>
+          <text flexShrink={0}>
+            <span style={{ fg: runtime().color }}>{GLYPH.dot + " "}</span>
+            <span style={{ fg: theme.dim }}>{runtime().text + " "}</span>
+          </text>
+        </HeaderBar>
+        <For each={statusRows()}>{(row) => <text fg={row.ok ? theme.dim : theme.bad}>{row.text}</text>}</For>
       </box>
 
       <Show when={page() === "teams"}>
-        <scrollbox flexGrow={1} scrollY>
-          <Show when={props.model.teams.length} fallback={<text fg={theme.idle}>{props.model.stateError ? "No usable team state is available." : "No teams are recorded."}</text>}>
-            <For each={props.model.teams}>{(item) => {
-              const selected = () => { props.revision(); return props.model.teamId === item.id; };
-              const occupied = () => { props.revision(); return props.model.sessionResult.connection === "connected"
-                ? item.seats.filter((member) => props.model.sessionResult.sessions.some((session) => session.teamId === item.id && session.seatId === member.id && session.sessionId)).length.toString()
-                : "unknown"; };
-              return (
-                <box height={2} flexShrink={0} flexDirection="column" paddingLeft={1} backgroundColor={selected() ? theme.selected : theme.panel}>
-                  <text fg={selected() ? theme.accent : theme.regular}>{selected() ? "▶ " : "  "}👥 {displayText(item.displayName)}  ({displayText(item.slug)})</text>
-                  <text fg={theme.muted}>{"     "}{item.seats.length} stable seats  ·  {occupied()} with runtime sessions{item.project ? "  ·  🐙 " + displayText(item.project.github, 60) : ""}</text>
-                </box>
-              );
-            }}</For>
-          </Show>
+        <scrollbox flexGrow={1} scrollY contentOptions={scrollContent}>
+          <Section title="TEAMS">
+            <Show when={props.model.teams.length} fallback={<text fg={theme.wait}>{props.model.stateError ? "No usable team state is available." : "No teams are recorded."}</text>}>
+              <For each={props.model.teams}>{(item) => {
+                const selected = () => { props.revision(); return props.model.teamId === item.id; };
+                const occupied = () => { props.revision(); return props.model.sessionResult.connection === "connected"
+                  ? item.seats.filter((member) => props.model.sessionResult.sessions.some((session) => session.teamId === item.id && session.seatId === member.id && session.sessionId)).length.toString()
+                  : "unknown"; };
+                return (
+                  <text flexShrink={0} bg={selected() ? theme.selected : undefined}>
+                    <span style={{ fg: theme.accent }}>{selected() ? GLYPH.selected + "   " : "    "}</span>
+                    <span style={{ fg: selected() ? theme.accent : theme.text }}>{pad(clip(displayText(item.displayName, 30) + "  (" + displayText(item.slug, 30) + ")", 24), 24) + " "}</span>
+                    <span style={{ fg: theme.dim }}>{item.seats.length + " seats  " + GLYPH.separator + "  " + occupied() + " in a session" + (item.project ? "  " + GLYPH.separator + "  " : "")}</span>
+                    <span style={{ fg: theme.text }}>{item.project ? clip(GLYPH.pr + " " + displayText(item.project.github, 60), 30) : ""}</span>
+                  </text>
+                );
+              }}</For>
+            </Show>
+          </Section>
         </scrollbox>
       </Show>
 
       <Show when={page() === "team" && !!team()}>
-        <scrollbox id="team-scroll" ref={teamScroll} flexGrow={1} scrollY>
-          <box flexDirection="column" flexShrink={0} border borderColor={theme.border} title={" 👥 " + displayText(team()?.displayName ?? "Team", 30) + " · " + (team()?.seats.length ?? 0) + " STABLE SEATS " + (teamCounts() ? "· " + teamCounts() + " " : "")} titleColor={theme.accent}>
-            <Show when={team()?.seats.length} fallback={<text fg={theme.idle}>No seats are recorded for this team.</text>}>
-              <For each={team()?.seats ?? []}>{(item) => <SeatRow model={props.model} seat={item} revision={props.revision} pulse={pulse} now={now} width={() => dimensions().width - 5} open={open} />}</For>
+        <scrollbox id="team-scroll" ref={teamScroll} flexGrow={1} scrollY contentOptions={scrollContent}>
+          <AttentionSection model={props.model} seats={team()?.seats ?? []} revision={props.revision} pulse={pulse} width={contentWidth} />
+          <For each={sprints()}>{(sprint) => <SprintCard model={props.model} sprint={sprint} team={team()} session={sessionOf(sprint.id)} pulse={pulse} now={now} width={contentWidth} open={open} truecolor={truecolor()} />}</For>
+          <Section title={"SEATS " + GLYPH.separator + " " + displayText(team()?.displayName ?? "Team", 30) + " " + GLYPH.separator + " " + (team()?.seats.length ?? 0) + (teamCounts() ? "   " + teamCounts() : "")}>
+            <Show when={team()?.seats.length} fallback={<text fg={theme.wait}>No seats are recorded for this team.</text>}>
+              <SeatHeader width={contentWidth} />
+              <For each={team()?.seats ?? []}>{(item) => <SeatRow model={props.model} seat={item} revision={props.revision} pulse={pulse} now={now} width={contentWidth} open={open} burn={burn} truecolor={truecolor()} />}</For>
             </Show>
-          </box>
-          <For each={sprints()}>{(sprint) => <SprintCard model={props.model} sprint={sprint} team={team()} session={sessionOf(sprint.id)} pulse={pulse} now={now} open={open} />}</For>
+          </Section>
+          <ActivitySection model={props.model} seats={team()?.seats ?? []} revision={props.revision} now={now} width={contentWidth} />
+          <Show when={splash()}>
+            <IdleSplash frame={frame} width={contentWidth} truecolor={truecolor()} background={theme.background} caption="No sprint open" captionColor={theme.dim} />
+          </Show>
         </scrollbox>
       </Show>
 
       <Show when={page() === "seat"}>
-        <scrollbox id="detail-scroll" ref={detailScroll} flexGrow={1} scrollY>
-          <Show when={props.paneTail && seat()}>
-            <PaneTailPanel source={props.paneTail!} seat={seat} width={() => dimensions().width - 6} lines={() => seatPaneLines(dimensions().height)} />
-          </Show>
-          {seatDetail()}
-          <For each={sprints()}>{(sprint) => <SprintStrip sprint={sprint} team={team()} session={sessionOf(sprint.id)} pulse={pulse} open={open} />}</For>
-        </scrollbox>
+        <box flexGrow={1} flexDirection="row">
+          <scrollbox id="seat-list" width={SEAT_LIST_WIDTH} flexShrink={0} scrollY border borderColor={regionBorder("seats")} title=" SEATS " titleColor={theme.accent} onMouseDown={focus("seats")}>
+            <For each={team()?.seats ?? []}>{(item) => {
+              const selected = () => { props.revision(); return props.model.seatId === item.id; };
+              const state = () => { props.revision(); return seatState(props.model, item); };
+              return (
+                <box height={1} flexShrink={0} backgroundColor={selected() ? theme.selected : undefined} onMouseDown={focus("seats", item.id)}>
+                  <text wrapMode="none">
+                    <span style={{ fg: stateColor(state(), pulse()) }}>{HUB_STATE[state()].glyph + " "}</span>
+                    <span style={{ fg: selected() ? theme.accent : theme.text }}>{displayText(item.displayName, SEAT_LIST_WIDTH - 6)}</span>
+                  </text>
+                </box>
+              );
+            }}</For>
+          </scrollbox>
+          <box flexGrow={1} flexDirection="column">
+            <Show when={props.session && seat()}>
+              <SessionPane source={props.session!} seat={mirrored} rows={paneRows} width={paneWidth} scroll={() => { props.revision(); return props.model.sessionScroll; }} mode={paneMode}
+                onFocus={() => (props.onFocus ?? ((region: FocusRegion | undefined) => props.model.focusAt(region)))("session")}
+                onScroll={(lines) => props.onSessionScroll ? props.onSessionScroll(lines) : props.model.scrollSession(lines)} intervalMs={props.mirrorMs} />
+            </Show>
+            <scrollbox id="detail-scroll" ref={detailScroll} flexGrow={2} scrollY border borderColor={regionBorder("details")} title={" SEAT " + displayText(seat()?.displayName, 40) + " "} titleColor={theme.accent} onMouseDown={focus("details")} contentOptions={scrollContent}>
+              {seatDetail()}
+            </scrollbox>
+            <scrollbox id="sprint-scroll" ref={sprintScroll} flexGrow={1} scrollY border borderColor={regionBorder("sprints")} title=" SPRINTS " titleColor={theme.accent} onMouseDown={focus("sprints")} contentOptions={scrollContent}>
+              <For each={sprints()} fallback={<text fg={theme.dim}>No open sprint.</text>}>{(sprint) => <SprintStrip sprint={sprint} team={team()} session={sessionOf(sprint.id)} pulse={pulse} open={open} />}</For>
+            </scrollbox>
+          </box>
+        </box>
       </Show>
 
-      <box flexShrink={0} flexDirection="column">
-        <Show when={newGoalHint()}><text fg={theme.idle} wrapMode="word">{displayText(newGoalHint(), 240)}</text></Show>
-        <Show when={launchWarning()}><text fg={stateColor("failed", pulse())} wrapMode="word">⚠ {displayText(launchWarning())}</text></Show>
-        <Show when={notice()}><text fg={theme.idle} wrapMode="word">{displayText(notice())}</text></Show>
+      <box flexShrink={0} flexDirection="column" border={["top"]} borderColor={theme.rule}>
+        <Show when={newGoalHint()}><text fg={theme.dim} wrapMode="word">{displayText(newGoalHint(), 240)}</text></Show>
+        <Show when={launchWarning()}>
+          <text wrapMode="word"><span style={{ fg: stateColor("failed", pulse()) }}>{GLYPH.warn + " "}</span><span style={{ fg: theme.text }}>{displayText(launchWarning())}</span></text>
+        </Show>
+        <Show when={notice()}><text fg={theme.text} wrapMode="word">{displayText(notice())}</text></Show>
         <Show when={input()}>
-          <text fg={theme.heading} wrapMode="char">
+          <text fg={theme.dim}>{inputLine()}</text>
+          <text fg={theme.accent} wrapMode="char">
             New planning goal: {goalInputTail(input()?.value ?? "", dimensions().width)}▏
           </text>
-          <text fg={theme.muted}>
+          <text fg={theme.dim}>
             {(input()?.value.length ?? 0) >= GOAL_INPUT_LIMIT ? `Limit reached (${GOAL_INPUT_LIMIT} characters); extra characters are ignored.` : `${input()?.value.length ?? 0}/${GOAL_INPUT_LIMIT}`}
           </text>
         </Show>
         <Show when={confirm()}>
-          <text fg={stateColor("needs", pulse())} wrapMode="word">{confirmText(confirm()!, dimensions().width)}{confirm()?.action === "retry" ? " · n/Esc cancel" : " · any other key cancels"}</text>
+          <text wrapMode="word">
+            <span style={{ fg: stateColor("needs", pulse()) }}>{GLYPH.state.needs + " "}</span>
+            <span style={{ fg: theme.text }}>{confirmText(confirm()!, dimensions().width) + (confirm()?.action === "retry" ? " · n/Esc cancel" : " · any other key cancels")}</span>
+          </text>
         </Show>
-        <text fg={theme.accent} wrapMode="word">{keyLine()}</text>
-        <text fg={theme.muted}>? help  ·  {paused() ? "Auto-update paused  ·  U resumes" : "Auto-update  ·  U pauses"}  ·  r checks now  ·  R rolls back  ·  q quits, seats keep running</text>
+        <Show when={!props.model.drivingOn() && (page() === "teams" || page() === "team")}>
+          <KeyLegend line={(paused() ? "Auto-update paused · U resumes" : "Auto-update on · U pauses") + " · r checks now · R rolls back · q quits, seats keep running"} />
+        </Show>
       </box>
       <Show when={overlay() === "help"}><HelpOverlay /></Show>
       <Show when={overlay() === "transcript" && seat()}>
         <TranscriptView source={props.transcript} seat={seat()!} recordedHandle={() => props.model.selectedSession()?.sessionId} />
       </Show>
+    </box>
+      <ShortcutBar shortcuts={shortcuts} driving={() => paneMode() === "driving"} />
+    </box>
+  );
+}
+
+/** The always-visible bar of the keys that apply right now; it turns the driving colour while the owner drives. */
+export function ShortcutBar(props: { shortcuts: Accessor<Shortcut[]>; driving: Accessor<boolean> }) {
+  return (
+    <box id="shortcut-bar" flexShrink={0} flexDirection="row" flexWrap="wrap" paddingLeft={1} paddingRight={1} backgroundColor={theme.selected}>
+      <For each={props.shortcuts()}>{([key, meaning], index) => (
+        <text flexShrink={0}>
+          <span style={{ fg: theme.dim }}>{index() ? " " + GLYPH.separator + " " : ""}</span>
+          <span style={{ fg: props.driving() ? theme.wait : theme.accent }}>{key ? key + " " : ""}</span>
+          <span style={{ fg: theme.dim }}>{meaning}</span>
+        </text>
+      )}</For>
     </box>
   );
 }
@@ -297,10 +437,11 @@ export function openLink(url: string, run: (file: string, args: string[]) => voi
 /** Start the Solid/OpenTUI screen; renderer ownership and terminal cleanup stay in this function. */
 export async function runTerminalUi(state: StateInventory, sessions: SessionReadPort, options: {
   pollMs?: number;
-  /** Opens a seat's live view: `watch` with the pane's input off, `drive` with it on (only a verified headed run). */
-  attach?: (target: string, mode?: AttachMode) => Promise<unknown>;
-  /** Whether a seat's target is Indra's own verified session with a headed run going, so `D` can drive it. */
-  driveCheck?: (target: string) => Promise<boolean>;
+  /**
+   * Mirrors the selected seat's live session in the seat screen, and drives it (verified pane, headed run only) while
+   * the owner has focused the session pane.
+   */
+  session?: SessionPort;
   /** Reads the running token totals of the headed runs still going. */
   liveUsage?: LiveUsagePort;
   signal?: AbortSignal;
@@ -317,8 +458,6 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
   view?: UiView;
   /** Saves the view and returns the exit code that asks the launcher to start the UI again. */
   reload?: (view: UiView) => Promise<number>;
-  /** Reads the selected seat's live pane while its detail is visible. */
-  paneTail?: PaneTailSource;
   /** Returns a warning when Indra was launched under ttyd or its seats' tmux server cannot be verified. */
   launchCheck?: () => Promise<string | undefined>;
   /** Reads the selected seat's engine session log for the transcript view (`t`). */
@@ -335,18 +474,21 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
   model.changed = () => { if (active) setRevision(model.revision); };
   let active = true;
   let refreshing = false;
-  let attaching = false;
+  const publish = () => { if (active) { model.revision++; setRevision(model.revision); } };
+  const driver = options.session ? new SessionDriver(model, options.session, publish) : undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
   let syncTimer: ReturnType<typeof setInterval> | undefined;
   let updateTimer: ReturnType<typeof setInterval> | undefined;
   let reloadNow = () => {};
   const refresh = async () => {
-    if (!active || refreshing || attaching) return;
+    if (!active || refreshing) return;
     refreshing = true;
     try {
       if (await model.refresh() && active) setRevision(model.revision);
+      // A refresh can end driving (the seat left the state); the pane's input then goes back off.
+      driver?.sync();
       // A new build (self-update or `npm run dev`) reloads the UI once nothing is in flight.
-      if (await model.checkBuild() && model.readyToReload() && active && !attaching) reloadNow();
+      if (await model.checkBuild() && model.readyToReload() && active && !model.driving) reloadNow();
     }
     catch (error) {
       if (active) {
@@ -358,7 +500,7 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
     finally { refreshing = false; }
   };
   const openUrl = (url: string) => {
-    if (!active || attaching) return;
+    if (!active) return;
     const opened = openLink(url);
     model.notice = opened ? "Opened " + opened : "Not opened: that link is not a GitHub PR or an Indra Mattermost page.";
     model.revision++;
@@ -372,6 +514,8 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
       if (syncTimer) clearInterval(syncTimer);
       if (updateTimer) clearInterval(updateTimer);
       options.signal?.removeEventListener("abort", finish);
+      // Quitting while driving switches the pane's input back off; the seat keeps running.
+      void driver?.release();
       renderer.destroy();
       return true;
     };
@@ -382,11 +526,14 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
     };
     // One screen rebuild per stdin chunk, not per key: a burst of keys otherwise exhausts OpenTUI's native renderables.
     const applyKey = keyInput(model, (current) => { if (active) setRevision(current); });
-    const key = (name: string, ctrl?: boolean, text?: string) => {
-      if (!active || attaching) return;
-      if (ctrl && name === "c") { finish(); return; }
-      const action = applyKey(name, text);
-      if (action === "quit") finish();
+    const key = (name: string, ctrl?: boolean, text?: string, mods: KeyMods = {}) => {
+      if (!active) return;
+      // Ctrl-C quits Indra, except while driving, when it goes to the session like every other key.
+      if (ctrl && name === "c" && !(model.page === "seat" && model.focus === "session" && model.driving)) { finish(); return; }
+      const action = applyKey(name, text, { ...mods, ctrl });
+      if (action === "forward") driver?.key(name, text, { ...mods, ctrl });
+      else if (action === "drive" || action === "release") driver?.sync();
+      else if (action === "quit") finish();
       else if (action === "refresh") { void refresh(); void model.updateCode(); }
       else if (action === "pause") void model.togglePause();
       else if (action === "ask-rollback") void model.askRollback();
@@ -397,49 +544,22 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
       else if (action === "sprint") void model.sprintConfirmed();
       else if (action === "retry") void model.retryConfirmed();
       else if (action === "stop" || action === "restart") void model.control(action);
-      else if (action === "attach" || action === "drive") {
-        const target = model.attachTarget();
-        if (!target) return;
-        attaching = true;
-        const name = model.seat?.displayName ?? "the seat";
-        const watching = "Watching " + name + " · " + WATCH_HINT;
-        let shown: string | undefined;
-        let suspended = false;
-        // Drive only a verified seat with a headed run going; the attach checks again and watches if that changed.
-        void (action === "drive" ? (options.driveCheck ?? (async () => false))(target).catch(() => false) : Promise.resolve(false)).then((headed) => {
-          if (!active) return;
-          const mode: AttachMode = action === "drive" && headed ? "drive" : "watch";
-          // Say how to get back before the screen switches to the seat.
-          shown = mode === "drive" ? driveWarning(name) : action === "drive" ? driveFallback(name) : watching;
-          model.notice = shown;
-          model.revision++;
-          setRevision(model.revision);
-          return new Promise((wait) => setTimeout(wait, WATCH_HINT_MS)).then(() => {
-            if (!active) return;
-            suspended = true;
-            renderer.suspend();
-            return (options.attach ?? ((to: string, how?: AttachMode) => attachTmux(to, undefined, undefined, how)))(target, mode);
-          });
-        }).then(() => { if (model.notice === shown && !shown?.startsWith(name + " is not in a headed run")) model.notice = undefined; }, (error: unknown) => {
-          model.notice = error instanceof Error ? error.message : "Could not open this seat's live view.";
-        }).finally(() => {
-          if (active) {
-            if (suspended) renderer.resume();
-            attaching = false;
-            model.revision++;
-            setRevision(model.revision);
-            void refresh();
-          }
-        });
-      }
     };
-    render(() => <TerminalApp model={model} revision={revision} onKey={key} paneTail={options.paneTail} transcript={options.transcript} openUrl={openUrl} />, renderer)
+    const onFocus = (region: FocusRegion | undefined, seatId?: string) => {
+      if (!active) return;
+      model.focusAt(region, seatId);
+      publish();
+      driver?.sync();
+    };
+    const onSessionScroll = (lines: number) => { if (active) { model.scrollSession(lines); publish(); } };
+    const onDrivePaste = (text: string) => { if (active) driver?.paste(text); };
+    render(() => <TerminalApp model={model} revision={revision} onKey={key} onFocus={onFocus} onSessionScroll={onSessionScroll} onDrivePaste={onDrivePaste} session={options.session} transcript={options.transcript} openUrl={openUrl} />, renderer)
       .then(() => {
         if (!active) return;
         timer = setInterval(() => { void refresh(); }, Math.max(500, options.pollMs ?? 2000));
         void model.start();
-        if (options.sync) syncTimer = setInterval(() => { if (active && !attaching) void model.syncState(); }, Math.max(5_000, options.syncMs ?? 60_000));
-        if (options.update) updateTimer = setInterval(() => { if (active && !attaching) void model.updateCode(); }, Math.max(5_000, options.updateMs ?? 60_000));
+        if (options.sync) syncTimer = setInterval(() => { if (active) void model.syncState(); }, Math.max(5_000, options.syncMs ?? 60_000));
+        if (options.update) updateTimer = setInterval(() => { if (active) void model.updateCode(); }, Math.max(5_000, options.updateMs ?? 60_000));
         options.signal?.addEventListener("abort", finish, { once: true });
         if (options.signal?.aborted) finish();
       })

@@ -12,9 +12,14 @@ import type { SeatLive, SeatProcessPort } from "../src/supervisor.js";
 import type { CeremonyStage } from "../src/session-snapshot.js";
 import { CEREMONY_STAGES, LocalSessionReader } from "../src/session-snapshot.js";
 import {
-  formatElapsed, formatTokens, mattermostChannelUrl, mattermostPostUrl, openableUrl, parseUsage, pipelineSteps, prLabel, sumUsage, totalTokens, usageLine,
+  compactionNote, contextText, formatElapsed, formatTokens, freshInputTokens, mattermostChannelUrl, mattermostPostUrl, openableUrl, parseUsage, pipelineSteps, prLabel,
+  sumUsage, totalTokens, usageLine, workTokens,
 } from "../src/hub-format.js";
+import { normalizeUsage } from "../src/runtime-facts.js";
+import { allGlyphs, faded, GLYPH, PALETTE, PULSE_MS } from "../src/hub-style.js";
+import { HelpOverlay } from "../src/help-overlay.js";
 import { assignmentFacts, seatHarness } from "../src/hub-facts.js";
+import { ansi256Rgb, paint, STAGE_COLOR } from "../src/hub-paint.js";
 import type { ImplementationFacts } from "../src/implementation-facts.js";
 import type { SeatTaskRecord } from "../src/developer-seat.js";
 import type { RuntimeRecord } from "../src/planning.js";
@@ -60,9 +65,31 @@ describe("token and time formatting", () => {
     expect(totalTokens(total)).toBe(1_300_000);
     expect(totalTokens({ uncachedInputTokens: 10, cachedInputTokens: 5, outputTokens: 1 })).toBe(16);
     expect(totalTokens(undefined)).toBeUndefined();
-    expect(usageLine(total)).toBe("in 1.25M · cached 1M · out 50k · Σ 1.3M tok");
+    expect(usageLine(total)).toBe("work 300k · out 50k · cache 1M");
     expect(usageLine(undefined)).toBe("no tokens recorded yet");
     expect(sumUsage([undefined])).toBeUndefined();
+  });
+
+  it("counts fresh work as uncached input plus output for both engines, with cache re-reads apart", () => {
+    // Codex reports input including cached input: fresh input is input − cached.
+    const codex = normalizeUsage("codex", { input_tokens: 1_000_000, cached_input_tokens: 900_000, output_tokens: 20_000, reasoning_output_tokens: 5_000 });
+    expect([freshInputTokens(codex), workTokens(codex), codex?.cachedInputTokens]).toEqual([100_000, 120_000, 900_000]);
+    expect(usageLine(codex)).toBe("work 120k · out 20k · cache 900k");
+    // Claude: input_tokens + cache_creation_input_tokens is fresh; cache_read_input_tokens is the re-read.
+    const claude = normalizeUsage("claude", { input_tokens: 3_000, cache_creation_input_tokens: 40_000, cache_read_input_tokens: 500_000, output_tokens: 7_000 });
+    expect([freshInputTokens(claude), workTokens(claude), claude?.cachedInputTokens]).toEqual([43_000, 50_000, 500_000]);
+    // A Claude report missing a component has no inclusive input; the fresh parts still count.
+    expect(freshInputTokens({ uncachedInputTokens: 3_000, cacheWriteInputTokens: 40_000, cachedInputTokens: 500_000 })).toBe(43_000);
+    expect(workTokens(undefined)).toBeUndefined();
+    expect(workTokens({ cachedInputTokens: 5 })).toBeUndefined();
+  });
+
+  it("shows the live context window against the cap, and a compaction only while it is recent", () => {
+    expect(contextText(182_000, 300_000)).toBe("ctx 182k/300k");
+    expect(contextText(undefined, 300_000)).toBeUndefined();
+    expect(compactionNote(ago(2), NOW)).toBe("compacted 2m ago");
+    expect(compactionNote(ago(6), NOW)).toBeUndefined();
+    expect(compactionNote(undefined, NOW)).toBeUndefined();
   });
 
   it("formats elapsed runtime", () => {
@@ -116,7 +143,8 @@ describe("recorded facts", () => {
       { id: "a2", cause: "retry", claimedAt: "2026-01-01T01:00:00Z", events: [session("2", { inputTokens: 200, cachedInputTokens: 150, outputTokens: 20 }), { id: "c2", at: "y", kind: "ci", result: "started" }] },
     ] };
     const record = { goalId: "g", outcomeId: "o", step: "ci", branch: "b", worktree: "w", reviewFixRounds: 1, sessions: [] } as SeatTaskRecord;
-    expect(assignmentFacts(record, ledger)).toEqual({ step: "ci", fixRounds: 1, ci: "pending", usage: { inputTokens: 300, cachedInputTokens: 150, outputTokens: 30 }, sessions: 2, engine: "claude", claimedAt: "2026-01-01T01:00:00Z" });
+    expect(assignmentFacts(record, ledger)).toEqual({ step: "ci", fixRounds: 1, ci: "pending", usage: { inputTokens: 300, cachedInputTokens: 150, outputTokens: 30 }, sessions: 2, engine: "claude", claimedAt: "2026-01-01T01:00:00Z",
+      burn: [{ at: "2026-01-01T00:10:00Z", tokens: 110 }, { at: "2026-01-01T00:10:00Z", tokens: 220 }] });
     ledger.attempts[1].events.push({ id: "m", at: "z", kind: "merge", result: "passed" });
     ledger.attempts[1].terminal = { status: "merged", at: "2026-01-01T02:00:00Z" };
     expect(assignmentFacts(record, ledger)).toMatchObject({ ci: "passed", endedAt: "2026-01-01T02:00:00Z" });
@@ -172,9 +200,10 @@ const live: Record<string, SeatLive> = {
   "seat-001": { process: "running", harness: seatHarness("claude", ["Team Lead"]), attach: { kind: "tmux", target: "indra:chick" } },
   "seat-002": { process: "running", harness: seatHarness("codex", ["Developer"]), activity: { message: "Opened PR 103; review requested", at: ago(3) },
     assignment: { title: titles[0], status: "in-review", prUrl: "https://github.com/satoramoto/indra/pull/103", goalId: "goal-hub", outcomeId: "o1",
-      facts: { step: "ci", fixRounds: 0, ci: "pending", usage: usage(1.25), sessions: 3, engine: "codex", claimedAt: ago(47) } } },
+      facts: { step: "ci", fixRounds: 0, ci: "pending", usage: usage(1.25), sessions: 3, sessionIds: ["s-george"], engine: "codex", claimedAt: ago(47),
+        burn: [{ at: ago(90), tokens: 250_000 }, { at: ago(50), tokens: 400_000 }, { at: ago(20), tokens: 850_000 }] } } },
   "seat-003": { process: "running", harness: seatHarness("claude", ["Developer"]), activity: { message: "Building the pipeline row", at: ago(1) },
-    assignment: { title: titles[1], status: "running", goalId: "goal-hub", outcomeId: "o2", facts: { step: "build", usage: usage(0.4), sessions: 1, claimedAt: ago(12) } } },
+    assignment: { title: titles[1], status: "running", goalId: "goal-hub", outcomeId: "o2", facts: { step: "build", usage: usage(0.4), sessions: 1, sessionIds: ["s-aaron"], claimedAt: ago(12) } } },
   "seat-004": { process: "no credential", problem: "The 1Password service account token is missing; run npm start again.", harness: seatHarness("codex", ["Developer"]) },
   "seat-005": { process: "running", harness: seatHarness("codex", ["Developer"]),
     retry: { seatId: "seat-005", goalId: "goal-hub", goal: "Hub", outcomeId: "o4", title: titles[3], updatedAt: ago(5) } },
@@ -197,16 +226,21 @@ const hubSession = (stage: CeremonyStage = "implement"): TerminalSession => ({
   },
 });
 
-async function hubModel(session = hubSession()) {
+async function hubModel(session: TerminalSession | null = hubSession()) {
   const processes: SeatProcessPort = { ensureAll: async () => [], read: async () => live, stop: async () => {}, restart: async () => {}, retry: async () => "" };
   // The header's sync and update lines are on, as in the real app: 42 rows must hold them too.
   const stamp = { id: "build-1", sha: "82e2001aa", builtAt: ago(60) };
-  const model = new TerminalUiModel(new StateInventory({ read: async () => snapshot }), { readSessions: async () => ({ connection: "connected", sessions: [session] }) }, processes,
+  const model = new TerminalUiModel(new StateInventory({ read: async () => snapshot }), { readSessions: async () => ({ connection: "connected", sessions: session ? [session] : [] }) }, processes,
     { start: vi.fn(), propose: vi.fn(), approve: vi.fn(), sprint: vi.fn() }, { sync: vi.fn() },
     { running: stamp, canReload: true, check: vi.fn(), current: async () => stamp });
   await model.refresh();
   model.syncResult = { outcome: "synced", message: "Up to date with origin/main", changed: false, at: ago(1) };
   model.updateResult = { outcome: "up-to-date", message: "Up to date", at: ago(1) };
+  // Two headed runs going: George's window is above 80% of the cap, and Aaron's just compacted.
+  model.liveUsage = {
+    "seat-002": { engine: "codex", sessionId: "s-george", usage: usage(1.25), context: 250_000 },
+    "seat-003": { engine: "claude", sessionId: "s-aaron", usage: usage(0.4), context: 41_000, compactedAt: ago(1) },
+  };
   return model;
 }
 
@@ -221,72 +255,163 @@ async function keep(name: string, frame: string) {
   if (process.env.HUB_FRAMES_DIR) await writeFile(join(process.env.HUB_FRAMES_DIR, name + ".txt"), frame.split("\n").map((line) => line.trimEnd()).join("\n"));
 }
 
+/** Emoji, and anything a terminal may draw as one: pictographs and the emoji variation selector. */
+const EMOJI = /[\p{Extended_Pictographic}\u{FE0F}]/gu;
+
+const SCREENS = [
+  ["team", { page: "team" as const, seatId: "seat-002" }],
+  ["developer-seat", { page: "seat" as const, seatId: "seat-002" }],
+  ["lead-seat", { page: "seat" as const, seatId: "seat-001" }],
+  ["teams", { page: "teams" as const }],
+] as const;
+
+/** One screen of the busy afternoon at 96×42, with a live pane of progress lines. */
+async function screen(view: { page: "team" | "seat" | "teams"; seatId?: string }, pulse: () => boolean = () => false) {
+  const model = await hubModel();
+  model.restore({ ...view, teamId: "team-001" });
+  const session = { capture: async (_seat: unknown, size: { rows: number }) => ({ status: "ok" as const, lines: Array.from({ length: 20 }, (_, index) => [{ text: `15:${String(index).padStart(2, "0")} $ ✓ npm test step ${index}`, style: {} }]).slice(-size.rows) }) };
+  const setup = await testRender(() => <TerminalApp model={model} revision={() => model.revision} onKey={() => {}} session={session} pulse={pulse} now={() => NOW} />, { width: HUB_GRID.columns, height: HUB_GRID.rows });
+  await setup.renderOnce();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  await setup.renderOnce();
+  return setup;
+}
+
 describe("the hub on the owner's screen", () => {
   it("documents the grid it is designed for", () => {
     expect(HUB_GRID).toEqual({ columns: 96, rows: 42 });
   });
 
-  it.each([
-    ["team", { page: "team" as const, seatId: "seat-002" }],
-    ["developer-seat", { page: "seat" as const, seatId: "seat-002" }],
-    ["lead-seat", { page: "seat" as const, seatId: "seat-001" }],
-    ["teams", { page: "teams" as const }],
-  ])("fits the %s screen in 96×42 with every key field whole", async (name, view) => {
-    const model = await hubModel();
-    model.restore({ ...view, teamId: "team-001" });
-    const paneTail = { capture: async (_seat: unknown, size: { lines: number }) => ({ status: "ok" as const, lines: Array.from({ length: 20 }, (_, index) => `15:${String(index).padStart(2, "0")} ⚙ step ${index}`).slice(-size.lines) }) };
-    const setup = await testRender(() => <TerminalApp model={model} revision={() => model.revision} onKey={() => {}} paneTail={paneTail} pulse={() => false} now={() => NOW} />, { width: HUB_GRID.columns, height: HUB_GRID.rows });
+  it.each(SCREENS)("fits the %s screen in 96×42 with every key field whole and no emoji", async (name, view) => {
+    const setup = await screen(view);
     try {
-      await setup.renderOnce();
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      await setup.renderOnce();
       const frame = setup.captureCharFrame();
       await keep(name, frame);
       const scroll = setup.renderer.root.findDescendantById(view.page === "seat" ? "detail-scroll" : "team-scroll") as ScrollBoxRenderable | undefined;
-      // Nothing to scroll: the content is no taller than the screen gives it.
-      if (scroll) expect(scroll.scrollHeight, frame).toBeLessThanOrEqual(scroll.height);
+      // Nothing to scroll on the team screens: the content is no taller than the screen gives it. On a seat screen the
+      // live session takes most rows and the details are their own scrolling panel: every field is reachable by scrolling it.
+      const frames = [frame];
+      if (scroll && view.page === "seat") {
+        for (let page = 0; page < 10 && scroll.scrollTop + scroll.viewport.height < scroll.scrollHeight; page++) {
+          // A third of a page at a time, so a wrapped field is whole in at least one frame.
+          scroll.scrollBy(Math.max(1, Math.floor(scroll.viewport.height / 3)));
+          await setup.renderOnce();
+          frames.push(setup.captureCharFrame());
+        }
+      } else if (scroll) expect(scroll.scrollHeight, frame).toBeLessThanOrEqual(scroll.height);
       const expected: Record<string, string[]> = {
-        team: [...names, "Developer", "Team Lead", "NO CREDENTIAL", "Codex gpt-6-sol·medium", "Claude opus-5-5·max", "Claude opus-5-5·medium", "⌛ 47m", "⌛ 12m", "🧮 Σ1.3M",
-          "🐙 #103", "🟡", "The 1Password service account token is missing; run npm start again.", "Keep the hub inside a 96 by 42 terminal · failed · T retry",
-          "SPRINT · goal-hub", "Current stage: implement", "Closure: open", "planning → proposal → [implement] → release → retro", "1/4 merged",
-          "💬 goal thread", "📝 proposal post", "🧮 Sprint total: in 6.25M · cached 5M · out 250k · Σ 6.5M tok · ⌛ 3h20m since planning",
-          ...titles.map((title, index) => title + " · " + ["in review", "building", "merged", "failed"][index]),
-          "👤 George Duke", "🐙 #98", "🟢 CI passed", "🔴 CI failed", "Integration PR: not opened", "↑↓ seat · Enter details"],
-        "developer-seat": ["LIVE PANE · George Duke", "George Duke  @georgeduke", "Process: running (seat runner)", "🤖 Codex · model gpt-6-sol · effort medium",
-          `Assignment: ${titles[0]} · in-review`, "🐙 satoramoto/indra#103", "🟡 CI pending", "build ✓", "review ✓", "fix skipped", "ci ●", "merge",
-          "🟡 CI pending · 3 sessions · ⌛ 47m on this task", "🧮 in 1.25M · cached 1M · out 50k · Σ 1.3M tok", "Latest: Opened PR 103; review requested",
-          "SPRINT · goal-hub", "Current stage: implement", "Closure: open", "planning → proposal → [implement] → release → retro", "1/4 tickets merged",
-          "a watch · D drive (Ctrl-] back) · t transcript"],
-        "lead-seat": ["LIVE PANE · Chick Corea", "Chick Corea  @chickcorea", "Process: running (planning bridge)", "🤖 Claude · model claude-opus-5-5 · effort max",
-          "🧮 Planning: in 2.1M · cached 1.68M · out 84k · Σ 2.18M tok", "IDLE SESSION · Claude Code", "Planning goal: Make the terminal UI the owner's all-day hub",
-          "Claude Code session: claude:0e5f9f3e-1111-4222-8333-944445555666", "4 runs", "Live view: a watch · D drive · Ctrl-] back", "Current stage: implement", "💬 goal thread", "📝 proposal post"],
-        teams: ["👥 Yahaha  (yahaha)", "5 stable seats", "🐙 satoramoto/indra", "↑↓ choose team · Enter open"],
+        team: [...names, "NEEDS YOU · 2", "progress " + "▀".repeat(11) + " ".repeat(13) + "  45%", "The 1Password service account token is missing; run npm start again.", "Keep the hub inside a 96 by 42 terminal · failed · T retry",
+          "SPRINT goal-hub", "planning → proposal → [implement] → release → retro", "open · 1/4 merged", "work 1.5M · out 250k · cache 5M · 3h20m since planning",
+          "⇗ goal thread", "⇗ proposal post", "plan Plan approved.", "integration not opened", "release Waiting for implementation to finish.",
+          "⎇ #103 ●", "⎇ #98 ●", "⎇ #99 ●", "in review", "building", "merged", "failed", "George Duke", "Aaron Magner",
+          "SEATS · Yahaha · 5", "● 2 running", "◆ 1 needs you", "✗ 1 failed", "○ 1 idle",
+          "SEAT", "TASK", "STEPS", "MODEL", "WORK", "OUT", "CACHE", "CTX", "TIME", "gpt-6-sol", "opus-5-5", "no credential", "failed · T retry", "idle session",
+          "300k 50k 1M 250k 47m ⎇ #103 ●", "12m", "LATEST", "Opened PR 103; review requested", "context compacted 1m ago · Building the pipeline row"],
+        "developer-seat": ["LIVE · George Duke · progress · click or i to drive", "SEAT George Duke", "George Duke @georgeduke · Developer · running", "process running (seat runner)",
+          "harness Codex · model gpt-6-sol · effort medium", "tokens work 300k · out 50k · cache 1M · ctx 250k/300k · includes the run in progress",
+          // George Duke's last hour: 400k at 50 minutes ago and 850k at 20 (the 90-minute session is outside the window).
+          "burn ⢠⠀⢸⠀ last hour",
+          `assignment ${titles[0]} · in-review`, "pr ⎇ satoramoto/indra#103 · ● CI pending · 3 sessions · 47m on this task",
+          "steps ■ build → ■ review → ─ fix skipped → ◧ ci → □ merge", "latest Opened PR 103; review requested",
+          "SPRINTS", "planning → proposal → [implement] → release → retro", "tickets 1/4 tickets merged", "SEATS", ...names],
+        "lead-seat": ["LIVE · Chick Corea · progress · click or i to drive", "Chick Corea @chickcorea · Team Lead · idle", "process running (planning bridge)", "harness Claude · model claude-opus-5-5 · effort max",
+          "tokens work 504k · out 84k · cache 1.68M", "session idle session · Claude Code", "goal Make the terminal UI the owner's all-day hub",
+          "Claude Code session: claude:0e5f9f3e-1111-4222-8333-944445555666", "4 runs", "live shown above · i or a click on it drives", "[implement]", "⇗ goal thread", "⇗ proposal post"],
+        teams: ["TEAMS", "Yahaha (yahaha)", "5 seats", "⎇ satoramoto/indra"],
       };
       // Word wrapping inside a box is fine; cutting a key field short is not. Compare without spaces and box edges.
-      const compact = (text: string) => text.replace(/[\s│]/g, "");
-      for (const text of expected[name]) expect(compact(frame), text + "\n" + frame).toContain(compact(text));
+      const compact = (text: string) => text.replace(view.page === "seat" ? /[\s│█▀▄]/g : /\s/g, "");
+      for (const text of expected[name]) expect(frames.map(compact).join("\n"), text + "\n" + frames.join("\n")).toContain(compact(text));
+      for (const shown of frames) expect(shown).not.toMatch(/tmux|Ctrl-\]|Ctrl-b/);
+      for (const shown of frames) expect(shown.match(EMOJI) ?? [], shown).toEqual([]);
       expect(frame.split("\n").length - 1).toBe(HUB_GRID.rows);
+      expect(frame.match(EMOJI) ?? [], frame).toEqual([]);
     } finally { setup.renderer.destroy(); }
   });
 
-  it("colours states consistently and blinks what needs the owner", async () => {
-    const model = await hubModel();
-    model.restore({ page: "team", teamId: "team-001", seatId: "seat-002" });
-    const [pulse, setPulse] = createSignal(false);
-    const setup = await testRender(() => <TerminalApp model={model} revision={() => model.revision} onKey={() => {}} pulse={pulse} now={() => NOW} />, { width: 96, height: 42 });
+  it("renders no emoji in the help overlay either", async () => {
+    const setup = await testRender(() => <HelpOverlay />, { width: HUB_GRID.columns, height: HUB_GRID.rows });
     try {
       await setup.renderOnce();
-      // The colour of `text` on the row that names `seat`.
-      const color = (seat: string, text: string) => setup.captureSpans().lines.find((line) => line.spans.some((span) => span.text.includes(seat)))
-        ?.spans.find((span) => span.text.includes(text))?.fg.toInts().slice(0, 3);
-      const before = { failed: color("Corey Henry", "NO CREDENTIAL"), needs: color("Jordan Rudess", "RUNNING"), running: color("Aaron Magner", "RUNNING") };
-      expect(before).toEqual({ failed: [248, 113, 113], needs: [244, 114, 182], running: [74, 222, 128] });
-      setPulse(true);
-      await setup.renderOnce();
-      expect(color("Corey Henry", "NO CREDENTIAL")).not.toEqual(before.failed);
-      expect(color("Jordan Rudess", "RUNNING")).not.toEqual(before.needs);
-      expect(color("Aaron Magner", "RUNNING")).toEqual(before.running);
+      const frame = setup.captureCharFrame();
+      expect(frame).toContain("HELP · Esc, q or ? closes");
+      expect(frame.match(EMOJI) ?? [], frame).toEqual([]);
     } finally { setup.renderer.destroy(); }
+  });
+
+  it("uses one glyph set whose glyphs are each one terminal column and none an emoji", async () => {
+    const glyphs = [...new Set(allGlyphs())];
+    expect(glyphs.length).toBeGreaterThan(15);
+    for (const glyph of glyphs) {
+      expect(Array.from(glyph), glyph).toHaveLength(1);
+      expect(glyph, glyph).not.toMatch(/[\p{Extended_Pictographic}\u{FE0F}]/u);
+    }
+    // The renderer's own cell count for each glyph: one character, one cell. An emoji, two cells, is the control.
+    const rows = [...glyphs, "🟢"];
+    const setup = await testRender(() => <box flexDirection="column">{rows.map((row) => <text>{row}</text>)}</box>, { width: 10, height: rows.length });
+    try {
+      await setup.renderOnce();
+      const cellsOf = (index: number) => setup.captureSpans().lines[index].spans.filter((span) => span.text.trim()).reduce((sum, span) => sum + span.width - (Array.from(span.text).length - Array.from(span.text.trim()).length), 0);
+      glyphs.forEach((glyph, index) => expect(cellsOf(index), glyph).toBe(1));
+      expect(cellsOf(glyphs.length)).toBe(2);
+    } finally { setup.renderer.destroy(); }
+  });
+
+  it("lines the seats table up in columns under its header", async () => {
+    const setup = await screen({ page: "team", seatId: "seat-002" });
+    try {
+      const lines = setup.captureCharFrame().split("\n").map((line) => Array.from(line));
+      const header = lines.findIndex((line) => line.join("").includes("SEAT ") && line.join("").includes(" TASK "));
+      expect(header).toBeGreaterThan(0);
+      const at = (label: string) => lines[header].join("").indexOf(label);
+      const cell = (row: string[], label: string, width: number) => row.slice(at(label), at(label) + width).join("");
+      const rows = names.map((name) => lines.slice(header + 1).find((line) => line.join("").includes(name))!);
+      const model: Record<string, string> = { "Chick Corea": "opus-5-5", "George Duke": "gpt-6-sol", "Aaron Magner": "opus-5-5", "Corey Henry": "gpt-6-sol", "Jordan Rudess": "gpt-6-sol" };
+      rows.forEach((row, index) => {
+        expect(cell(row, "SEAT", names[index].length), row.join("")).toBe(names[index]);
+        expect(cell(row, "MODEL", model[names[index]].length), row.join("")).toBe(model[names[index]]);
+        // Numbers are right-aligned: the column ends where its header ends.
+        for (const label of ["WORK", "OUT", "CACHE", "CTX", "TIME"]) expect(row[at(label) + label.length - 1], label + ": " + row.join("")).not.toBe(" ");
+        for (const label of ["WORK", "OUT", "CACHE", "CTX", "TIME"]) expect(row[at(label) + label.length] ?? " ", label + ": " + row.join("")).toBe(" ");
+      });
+      const george = rows[names.indexOf("George Duke")];
+      expect(cell(george, "STEPS", 5)).toBe("■■─◧□");
+      expect(cell(rows[names.indexOf("Aaron Magner")], "STEPS", 5)).toBe("◧□□□□");
+      expect(cell(george, "PR", 8)).toBe("⎇ #103 ●");
+      const right = (row: string[], label: string, width: number) => row.slice(at(label) + label.length - width, at(label) + label.length).join("");
+      expect([right(george, "WORK", 5), right(george, "OUT", 5), right(george, "CACHE", 5), right(george, "CTX", 4), right(george, "TIME", 5)]).toEqual([" 300k", "  50k", "   1M", "250k", "  47m"]);
+    } finally { setup.renderer.destroy(); }
+  });
+
+  it("pulses gently, and only what needs the owner or the active step", async () => {
+    // At most one slow pulse: a flip every 1.5 s between the colour and its faded self.
+    expect(PULSE_MS).toBeGreaterThanOrEqual(1000);
+    expect(faded("#F87171")).not.toBe("#F87171");
+    const cells = (setup: Awaited<ReturnType<typeof testRender>>) => setup.captureSpans().lines.map((line) => line.spans.flatMap((span) => Array.from(span.text).map((char) => ({ char, fg: span.fg.toInts().slice(0, 3).join(",") }))));
+    const red = [PALETTE.bad].map((hex) => [1, 3, 5].map((index) => parseInt(hex.slice(index, index + 2), 16)).join(","))[0];
+    for (const view of [{ page: "team" as const, seatId: "seat-002" }, { page: "seat" as const, seatId: "seat-002" }]) {
+      const [pulse, setPulse] = createSignal(false);
+      const setup = await screen(view, pulse);
+      try {
+        const before = cells(setup);
+        setPulse(true);
+        await setup.renderOnce();
+        const after = cells(setup);
+        const changed: string[] = [];
+        before.forEach((line, row) => line.forEach((cell, column) => {
+          if (after[row]?.[column]?.fg === cell.fg || cell.char === " ") return;
+          changed.push(cell.char);
+          // A pulsing cell is in the needs-you/failed red, or it is the active pipeline step.
+          expect(cell.fg === red || cell.char === GLYPH.stage.active, `${cell.char} at ${row}:${column}`).toBe(true);
+        }));
+        // The seat screen's pipeline sits below the fold of its scrolling details panel.
+        if (view.page === "team") expect(changed).toContain(GLYPH.stage.active);
+        if (view.page === "team") expect(changed).toEqual(expect.arrayContaining([GLYPH.state.needs, GLYPH.state.failed]));
+        // The running glyph and the rest of the screen hold still.
+        expect(changed).not.toContain(GLYPH.state.running);
+        expect(changed.length).toBeLessThan(80);
+      } finally { setup.renderer.destroy(); }
+    }
   });
 
   it("keeps a blink cheap: it recolours existing renderables and never re-reads the model", async () => {
@@ -320,13 +445,136 @@ describe("the hub on the owner's screen", () => {
     const opened: string[] = [];
     const setup = await testRender(() => <TerminalApp model={model} revision={() => model.revision} onKey={() => {}} pulse={() => false} now={() => NOW} openUrl={(url) => opened.push(url)} />, { width: 96, height: 42 });
     try {
+      // Let the layout settle: the hit grid a click lands on is the one from the frame before.
+      await setup.renderOnce();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      await setup.renderOnce();
       await setup.renderOnce();
       const find = (label: string) => [...walk(setup.renderer.root)].find((node) => (node as unknown as { plainText?: string }).plainText?.includes(label))!;
-      for (const [label, url] of [["🐙 #98", "https://github.com/satoramoto/indra/pull/98"], ["💬 goal thread", `https://mattermost.newegypt.io/yahaha/pl/${ids.thread}`], ["📝 proposal post", `https://mattermost.newegypt.io/yahaha/pl/${ids.proposal}`]]) {
+      for (const [label, url] of [["⎇ #98", "https://github.com/satoramoto/indra/pull/98"], ["⎇ #103", "https://github.com/satoramoto/indra/pull/103"], ["⇗ goal thread", `https://mattermost.newegypt.io/yahaha/pl/${ids.thread}`], ["⇗ proposal post", `https://mattermost.newegypt.io/yahaha/pl/${ids.proposal}`]]) {
         const node = find(label);
         await setup.mockMouse.click(node.x + 1, node.y);
         expect(opened.at(-1), label).toBe(url);
       }
+    } finally { setup.renderer.destroy(); }
+  });
+});
+
+describe("per-cell polish", () => {
+  const PALETTE = new Set(Array.from({ length: 240 }, (_, index) => ansi256Rgb(index + 16).join(",")));
+  /** Every cell's colours on screen row `y`, from the captured spans. */
+  const rowColors = (setup: Awaited<ReturnType<typeof testRender>>, y: number) => setup.captureSpans().lines[y].spans
+    .flatMap((span) => Array.from({ length: Array.from(span.text).length }, () => ({ fg: span.fg.toInts().slice(0, 3).join(","), bg: span.bg.toInts().slice(0, 3).join(",") })));
+
+  async function animate(model: TerminalUiModel, truecolor: boolean) {
+    const [frame, setFrame] = createSignal(0);
+    const setup = await testRender(() => <TerminalApp model={model} revision={() => model.revision} onKey={() => {}} pulse={() => false} now={() => NOW} frame={frame} truecolor={truecolor} />, { width: HUB_GRID.columns, height: HUB_GRID.rows });
+    await setup.renderOnce();
+    await setup.renderOnce();
+    return { setup, setFrame };
+  }
+
+  it.each([
+    ["a running sprint", () => hubModel()],
+    ["the idle splash", () => hubModel(null)],
+  ])("draws 60 animation frames over %s without creating a renderable", async (_name, make) => {
+    const model = await make();
+    model.restore({ page: "team", teamId: "team-001", seatId: "seat-002" });
+    const { setup, setFrame } = await animate(model, true);
+    try {
+      const nodes = walk(setup.renderer.root);
+      const reads = vi.spyOn(model, "sessionsFor");
+      const screens = new Set<string>();
+      for (let tick = 1; tick <= 60; tick++) {
+        setFrame(tick);
+        await setup.renderOnce();
+        screens.add(JSON.stringify(setup.captureSpans().lines.map((line) => line.spans.map((span) => [span.text, span.fg.toInts(), span.bg.toInts()]))));
+      }
+      expect(walk(setup.renderer.root)).toEqual(nodes);
+      expect(reads).not.toHaveBeenCalled();
+      // The frames really moved something: the header drift or the splash shimmer.
+      expect(screens.size).toBeGreaterThan(1);
+    } finally { setup.renderer.destroy(); }
+  });
+
+  it("drifts the header gradient only while a sprint is running", async () => {
+    for (const [session, drifts] of [[hubSession(), true], [null, false]] as const) {
+      const model = await hubModel(session);
+      model.restore({ page: "team", teamId: "team-001" });
+      const { setup, setFrame } = await animate(model, true);
+      try {
+        const before = rowColors(setup, 0).map((cell) => cell.bg);
+        // Behind the title the bar is a gradient, not one flat colour.
+        expect(new Set(before).size).toBeGreaterThan(5);
+        setFrame(60);
+        await setup.renderOnce();
+        expect(rowColors(setup, 0).map((cell) => cell.bg).join(" ") !== before.join(" ")).toBe(drifts);
+        // The title still reads on top of it.
+        expect(setup.captureCharFrame().split("\n")[0]).toContain("INDRA  ›  Yahaha");
+      } finally { setup.renderer.destroy(); }
+    }
+  });
+
+  it("fills the progress bar in the current stage's colour and snaps every drawn colour to 256 without truecolor", async () => {
+    for (const truecolor of [true, false]) {
+      const model = await hubModel();
+      model.restore({ page: "team", teamId: "team-001", seatId: "seat-002" });
+      const { setup } = await animate(model, truecolor);
+      try {
+        const lines = setup.captureCharFrame().split("\n");
+        const y = lines.findIndex((line) => line.includes(" progress "));
+        const x = Array.from(lines[y]).indexOf("▀");
+        const cells = rowColors(setup, y);
+        expect(cells[x].bg).toBe(paint(STAGE_COLOR.implement, truecolor).join(","));
+        // The bar spans the row inside the page's one-column side padding.
+        const header = rowColors(setup, 0).slice(1, -1).map((cell) => cell.bg);
+        const drawn = [...header, ...cells.slice(x, x + 24).flatMap((cell) => [cell.fg, cell.bg])];
+        if (truecolor) expect(drawn.some((color) => !PALETTE.has(color))).toBe(true);
+        else expect(drawn.filter((color) => !PALETTE.has(color))).toEqual([]);
+      } finally { setup.renderer.destroy(); }
+    }
+  });
+
+  it("never paints the progress bar outside its scroll box on a short screen", async () => {
+    const model = await hubModel();
+    model.restore({ page: "team", teamId: "team-001", seatId: "seat-002" });
+    const setup = await testRender(() => <TerminalApp model={model} revision={() => model.revision} onKey={() => {}} pulse={() => false} now={() => NOW} frame={() => 0} truecolor />, { width: 96, height: 16 });
+    try {
+      await setup.renderOnce();
+      const scroll = setup.renderer.root.findDescendantById("team-scroll") as ScrollBoxRenderable;
+      for (let top = 0; top < scroll.scrollHeight; top++) {
+        scroll.scrollTo(top);
+        await setup.renderOnce();
+        const lines = setup.captureCharFrame().split("\n");
+        const outside = lines.filter((_, y) => y < scroll.y || y >= scroll.y + scroll.height);
+        expect(outside.filter((line) => line.includes("▀") || line.includes("▄")), "scrolled to " + top).toEqual([]);
+        expect(lines[0]).toContain("INDRA");
+      }
+    } finally { setup.renderer.destroy(); }
+  });
+
+  it("shows the INDRA wordmark on a team with no open sprint, inside 96×42", async () => {
+    const model = await hubModel(null);
+    model.restore({ page: "team", teamId: "team-001", seatId: "seat-002" });
+    const { setup } = await animate(model, true);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      await setup.renderOnce();
+      const frame = setup.captureCharFrame();
+      await keep("idle-splash", frame);
+      // The seats table keeps its full width: the splash never pushes a scroll bar in.
+      const lines = frame.split("\n");
+      const header = lines.find((line) => line.includes(" TASK ")) ?? "";
+      expect(header.trimEnd().endsWith("PR    CI"), frame).toBe(true);
+      // One column of page padding, then the table across the whole content width.
+      expect(header.trimEnd().length).toBe(1 + HUB_GRID.columns - 3);
+      // Centred in the content width: the page's side padding and the column kept free for the scroll bar.
+      expect(lines.find((line) => line.includes("No sprint open"))?.indexOf("No sprint open")).toBe(1 + Math.floor((HUB_GRID.columns - 3 - 14) / 2));
+      expect(frame).toContain("No sprint open");
+      expect(frame).toContain("█");
+      expect(frame.split("\n").length - 1).toBe(HUB_GRID.rows);
+      const scroll = setup.renderer.root.findDescendantById("team-scroll") as ScrollBoxRenderable;
+      expect(scroll.scrollHeight, frame).toBeLessThanOrEqual(scroll.height);
     } finally { setup.renderer.destroy(); }
   });
 });

@@ -21,12 +21,15 @@ export function stderrExcerpt(stderr: string, max = 120): string {
   return (text || "no output").slice(0, max);
 }
 
-/** Runs commands without a shell; output is kept in memory only. */
-export const processShell: Shell = {
-  run: (command, args, cwd) => new Promise((done) => {
-    execFile(command, args, { cwd, encoding: "utf8", maxBuffer: 20_000_000, timeout: 2 * 60 * 60_000, env: childEnv() }, (error, stdout, stderr) => {
+/** Runs commands without a shell; output is kept in memory only. `envFor` adjusts the (credential-free) child environment. */
+export function shellWithEnv(envFor: (env: NodeJS.ProcessEnv) => NodeJS.ProcessEnv): Shell {
+  return { run: (command, args, cwd) => new Promise((done) => {
+    execFile(command, args, { cwd, encoding: "utf8", maxBuffer: 20_000_000, timeout: 2 * 60 * 60_000, env: envFor(childEnv()) }, (error, stdout, stderr) => {
       const code = error ? (typeof (error as { code?: unknown }).code === "number" ? (error as { code: number }).code : 1) : 0;
       done({ code, stdout, stderr });
     });
-  }),
-};
+  }) };
+}
+
+/** Runs commands without a shell; output is kept in memory only. */
+export const processShell: Shell = shellWithEnv((env) => env);

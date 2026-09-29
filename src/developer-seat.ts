@@ -5,10 +5,10 @@ import type { AgentResult, AgentRuntime, WriteAccess } from "./codex-runtime.js"
 import { runChecked, type Shell, type ShellResult } from "./command-shell.js";
 import { maintainDeveloperSeat, ownsSeatRecord, retainSeatRecord, seatRecordName } from "./developer-maintenance.js";
 import { postReviewOnce, requireApprovedReview } from "./developer-review.js";
-import { missingTeamMessage, teamProject, type PlanningAssignment as Assignment, type PlanningGoal, type PlanningOutcome as ApprovedOutcome, type PlanningStore } from "./planning.js";
+import { developerSeats, missingTeamMessage, teamProject, type PlanningAssignment as Assignment, type PlanningDocument, type PlanningGoal, type PlanningOutcome as ApprovedOutcome, type PlanningStore } from "./planning.js";
 import { ensureProjectCheckout, ProjectCheckoutError, projectCheckoutPath } from "./project-checkout.js";
 import { schemaPathOf } from "./reload.js";
-import { ImplementationRecorder, implementationEligible, type ImplementationEvent } from "./implementation-facts.js";
+import { ImplementationRecorder, implementationEligible, implementationFactsName, type ImplementationEvent } from "./implementation-facts.js";
 import { AgentRunError } from "./runtime-facts.js";
 import { activityRecordName } from "./supervisor.js";
 
@@ -47,6 +47,26 @@ export const baseBranch = (goal: PlanningGoal) => {
 };
 // gh supplies the credential for one command; Git's configuration is never changed.
 const GH_CREDENTIAL = ["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential"];
+
+type Queued = { goal: PlanningGoal; assignment: Assignment };
+/** A seat's own queue order: oldest assignment first, then the older goal. */
+const byQueue = (a: Queued, b: Queued) => a.assignment.updatedAt.localeCompare(b.assignment.updatedAt) || a.goal.createdAt.localeCompare(b.goal.createdAt);
+const assignmentOf = (goals: PlanningGoal[] | undefined, goalId: string, outcomeId: string, seatId: string) =>
+  goals?.find((goal) => goal.id === goalId)?.assignments?.find((item) => item.outcomeId === outcomeId && item.seatId === seatId);
+export const takeoverNote = (from: string) => `taken over from ${from} (idle)`;
+
+/**
+ * Another seat's queued assignment is free to take when its seat is busy with other work, or has more queued and
+ * would reach this one only later. Its own next pick stays with an idle seat. Running, in-review and failed work is never free.
+ */
+export function takeable(goals: PlanningGoal[], goal: PlanningGoal, assignment: Assignment): boolean {
+  if (assignment.status !== "queued" || !implementationEligible(goal)) return false;
+  const owner = assignment.seatId;
+  const held = goals.flatMap((item) => (item.assignments ?? []).filter((entry) => entry.seatId === owner).map((entry) => ({ goal: item, assignment: entry })));
+  if (held.some((item) => ACTIVE.has(item.assignment.status))) return true;
+  const ownerNext = held.filter((item) => item.assignment.status === "queued" && implementationEligible(item.goal)).sort(byQueue)[0];
+  return !!ownerNext && !(ownerNext.goal.id === goal.id && ownerNext.assignment.outcomeId === assignment.outcomeId);
+}
 
 /** A failure whose message is ours and safe to record in state and the thread. */
 export class SeatError extends Error { override name = "SeatError"; }
@@ -88,16 +108,20 @@ export class DeveloperSeat {
     const mine = goals.flatMap((goal) => (goal.assignments ?? []).filter((item) => item.seatId === this.seat.id).map((assignment) => ({ goal, assignment })));
     const active = mine.find((item) => ACTIVE.has(item.assignment.status));
     if (active) { await this.resume(active.goal, active.assignment); return "worked"; }
-    const next = mine.filter((item) => item.assignment.status === "queued").sort((a, b) => a.assignment.updatedAt.localeCompare(b.assignment.updatedAt) || a.goal.createdAt.localeCompare(b.goal.createdAt))[0];
+    const own = mine.filter((item) => item.assignment.status === "queued").sort(byQueue)[0];
+    const next: { goal: PlanningGoal; assignment: Assignment; from?: string } | undefined = own ?? await this.takeoverCandidate(await this.store.read());
     if (!next) return "idle";
+    const owner = next.from ?? this.seat.id;
     // Release and retry use the same lock. Recheck eligibility after acquiring it, and again in the state transaction.
     const claimed = await this.store.withGoalLock(next.goal.id, async () => {
       const state = await this.store.read();
       const goal = state.planningGoals?.find((item) => item.id === next.goal.id);
       if (!goal || !implementationEligible(goal)) return;
-      const assignment = this.find(state.planningGoals, goal.id, next.assignment.outcomeId);
-      if (assignment.status !== "queued") return;
+      const assignment = assignmentOf(state.planningGoals, goal.id, next.assignment.outcomeId, owner);
+      if (assignment?.status !== "queued") return;
       if ((state.planningGoals ?? []).some((item) => item.assignments?.some((item) => item.seatId === this.seat.id && ACTIVE.has(item.status)))) return;
+      // A takeover is re-proven under the lock: the owner is still busy and left nothing of an attempt behind.
+      if (next.from && !(takeable(state.planningGoals ?? [], goal, assignment) && await this.unattempted(goal.id, assignment))) return;
       const name = this.recordName(goal.id, assignment.outcomeId);
       const saved = await this.store.readRuntimeFile<SeatTaskRecord>(name);
       const reusable = saved && this.ownsRecord(goal, assignment.outcomeId, saved);
@@ -114,11 +138,16 @@ export class DeveloperSeat {
         if (!currentGoal || !implementationEligible(currentGoal)) throw new SeatError("Goal no longer accepts implementation claims.");
         const all = (current.planningGoals ?? []).flatMap((item) => item.assignments ?? []);
         if (all.some((item) => item.seatId === this.seat.id && ACTIVE.has(item.status))) throw new SeatError("Seat already owns an assignment.");
-        const target = this.find(current.planningGoals, goal.id, assignment.outcomeId);
-        if (target.status !== "queued" || target.updatedAt !== assignment.updatedAt) throw new SeatError("Assignment is no longer queued.");
-        Object.assign(target, { status: "running", updatedAt: attempt.claim!.at });
-        delete target.note;
-      }, `Seat ${this.seat.id} claims ${goal.id}/${assignment.outcomeId}: running`);
+        const target = assignmentOf(current.planningGoals, goal.id, assignment.outcomeId, owner);
+        if (target?.status !== "queued" || target.updatedAt !== assignment.updatedAt) throw new SeatError("Assignment is no longer queued.");
+        if (next.from && !takeable(current.planningGoals ?? [], currentGoal, target)) throw new SeatError("Assignment is no longer free to take over.");
+        // Reassign and claim in one write; file ownership stays with the outcome in the approved proposal.
+        Object.assign(target, { seatId: this.seat.id, status: "running", updatedAt: attempt.claim!.at });
+        if (next.from) target.note = takeoverNote(next.from);
+        else delete target.note;
+      }, next.from
+        ? `Seat ${this.seat.id} takes over ${goal.id}/${assignment.outcomeId} from ${next.from}: running`
+        : `Seat ${this.seat.id} claims ${goal.id}/${assignment.outcomeId}: running`);
       // The preceding attempt's evidence is durable before resetting either budget.
       record.conflictRounds = 0;
       record.reviewFixRounds = 0;
@@ -130,10 +159,34 @@ export class DeveloperSeat {
     const { goal, record, reusable } = claimed;
     if (reusable) await this.resume(goal, this.find((await this.store.read()).planningGoals, goal.id, record.outcomeId), record);
     else {
-      await this.say(goal, `Claimed **${this.outcome(goal, record.outcomeId).title}** (${record.outcomeId}). Starting work.`);
+      await this.say(goal, `Claimed **${this.outcome(goal, record.outcomeId).title}** (${record.outcomeId})${next.from ? `, taken over from ${next.from}, which is busy` : ""}. Starting work.`);
       await this.work(goal, record);
     }
     return "worked";
+  }
+
+  /** The oldest queued outcome (proposal order) in this seat's teams' open sprints that another, busy seat holds. */
+  private async takeoverCandidate(state: PlanningDocument): Promise<(Queued & { from: string }) | undefined> {
+    const goals = state.planningGoals ?? [];
+    const open = goals.filter((goal) => implementationEligible(goal) && developerSeats(state, goal.teamId).some((seat) => seat.id === this.seat.id))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    for (const goal of open) {
+      for (const outcome of goal.proposal?.outcomes ?? []) {
+        const assignment = goal.assignments?.find((item) => item.outcomeId === outcome.id);
+        if (!assignment || assignment.seatId === this.seat.id || !takeable(goals, goal, assignment)) continue;
+        if (await this.unattempted(goal.id, assignment)) return { goal, assignment, from: assignment.seatId };
+      }
+    }
+    return undefined;
+  }
+
+  /** Nothing of an earlier attempt remains: no seat record, ledger attempt or worktree for the owning seat's work. */
+  private async unattempted(goalId: string, assignment: Assignment): Promise<boolean> {
+    if (await this.store.readRuntimeFile(seatRecordName(assignment.seatId, goalId, assignment.outcomeId))) return false;
+    const facts = await this.store.readRuntimeFile<{ attempts?: unknown[] }>(implementationFactsName(assignment.seatId, goalId, assignment.outcomeId));
+    if (facts?.attempts?.length) return false;
+    const worktree = join(this.store.runtimeDir, "worktrees", `${goalId}-${assignment.outcomeId}`);
+    return await lstat(worktree).then(() => false, (error: NodeJS.ErrnoException) => error.code === "ENOENT");
   }
 
   private async resume(goal: PlanningGoal, assignment: Assignment, saved?: SeatTaskRecord): Promise<void> {
