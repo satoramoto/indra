@@ -70,15 +70,24 @@ describe("Codex invocation facts", () => {
     expect(result.facts?.usage).toBeUndefined();
   });
 
-  it("retains workspace-write, named extras, isolated home and OP-free child environment", async () => {
-    vi.stubEnv("OP_SESSION_test", "fixture-only");
-    const run = new CodexRuntime("/workspace", 60_000, { extraDirs: ["/git-dir"] }, "/seat-home").message("Build", "/schema.json");
+  it.each([undefined, "/seat-home"])("retains workspace-write, named extras and its child environment with home %s", async (home) => {
+    const excluded = ["OP_SERVICE_ACCOUNT_TOKEN", "OP_SESSION_test", "OP_FUTURE_VARIABLE", "INDRA_STATE_GITHUB_TOKEN"];
+    for (const name of excluded) vi.stubEnv(name, "fixture-only");
+    vi.stubEnv("CODEX_HOME", "/ambient-home");
+    vi.stubEnv("INDRA_RUNTIME_TEST", "visible");
+    vi.stubEnv("MAX_TOKENS", "100");
+    const run = new CodexRuntime("/workspace", 60_000, { extraDirs: ["/git-dir"] }, home).message("Build", "/schema.json");
     await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
     expect(args()).toEqual(["exec", "--json", "--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true", "--add-dir", "/git-dir", "--output-schema", "/schema.json", "-"]);
-    expect(vi.mocked(spawn).mock.calls[0][2]?.env).toMatchObject({ CODEX_HOME: "/seat-home" });
-    expect(vi.mocked(spawn).mock.calls[0][2]?.env).not.toHaveProperty("OP_SESSION_test");
+    const env = vi.mocked(spawn).mock.calls[0][2]?.env;
+    expect(env).toMatchObject({ CODEX_HOME: home ?? "/ambient-home", INDRA_RUNTIME_TEST: "visible", MAX_TOKENS: "100" });
+    for (const name of excluded) {
+      expect(env).not.toHaveProperty(name);
+      expect(process.env[name]).toBe("fixture-only");
+    }
+    expect(process.env.CODEX_HOME).toBe("/ambient-home");
     child.close(); await run;
-    expect(ensureCodexHome).toHaveBeenCalledTimes(2);
+    expect(ensureCodexHome).toHaveBeenCalledTimes(home ? 2 : 0);
   });
 
   it.each([7, null])("preserves usage on exit %s without echoing stderr or a final response", async (code) => {
@@ -130,12 +139,14 @@ describe("Codex invocation facts", () => {
     else if (reason === "stdin-error") child.stdin.emit("error", new Error("private stdin diagnostic"));
     else child.emit("error", new Error("private process diagnostic"));
     child.emit("exit", 0);
+    child.stderr.write("private shutdown diagnostic");
     await vi.advanceTimersByTimeAsync(50);
     expect(settled).toBe(false);
     // Complete a frame buffered before shutdown, then repeat the cumulative report without a newline.
     child.close(usage.slice(40) + "\n" + usage);
     const error = await run;
     expect(error.facts).toMatchObject({ engine: "codex", status: reason.endsWith("error") ? "failed" : reason, sessionId: id, usage: { inputTokens: 100, outputTokens: 9 }, finishedAt: new Date().toISOString() });
+    expect(error.message).not.toContain("private");
     expect(JSON.stringify(error)).not.toContain("private");
   });
 

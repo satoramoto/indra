@@ -48,13 +48,19 @@ describe("Claude runtime", () => {
 
   it("resumes only the explicit Claude UUID, reapplies the schema, and disables interrupted-turn replay", async () => {
     vi.stubEnv("CLAUDE_CODE_RESUME_INTERRUPTED_TURN", "1");
-    vi.stubEnv("ANTHROPIC_API_KEY", "test-only-must-not-forward");
-    vi.stubEnv("OP_SESSION_example", "test-only-op-session");
+    const excluded = ["OP_SERVICE_ACCOUNT_TOKEN", "OP_SESSION_example", "INDRA_STATE_GITHUB_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_APIKEY", "DB_PASSWORD", "DB_PASSWD", "clientSecret", "access_token", "MAX_TOKENS"];
+    for (const name of excluded) vi.stubEnv(name, "fixture-only");
+    vi.stubEnv("INDRA_RUNTIME_TEST", "visible");
+    vi.stubEnv("API-KEY", "fixture-only");
     const run = new ClaudeRuntime(dir).message("Next", schema, handle);
     await launched(); expect(flag("--resume")).toBe(id); expect(args()).toContain("--json-schema");
     const env = vi.mocked(spawn).mock.calls[0][2]?.env;
-    expect(env?.CLAUDE_CODE_RESUME_INTERRUPTED_TURN).toBe("0"); expect(env).not.toHaveProperty("ANTHROPIC_API_KEY");
-    expect(env).not.toHaveProperty("OP_SESSION_example");
+    expect(env).toMatchObject({ CLAUDE_CODE_RESUME_INTERRUPTED_TURN: "0", INDRA_RUNTIME_TEST: "visible", "API-KEY": "fixture-only" });
+    for (const name of excluded) {
+      expect(env).not.toHaveProperty(name);
+      expect(process.env[name]).toBe("fixture-only");
+    }
+    expect(process.env.CLAUDE_CODE_RESUME_INTERRUPTED_TURN).toBe("1");
     child.close(); expect((await run).sessionId).toBe(handle);
   });
 
@@ -239,11 +245,13 @@ describe("Claude invocation facts", () => {
     else if (reason === "stdin-error") child.stdin.emit("error", new Error("private stdin diagnostic"));
     else child.emit("error", new Error("private process diagnostic"));
     child.emit("exit", 0);
+    child.stderr.write("private shutdown diagnostic");
     await vi.advanceTimersByTimeAsync(50);
     expect(settled).toBe(false);
     child.close(shutdown.slice(40) + "\n" + shutdown);
     const error = await run;
     expect(error.facts).toMatchObject({ engine: "claude", status: reason.endsWith("error") ? "failed" : reason, sessionId: handle, usage: { inputTokens: 60, outputTokens: 12 }, finishedAt: new Date().toISOString() });
+    expect(error.message).not.toContain("private");
     expect(JSON.stringify(error)).not.toContain("private");
   });
 
