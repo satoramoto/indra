@@ -32,6 +32,9 @@ import type { UiView } from "./terminal-ui.js";
 import { LocalSessionReader } from "./session-snapshot.js";
 import { CliGoalStarter, Supervisor } from "./supervisor.js";
 import { TmuxPaneTail } from "./pane-tail.js";
+import { attachTmux } from "./tmux-attach.js";
+import { verifyOwnedSession } from "./tmux-attach-owned.js";
+import { LocalTranscriptSource, TranscriptLocator } from "./session-transcript.js";
 import { checkConsistency, printConsistency, type TeamMemberReader } from "./consistency.js";
 
 /**
@@ -330,6 +333,9 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         processes: new Supervisor(options.checkout, undefined, undefined, undefined, store, (force) => stageServiceToken(options.checkout, { force })),
         goals: new CliGoalStarter(options.checkout),
         paneTail: new TmuxPaneTail(options.checkout),
+        // Watching a seat sets up keys, scrolling and the status line only on this checkout's verified sessions.
+        attach: (target) => attachTmux(target, undefined, (socket, session) => verifyOwnedSession(options.checkout, socket, session)),
+        transcript: new LocalTranscriptSource(new TranscriptLocator(options.checkout)),
         launchCheck: () => checkLaunch(options.checkout, new SystemTmux(), new TmuxHost(options.checkout).socket),
         sync: store,
         update: {

@@ -266,7 +266,7 @@ describe("terminal UI", () => {
       expect(frame).toContain("Earlier response");
       expect(frame).toContain("Planning goal: Plan the next cycle");
       expect(frame).toContain("Planning detail: clarifying");
-      expect(frame).toContain("no verified tmux target");
+      expect(frame).toContain("Live view: not available");
     } finally { setup.renderer.destroy(); }
   });
 

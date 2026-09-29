@@ -1,0 +1,11 @@
+{"type":"queue-operation","operation":"enqueue","timestamp":"2026-09-29T10:00:00.000Z","sessionId":"11111111-2222-4333-8444-555555555555"}
+{"type":"user","isMeta":true,"timestamp":"2026-09-29T10:00:00.500Z","message":{"role":"user","content":"<local-command-caveat>meta</local-command-caveat>"}}
+{"type":"user","timestamp":"2026-09-29T10:00:01.000Z","message":{"role":"user","content":"Build the outcome: add a help overlay."}}
+{"type":"assistant","timestamp":"2026-09-29T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"The user wants a help overlay. The token=ghp_abcdefghijklmnopqrstuvwxyz0123456789 must never show.","signature":"sig"}]}}
+{"type":"assistant","timestamp":"2026-09-29T10:00:03.000Z","message":{"role":"assistant","content":[{"type":"text","text":"I'll look at the terminal UI first."},{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"grep -n overlay src/terminal-ui.ts","description":"Find overlay"}}]}}
+{"type":"user","timestamp":"2026-09-29T10:00:04.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"src/terminal-ui.ts:12: overlay\nAuthorization: Bearer abc.def.ghi"}]}}
+{"type":"assistant","timestamp":"2026-09-29T10:00:05.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"Read","input":{"file_path":"/tmp/missing.ts"}}]}}
+{"type":"user","timestamp":"2026-09-29T10:00:06.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_2","is_error":true,"content":[{"type":"text","text":"File does not exist."}]}]}}
+not json at all
+{"type":"assistant","isApiErrorMessage":true,"timestamp":"2026-09-29T10:00:07.000Z","message":{"role":"assistant","content":[{"type":"text","text":"API Error: 529 overloaded"}]}}
+{"type":"system","subtype":"informational","timestamp":"2026-09-29T10:00:08.000Z","content":"compacted"}

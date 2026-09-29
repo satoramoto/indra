@@ -125,6 +125,8 @@ export class TerminalUiModel {
   input?: UiInput;
   /** Set while a y/n confirmation is open. */
   confirm?: UiApproval | UiRollback | UiRetry;
+  /** A full-screen view over the page: the key help (`?`) or the selected seat's session transcript (`t`). */
+  overlay?: "help" | "transcript";
   private retrying?: UiRetry;
   private retryPending = false;
   /** The approval the owner confirmed, until `approveConfirmed` runs it. */
@@ -633,8 +635,21 @@ export class TerminalUiModel {
       this.notice = (target.action === "retry" ? "Retry" : target.action === "rollback" ? "Rollback" : target.action === "propose" ? "Proposal request" : target.action === "approve" ? "Approval" : "Sprint " + target.action) + " cancelled; nothing changed.";
       return "none";
     }
+    if (this.overlay) {
+      // Esc or q returns; the overlay handles its own scrolling keys.
+      const name = value.toLowerCase();
+      if (name === "escape" || name === "q" || (this.overlay === "help" && text === "?")) { this.overlay = undefined; this.revision++; }
+      return "none";
+    }
     this.notice = undefined;
     const input = value.toLowerCase();
+    if (text === "?") { this.overlay = "help"; this.revision++; return "none"; }
+    if (text === "t" || (text === undefined && value === "t")) {
+      if (this.page !== "seat" || !this.seat) this.notice = "Open a seat first to read its session transcript.";
+      else this.overlay = "transcript";
+      this.revision++;
+      return "none";
+    }
     if (input === "q") return "quit";
     if (text === "U") return "pause";
     if (text === "R") return "ask-rollback";
@@ -697,8 +712,8 @@ export class TerminalUiModel {
       if (this.page === "teams" && this.team) this.page = "team";
       else if (this.page === "team" && this.seat) this.page = "seat";
     } else if (input === "a") {
-      if (this.page !== "seat") this.notice = "Open a seat first to inspect its process log.";
-      else if (!this.attachTarget()) this.notice = "No verified Indra tmux target is available for this seat.";
+      if (this.page !== "seat") this.notice = "Open a seat first to watch its live process.";
+      else if (!this.attachTarget()) this.notice = "No live view is available for this seat; its process is not running under Indra.";
       else return "attach";
     }
     this.revision++;
