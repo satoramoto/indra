@@ -17,6 +17,7 @@ const ready: CeremonyWriteReadiness = { version: 1, consumers: { planning: 1, de
 const plan: ApprovalEvidence = { kind: "approval", proposalId: "proposal-one", proposalPostId: "proposal-post", approval: { source: "owner-command", command: "planning approve", at: at(2) } };
 const implementation: ImplementationEvidence = { kind: "implementation", outcomes: [{ outcomeId: "outcome-one", seatId: "seat-two", prUrl: "https://github.com/owner/project/pull/1", baseBranch: "sprint/goal-one", mergedSha: sha("a"), checksPassed: true, reviewApproved: true }] };
 const running: RunningReleaseEvidence = { kind: "release-running", prUrl: "https://github.com/owner/project/pull/2", mergedSha: sha("b"), mergePostId: "merge-post", approval: { source: "owner-command", command: "planning merge", at: at(5) }, checksPassed: true, buildSha: sha("b"), runningSha: sha("b"), runningAt: at(6) };
+const descendant: RunningReleaseEvidence = { ...running, buildSha: sha("e"), runningSha: sha("e"), ancestry: { ancestorSha: running.mergedSha, descendantSha: sha("e"), verified: true } };
 const retro: PublishedRetroEvidence = { kind: "retro-published", path: "docs/retros/goal-one.md", prUrl: "https://github.com/owner/project/pull/3", baseBranch: "main", mergedSha: sha("c"), postId: "retro-post", publishedAt: at(8), factsOnly: true, suggestions: "owner-proposals-only" };
 
 function goal(id = "goal-one"): PlanningGoal {
@@ -141,6 +142,20 @@ describe("ordered ceremony", () => {
     item.integration!.status = "reverted";
     expect(() => advanceCeremony(item, transition("retro"))).toThrow("not been reverted");
   });
+  it("accepts a running descendant only with verified ancestry bound to the merged and running build commits", () => {
+    const item = staged("release"); prepare(item, "retro");
+    const advance = (evidence: RunningReleaseEvidence) => advanceCeremony(item, { to: "retro", at: at(7), evidence });
+    expect(advance(descendant).stage).toBe("retro");
+    for (const patch of [
+      { ancestry: undefined },
+      { ancestry: { ...descendant.ancestry, verified: false } },
+      { ancestry: { ...descendant.ancestry, ancestorSha: sha("a") } },
+      { ancestry: { ...descendant.ancestry, descendantSha: sha("a") } },
+      { runningSha: sha("a") },
+    ]) expect(() => advance({ ...descendant, ...patch } as RunningReleaseEvidence)).toThrow();
+    expect(() => advance({ ...running, ancestry: descendant.ancestry })).toThrow();
+    expect(item.ceremony?.stage).toBe("release");
+  });
   it("requires the goal's retro document, merged PR, thread post and recorded facts", () => {
     const item = staged("retro");
     for (const patch of [{ path: "docs/retros/goal-other.md" }, { mergedSha: "" }, { postId: "" }, { prUrl: "" }, { factsOnly: false }, { suggestions: "apply-automatically" }, { publishedAt: at(0) }]) {
@@ -192,6 +207,18 @@ describe("ceremony persistence and team lock", () => {
     await persistence.update((doc) => { const other = structuredClone(doc.teams[0]) as { id: string; slug: string }; other.id = "team-two"; other.slug = "team-two"; doc.teams.push(other); }, "Add another team");
     await persistence.createGoal({ ...goal("goal-two"), teamId: "team-two" });
     expect((await persistence.read()).planningGoals).toHaveLength(2);
+  });
+  it("persists a verified running descendant and releases the team lock after its retro closes", async () => {
+    const persistence = await store([staged("release")]);
+    await persistence.update((doc) => {
+      const item = doc.planningGoals![0]; prepare(item, "retro");
+      item.ceremony = advanceCeremony(item, { to: "retro", at: at(7), evidence: descendant });
+    }, "Record the running descendant");
+    expect((await persistence.read()).planningGoals![0].ceremony?.history.at(-1)).toMatchObject({ stage: "retro", evidence: descendant });
+    await expect(persistence.createGoal(goal("goal-two"))).rejects.toThrow("unclosed");
+    await persistence.update((doc) => { const item = doc.planningGoals![0]; item.ceremony = closeCeremony(item, at(9), retro); }, "Close after retro");
+    await persistence.createGoal(goal("goal-two"));
+    expect(await persistence.teamConflicts()).toEqual([]);
   });
   it("cannot bypass order, rewrite evidence, remove history, delete goals or reopen through a mutator", async () => {
     const persistence = await store([staged("implement")]);
@@ -259,6 +286,74 @@ describe("ceremony persistence and team lock", () => {
 });
 
 describe("legacy migration", () => {
+  it("requires migration before an activated writer changes a legacy workflow", async () => {
+    const item = staged("proposal"); delete item.ceremony;
+    const persistence = await store([item]);
+    const before = await readFile(join(persistence.checkout, "state.json"), "utf8");
+    await expect(persistence.update((doc) => prepare(doc.planningGoals![0], "implement"), "Approve without evidence")).rejects.toThrow("migration");
+    expect(await readFile(join(persistence.checkout, "state.json"), "utf8")).toBe(before);
+    expect(git(persistence.checkout, "rev-list", "--count", "HEAD").trim()).toBe("1");
+    await persistence.migrateGoal(item.id, {}, at(2));
+    await persistence.update((doc) => {
+      const goal = doc.planningGoals![0]; prepare(goal, "implement");
+      goal.ceremony = advanceCeremony(goal, transition("implement"));
+    }, "Approve with evidence after migration");
+    expect((await persistence.read()).planningGoals![0].ceremony?.history.at(-1)).toMatchObject({ stage: "implement", evidence: plan });
+  });
+  it("guards legacy drafting, proposal, assignment and integration changes after activation", async () => {
+    for (const [stage, mutate] of [
+      ["planning", (item) => { item.stage = "drafting"; }],
+      ["proposal", (item) => { item.proposal!.summary = "Another proposal"; }],
+      ["implement", (item) => { item.assignments![0].status = "running"; }],
+      ["release", (item) => prepare(item, "retro")],
+    ] satisfies [CeremonyStage, (item: PlanningGoal) => void][]) {
+      const item = staged(stage); delete item.ceremony;
+      const persistence = await store([item]);
+      await expect(persistence.update((doc) => mutate(doc.planningGoals![0]), "Advance legacy workflow")).rejects.toThrow("migration");
+      expect((await persistence.read()).planningGoals![0]).toEqual(item);
+    }
+  });
+  it("leaves legacy behavior available before rollout and guards old writers in mixed documents", async () => {
+    const item = staged("proposal"); delete item.ceremony;
+    const disabled = await store([item], false);
+    await disabled.update((doc) => prepare(doc.planningGoals![0], "implement"), "Legacy approval");
+    expect((await disabled.read()).planningGoals![0].stage).toBe("approved");
+    const mixed = await store([item, { ...staged("planning"), id: "goal-two" }], false);
+    await expect(mixed.update((doc) => prepare(doc.planningGoals![0], "implement"), "Old writer approval")).rejects.toThrow("migration");
+    await mixed.update((doc) => { doc.planningGoals![0].brief.decisions.push("Keep a historical note"); }, "Annotate legacy goal");
+    expect((await mixed.read()).planningGoals![0].brief.decisions).toEqual(["Keep a historical note"]);
+  });
+  it.each(["proposal", "implement", "release", "retro"] as const)("cannot erase known %s facts while attaching migration provenance", async (stage) => {
+    const item = staged(stage); delete item.ceremony;
+    const persistence = await store([item]);
+    const before = await readFile(join(persistence.checkout, "state.json"), "utf8");
+    await expect(persistence.update((doc) => {
+      const target = doc.planningGoals![0]; target.stage = "clarifying";
+      delete target.proposal; delete target.assignments; delete target.integration;
+      target.ceremony = { ...startCeremony(target.createdAt), migratedAt: at(10) };
+    }, "Erase known history")).rejects.toThrow("migration");
+    expect(await readFile(join(persistence.checkout, "state.json"), "utf8")).toBe(before);
+    expect(git(persistence.checkout, "rev-list", "--count", "HEAD").trim()).toBe("1");
+  });
+  it("validates supplied migration history against the original record and keeps unknown times unknown", async () => {
+    const item = staged("retro"); delete item.ceremony;
+    const persistence = await store([item]);
+    const result = migrateLegacyCeremony(item, { approval: plan, implementation, release: running }, at(10));
+    if (result.status !== "ready") throw new Error("Expected migration");
+    for (const mutate of [
+      (goal: PlanningGoal) => { goal.proposal!.summary = "Replace the approved plan"; },
+      (goal: PlanningGoal) => { goal.assignments![0].status = "queued"; },
+      (goal: PlanningGoal) => { goal.integration!.status = "collecting"; },
+      (goal: PlanningGoal) => { goal.ceremony!.history[1].enteredAt = at(1); },
+    ]) {
+      await expect(persistence.update((doc) => {
+        doc.planningGoals![0].ceremony = structuredClone(result.ceremony); mutate(doc.planningGoals![0]);
+      }, "Rewrite legacy history")).rejects.toThrow();
+    }
+    expect((await persistence.read()).planningGoals![0]).toEqual(item);
+    await persistence.migrateGoal(item.id, { approval: plan, implementation, release: running }, at(10));
+    expect((await persistence.read()).planningGoals![0]).toEqual({ ...item, ceremony: result.ceremony });
+  });
   it("leaves an approved/merged legacy goal unknown without verified history", () => {
     const item = staged("retro"); delete item.ceremony;
     const before = structuredClone(item);

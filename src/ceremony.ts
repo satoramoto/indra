@@ -18,6 +18,8 @@ export interface ImplementationEvidence {
 export interface RunningReleaseEvidence {
   kind: "release-running"; prUrl: string; mergedSha: string; mergePostId: string; approval: HumanApproval;
   checksPassed: true; buildSha: string; runningSha: string; runningAt: string;
+  /** Required for a descendant build; the adapter verifies this exact commit pair in the team's project. */
+  ancestry?: { ancestorSha: string; descendantSha: string; verified: true };
 }
 export interface PublishedRetroEvidence {
   kind: "retro-published"; path: string; prUrl: string; baseBranch: "main"; mergedSha: string; postId: string;
@@ -65,7 +67,9 @@ export const CEREMONY_SCHEMA_DEFS = {
     type: "array", minItems: 1, items: object({ outcomeId: id, seatId: id, prUrl: ref("ceremonyPr"), baseBranch: text, mergedSha: sha, checksPassed: { const: true }, reviewApproved: { const: true } }),
   } }),
   ceremonyRelease: object({ kind: { const: "release-running" }, prUrl: ref("ceremonyPr"), mergedSha: sha, mergePostId: text,
-    approval, checksPassed: { const: true }, buildSha: sha, runningSha: sha, runningAt: time }),
+    approval, checksPassed: { const: true }, buildSha: sha, runningSha: sha, runningAt: time,
+    ancestry: object({ ancestorSha: sha, descendantSha: sha, verified: { const: true } }),
+  }, ["kind", "prUrl", "mergedSha", "mergePostId", "approval", "checksPassed", "buildSha", "runningSha", "runningAt"]),
   ceremonyRetro: object({ kind: { const: "retro-published" }, path: { type: "string", pattern: "^docs/retros/[a-z][a-z0-9-]+\\.md$" },
     prUrl: ref("ceremonyPr"), baseBranch: { const: "main" }, mergedSha: sha, postId: text, publishedAt: time,
     factsOnly: { const: true }, suggestions: { const: "owner-proposals-only" } }),
@@ -126,7 +130,9 @@ function validateImplementation(goal: PlanningGoal, evidence: ImplementationEvid
 function validateRelease(goal: PlanningGoal, evidence: RunningReleaseEvidence): void {
   // A later owner-approved rollback does not erase the fact that this release ran.
   requireThat((goal.integration?.status === "merged" || goal.integration?.status === "reverted") && goal.integration.prUrl === evidence.prUrl && goal.integration.mergedSha === evidence.mergedSha, "Release evidence must reference the merged integration PR.");
-  requireThat(evidence.buildSha === evidence.mergedSha && evidence.runningSha === evidence.mergedSha, "Release is complete only when the merged build is running.");
+  requireThat(evidence.buildSha === evidence.runningSha, "Release is complete only when the verified build is running.");
+  if (evidence.ancestry) requireThat(evidence.ancestry.verified === true && evidence.ancestry.ancestorSha === evidence.mergedSha && evidence.ancestry.descendantSha === evidence.buildSha, "Release ancestry must verify the merged commit in this build.");
+  requireThat(evidence.buildSha === evidence.mergedSha || evidence.ancestry, "A descendant release build requires verified ancestry from the merged commit.");
   validateHuman(evidence.approval, "planning merge", evidence.mergePostId, goal);
   notBefore(evidence.runningAt, evidence.approval.at);
 }
@@ -195,11 +201,24 @@ export function closeCeremony(goal: PlanningGoal, at: string, evidence: Publishe
 }
 
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
-/** Store-level guard: a generic mutator cannot erase, rewrite, skip or reopen the durable ceremony. */
+/** Store-level guard: legacy workflow changes need migration; durable history cannot be erased or rewritten. */
 export function validateCeremonyMutation(before: PlanningGoal, after: PlanningGoal | undefined): void {
   requireThat(after && after.teamId === before.teamId && after.createdAt === before.createdAt, "A ceremony goal cannot be removed or moved to another team.");
   if (!before.ceremony) {
-    requireThat(after.ceremony?.migratedAt, "Existing goals require explicit evidence-based migration.");
+    requireThat((["stage", "proposal", "assignments", "integration"] as const).every((key) => same(before[key], after[key])), "Legacy goals require evidence-based migration before workflow changes; migration must preserve the original workflow.");
+    const next = after.ceremony;
+    if (!next) return;
+    requireThat(next.migratedAt, "Existing goals require explicit evidence-based migration.");
+    validateCeremony(before, next);
+    const evidence: LegacyEvidence = {};
+    for (const entry of next.history) {
+      if (entry.stage === "implement") evidence.approval = entry.evidence;
+      if (entry.stage === "release") evidence.implementation = entry.evidence;
+      if (entry.stage === "retro") evidence.release = entry.evidence;
+    }
+    if (next.closure) evidence.retro = next.closure.evidence;
+    const migration = migrateLegacyCeremony(before, evidence, next.migratedAt);
+    requireThat(migration.status === "ready" && same(migration.ceremony, next), "Migration must preserve known history and leave unproven history unknown.");
     return;
   }
   const old = before.ceremony; const next = after.ceremony;
