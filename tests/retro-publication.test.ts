@@ -1,13 +1,15 @@
-import { describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CeremonyContext } from "../src/planning-bridge.js";
 import { advanceCeremony, startCeremony, type HumanApproval } from "../src/ceremony.js";
 import type { PlanningGoal, PlanningStore } from "../src/planning.js";
-import { createCeremonyAdapters, RetroPublication, retroRuntimeName, type RetroPublicationRecord } from "../src/retro-publication.js";
-import { buildRetroSnapshot, renderSprintRetro, type SprintRetroDraft } from "../src/sprint-retro.js";
+import { createCeremonyAdapters, RetroPublication, retroRetryDelayMs, retroRuntimeName, type RetroPublicationRecord } from "../src/retro-publication.js";
+import { buildRetroSnapshot, renderSprintRetro, RetroGenerationError, type RetroPriorAttempt, type SprintRetroDraft } from "../src/sprint-retro.js";
 import { SprintGitHub, type RetroArchive, type RetroPr } from "../src/sprint.js";
 import { SeatRuntime } from "../src/seat-runtime.js";
 import * as mattermost from "../src/planning-mattermost.js";
 
+afterEach(() => { vi.useRealTimers(); });
 const at = (second: number) => `2026-01-01T00:00:${String(second).padStart(2, "0")}.000Z`;
 function goalAtRetro(): PlanningGoal {
   const goal: PlanningGoal = { id: "goal-one", teamId: "team-one", seatId: "seat-lead", participantSeatIds: ["seat-dev"], goal: "Ship", projectRefs: ["test/project"],
@@ -40,7 +42,7 @@ async function fixture() {
       return delivered.id;
     }), recordRun: vi.fn(), recordSession: vi.fn(),
   };
-  const draft = vi.fn(async (): Promise<SprintRetroDraft> => {
+  const draft = vi.fn(async (_context?: CeremonyContext, _prior?: RetroPriorAttempt[]): Promise<SprintRetroDraft> => {
     const snapshot = buildRetroSnapshot({ goal, cutoffAt: at(7), facts: { seats: [], sessions: [], reviews: [], rounds: [], failures: [] } });
     const generation = { sessionId: "retro-session", startedAt: at(8), finishedAt: at(9), status: "succeeded" as const, wallTimeMs: 1000,
       usage: { inputTokens: 12, uncachedInputTokens: null, cachedInputTokens: null, cacheWriteInputTokens: null, outputTokens: 7, reasoningOutputTokens: null } };
@@ -148,13 +150,54 @@ describe("recoverable retro publication", () => {
   });
 
   it("records failed draft attempts and never publishes unsupported model content", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] }); const start = Date.parse("2026-01-01T01:00:00.000Z");
+    const poll = async (f: Awaited<ReturnType<typeof fixture>>, offsetMs: number) => { vi.setSystemTime(start + offsetMs); return await f.restart().poll(f.context); };
     const f = await fixture(); f.draft.mockRejectedValueOnce(new Error("Generation unavailable"));
-    await f.restart().poll(f.context); expect(f.record().attempts).toHaveLength(1);
+    await poll(f, 0); expect(f.record().attempts).toHaveLength(1);
+    expect(f.record().attempts[0]).toMatchObject({ errorKind: "draft-error" });
     expect(f.deliveries.size).toBe(0);
     const valid = await f.draft(); f.draft.mockResolvedValueOnce({ ...valid, markdown: "Unsupported assertion" });
-    await f.restart().poll(f.context); expect(f.record().frozen).toBeUndefined();
+    await poll(f, 15_000); expect(f.record().frozen).toBeUndefined();
+    expect(f.record().attempts[1]).toMatchObject({ errorKind: "unverified-content" });
     expect(f.deliveries.size).toBe(0);
-    await f.restart().poll(f.context); expect(f.record().attempts).toHaveLength(3);
+    await poll(f, 45_000); expect(f.record().attempts).toHaveLength(3);
+    expect(f.record().frozen).toBeDefined();
+  });
+
+  it("backs off exponentially between failed drafts instead of retrying every poll", async () => {
+    expect([1, 2, 3, 4, 5, 6, 30].map(retroRetryDelayMs)).toEqual([15_000, 30_000, 60_000, 120_000, 240_000, 300_000, 300_000]);
+    vi.useFakeTimers({ toFake: ["Date"] }); const start = Date.parse("2026-01-01T01:00:00.000Z");
+    const f = await fixture();
+    const poll = async (offsetMs: number) => { vi.setSystemTime(start + offsetMs); return await f.restart().poll(f.context); };
+    f.draft.mockRejectedValue(new RetroGenerationError("failed", undefined, "runtime-failed"));
+    await poll(0); expect(f.draft).toHaveBeenCalledTimes(1);
+    let last = 0;
+    for (const [index, delay] of [15_000, 30_000, 60_000, 120_000, 240_000, 300_000, 300_000].entries()) {
+      expect(await poll(last + delay - 1)).toMatchObject({ status: "pending", reason: expect.stringContaining(`${index + 1} time(s)`) });
+      expect(f.draft).toHaveBeenCalledTimes(index + 1);
+      await poll(last + delay); expect(f.draft).toHaveBeenCalledTimes(index + 2);
+      last += delay;
+    }
+    expect(f.record().attempts.every((attempt) => attempt.errorKind === "runtime-failed" && attempt.finishedAt)).toBe(true);
+    // An attempt aborted before it could record its end backs off from its start.
+    f.record().attempts.push({ startedAt: new Date(start + last + 1_000).toISOString() });
+    expect((await poll(last + 1_000 + 299_999)).status).toBe("pending"); expect(f.draft).toHaveBeenCalledTimes(8);
+    await poll(last + 1_000 + 300_000); expect(f.draft).toHaveBeenCalledTimes(9);
+  });
+
+  it("gives the next draft every earlier failed or aborted attempt with its error kind", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] }); const start = Date.parse("2026-01-01T01:00:00.000Z");
+    const f = await fixture();
+    const generation = { sessionId: "failed-retro", invocationId: "failed-invocation", startedAt: at(8), finishedAt: at(9), status: "timed-out" as const, wallTimeMs: 1000, usage: (await f.draft()).generation.usage };
+    f.draft.mockClear();
+    f.draft.mockRejectedValueOnce(new RetroGenerationError("failed", generation, "timed-out")).mockRejectedValueOnce(new Error("state unavailable"));
+    for (const offset of [0, 15_000, 45_000]) { vi.setSystemTime(start + offset); await f.restart().poll(f.context); }
+    expect(f.draft.mock.calls.map((call) => call[1])).toEqual([[], [
+      { startedAt: new Date(start).toISOString(), sessionId: "failed-retro", invocationId: "failed-invocation", errorKind: "timed-out" },
+    ], [
+      { startedAt: new Date(start).toISOString(), sessionId: "failed-retro", invocationId: "failed-invocation", errorKind: "timed-out" },
+      { startedAt: new Date(start + 15_000).toISOString(), sessionId: null, invocationId: null, errorKind: "draft-error" },
+    ]]);
     expect(f.record().frozen).toBeDefined();
   });
 
@@ -217,15 +260,57 @@ describe("recoverable retro publication", () => {
     expect(f.archive.mergeRetroPr).toHaveBeenCalledTimes(1);
   });
 
-  it("freezes Chick's attribution along with the document and leaves proposals inert", async () => {
-    const f = await fixture(); const format = async (_context: CeremonyContext, text: string) => `Chick\n\n${text}`;
+  const filler = "Bringing the parts together.";
+  /** Like the real Chick chat, every post (content and merge gate) carries the persona prefix. */
+  async function attributed() {
+    const f = await fixture(); const format = async (_context: CeremonyContext, text: string) => `${filler}\n\n${text}`;
     const post = f.context.post;
-    f.context.post = (key, message, kind) => post(key, `Chick\n\n${message}`, kind);
-    await new RetroPublication(f.archive, f.draft, { ...f.services, formatPost: format }).poll(f.context);
-    expect(f.record().frozen!.markdown).toBe(`Chick\n\n${f.record().frozen!.draft.markdown}`);
-    expect(f.context.store.readRuntimeFile).toBeDefined();
+    f.context.post = (key, message, kind) => post(key, `${filler}\n\n${message}`, kind);
+    const draft = await f.draft();
+    draft.snapshot.missing = Array.from({ length: 18 }, (_, index) => `${index}: ${"Historical evidence unavailable. ".repeat(35)}`);
+    draft.markdown = await renderSprintRetro(draft.snapshot, draft.narrative, draft.generation);
+    f.draft.mockResolvedValue(draft);
+    return { ...f, format, publication: () => new RetroPublication(f.archive, f.draft, { ...f.services, formatPost: format }) };
+  }
+
+  it("keeps persona filler out of the archive while thread posts and archive both match the frozen parts", async () => {
+    const f = await attributed(); await f.publication().poll(f.context);
+    const frozen = f.record().frozen!;
+    expect(frozen.parts.length).toBeGreaterThan(1);
+    expect(frozen.markdown).toBe(frozen.parts.join("")); expect(frozen.markdown).toBe(frozen.draft.markdown);
+    expect(frozen.markdown).not.toContain(filler);
+    const posted = [...f.deliveries.values()].filter((item) => !item.mergePost).map((item) => item.message);
+    expect(posted).toEqual(frozen.parts.map((part) => `${filler}\n\n${part}`));
+    expect(f.archive.ensureRetroPr).toHaveBeenCalledWith("test/project", "goal-one", frozen.markdown);
     expect(f.state.planningGoals[0]).toEqual(goalAtRetro());
-    expect(f.record().frozen!.markdown).toContain("Proposals require the owner's decision");
+    expect(frozen.markdown).toContain("Proposals require the owner's decision");
+    // Thread verification still binds every post to its frozen part.
+    const content = [...f.deliveries.values()].find((item) => !item.mergePost)!; const original = content.message;
+    content.message = frozen.parts[0];
+    await expect(f.publication().merge(f.context, f.owner())).rejects.toThrow("unverified");
+    content.message = original;
+    await expect(f.publication().merge(f.context, f.owner())).resolves.toContain("merged");
+  });
+
+  it("still verifies a version 1 record frozen with the attribution inside its archive", async () => {
+    const f = await attributed(); await f.publication().poll(f.context);
+    const frozen = f.record().frozen!;
+    const content = [...f.deliveries.values()].find((item) => !item.mergePost)!;
+    const original = { part: frozen.parts[0], draft: frozen.draft.markdown, post: content.message };
+    // Rewrite the record as version 1 would have frozen it, with `extra` in its first fragment everywhere it appears.
+    const legacyWith = (extra: string, version: number) => {
+      frozen.parts[0] = original.part + extra; frozen.draft.markdown = original.draft.replace(original.part, frozen.parts[0]);
+      content.message = original.post + extra;
+      const legacy = frozen.parts.map((part) => `${filler}\n\n${part}`).join("");
+      Object.assign(frozen, { markdown: legacy, sha256: createHash("sha256").update(legacy).digest("hex") });
+      (frozen.draft.snapshot as { version: number }).version = version;
+    };
+    legacyWith("", 2);
+    await expect(f.publication().merge(f.context, f.owner())).rejects.toThrow();
+    legacyWith("\npassword=private-value\n", 1);
+    await expect(f.publication().merge(f.context, f.owner())).rejects.toThrow();
+    legacyWith("", 1);
+    await expect(f.publication().merge(f.context, f.owner())).resolves.toContain("merged");
   });
 
   it("recovers every part of a long retrospective before offering its archive", async () => {

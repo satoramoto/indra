@@ -6,6 +6,8 @@ import { PassThrough } from "node:stream";
 import { spawn } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentResult, AgentRuntime } from "../src/codex-runtime.js";
+import { CEREMONY_STAGES } from "../src/ceremony.js";
+import type { ImplementationFacts } from "../src/implementation-facts.js";
 import { CODEX_CONFIG, engineHome, seatHarnessDir } from "../src/harness-home.js";
 import type { PlanningGoal } from "../src/planning.js";
 import { SeatRuntime } from "../src/seat-runtime.js";
@@ -46,10 +48,11 @@ function input(): RetroInput {
     reviews: [{ outcomeId: "outcome-one", prUrl: pr, findings: ["src/change.ts:4: wrong exit code"] }],
     rounds: [{ outcomeId: "outcome-one", fix: 1, conflict: 2 }],
     failures: [{ at: at(24), outcomeId: "outcome-one", message: "Build failed", retries: 2 }],
-  } };
+  }, implementation: [{ version: 1, goalId: "goal-one", outcomeId: "outcome-one", seatId: "seat-two", attempts: [{ id: "attempt-1", cause: "claim", claimedAt: at(20), terminal: { status: "merged", at: at(29) }, events: [] }] }] };
 }
 function narrative(snapshot: RetroEvidenceSnapshot): RetroNarrative {
-  return { observations: [snapshot.choices.observations.find((item) => item.kind === "went-well")!, snapshot.choices.observations.find((item) => item.kind === "went-poorly")!], ownerProposals: snapshot.choices.ownerProposals.slice(0, 1) };
+  const phaseReflections = CEREMONY_STAGES.flatMap((phase) => snapshot.choices.phaseReflections.filter((item) => item.phase === phase).slice(0, 1));
+  return { observations: [snapshot.choices.observations.find((item) => item.kind === "went-well")!, snapshot.choices.observations.find((item) => item.kind === "went-poorly")!], phaseReflections, ownerProposals: snapshot.choices.ownerProposals.slice(0, 1) };
 }
 const generation = (): RetroGeneration => ({ sessionId: "fresh-retro-session", status: "succeeded", startedAt: at(50), finishedAt: at(55), wallTimeMs: 5_000, usage: counters(10, 2) });
 function run(snapshot = buildRetroSnapshot(input()), response: unknown = narrative(snapshot)): AgentResult {
@@ -199,7 +202,7 @@ describe("Chick's evidence-bound narrative", () => {
     const snapshot = buildRetroSnapshot(input()); const response = narrative(snapshot);
     await expect(validateRetroNarrative(snapshot, response)).resolves.toEqual(response);
     const markdown = await renderSprintRetro(snapshot, response, generation());
-    expect(markdown).toContain("Owner proposal (not applied): Consider a pre-review check");
+    expect(markdown).toContain("Owner proposal (not applied, implement phase): Consider a pre-review check");
     for (const patch of [{ kind: "apply-automatically" }, { text: "I disabled the CI workflow." }, { edits: [".github/workflows/ci.yml"] }]) {
       const bad = structuredClone(response); Object.assign(bad.ownerProposals[0], patch);
       await expect(validateRetroNarrative(snapshot, bad)).rejects.toThrow();
@@ -302,5 +305,200 @@ describe("fresh read-only retro generation", () => {
     const unsupported = run(undefined, { observations: [{ evidenceId: "release-running", kind: "went-well", text: "Everything was perfect." }], ownerProposals: [] });
     await expect(draftSprintRetro(input(), () => ({ message: async () => unsupported }))).rejects.toMatchObject({ generation: { usage: { inputTokens: 10, outputTokens: 2 } }, message: expect.stringContaining("unsupported narrative") });
     await expect(draftSprintRetro(input(), () => ({ message: async () => ({ ...run(), sessionId: "planning-session" }) }))).rejects.toThrow("fresh session");
+  });
+
+  it("labels each failure with a fixed error kind and never a provider diagnostic", async () => {
+    const unsupported = run(undefined, { observations: [], phaseReflections: [], ownerProposals: [] });
+    await expect(draftSprintRetro(input(), () => ({ message: async () => unsupported }))).rejects.toMatchObject({ kind: "unsupported-narrative" });
+    await expect(draftSprintRetro(input(), () => ({ message: async () => ({ ...run(), sessionId: "planning-session" }) }))).rejects.toMatchObject({ kind: "not-fresh" });
+    const timedOut = Object.assign(new Error("provider said: secret"), { facts: { sessionId: "failed-session", engine: "codex", status: "timed-out", startedAt: at(50), finishedAt: at(52) } });
+    await expect(draftSprintRetro(input(), () => ({ message: async () => { throw timedOut; } }))).rejects.toMatchObject({ kind: "timed-out" });
+    await expect(draftSprintRetro(input(), () => ({ message: async () => { throw new Error("invalid schema"); } }))).rejects.toMatchObject({ kind: "runtime-failed" });
+  });
+});
+
+const CLARIFY_FAILURE = "Chick clarification failed or was interrupted.";
+const DRAFT_FAILURE = "Chick proposal draft failed or was interrupted.";
+const pr2 = "https://github.com/owner/project/pull/2";
+/** Two developer seats, a failed clarification turn and draft, a retried outcome and two failed retro drafts. */
+function realistic(): RetroInput {
+  const data = input(); const g = data.goal;
+  g.participantSeatIds = ["seat-three", "seat-two"]; g.updatedAt = at(5600);
+  g.proposal = { ...g.proposal!, createdAt: at(900), outcomes: [
+    { id: "outcome-one", title: "Change", description: "Done", seatId: "seat-two" }, { id: "outcome-two", title: "Docs", description: "Done", seatId: "seat-three" },
+  ] };
+  g.assignments = [{ outcomeId: "outcome-one", seatId: "seat-two", status: "merged", prUrl: pr, updatedAt: at(3100) }, { outcomeId: "outcome-two", seatId: "seat-three", status: "merged", prUrl: pr2, updatedAt: at(4520) }];
+  g.ceremony!.history = [
+    { stage: "planning", enteredAt: at(0) }, { stage: "proposal", enteredAt: at(600) },
+    { stage: "implement", enteredAt: at(1500), evidence: { kind: "approval", proposalId: "proposal-one", proposalPostId: "proposal-post", approval: { source: "owner-command", command: "planning approve", at: at(1500) } } },
+    { stage: "release", enteredAt: at(5000), evidence: { kind: "implementation", outcomes: [
+      { outcomeId: "outcome-one", seatId: "seat-two", prUrl: pr, baseBranch: "sprint/goal-one", mergedSha: "c".repeat(40), checksPassed: true, reviewApproved: true },
+      { outcomeId: "outcome-two", seatId: "seat-three", prUrl: pr2, baseBranch: "sprint/goal-one", mergedSha: "d".repeat(40), checksPassed: true, reviewApproved: true },
+    ] } },
+    { stage: "retro", enteredAt: at(5600), evidence: { kind: "release-running", prUrl: pr, mergedSha: "b".repeat(40), buildSha: "b".repeat(40), runningSha: "b".repeat(40), runningAt: at(5590), mergePostId: "merge-post", approval: { source: "owner-command", command: "planning merge", at: at(5400) }, checksPassed: true } },
+  ];
+  const chick = (start: number, end: number, sessionId = "chick-planning", usage = counters(10, 2)) => ({ seatId: "seat-one", sessionId, startedAt: at(start), finishedAt: at(end), usage });
+  data.cutoffAt = at(5700);
+  data.facts = {
+    seats: [{ seatId: "seat-one", wallTimeMs: 1_000 }, { seatId: "seat-two", wallTimeMs: 1_490_000 }, { seatId: "seat-three", wallTimeMs: 3_000_000 }],
+    sessions: [chick(60, 70), chick(200, 210), chick(300, 320), chick(610, 640), chick(800, 890),
+      { seatId: "seat-two", sessionId: "dev-two", startedAt: at(1510), finishedAt: at(1990), usage: counters() },
+      { seatId: "seat-three", sessionId: "dev-three", startedAt: at(1520), finishedAt: at(4500), usage: counters() },
+      chick(5610, 5611, "retro-fail-1", counters(5, 1)), chick(5640, 5650, "retro-fail-2", counters(6, 2))],
+    reviews: [{ outcomeId: "outcome-one", prUrl: pr, findings: ["src/a.ts:1: wrong", "src/a.ts:9: missing test"] }, { outcomeId: "outcome-two", prUrl: pr2, findings: [] }],
+    rounds: [{ outcomeId: "outcome-one", fix: 1, conflict: 1 }, { outcomeId: "outcome-two", fix: 0, conflict: 0 }],
+    failures: [{ at: at(200), message: CLARIFY_FAILURE, retries: 0 }, { at: at(610), message: DRAFT_FAILURE, retries: 0 }],
+  };
+  const ledger = (outcomeId: string, seatId: string, attempts: ImplementationFacts["attempts"]): ImplementationFacts => ({ version: 1, goalId: "goal-one", outcomeId, seatId, attempts });
+  data.implementation = [
+    ledger("outcome-one", "seat-two", [
+      { id: "one-1", cause: "claim", claimedAt: at(1510), terminal: { status: "failed", at: at(2000) }, events: [
+        { id: "review:1", at: at(1700), kind: "review", verdict: "REQUEST_CHANGES", findings: ["src/a.ts:1: wrong", "src/a.ts:9: missing test"] },
+        { id: "fix-1", at: at(1800), kind: "fix", result: "started", round: 1 }, { id: "fix-1-done", at: at(1900), kind: "fix", result: "passed", round: 1 },
+      ] },
+      { id: "one-2", cause: "retry", claimedAt: at(2100), terminal: { status: "merged", at: at(3100) }, events: [
+        { id: "conflict-1", at: at(2500), kind: "conflict", result: "started", round: 1 }, { id: "review:2", at: at(2900), kind: "review", verdict: "APPROVE", findings: [] },
+      ] },
+    ]),
+    ledger("outcome-two", "seat-three", [{ id: "two-1", cause: "claim", claimedAt: at(1520), terminal: { status: "merged", at: at(4520) }, events: [{ id: "review:3", at: at(4400), kind: "review", verdict: "APPROVE", findings: [] }] }]),
+  ];
+  data.retroAttempts = [{ startedAt: at(5610), errorKind: "runtime-failed", sessionId: "retro-fail-1" }, { startedAt: at(5640), errorKind: "timed-out", sessionId: "retro-fail-2" }];
+  return data;
+}
+const lateGeneration = (): RetroGeneration => ({ ...generation(), startedAt: at(5700), finishedAt: at(5705) });
+const phaseValue = (snapshot: RetroEvidenceSnapshot, phase: string, id: string) => snapshot.phases.find((item) => item.phase === phase)!.facts.find((item) => item.evidenceId === id)!.value;
+
+describe("per-phase process reflection", () => {
+  it("computes each phase's facts from a realistic recorded fixture", () => {
+    const snapshot = buildRetroSnapshot(realistic());
+    expect(snapshot.phases.map((phase) => phase.phase)).toEqual(["planning", "proposal", "implement", "release", "retro"]);
+    expect(Object.fromEntries(snapshot.phases.flatMap((phase) => phase.facts.map((item) => [item.evidenceId, item.value])))).toEqual({
+      "planning-turns": 3, "planning-failures": 1,
+      "proposal-drafts": 2, "proposal-draft-failures": 1, "proposal-approval-wait": 600_000,
+      "implement-critical-path": 3_000_000, "implement-slowest-seat": "seat-three", "implement-reviews": 3, "implement-findings": 2,
+      "implement-fix-rounds": 1, "implement-conflict-rounds": 1, "implement-retries": 1,
+      "release-integration-conflicts": null, "release-merge-rounds": null, "release-approval-to-running": 190_000,
+      "retro-drafts": 3, "retro-failed-drafts": 2, "retro-first-error": "runtime-failed", "retro-last-error": "timed-out",
+    });
+    expect(snapshot.phases.find((phase) => phase.phase === "implement")!.seats).toEqual([
+      { seatId: "seat-three", outcomes: 1, attempts: 1, wallTimeMs: 3_000_000 }, { seatId: "seat-two", outcomes: 1, attempts: 2, wallTimeMs: 1_490_000 },
+    ]);
+    expect(snapshot.choices.phaseReflections).toEqual(expect.arrayContaining([
+      { phase: "implement", evidenceId: "implement-time", kind: "noted", text: "Implement was the longest recorded phase at 58m 20s." },
+      { phase: "planning", evidenceId: "planning-failures", kind: "slowed", text: "Planning recorded 1 failed clarification turn(s) out of 3." },
+      { phase: "implement", evidenceId: "implement-slowest-seat", kind: "noted", text: "seat-three was the slowest seat at 50m 00s, the implement critical path." },
+      { phase: "retro", evidenceId: "retro-failed-drafts", kind: "slowed", text: "The retro draft failed or was aborted 2 time(s) before this attempt (first: runtime-failed; last: timed-out)." },
+    ]));
+    expect(snapshot.choices.ownerProposals).toContainEqual({ evidenceId: "retro-failed-drafts", kind: "owner-proposal", text: "Consider investigating the recorded retro draft failures.", phase: "retro" });
+    // Measured durations carry no code judgment: code offers them only as neutral "noted" facts.
+    expect(snapshot.choices.phaseReflections.filter((item) => item.evidenceId === "release-approval-to-running")).toEqual([
+      { phase: "release", evidenceId: "release-approval-to-running", kind: "noted", text: "The new build was recorded running 3m 10s after the merge approval (includes CI wait, merge and build)." }]);
+    for (const id of ["implement-time", "implement-slowest-seat", "proposal-approval-wait"]) {
+      expect(snapshot.choices.phaseReflections.filter((item) => item.evidenceId === id).map((item) => item.kind)).toEqual(["noted"]);
+    }
+  });
+
+  it("lets Chick judge a noted duration once, but not both ways, and never judge a recorded outcome", async () => {
+    const snapshot = buildRetroSnapshot(realistic());
+    const noted = snapshot.choices.phaseReflections.find((item) => item.evidenceId === "release-approval-to-running")!;
+    const response = narrative(snapshot);
+    response.phaseReflections = response.phaseReflections.filter((item) => item.phase !== "release").concat({ ...noted, kind: "slowed" });
+    await expect(validateRetroNarrative(snapshot, response)).resolves.toBeDefined();
+    response.phaseReflections.push({ ...noted, kind: "worked" });
+    await expect(validateRetroNarrative(snapshot, response)).rejects.toThrow("repeated");
+    const flipped = narrative(snapshot); const failures = flipped.phaseReflections.findIndex((item) => item.evidenceId === "planning-failures");
+    flipped.phaseReflections[failures] = { ...flipped.phaseReflections[failures], kind: "worked" };
+    await expect(validateRetroNarrative(snapshot, flipped)).rejects.toThrow("unsupported");
+  });
+
+  it("keeps unrecorded phase facts unknown instead of zero, and falls back only to complete review/round tables", () => {
+    const data = realistic(); data.implementation = [];
+    data.facts.sessions = data.facts.sessions.filter((row) => row.seatId !== "seat-one");
+    data.facts.rounds = data.facts.rounds.slice(0, 1);
+    const snapshot = buildRetroSnapshot(data);
+    for (const id of ["planning-turns", "planning-failures", "proposal-drafts", "proposal-draft-failures"]) expect(phaseValue(snapshot, id.split("-")[0], id)).toBeNull();
+    for (const id of ["implement-critical-path", "implement-slowest-seat", "implement-fix-rounds", "implement-conflict-rounds", "implement-retries"]) expect(phaseValue(snapshot, "implement", id)).toBeNull();
+    expect(phaseValue(snapshot, "implement", "implement-reviews")).toBe(2);
+    expect(phaseValue(snapshot, "implement", "implement-findings")).toBe(2);
+    expect(snapshot.missing).toContain("outcome-one: implementation ledger is unavailable; per-seat implement time is unknown.");
+    const migrated = realistic(); migrated.goal.ceremony!.migratedAt = at(5600);
+    for (const entry of migrated.goal.ceremony!.history.slice(1, 4)) entry.enteredAt = null;
+    const legacy = buildRetroSnapshot(migrated);
+    expect(phaseValue(legacy, "planning", "planning-turns")).toBeNull();
+    expect(legacy.choices.phaseReflections).toContainEqual({ phase: "proposal", evidenceId: "proposal-time", kind: "unknown", text: "Proposal timing was not recorded." });
+  });
+
+  it("rejects phase reflections that are unsupported, moved to another phase, invented or missing", async () => {
+    const snapshot = buildRetroSnapshot(realistic());
+    await expect(validateRetroNarrative(snapshot, narrative(snapshot))).resolves.toBeDefined();
+    const planning = narrative(snapshot).phaseReflections.findIndex((item) => item.phase === "planning");
+    for (const patch of [{ text: "Planning was flawless and saved a day." }, { phase: "retro" }, { evidenceId: "retro-drafts" }, { evidenceId: "invented" }, { kind: "worked" }]) {
+      const bad = narrative(snapshot); Object.assign(bad.phaseReflections[planning] = { ...bad.phaseReflections[planning] }, patch);
+      await expect(validateRetroNarrative(snapshot, bad)).rejects.toThrow("unsupported");
+    }
+    const omitted = narrative(snapshot); omitted.phaseReflections = omitted.phaseReflections.filter((item) => item.phase !== "release");
+    await expect(validateRetroNarrative(snapshot, omitted)).rejects.toThrow("omits a phase reflection");
+    const moved = narrative(snapshot); moved.ownerProposals = [{ ...moved.ownerProposals[0], phase: "planning" }];
+    await expect(validateRetroNarrative(snapshot, moved)).rejects.toThrow("unsupported");
+    const repeated = narrative(snapshot); repeated.phaseReflections.push(repeated.phaseReflections[0]);
+    await expect(validateRetroNarrative(snapshot, repeated)).rejects.toThrow("repeated");
+    // A supported sentence whose evidence belongs to another phase is still refused.
+    const crossed = structuredClone(snapshot); const smuggled = { phase: "planning" as const, evidenceId: "retro-drafts", kind: "worked" as const, text: "The retro was drafted on the first recorded attempt." };
+    crossed.choices.phaseReflections.push(smuggled);
+    const response = narrative(crossed); response.phaseReflections.push(smuggled);
+    await expect(validateRetroNarrative(crossed, response)).rejects.toThrow("another phase");
+  });
+
+  it("renders a Process phases section with per-phase tables, reflections and phase-tagged proposals", async () => {
+    const snapshot = buildRetroSnapshot(realistic());
+    const markdown = await renderSprintRetro(snapshot, narrative(snapshot), lateGeneration());
+    const section = markdown.slice(markdown.indexOf("## Process phases"), markdown.indexOf("## Per-seat wall time"));
+    expect(section).toContain(`| implement | ${at(1500)} | ${at(5000)} | 3500000 | 58m 20s | implement-time |`);
+    expect(section).toContain(`| retro | ${at(5600)} | ${at(5700)} | 100000 | 1m 40s | retro-time |`);
+    for (const text of ["### Planning", "### Proposal", "### Implement", "### Release", "### Retro",
+      "| Clarification turns | 3 | planning-turns |", "| Draft waiting for plan approval | 10m 00s | proposal-approval-wait |",
+      "| Slowest seat | seat-three | implement-slowest-seat |", "| seat-two | 1 | 2 | 24m 50s |", "| Integration PR conflict rounds | unknown | release-integration-conflicts |",
+      "| Failed or aborted draft attempts | 2 | retro-failed-drafts |", "- Noted: Implement was the longest recorded phase at 58m 20s. [implement-time]",
+      "| From merge approval to the new build running (includes CI wait, merge and build) | 3m 10s | release-approval-to-running |",
+      "- Noted: The new build was recorded running 3m 10s after the merge approval (includes CI wait, merge and build). [release-approval-to-running]",
+      "- Slowed or hurt: Planning recorded 1 failed clarification turn(s) out of 3. [planning-failures]"]) expect(section).toContain(text);
+    expect(section.indexOf("### Planning")).toBeLessThan(section.indexOf("### Retro"));
+    expect(markdown).toContain("- Owner proposal (not applied, implement phase): Consider a pre-review check for the recorded review findings. [review-1]");
+    expect(markdown).not.toContain("## Ceremony stage time");
+  });
+
+  it("summarises failed retro attempts in one line instead of listing their sessions", async () => {
+    const snapshot = buildRetroSnapshot(realistic());
+    expect(snapshot.retroAttempts).toEqual({ failed: 2, firstErrorKind: "runtime-failed", lastErrorKind: "timed-out", sessions: 2, usage: expect.objectContaining({ inputTokens: 11, outputTokens: 3 }) });
+    expect(snapshot.sessions.find((row) => row.seatId === "seat-one")).toMatchObject({ invocations: 5 });
+    const markdown = await renderSprintRetro(snapshot, narrative(snapshot), lateGeneration());
+    expect(markdown.match(/^\| session-\d+ /gm)).toHaveLength(3);
+    expect(markdown).toContain("| retro-generation | seat-one | 1 |");
+    expect(markdown).toContain("Failed or aborted retro-generation attempts before this draft: 2 (first error: runtime-failed; last error: timed-out). Their 2 recorded session(s) are summarised here rather than listed, and are not in the totals above; their input + output tokens: 14.");
+    const clean = buildRetroSnapshot(input());
+    expect(await renderSprintRetro(clean, narrative(clean), generation())).toContain("No failed or aborted retro-generation attempts were recorded before this draft.");
+  });
+
+  it("drops only sessions matched to a failed attempt by recorded ID; other lead-seat sessions stay in the table and totals", async () => {
+    const data = realistic();
+    // A non-retro lead-seat session after retro started and after the first failed attempt.
+    data.facts.sessions.push({ seatId: "seat-one", sessionId: "chick-other", startedAt: at(5620), finishedAt: at(5625), usage: counters(7, 1) });
+    const snapshot = buildRetroSnapshot(data);
+    expect(snapshot.sessions.filter((row) => row.seatId === "seat-one").map((row) => [row.startedAt, row.invocations, row.usage.inputTokens])).toEqual([[at(5620), 1, 7], [at(60), 5, 50]]);
+    expect(snapshot.retroAttempts.sessions).toBe(2);
+    const markdown = await renderSprintRetro(snapshot, narrative(snapshot), lateGeneration());
+    // 5 Chick turns + 2 developer sessions + the other lead-seat session + this generation; 50 + 100 + 100 + 7 + 10 input tokens.
+    expect(markdown).toContain("| Total |  | 9 | 267 |");
+
+    const unrecorded = realistic(); unrecorded.retroAttempts![1].sessionId = null;
+    const kept = buildRetroSnapshot(unrecorded);
+    expect(kept.retroAttempts).toMatchObject({ failed: 2, sessions: 1 });
+    expect(kept.sessions.some((row) => row.startedAt === at(5640))).toBe(true);
+
+    const byInvocation = realistic(); byInvocation.retroAttempts![1] = { ...byInvocation.retroAttempts![1], sessionId: null, invocationId: "retro-invocation-2" };
+    Object.assign(byInvocation.facts.sessions.find((row) => row.sessionId === "retro-fail-2")!, { invocationId: "retro-invocation-2" });
+    const matched = buildRetroSnapshot(byInvocation);
+    expect(matched.retroAttempts.sessions).toBe(2);
+    expect(matched.sessions.some((row) => row.startedAt === at(5640))).toBe(false);
   });
 });
