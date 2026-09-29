@@ -970,13 +970,18 @@ describe("persisted ceremony and allowed actions", () => {
     await check(ceremonySession("proposal"), []);
   });
 
-  it.each(["refresh", "restart"])("offers a confirmed proposal retry after draft recovery on %s", async (recovery) => {
+  it.each(["refresh", "restart", "return from controls"])("offers a confirmed proposal retry after draft recovery on %s", async (recovery) => {
     const drafting = { ...ceremonySession("proposal"), stage: "drafting" };
     const fixture = await ceremonyHarness([drafting]);
     expect(fixture.model.ceremonyKeys()).toEqual([]);
     fixture.sessions([{ ...drafting, stage: "clarifying" }]);
     const model = recovery === "restart" ? new TerminalUiModel(fixture.state, fixture.reader, undefined, fixture.goals) : fixture.model;
     model.restore(fixture.model.view());
+    if (recovery === "return from controls") {
+      model.key("c", "C"); expect(model.page).toBe("controls");
+      model.key("o", "o"); expect(model.confirm).toBeUndefined();
+      model.key("b"); model.key("enter"); expect(model.page).toBe("seat");
+    }
     await model.refresh();
     expect(model.ceremonyKeys()).toEqual(["P propose"]);
     const setup = await testRender(() => <TerminalApp model={model} revision={() => model.revision} onKey={() => {}} />, { width: 100, height: 32 });
