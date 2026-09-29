@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { PlanningStore, type PlanningAssignment, type PlanningGoal, type RuntimeRecord } from "../src/planning.js";
-import { CEREMONY_STAGES, engineLabel, LocalSessionReader, projectSprint, sessionEngine, type CeremonyGoal } from "../src/session-snapshot.js";
+import { CEREMONY_STAGES, engineLabel, LocalSessionReader, projectSprint, sessionEngine, type CeremonyGoal, type CeremonySnapshot, type CeremonyStage } from "../src/session-snapshot.js";
 
 const time = "2026-09-28T12:00:00Z";
 function goal(statuses: PlanningAssignment["status"][] = []): PlanningGoal {
@@ -19,27 +19,44 @@ function goal(statuses: PlanningAssignment["status"][] = []): PlanningGoal {
   };
 }
 
+
+const released = {
+  kind: "release-running", prUrl: "https://github.com/example/indra/pull/20", mergedSha: "a".repeat(40), mergePostId: "merge-post",
+  approval: { source: "owner-command", command: "planning merge", at: time }, checksPassed: true,
+  buildSha: "a".repeat(40), runningSha: "a".repeat(40), runningAt: time,
+};
+function ceremony(stage: CeremonyStage): CeremonySnapshot {
+  const history: CeremonySnapshot["history"] = [
+    { stage: "planning", enteredAt: time }, { stage: "proposal", enteredAt: time },
+    { stage: "implement", enteredAt: time, evidence: { kind: "approval", proposalId: "proposal-1", proposalPostId: "proposal-post", approval: { source: "owner-command", command: "planning approve", at: time } } },
+    { stage: "release", enteredAt: time, evidence: { kind: "implementation", outcomes: [{ outcomeId: "outcome-0", seatId: "seat-2", prUrl: "https://github.com/example/indra/pull/1", baseBranch: "sprint/goal-loop", mergedSha: "a".repeat(40), checksPassed: true, reviewApproved: true }] } },
+    { stage: "retro", enteredAt: time, evidence: released },
+  ];
+  return { version: 1, stage, history: history.slice(0, CEREMONY_STAGES.indexOf(stage) + 1) };
+}
+
 describe("sprint projection", () => {
   it.each(CEREMONY_STAGES)("exposes persisted %s without advancing it from build evidence", (stage) => {
-    const saved: CeremonyGoal = { ...goal(["merged"]), ceremony: { stage, retro: { status: "pending" } } };
+    const saved: CeremonyGoal = { ...goal(["merged"]), ceremony: ceremony(stage) };
     saved.integration!.status = "merged";
     const loop = projectSprint(saved, { status: "running", reason: "Both processes are ready." });
     expect(loop.stage).toBe(stage);
     expect(loop.ceremony).toEqual(saved.ceremony);
-    expect(loop.ceremony?.closedAt).toBeUndefined();
+    expect(loop.closedAt).toBeUndefined();
+    expect(loop.retro?.status).toBe(stage === "retro" ? "pending" : "not-started");
   });
 
   it("preserves closure, recorded release facts and retro status independently from unavailable live evidence", () => {
     const saved: CeremonyGoal = { ...goal(["merged"]), ceremony: {
-      stage: "retro", closedAt: time, release: { integrationSha: "a".repeat(40), applicationSha: "b".repeat(40), bridgeSha: "b".repeat(40), activatedAt: time },
-      retro: { status: "complete", prUrl: "https://github.com/example/indra/pull/25", postedAt: time },
+      ...ceremony("retro"), closure: { closedAt: time, evidence: { path: "docs/retros/goal-loop.md", prUrl: "https://github.com/example/indra/pull/25", publishedAt: time } },
     } };
     saved.integration!.status = "merged";
     const before = structuredClone(saved);
     const loop = projectSprint(saved, { status: "unavailable", reason: "Bridge readiness is unavailable." });
     expect(loop).toMatchObject({ stage: "retro", ceremony: saved.ceremony, build: { status: "unavailable", reason: "Bridge readiness is unavailable." } });
-    loop.ceremony!.retro!.status = "pending";
-    loop.ceremony!.release!.activatedAt = "changed by a consumer";
+    expect(loop).toMatchObject({ closedAt: time, release: released, retro: { status: "published", prUrl: "https://github.com/example/indra/pull/25", publishedAt: time } });
+    loop.ceremony!.closure!.evidence.publishedAt = "changed by a consumer";
+    loop.release!.runningAt = "changed by a consumer";
     expect(saved).toEqual(before);
   });
 
@@ -95,7 +112,7 @@ describe("sprint projection", () => {
     expect(projectSprint(saved, { status: "running" })).toMatchObject({ stage: "Merge", build: { status: "revert-open" } });
     saved.integration.status = "reverted";
     expect(projectSprint(saved, { status: "running" })).toMatchObject({ stage: "Merge", build: { status: "reverted" } });
-    expect(projectSprint(saved, { status: "running", evidence: { integrationSha: "a".repeat(40), applicationSha: "a".repeat(40), bridgeSha: "a".repeat(40), activatedAt: time } }).build?.evidence).toBeUndefined();
+    expect(projectSprint(saved, { status: "running", evidence: { mergedSha: "a".repeat(40), runningSha: "a".repeat(40), buildSha: "a".repeat(40), runningAt: time } }).build?.evidence).toBeUndefined();
   });
 });
 
@@ -104,14 +121,15 @@ describe("read-only session snapshots", () => {
   const host = () => ({ verifiedRecord: vi.fn(async () => undefined), isReady: vi.fn(async () => false), attachTarget: vi.fn(() => "unused"), start: vi.fn() });
 
   it("shares persisted ceremony and actionable readiness even when run metadata is unreadable", async () => {
-    const saved: CeremonyGoal = { ...goal(["merged"]), ceremony: { stage: "release", retro: { status: "pending" } } };
+    const saved: CeremonyGoal = { ...goal(["merged"]), ceremony: ceremony("release") };
     saved.integration!.status = "merged";
     const store = { read: async () => ({ $schema: "", schemaVersion: 1, teams: [], sprints: [], planningGoals: [saved] }), runtime: async (): Promise<RuntimeRecord> => { throw new Error("unreadable"); } };
     const builds = { read: vi.fn(async () => ({ status: "reload-pending" as const, reason: "Wait for the owned bridge to restart safely." })) };
     const session = (await new LocalSessionReader("unused", store, host(), builds).readSessions()).sessions[0];
     expect(builds.read).toHaveBeenCalledWith(saved.integration);
     expect(session).toMatchObject({ status: "error", ceremony: saved.ceremony, loop: { stage: "release", ceremony: saved.ceremony, build: { reason: "Wait for the owned bridge to restart safely." } } });
-    expect(saved.ceremony?.closedAt).toBeUndefined();
+    expect(session.closedAt).toBeUndefined();
+    expect(session.retro?.status).toBe("not-started");
   });
 
   it.each([

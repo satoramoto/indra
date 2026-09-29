@@ -16,13 +16,16 @@ export type CeremonyStage = typeof CEREMONY_STAGES[number];
 export type SprintStage = typeof SPRINT_STAGES[number] | CeremonyStage;
 /** State facts are projected verbatim; the transition owner defines and validates their complete shape. */
 export interface CeremonySnapshot {
+  version: 1;
   stage: CeremonyStage;
-  closedAt?: string;
-  release?: Record<string, unknown>;
-  retro?: { status: string; prUrl?: string; [fact: string]: unknown };
-  [fact: string]: unknown;
+  history: { stage: CeremonyStage; enteredAt: string | null; evidence?: unknown }[];
+  migratedAt?: string;
+  closure?: { closedAt: string; evidence: { path: string; prUrl: string; publishedAt: string } };
 }
-export type CeremonyGoal = PlanningGoal & { ceremony?: CeremonySnapshot };
+/** The durable release entry is separate from today's live process evidence. */
+export interface RecordedReleaseSnapshot { kind: "release-running"; prUrl: string; mergedSha: string; buildSha: string; runningSha: string; runningAt: string }
+export interface RetroSnapshot { status: "not-started" | "pending" | "published"; path?: string; prUrl?: string; publishedAt?: string }
+export type CeremonyGoal = Omit<PlanningGoal, "ceremony"> & { ceremony?: CeremonySnapshot };
 export interface SprintTicket {
   id: string; title: string; seatId: string; prUrl?: string;
   status: "queued" | "building" | "in review" | "merged" | "failed" | "not assigned";
@@ -37,6 +40,9 @@ export interface SprintLoop {
   stage: SprintStage;
   /** The persisted ceremony, including closure, release facts and retro progress, independent of live readiness. */
   ceremony?: CeremonySnapshot;
+  closedAt?: string;
+  release?: RecordedReleaseSnapshot;
+  retro?: RetroSnapshot;
   tickets: SprintTicket[];
   integration?: SprintIntegration;
   build?: SprintBuild;
@@ -69,7 +75,16 @@ export function projectSprint(goal: CeremonyGoal, build?: SprintBuild): SprintLo
   } else if (tickets.length && tickets.every((ticket) => ticket.status === "in review" || ticket.status === "merged")) {
     stage = "Review";
   } else stage = "Build";
-  return { stage, tickets, ...(goal.ceremony ? { ceremony: structuredClone(goal.ceremony) } : {}), ...(integration ? { integration: { ...integration } } : {}), ...(build ? { build: structuredClone(build) } : {}) };
+  const ceremony = goal.ceremony && structuredClone(goal.ceremony);
+  const release = ceremony?.history.find((entry) => entry.stage === "retro")?.evidence as RecordedReleaseSnapshot | undefined;
+  const published = ceremony?.closure?.evidence;
+  const retro: RetroSnapshot | undefined = ceremony ? {
+    status: published ? "published" : ceremony.stage === "retro" ? "pending" : "not-started",
+    ...(published ? { path: published.path, prUrl: published.prUrl, publishedAt: published.publishedAt } : {}),
+  } : undefined;
+  return { stage, tickets, ...(ceremony ? { ceremony } : {}), ...(ceremony?.closure ? { closedAt: ceremony.closure.closedAt } : {}),
+    ...(release ? { release: structuredClone(release) } : {}), ...(retro ? { retro } : {}),
+    ...(integration ? { integration: { ...integration } } : {}), ...(build ? { build: structuredClone(build) } : {}) };
 }
 
 export interface SprintBuildReadPort { read(integration: SprintIntegration): Promise<SprintBuild> }
@@ -82,6 +97,9 @@ export interface SessionSnapshot {
     id: string; teamId: string; seatId: string; status: "idle" | "running" | "error"; engine: SessionEngine;
     sessionId?: string; goal: string; stage: string; updatedAt?: string; recentActivity: string[];
     ceremony?: CeremonySnapshot;
+    closedAt?: string;
+    release?: RecordedReleaseSnapshot;
+    retro?: RetroSnapshot;
     attach?: { kind: "tmux"; target: string };
     /** The sprint's integration status; `revert-open` is a merged sprint whose revert PR is open. */
     sprint?: SprintView;
@@ -90,15 +108,19 @@ export interface SessionSnapshot {
 }
 export type SprintView = "collecting" | "pr-open" | "merged" | "revert-open" | "reverted";
 
-export function sprintView(goal: PlanningGoal): SprintView | undefined {
+export function sprintView(goal: Pick<PlanningGoal, "integration">): SprintView | undefined {
   const integration = goal.integration;
   if (!integration) return undefined;
   return integration.status === "merged" && integration.revertPrUrl ? "revert-open" : integration.status;
 }
 export interface SessionReadPort { readSessions(): Promise<SessionSnapshot> }
+export interface SessionPlanningReadPort {
+  read(): Promise<{ planningGoals?: CeremonyGoal[] }>;
+  runtime: PlanningStore["runtime"];
+}
 
 export class LocalSessionReader implements SessionReadPort {
-  constructor(stateCheckout: string, private readonly store: Pick<PlanningStore, "read" | "runtime"> = new PlanningStore(stateCheckout), private readonly host: Pick<TmuxHost, "verifiedRecord" | "isReady" | "attachTarget"> = new TmuxHost(stateCheckout), private readonly builds: SprintBuildReadPort = new LocalSprintBuildReader(stateCheckout)) {}
+  constructor(stateCheckout: string, private readonly store: SessionPlanningReadPort = new PlanningStore(stateCheckout), private readonly host: Pick<TmuxHost, "verifiedRecord" | "isReady" | "attachTarget"> = new TmuxHost(stateCheckout), private readonly builds: SprintBuildReadPort = new LocalSprintBuildReader(stateCheckout)) {}
   async readSessions(): Promise<SessionSnapshot> {
     let connection: SessionSnapshot["connection"] = "disconnected";
     let target: string | undefined;
@@ -113,7 +135,9 @@ export class LocalSessionReader implements SessionReadPort {
         ? await this.builds.read(goal.integration).catch((): SprintBuild => ({ status: "unavailable" })) : undefined;
       const loop = projectSprint(goal, build);
       const context = { id: goal.id, teamId: goal.teamId, seatId: goal.seatId, goal: goal.goal, stage: goal.stage, updatedAt: goal.updatedAt,
-        loop, ...(loop.ceremony ? { ceremony: structuredClone(loop.ceremony) } : {}), ...(goal.integration ? { sprint: sprintView(goal) } : {}) };
+        loop, ...(loop.ceremony ? { ceremony: structuredClone(loop.ceremony), retro: structuredClone(loop.retro) } : {}),
+        ...(loop.closedAt ? { closedAt: loop.closedAt } : {}), ...(loop.release ? { release: structuredClone(loop.release) } : {}),
+        ...(goal.integration ? { sprint: sprintView(goal) } : {}) };
       let runtime: Awaited<ReturnType<PlanningStore["runtime"]>>;
       try {
         runtime = await this.store.runtime(goal.id);

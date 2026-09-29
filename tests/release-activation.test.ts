@@ -93,13 +93,13 @@ describe("release activation", () => {
     await start();
     expect(await reader.read(integration())).toMatchObject({ status: "reload-pending" });
     await ready();
-    expect(await reader.read(integration())).toMatchObject({ status: "running", evidence: { integrationSha: merged, applicationSha: merged, bridgeSha: merged } });
+    expect(await reader.read(integration())).toMatchObject({ status: "running", evidence: { mergedSha: merged, runningSha: merged, buildSha: merged } });
   });
 
   it("accepts ready descendants and recovers their evidence in a fresh reader without moving state", async () => {
     await select(after); await start(after); await ready();
     const first = await reader.read(integration());
-    expect(first).toMatchObject({ status: "running", runningSha: after, bridgeSha: after, evidence: { integrationSha: merged, applicationSha: after, bridgeSha: after } });
+    expect(first).toMatchObject({ status: "running", runningSha: after, bridgeSha: after, evidence: { mergedSha: merged, runningSha: after, buildSha: after } });
     expect(await new LocalReleaseActivationReader(state, { appDir, host, processStart: probe }).read(integration())).toEqual(first);
     expect(first.evidence).not.toHaveProperty("pid");
     expect(first.evidence).not.toHaveProperty("processStart");
@@ -107,7 +107,7 @@ describe("release activation", () => {
 
   it("accepts different application and bridge builds when both contain the integration", async () => {
     await select(after); await start(after, merged); await ready();
-    expect(await reader.read(integration())).toMatchObject({ status: "running", evidence: { applicationSha: after, bridgeSha: merged } });
+    expect(await reader.read(integration())).toMatchObject({ status: "running", evidence: { runningSha: after, buildSha: merged } });
   });
 
   it("rejects a dead process's leftover receipt and recovers after fresh startup and readiness", async () => {

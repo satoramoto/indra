@@ -10,7 +10,12 @@ import { TmuxHost, type HostRecord } from "./tmux-host.js";
 
 /** Safe to retain as release facts; process identities and startup receipts stay in the runtime directory. */
 export interface ReleaseEvidence {
-  integrationSha: string; applicationSha: string; bridgeSha: string; activatedAt: string;
+  mergedSha: string;
+  /** The loaded, ready bridge build; never the currently selected dist build. */
+  buildSha: string;
+  /** The loaded, ready Indra application build. Both builds may be verified descendants of mergedSha. */
+  runningSha: string;
+  runningAt: string;
 }
 export type ReleaseActivation = {
   reason: string;
@@ -121,7 +126,7 @@ export class LocalReleaseActivationReader implements ReleaseActivationReadPort {
           if (JSON.stringify(await readUpdateSettings(this.runtimeDir, true)) !== JSON.stringify(settings)
             || JSON.stringify(await readUpdateStatus(this.runtimeDir)) !== JSON.stringify(update)) return pending("update-pending", "Update settings or status changed during release verification; wait for a stable update check and retry.");
           return { status: "running", reason: "The ready application and owned bridge both contain the integration commit.", ...shas,
-            evidence: { integrationSha: integration.mergedSha, applicationSha: application.stamp.sha, bridgeSha: bridge.stamp.sha, activatedAt: new Date(Math.max(date(application.readyAt), date(bridge.readyAt))).toISOString() } };
+            evidence: { mergedSha: integration.mergedSha, runningSha: application.stamp.sha, buildSha: bridge.stamp.sha, runningAt: new Date(Math.max(date(application.readyAt), date(bridge.readyAt))).toISOString() } };
         }
       }
       const built = await this.contains(integration.mergedSha, available?.sha);
