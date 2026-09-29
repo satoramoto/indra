@@ -13,7 +13,7 @@
       "items": { "$ref": "#/$defs/team" }
     },
     "sprints": {
-      "description": "Retired draft sprints from before planning goals. Accepted only so older documents stay readable; Indra removes it at start-up.",
+      "description": "Retired draft sprints from before planning goals. Ignored by Indra, which empties it at start-up; kept as [] because older builds require it.",
       "deprecated": true,
       "type": "array"
     },

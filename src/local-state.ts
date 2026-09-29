@@ -130,7 +130,7 @@ export function parseState(raw: unknown): StateSnapshot {
     throw new StateDataError(`Unsupported schemaVersion '${String(data.schemaVersion)}'; expected 1.`);
   }
   const teams = array(data.teams, "teams").map(team);
-  // Retired draft sprints: still readable so the start-up migration can remove them (`PlanningStore.retireLegacySprints`).
+  // Retired draft sprints: ignored, and emptied at start-up (`PlanningStore.retireLegacySprints`); older builds require the key.
   if (data.sprints !== undefined) array(data.sprints, "sprints");
   unique(teams.map((item) => item.id), "teams");
   unique(teams.map((item) => item.slug), "team slugs", "slug");

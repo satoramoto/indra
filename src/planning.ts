@@ -82,7 +82,7 @@ export interface RuntimeRecord { sessionId?: string; lastSeenAt: number; process
   pending?: { inputPostId: string; message: string; since: number; proposal?: boolean; mergePost?: MergeKind }; /** The owner's `planning propose`, waiting for the bridge's next poll. */ proposalRequest?: { requestedAt: number }; runs: { startedAt: string; finishedAt: string; usage?: unknown }[];
   /** Why the last proposal draft failed, redacted and capped; local only, never posted. */ lastDraftError?: { at: string; message: string } }
 export interface PlanningDocument { $schema: string; schemaVersion: number; teams: unknown[];
-  /** Retired draft sprints from before planning goals; read only so `retireLegacySprints` can remove them. */ sprints?: unknown[];
+  /** Retired draft sprints from before planning goals; `retireLegacySprints` empties them, keeping `[]` for older builds. */ sprints?: unknown[];
   planningGoals?: PlanningGoal[] }
 
 export function validatePlanningGoal(goal: PlanningGoal): void {
@@ -266,15 +266,16 @@ export class PlanningStore {
     return results;
   }
   /**
-   * Removes the retired top-level `sprints` array (draft sprints from before planning goals) in one state commit
-   * through the normal write path. Returns whether it removed anything; running it again changes nothing.
+   * Empties the retired top-level `sprints` array (draft sprints from before planning goals) in one state commit
+   * through the normal write path. The key stays, as `[]`, because builds before this one require it and rollback
+   * must still read the state. Returns whether it removed anything; running it again changes nothing.
    */
   async retireLegacySprints(): Promise<boolean> {
-    if ((await this.read()).sprints === undefined) return false;
+    if (!(await this.read()).sprints?.length) return false;
     let removed = false;
     await this.update((state) => {
-      if (state.sprints === undefined) return;
-      delete state.sprints;
+      if (!state.sprints?.length) return;
+      state.sprints = [];
       removed = true;
     }, "Retire legacy draft sprints");
     return removed;

@@ -303,14 +303,14 @@ function withDraftSprint(): PlanningDocument {
 }
 
 describe("retiring the legacy draft sprints", () => {
-  it("removes the top-level sprints in one commit, leaving a state the v1 schema accepts, and is idempotent", async () => {
+  it("empties the top-level sprints in one commit, keeping the key for older builds, valid against the v1 schema, and is idempotent", async () => {
     const legacyState = withDraftSprint();
     expect(validSchema(legacyState), JSON.stringify(validSchema.errors)).toBe(true);
     const persistence = await store(legacyState);
     expect(await persistence.retireLegacySprints()).toBe(true);
     const state = await persistence.read();
-    expect(state).not.toHaveProperty("sprints");
-    expect(state).toEqual((({ sprints: _sprints, ...rest }) => rest)(legacyState));
+    expect(state.sprints).toEqual([]);
+    expect(state).toEqual({ ...legacyState, sprints: [] });
     expect(validSchema(state), JSON.stringify(validSchema.errors)).toBe(true);
     expect(commits(persistence)).toEqual(["Retire legacy draft sprints", "Add schema", "Initial state"]);
     expect(git(persistence.checkout, "show", "--name-only", "--format=", "HEAD").trim()).toBe("state.json");
@@ -320,12 +320,19 @@ describe("retiring the legacy draft sprints", () => {
     expect(await readFile(join(persistence.checkout, "state.json"), "utf8")).toBe(before);
     expect(commits(persistence)).toHaveLength(3);
   });
+  it.each([["already empty", real], ["without the key", (({ sprints: _sprints, ...rest }) => rest)(real)]])("changes nothing when sprints are %s", async (_label, state) => {
+    const persistence = await store(state);
+    const before = await readFile(join(persistence.checkout, "state.json"), "utf8");
+    expect(await persistence.retireLegacySprints()).toBe(false);
+    expect(await readFile(join(persistence.checkout, "state.json"), "utf8")).toBe(before);
+    expect(commits(persistence)).toHaveLength(2);
+  });
   it("runs alongside the legacy goal migration, ending with the whole real state valid against the v1 schema", async () => {
     const persistence = await store(withDraftSprint());
     await persistence.migrateLegacyGoals(migratedAt, preCeremony);
     expect(await persistence.retireLegacySprints()).toBe(true);
     const state = await persistence.read();
-    expect(state).not.toHaveProperty("sprints");
+    expect(state.sprints).toEqual([]);
     expect(state.planningGoals!.every((goal) => goal.ceremony)).toBe(true);
     expect(validSchema(state), JSON.stringify(validSchema.errors)).toBe(true);
     expect(commits(persistence)[0]).toBe("Retire legacy draft sprints");
