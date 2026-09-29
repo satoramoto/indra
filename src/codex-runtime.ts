@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { codexProgress } from "./codex-progress.js";
+import { childEnv } from "./op-env.js";
 
 export interface AgentResult { sessionId: string; response: unknown; usage?: unknown; startedAt: string; finishedAt: string }
 /** `purpose` labels this run's live progress lines, e.g. "build", "review", "fix", "draft". */
@@ -39,7 +40,7 @@ export class CodexRuntime implements AgentRuntime {
     const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs);
     signal?.addEventListener("abort", () => controller.abort(), { once: true });
     try {
-      const child = spawn("codex", args, { cwd: this.cwd, stdio: ["pipe", "pipe", "pipe"], signal: controller.signal });
+      const child = spawn("codex", args, { cwd: this.cwd, stdio: ["pipe", "pipe", "pipe"], signal: controller.signal, env: childEnv() });
       child.stdin.end(prompt);
       let output = ""; let stderr = "";
       child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");

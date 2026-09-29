@@ -14,6 +14,7 @@ class FakeTmux implements TmuxRunner {
   session?: string;
   identity = "123:456";
   dead = false;
+  globalEnv = "";
   onStart?: (nonce: string) => Promise<void>;
   async run(args: string[]): Promise<string> {
     this.calls.push(args);
@@ -22,6 +23,7 @@ class FakeTmux implements TmuxRunner {
     if (args.includes("list-panes")) { if (!this.pane) throw new Error("gone"); return `${this.pane}:${this.dead ? 1 : 0}`; }
     if (args.includes("list-sessions")) return this.pane ? `${this.session} ${this.identity.split(":")[1]}` : "";
     if (args.includes("has-session")) throw new Error("absent");
+    if (args.includes("show-environment")) return this.globalEnv;
     if (args.includes("new-session")) { this.pane = "%1"; this.session = args[args.indexOf("-s") + 1]; if (this.onStart) await this.onStart(args[args.indexOf("--ready-nonce") + 1]); return `${args[args.indexOf("-s") + 1]}:%1`; }
     throw new Error("unexpected tmux call");
   }
@@ -50,6 +52,17 @@ describe("tmux host", () => {
     expect(host.attachTarget(record)).toMatch(/^indra-[a-f0-9]{12}:chick-[a-f0-9]{12}$/);
     await host.start();
     expect(fake.calls.filter((args) => args.includes("new-session"))).toHaveLength(1);
+  });
+
+  it("unsets OP_SERVICE_ACCOUNT_TOKEN and any OP_* variable in the tmux server's environment for the hosted pane", async () => {
+    const dir = await fixture(); const fake = new FakeTmux(); const host = new TmuxHost(dir, fake, dir);
+    fake.globalEnv = "HOME=/h\nOP_SERVICE_ACCOUNT_TOKEN=ops_old\nOP_SESSION_owner=s\n-OP_GONE";
+    fake.onStart = async (nonce) => { await writeFile(host.readyFile(nonce), JSON.stringify({ nonce })); };
+    await host.start();
+    const launch = fake.calls.find((args) => args.includes("new-session"))!;
+    const command = launch.slice(launch.indexOf("/usr/bin/env"));
+    expect(command.slice(0, command.indexOf(process.execPath))).toEqual(["/usr/bin/env", "-u", "OP_SERVICE_ACCOUNT_TOKEN", "-u", "OP_SESSION_owner"]);
+    expect(launch.join(" ")).not.toContain("ops_old");
   });
 
   it("withholds attach target when pane no longer matches", async () => {
