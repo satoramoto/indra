@@ -1,0 +1,36 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["observations", "ownerProposals"],
+  "properties": {
+    "observations": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 6,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["evidenceId", "kind", "text"],
+        "properties": {
+          "evidenceId": { "type": "string", "minLength": 1, "maxLength": 160 },
+          "kind": { "enum": ["went-well", "went-poorly"] },
+          "text": { "type": "string", "minLength": 1, "maxLength": 2000 }
+        }
+      }
+    },
+    "ownerProposals": {
+      "type": "array",
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["evidenceId", "kind", "text"],
+        "properties": {
+          "evidenceId": { "type": "string", "minLength": 1, "maxLength": 160 },
+          "kind": { "const": "owner-proposal" },
+          "text": { "type": "string", "minLength": 1, "maxLength": 2000 }
+        }
+      }
+    }
+  }
+}
