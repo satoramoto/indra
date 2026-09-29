@@ -2,14 +2,24 @@
 
 ## Start it from your own terminal
 
-Start the terminal UI from a terminal app you use yourself (Terminal, iTerm), inside the `indra-ui` tmux session:
+Start Indra from a terminal app you use yourself (Terminal, iTerm):
 
 ```sh
-tmux -L indra-ui new-session -A -s ui -x 160 -y 48 npm start
+npm start
 ```
 
-The UI then starts Chick's bridge and the Developer seats in Indra's own tmux server (socket `indra-<hash>`). That server
-keeps running after the UI quits, and later UIs reuse it.
+That is all. Closing the terminal window leaves Indra running; `npm start` again, from any terminal, brings the same
+screen back instead of starting a second one. `q` in the UI quits it.
+
+Under the hood, `npm start` runs the UI in Indra's own UI session (tmux socket `indra-ui`, session `ui`): it creates
+the session when there is none and attaches to it when there is. The UI then starts Chick's bridge and the Developer
+seats in Indra's own seat server (socket `indra-<hash>`), which keeps running after the UI quits; later UIs reuse it.
+Indra never touches your own tmux server or configuration. Commands other than the UI (`npm start -- planning …`,
+`--once`, `--mattermost`, `seat run`) run directly in your terminal as before.
+
+In the UI, `a` watches a seat's live process: `Ctrl-]` comes back to Indra, the mouse wheel or `PgUp` scrolls back,
+and `q`, `Esc` or scrolling to the bottom returns to live. Nothing you type reaches the seat's run. `t` shows the seat's
+current Claude or Codex session as a read-only transcript that follows it live. `?` lists every key.
 
 A browser preview may attach to the running session (`tmux -L indra-ui attach -t ui`), but it must never start it.
 
@@ -39,7 +49,7 @@ The UI shows a red warning line when:
   until it is replaced.
 
 Indra never kills a tmux server. To replace the seats' server, stop every seat from the UI (the server exits with its
-last session), quit the UI, and start it again with the command above.
+last session), quit the UI, and start it again with `npm start`.
 
 ## Full Disk Access instead
 

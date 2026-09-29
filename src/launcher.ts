@@ -9,6 +9,7 @@ import { join } from "node:path";
  * this file: the build would move it into a shared chunk and the entry check below would never match.
  */
 import { appRootOf, isEntry, LAUNCHER_ENV, RELOAD_EXIT_CODE } from "./reload.js";
+import { enterUiSession, insideUiSession, uiSessionPlan } from "./ui-session.js";
 
 export { LAUNCHER_ENV, RELOAD_EXIT_CODE };
 
@@ -35,8 +36,26 @@ export function cliChild(cli: string, args: string[], nodeArgs = ["--experimenta
   });
 }
 
+/** Keeps a failed UI's last words on screen inside the UI session, which would otherwise close with the pane. */
+function waitForEnter(code: number): Promise<void> {
+  process.stdout.write(`\nIndra exited with code ${code}. Press Enter to close.\n`);
+  return new Promise((resolve) => { process.stdin.once("data", () => { process.stdin.pause(); resolve(); }); process.stdin.resume(); });
+}
+
 if (isEntry(import.meta.url)) {
-  // Ctrl-C reaches the child directly from the terminal; the launcher waits for the child's exit instead.
-  process.on("SIGINT", () => {});
-  process.exitCode = await launch(cliChild(join(appRootOf(import.meta.url), "dist", "cli.js"), process.argv.slice(2)));
+  const root = appRootOf(import.meta.url);
+  const args = process.argv.slice(2);
+  const facts = { args, env: process.env, tty: !!process.stdin.isTTY && !!process.stdout.isTTY };
+  // Outside Indra's UI session, `npm start` creates it, or reattaches to the UI already running there.
+  const entered = uiSessionPlan(facts).kind === "session"
+    ? await enterUiSession([process.execPath, join(root, "dist", "launcher.js"), ...args], process.cwd())
+    : undefined;
+  if (entered !== undefined) process.exitCode = entered;
+  else {
+    // Ctrl-C reaches the child directly from the terminal; the launcher waits for the child's exit instead.
+    process.on("SIGINT", () => {});
+    const code = await launch(cliChild(join(root, "dist", "cli.js"), args));
+    if (code !== 0 && facts.tty && insideUiSession(process.env)) await waitForEnter(code);
+    process.exitCode = code;
+  }
 }

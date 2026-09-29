@@ -9,6 +9,10 @@ import type { GoalStarter, SeatLive, SeatProcessPort } from "./supervisor.js";
 import type { PaneTailSource } from "./pane-tail.js";
 import { PaneTailPanel, paneTailLines } from "./pane-tail-panel.js";
 import { keyInput } from "./key-batch.js";
+import { HelpOverlay } from "./help-overlay.js";
+import { TranscriptView } from "./transcript-view.js";
+import type { TranscriptSource } from "./session-transcript.js";
+import { RETURN_KEY, WATCH_HINT, WATCH_HINT_MS } from "./watch-keys.js";
 
 const theme = {
   background: "#111827", panel: "#1F2937", selected: "#243B53",
@@ -169,6 +173,8 @@ export interface TerminalAppProps {
   onKey: (name: string, ctrl?: boolean, text?: string) => void;
   /** Reads the selected seat's live pane while its detail is visible. */
   paneTail?: PaneTailSource;
+  /** Reads the selected seat's engine session log while the transcript (`t`) is open. */
+  transcript?: TranscriptSource;
 }
 
 export function TerminalApp(props: TerminalAppProps) {
@@ -205,12 +211,13 @@ export function TerminalApp(props: TerminalAppProps) {
     return newGoalBlocked() && open.length ? "New goal blocked: " + open.map((goal) => goal.id).join(", ") + " still open." : newGoalBlocked();
   });
   const ceremonyKeys = createMemo(() => { props.revision(); return props.model.ceremonyKeys(); });
+  const overlay = createMemo(() => { props.revision(); return props.model.overlay; });
 
   let teamScroll: ScrollBoxRenderable | undefined;
   let sprintScroll: ScrollBoxRenderable | undefined;
   let detailScroll: ScrollBoxRenderable | undefined;
   useKeyboard((key) => {
-    if (!props.model.input && !props.model.confirm && (key.name === "pageup" || key.name === "pagedown")) {
+    if (!props.model.input && !props.model.confirm && !props.model.overlay && (key.name === "pageup" || key.name === "pagedown")) {
       const target = page() === "seat" ? detailScroll : page() === "team" ? wide() ? sprintScroll : teamScroll : undefined;
       target?.scrollBy(key.name === "pageup" ? -1 : 1, "viewport");
     } else props.onKey(key.name, key.ctrl, key.sequence);
@@ -261,7 +268,7 @@ export function TerminalApp(props: TerminalAppProps) {
               <text fg={theme.idle}>A approves it here, or react :white_check_mark: on its proposal post</text>
             </Show>
             <text fg={props.model.sessionResult.connection === "connected" && session.attach ? theme.running : theme.muted}>
-              Bridge view: {props.model.sessionResult.connection === "connected" && session.attach ? displayText(session.attach.target) : "no verified tmux target"}
+              Live view: {props.model.sessionResult.connection === "connected" && session.attach ? "a watch · " + RETURN_KEY + " back" : "not available"}
             </text>
             <text fg={theme.accent}>Recorded activity</text>
             <Show when={session.recentActivity.length} fallback={<text fg={theme.muted}>No runtime activity recorded.</text>}>
@@ -369,11 +376,15 @@ export function TerminalApp(props: TerminalAppProps) {
         </Show>
         <text fg={theme.accent} wrapMode="word">
           {input() ? (newGoalBlocked() ? "Start blocked · Esc cancel" : "Enter start · Esc cancel") + " · " + displayText(team()?.project?.github, 80) + " · home channel"
-            : [page() === "teams" ? "↑↓ choose team · Enter open" : page() === "team" ? "↑↓ seat · Enter details · T retry · s restart · x stop · b teams" : "a attach · T retry · s restart · x stop · b team",
+            : [page() === "teams" ? "↑↓ choose team · Enter open" : page() === "team" ? "↑↓ seat · Enter details · T retry · s restart · x stop · b teams" : `a watch (${RETURN_KEY} back) · t transcript · T retry · s restart · x stop · b team`,
               ...ceremonyKeys(), ...(newGoalBlocked() ? [] : ["n new goal"]), "q quit"].join(" · ")}
         </text>
-        <text fg={theme.muted}>{paused() ? "Auto-update paused  ·  U resumes" : "Auto-update  ·  U pauses"}  ·  r checks now  ·  R rolls back  ·  q leaves seat processes running</text>
+        <text fg={theme.muted}>? help  ·  {paused() ? "Auto-update paused  ·  U resumes" : "Auto-update  ·  U pauses"}  ·  r checks now  ·  R rolls back  ·  q leaves seat processes running</text>
       </box>
+      <Show when={overlay() === "help"}><HelpOverlay /></Show>
+      <Show when={overlay() === "transcript" && seat()}>
+        <TranscriptView source={props.transcript} seat={seat()!} recordedHandle={() => props.model.selectedSession()?.sessionId} />
+      </Show>
     </box>
   );
 }
@@ -400,6 +411,8 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
   paneTail?: PaneTailSource;
   /** Returns a warning when Indra was launched under ttyd or its seats' tmux server cannot be verified. */
   launchCheck?: () => Promise<string | undefined>;
+  /** Reads the selected seat's engine session log for the transcript view (`t`). */
+  transcript?: TranscriptSource;
 } = {}): Promise<number> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error("The terminal UI needs an interactive TTY. Use --once for redirected output.");
   const model = new TerminalUiModel(state, sessions, options.processes, options.goals, options.sync, options.update);
@@ -470,12 +483,21 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
         const target = model.attachTarget();
         if (!target) return;
         attaching = true;
-        renderer.suspend();
-        void (options.attach ?? attachTmux)(target).catch((error: unknown) => {
-          model.notice = error instanceof Error ? error.message : "Could not attach to tmux.";
+        // Say how to get back before the screen switches to the seat.
+        model.notice = "Watching " + (model.seat?.displayName ?? "the seat") + " · " + WATCH_HINT;
+        model.revision++;
+        setRevision(model.revision);
+        let suspended = false;
+        void new Promise((wait) => setTimeout(wait, WATCH_HINT_MS)).then(() => {
+          if (!active) return;
+          suspended = true;
+          renderer.suspend();
+          return (options.attach ?? attachTmux)(target);
+        }).then(() => { if (model.notice?.startsWith("Watching ")) model.notice = undefined; }, (error: unknown) => {
+          model.notice = error instanceof Error ? error.message : "Could not open this seat's live view.";
         }).finally(() => {
           if (active) {
-            renderer.resume();
+            if (suspended) renderer.resume();
             attaching = false;
             model.revision++;
             setRevision(model.revision);
@@ -484,7 +506,7 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
         });
       }
     };
-    render(() => <TerminalApp model={model} revision={revision} onKey={key} paneTail={options.paneTail} />, renderer)
+    render(() => <TerminalApp model={model} revision={revision} onKey={key} paneTail={options.paneTail} transcript={options.transcript} />, renderer)
       .then(() => {
         if (!active) return;
         timer = setInterval(() => { void refresh(); }, Math.max(500, options.pollMs ?? 2000));

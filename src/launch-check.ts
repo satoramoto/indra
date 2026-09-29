@@ -20,7 +20,8 @@ import { randomUUID } from "node:crypto";
 import { childEnv } from "./op-env.js";
 import type { TmuxRunner } from "./tmux-host.js";
 
-export const OWNER_START_COMMAND = "tmux -L indra-ui new-session -A -s ui -x 160 -y 48 npm start";
+/** `npm start` creates or reattaches Indra's own UI session itself (src/ui-session.ts). */
+export const OWNER_START_COMMAND = "npm start";
 
 export interface ProcessEntry { pid: number; ppid: number; args: string }
 export type ProcessTable = Map<number, ProcessEntry>;
