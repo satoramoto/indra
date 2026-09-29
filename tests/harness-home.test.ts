@@ -1,11 +1,11 @@
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { CODEX_CONFIG, engineHome, ensureCodexHome, ownerCodexAuth, seatHarnessDir } from "../src/harness-home.js";
+import { CODEX_CONFIG, engineHome, ensureCodexHome, ownerCodexAuth, promoteSeatAuth, seatHarnessDir, writeFileAtomic } from "../src/harness-home.js";
 import { CodexRuntime } from "../src/codex-runtime.js";
 import { claudePermissionArgs } from "../src/claude-runtime.js";
 
@@ -117,5 +117,56 @@ describe("seat harness homes", () => {
     expect(JSON.parse(args[args.indexOf("--settings") + 1])).toMatchObject({ disableAllHooks: true, autoMemoryEnabled: false });
     expect(args).toEqual(expect.arrayContaining(["--strict-mcp-config", "--disable-slash-commands"]));
     expect(JSON.parse(args[args.indexOf("--mcp-config") + 1])).toEqual({ mcpServers: {} });
+  });
+});
+
+describe("seat auth promotion and config writes", () => {
+  const ownerAuth = () => join(owner, ".codex", "auth.json");
+  const seatHome = () => engineHome(seatHarnessDir(runtimeDir, "dev-1"), "codex");
+
+  it("promotes a newer regular seat auth.json over the owner's and restores the symlink", async () => {
+    const home = await ensureCodexHome(seatHome(), ownerAuth());
+    await writeFile(join(owner, ".codex", "auth.json"), JSON.stringify({ last_refresh: "2026-01-01T00:00:00Z" }));
+    await utimes(ownerAuth(), new Date("2026-01-01"), new Date("2026-01-01"));
+    await unlink(join(home, "auth.json"));
+    await writeFile(join(home, "auth.json"), JSON.stringify({ last_refresh: "2026-09-01T00:00:00Z", fake: "rotated" }));
+    expect(await promoteSeatAuth(home, ownerAuth())).toBe("promoted");
+    expect(JSON.parse(await readFile(ownerAuth(), "utf8"))).toMatchObject({ fake: "rotated" });
+    expect(await mode(ownerAuth())).toBe(0o600);
+    await ensureCodexHome(home, ownerAuth());
+    expect((await lstat(join(home, "auth.json"))).isSymbolicLink()).toBe(true);
+    expect(await readlink(join(home, "auth.json"))).toBe(ownerAuth());
+  });
+
+  it("discards an older regular seat auth.json and keeps the owner's", async () => {
+    const home = await ensureCodexHome(seatHome(), ownerAuth());
+    await writeFile(ownerAuth(), JSON.stringify({ last_refresh: "2026-09-01T00:00:00Z", fake: "owner" }));
+    await unlink(join(home, "auth.json"));
+    await writeFile(join(home, "auth.json"), JSON.stringify({ last_refresh: "2026-01-01T00:00:00Z", fake: "stale" }));
+    await utimes(join(home, "auth.json"), new Date("2026-01-01"), new Date("2026-01-01"));
+    await ensureCodexHome(home, ownerAuth());
+    expect(JSON.parse(await readFile(ownerAuth(), "utf8"))).toMatchObject({ fake: "owner" });
+    expect(await readlink(join(home, "auth.json"))).toBe(ownerAuth());
+  });
+
+  it("leaves the symlink alone", async () => {
+    const home = await ensureCodexHome(seatHome(), ownerAuth());
+    expect(await promoteSeatAuth(home, ownerAuth())).toBe("none");
+  });
+
+  it("writes config.toml by temp file and rename, and skips identical content", async () => {
+    const home = await ensureCodexHome(seatHome(), ownerAuth());
+    const config = join(home, "config.toml");
+    await writeFile(config, "stale");
+    const before = (await stat(config)).ino;
+    await ensureCodexHome(home, ownerAuth());
+    expect(await readFile(config, "utf8")).toBe(CODEX_CONFIG);
+    const replaced = (await stat(config)).ino;
+    expect(replaced).not.toBe(before);
+    expect((await readdir(home)).some((name) => name.endsWith(".tmp"))).toBe(false);
+    await ensureCodexHome(home, ownerAuth());
+    expect((await stat(config)).ino).toBe(replaced);
+    await writeFileAtomic(config, "x");
+    expect(await readFile(config, "utf8")).toBe("x");
   });
 });
