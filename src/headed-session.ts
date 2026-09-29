@@ -18,11 +18,15 @@
  * stdout, only one at a time per process, and never when `INDRA_HEADLESS` is set. If the CLI never starts a session
  * (no session log within `headedTiming.startupMs`, e.g. a first-run dialog), Indra ends it and the runtime falls back
  * to its headless mode for that task.
+ *
+ * While the CLI owns the pane, this process's own console lines are held and printed once the run ends, so they never
+ * draw over the CLI's screen, and a headed-run marker (headedMarkerFile) tells the UI that the owner may drive the
+ * session (`D`) and where its session log is, for live token totals.
  */
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import { RuntimeStop, type RuntimeFacts } from "./runtime-facts.js";
@@ -51,6 +55,68 @@ export function claimHeaded(): (() => void) | undefined {
   busy = true;
   let released = false;
   return () => { if (!released) { released = true; busy = false; } };
+}
+
+/**
+ * The headed-run marker of one hosted process: `<state-checkout>.runtime/headed-<ready nonce>.json`. The nonce is the
+ * one in the process's verified tmux ownership record, so the UI finds the marker only through that record. It holds
+ * the process ID, the engine and, once the CLI started, its session log path; it exists only while a headed run owns
+ * the pane. Runtime metadata, never in Git, never a credential.
+ */
+export function headedMarkerFile(stateCheckout: string, readyNonce: string): string {
+  if (!/^[a-f0-9-]{36}$/.test(readyNonce)) throw new Error("Invalid ready nonce for a headed-run marker.");
+  return join(`${resolve(stateCheckout)}.runtime`, `headed-${readyNonce}.json`);
+}
+
+export interface HeadedMarker { pid: number; engine: "claude" | "codex"; startedAt: string; log?: string }
+
+let markerFile: string | undefined;
+/** Set once by a hosted process (`seat run` or `planning serve` with `--ready-nonce`); every headed run then keeps the marker. */
+export function useHeadedMarker(file: string | undefined): void { markerFile = file; }
+
+const pidAlive = (pid: number) => { try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; } };
+
+/** The marker of a headed run that is still going: its process is alive. A marker a crashed process left counts as none. */
+export async function readHeadedMarker(file: string, alive: (pid: number) => boolean = pidAlive): Promise<HeadedMarker | undefined> {
+  try {
+    const marker = JSON.parse(await readFile(file, "utf8")) as Partial<HeadedMarker>;
+    if (typeof marker.pid !== "number" || !Number.isSafeInteger(marker.pid) || marker.pid <= 0 || !alive(marker.pid)) return undefined;
+    if (marker.engine !== "claude" && marker.engine !== "codex") return undefined;
+    return { pid: marker.pid, engine: marker.engine, startedAt: typeof marker.startedAt === "string" ? marker.startedAt : "", ...(typeof marker.log === "string" && marker.log.endsWith(".jsonl") ? { log: marker.log } : {}) };
+  } catch { return undefined; }
+}
+
+async function writeMarker(file: string, marker: HeadedMarker): Promise<void> {
+  await mkdir(dirname(file), { recursive: true, mode: 0o700 });
+  const temp = `${file}.${randomUUID()}.tmp`;
+  await writeFile(temp, JSON.stringify(marker), { mode: 0o600 });
+  await rename(temp, file);
+}
+
+/** Console lines kept while a headed run owns the pane; later ones are counted and dropped. */
+export const HELD_LINES = 500;
+const CONSOLE_METHODS = ["log", "info", "warn", "error"] as const;
+type HeldConsole = Pick<Console, typeof CONSOLE_METHODS[number]>;
+
+/**
+ * While a headed CLI owns the pane, this process's own log lines would be drawn over the CLI's screen. Holds every
+ * console line instead, and returns the release: it restores the console and prints the held lines, in order.
+ */
+export function holdConsole(target: HeldConsole = console): () => void {
+  const original = { log: target.log, info: target.info, warn: target.warn, error: target.error };
+  const held: { method: typeof CONSOLE_METHODS[number]; args: unknown[] }[] = [];
+  let dropped = 0;
+  for (const method of CONSOLE_METHODS) {
+    target[method] = (...args: unknown[]) => { if (held.length < HELD_LINES) held.push({ method, args }); else dropped++; };
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    Object.assign(target, original);
+    for (const { method, args } of held) original[method].apply(target, args);
+    if (dropped) original.log.call(target, `(${dropped} more log lines from the headed run were dropped.)`);
+  };
 }
 
 export interface TaskFiles { id: string; task: string; result: string; taskRel: string; resultRel: string }
@@ -90,10 +156,14 @@ export interface HeadedSpec {
   files: TaskFiles;
   validate(value: unknown): boolean;
   launch: HeadedLaunch;
-  /** Whether the CLI has started its session (its session log exists). */
-  started(): Promise<boolean>;
+  /** The CLI's session log once it has started its session; undefined before. */
+  started(): Promise<string | undefined>;
   timeoutMs: number;
   signal?: AbortSignal;
+  /** The headed-run marker; defaults to the one set by useHeadedMarker. */
+  marker?: string;
+  /** The console held while the CLI owns the pane; defaults to the global console. */
+  console?: HeldConsole;
 }
 
 /** The CLI never started a session; the caller may run the task headless instead. Nothing was sent to a model. */
@@ -124,6 +194,11 @@ export async function runHeaded(spec: HeadedSpec): Promise<unknown> {
     // Same process group as this hosted process, which is the pane's foreground group: the CLI can read the terminal.
     child = spawn(spec.launch.command, spec.launch.args, { cwd: spec.cwd, stdio: "inherit", env: spec.launch.env });
   } catch { await cleanup(files); throw new RuntimeStop(`${label} could not be started; check the executable and working directory.`); }
+  // From here the CLI owns the pane: this process's log lines wait until it ends, and the marker says a headed run is on.
+  const releaseConsole = holdConsole(spec.console);
+  const marker = spec.marker ?? markerFile;
+  const markerState: HeadedMarker = { pid: process.pid, engine: label.toLowerCase() === "codex" ? "codex" : "claude", startedAt: new Date().toISOString() };
+  if (marker) await writeMarker(marker, markerState).catch(() => undefined);
   // In raw mode Ctrl-C reaches the CLI as a key; before and after, it must not stop the seat process that waits for it.
   const ignoreInterrupt = () => undefined;
   process.on("SIGINT", ignoreInterrupt);
@@ -146,7 +221,9 @@ export async function runHeaded(spec: HeadedSpec): Promise<unknown> {
       }
       if (Date.now() - startedAt >= spec.timeoutMs) throw new RuntimeStop(`${label} run timed out after ${minutes(spec.timeoutMs)}.`, "timed-out");
       if (!seenStart) {
-        seenStart = await spec.started().catch(() => false);
+        const log = await spec.started().catch(() => undefined);
+        seenStart = !!log;
+        if (log && marker) await writeMarker(marker, { ...markerState, log }).catch(() => undefined);
         if (!seenStart && Date.now() - startedAt >= headedTiming.startupMs) throw new HeadedStartError(`${label} did not start a headed session within ${Math.round(headedTiming.startupMs / 1000)} s.`);
       }
       await waitFor(headedTiming.pollMs, exited, spec.signal);
@@ -158,7 +235,9 @@ export async function runHeaded(spec: HeadedSpec): Promise<unknown> {
       await exited; clearTimeout(escalate);
     }
     process.removeListener("SIGINT", ignoreInterrupt);
+    if (marker) await rm(marker, { force: true }).catch(() => undefined);
     resetTerminal();
+    releaseConsole();
     await cleanup(files);
   }
 }
