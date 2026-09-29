@@ -5,6 +5,7 @@ import { access, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { readBuildStamp } from "./build-stamp.js";
 import { appRootOf } from "./reload.js";
+import { childEnv, opVariablesIn } from "./op-env.js";
 
 const execFileAsync = promisify(execFile);
 export interface TmuxRunner { run(args: string[]): Promise<string> }
@@ -28,7 +29,7 @@ export class NoChannelError extends Error { override name = "NoChannelError"; }
 
 export class SystemTmux implements TmuxRunner {
   async run(args: string[]): Promise<string> {
-    const { stdout } = await execFileAsync("tmux", args, { encoding: "utf8", timeout: 15_000 });
+    const { stdout } = await execFileAsync("tmux", args, { encoding: "utf8", timeout: 15_000, env: childEnv() });
     return stdout.trim();
   }
 }
@@ -109,7 +110,11 @@ export class TmuxHost {
     await mkdir(this.runtimeDir, { recursive: true, mode: 0o700 });
     const readyNonce = randomUUID();
     const build = (await readBuildStamp(this.appDir))?.id;
-    const output = await this.runner.run(["-L", this.socket, "new-session", "-d", "-P", "-F", "#{session_name}:#{pane_id}", "-s", this.session, "-c", this.appDir, process.execPath, "--experimental-ffi", "--use-system-ca", this.cli, ...this.command(readyNonce)]);
+    // The pane inherits the tmux server's global environment, which a server started before Indra stripped OP_*
+    // may still hold; unset every OP_* variable there so no hosted process sees the owner's 1Password token.
+    const global = await this.runner.run(["-L", this.socket, "show-environment", "-g"]).catch(() => "");
+    const unset = [...new Set(["OP_SERVICE_ACCOUNT_TOKEN", ...opVariablesIn(global)])].flatMap((name) => ["-u", name]);
+    const output = await this.runner.run(["-L", this.socket, "new-session", "-d", "-P", "-F", "#{session_name}:#{pane_id}", "-s", this.session, "-c", this.appDir, "/usr/bin/env", ...unset, process.execPath, "--experimental-ffi", "--use-system-ca", this.cli, ...this.command(readyNonce)]);
     const [name, paneId] = output.split(":");
     if (name !== this.session || !/^%\d+$/.test(paneId ?? "")) throw new Error(`Tmux started but returned an unexpected pane identity; inspect socket ${this.socket} before retrying.`);
     const tmuxIdentity = await this.identity().catch(() => undefined);
