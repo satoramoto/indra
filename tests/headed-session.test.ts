@@ -11,6 +11,12 @@ import { claimHeaded, headedAvailable, headedMarkerFile, headedTiming, HELD_LINE
 import { AgentRunError } from "../src/runtime-facts.js";
 
 vi.mock("node:child_process", () => ({ spawn: vi.fn(), spawnSync: vi.fn(), execFile: vi.fn() }));
+// Real process trees are covered in process-tree.test.ts; here each run's tree tracking is recorded.
+const trees = vi.hoisted(() => ({ tracked: [] as (number | undefined)[], ended: 0 }));
+vi.mock("../src/process-tree.js", async (original) => ({
+  ...await original<typeof import("../src/process-tree.js")>(),
+  ownedProcesses: { track: async (pid: number | undefined) => { trees.tracked.push(pid); return { refresh: async () => {}, end: async () => { trees.ended++; return 0; } }; } },
+}));
 
 /** The interactive CLI: no pipes; it exits when Indra signals it. */
 class Headed extends EventEmitter {
@@ -127,11 +133,14 @@ describe("headed Claude", () => {
 
   it("an owner who quits the CLI before the result exists fails the task", async () => {
     const child = new Headed(); vi.mocked(spawn).mockReturnValue(child as unknown as ReturnType<typeof spawn>);
+    const ended = trees.ended;
     const run = failure(new ClaudeRuntime(dir, 60_000, { extraDirs: [] }, undefined, true).message("Build", schema));
     await launched(); await taskFile();
     child.emit("exit", 0, null);
     expect((await run).message).toBe("Claude session ended without writing its result file.");
     expect(child.kill).not.toHaveBeenCalled();
+    // Tools the CLI left running still end with the run.
+    expect(trees.ended).toBe(ended + 1);
   });
 
   it("keeps waiting while the owner drives, then times out honestly and ends the session", async () => {

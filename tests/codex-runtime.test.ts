@@ -7,6 +7,11 @@ import { AgentRunError } from "../src/runtime-facts.js";
 import { ensureCodexHome } from "../src/harness-home.js";
 
 vi.mock("node:child_process", () => ({ spawn: vi.fn(), execFile: vi.fn() }));
+// Real process trees are covered in process-tree.test.ts.
+vi.mock("../src/process-tree.js", async (original) => ({
+  ...await original<typeof import("../src/process-tree.js")>(),
+  ownedProcesses: { track: async () => ({ refresh: async () => {}, end: async () => 0 }) },
+}));
 vi.mock("../src/codex-progress.js", () => ({ codexProgress: () => ({ push: vi.fn(), end: vi.fn() }) }));
 vi.mock("../src/harness-home.js", () => ({ DEVELOPER_CODEX_CONFIG: "developer config", ensureCodexHome: vi.fn(async (home: string) => home) }));
 

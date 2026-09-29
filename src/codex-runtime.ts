@@ -6,6 +6,7 @@ import { codexProgress } from "./codex-progress.js";
 import { DEVELOPER_CODEX_CONFIG, ensureCodexHome } from "./harness-home.js";
 import { claimHeaded, firstMessage, HeadedStartError, headedAvailable, prepareTaskFiles, readLog, resultValidator, runHeaded, taskDocument } from "./headed-session.js";
 import { childEnv } from "./op-env.js";
+import { ownedProcesses, TREE_REFRESH_MS, type TrackedRun } from "./process-tree.js";
 import { AgentRunError, RuntimeEventStream, RuntimeFacts, RuntimeStop, jsonObject, recordedError, type RuntimeSessionFacts, type TokenUsage } from "./runtime-facts.js";
 
 export interface AgentResult { sessionId: string; response: unknown; usage?: unknown; startedAt: string; finishedAt: string; facts?: RuntimeSessionFacts }
@@ -145,6 +146,7 @@ export class CodexRuntime implements AgentRuntime {
     const controller = new AbortController(); let timeout: ReturnType<typeof setTimeout> | undefined;
     let killTimer: ReturnType<typeof setTimeout> | undefined;
     let ownsProcessGroup = false;
+    let tree: Promise<TrackedRun> | undefined; let treeTimer: ReturnType<typeof setInterval> | undefined;
     const abort = () => { stop ??= new RuntimeStop("Codex run cancelled.", "interrupted"); controller.abort(); };
     let progress: ReturnType<typeof codexProgress> | undefined;
     try {
@@ -160,6 +162,11 @@ export class CodexRuntime implements AgentRuntime {
       signal?.addEventListener("abort", abort, { once: true });
       const child = spawn("codex", args, { cwd: this.cwd, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32", signal: controller.signal, env });
       ownsProcessGroup = process.platform !== "win32" && child.pid !== undefined;
+      // Codex runs its commands in process groups of their own: track the whole tree and end it with the run.
+      tree = ownedProcesses.track(child.pid);
+      const tracked = tree;
+      treeTimer = setInterval(() => { void tracked.then((run) => run.refresh()); }, TREE_REFRESH_MS);
+      treeTimer.unref?.();
       controller.signal.addEventListener("abort", () => {
         killTimer = setTimeout(() => {
           // Codex's launcher gives its native child these pipes; killing only the launcher cannot drain them.
@@ -210,6 +217,8 @@ export class CodexRuntime implements AgentRuntime {
       // Owned descendants may outlive the launcher even after its pipes close.
       if (!ownsProcessGroup) clearTimeout(killTimer);
       signal?.removeEventListener("abort", abort);
+      clearInterval(treeTimer);
+      if (tree) await tree.then((run) => run.end(1000)).catch(() => 0);
       progress?.end();
       if (this.home) await ensureCodexHome(this.home, this.config).catch(() => undefined);
     }

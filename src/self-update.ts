@@ -94,7 +94,17 @@ export class SelfUpdater {
 
   private git(...args: string[]): Promise<string> { return this.exec("git", args); }
 
-  async check(): Promise<UpdateResult> {
+  private checking?: Promise<UpdateResult>;
+
+  /**
+   * One check at a time: a call while a check runs (the 5 s timer, a key press) gets that check's result instead of
+   * starting a second fetch, install or build next to it.
+   */
+  check(): Promise<UpdateResult> {
+    return this.checking ??= this.runCheck().finally(() => { this.checking = undefined; });
+  }
+
+  private async runCheck(): Promise<UpdateResult> {
     // Called by the initialized application, including when auto-update is paused.
     confirmApplicationReady(this.runtimeDir);
     await this.saveStatus({ outcome: "checking", at: new Date().toISOString() });

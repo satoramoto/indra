@@ -68,6 +68,18 @@ fi
 }
 
 describe("self-update", () => {
+  it("never runs two checks at once: a check requested while one runs gets its result and spawns nothing", async () => {
+    const { updater, merge, npmCalls } = await fixture();
+    await merge("code.ts", "export const version = 2;\n");
+    const [first, second, third] = await Promise.all([updater.check(), updater.check(), updater.check()]);
+    expect(first).toMatchObject({ outcome: "built" });
+    expect(second).toBe(first);
+    expect(third).toBe(first);
+    expect((await npmCalls()).filter((line) => line === "run build")).toHaveLength(1);
+    // Once it ends, the next check runs on its own.
+    expect(await updater.check()).toMatchObject({ outcome: "up-to-date" });
+  });
+
   it("captures the loaded application at startup, confirms readiness on a paused check, and never changes that evidence when dist switches", async () => {
     const { app, runtime, updater, merge } = await fixture();
     const args = process.argv;

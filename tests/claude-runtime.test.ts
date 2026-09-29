@@ -11,6 +11,11 @@ import { AGENT_PROMPT_LIMIT_BYTES } from "../src/codex-runtime.js";
 import { SeatRuntime } from "../src/seat-runtime.js";
 
 vi.mock("node:child_process", () => ({ spawn: vi.fn(), execFile: vi.fn() }));
+// Real process trees are covered in process-tree.test.ts.
+vi.mock("../src/process-tree.js", async (original) => ({
+  ...await original<typeof import("../src/process-tree.js")>(),
+  ownedProcesses: { track: async () => ({ refresh: async () => {}, end: async () => 0 }) },
+}));
 const id = "12345678-1234-4321-8765-123456789abc";
 const handle = `claude:${id}`;
 const envelope = (extra = {}) => JSON.stringify({ type: "result", subtype: "success", is_error: false, session_id: id, structured_output: { summary: "Done" }, usage: { input_tokens: 32, output_tokens: 9 }, ...extra });

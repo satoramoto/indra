@@ -36,6 +36,7 @@ import { LocalSessionReader } from "./session-snapshot.js";
 import { CliGoalStarter, Supervisor } from "./supervisor.js";
 import { TmuxSeatSession } from "./session-mirror.js";
 import { headedMarkerFile, useHeadedMarker } from "./headed-session.js";
+import { ownedProcesses } from "./process-tree.js";
 import { LiveUsageReader } from "./live-usage.js";
 import { LocalTranscriptSource, TranscriptLocator } from "./session-transcript.js";
 import { checkConsistency, printConsistency, type TeamMemberReader } from "./consistency.js";
@@ -294,6 +295,8 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
     if (options.mode === "seat") {
       recordRunningBuild(`${options.checkout}.runtime`, import.meta.url);
       if (options.readyNonce) useHeadedMarker(headedMarkerFile(options.checkout, options.readyNonce));
+      // A hosted runner records the engine process trees it starts and ends them when its pane or process is stopped.
+      if (options.readyNonce) ownedProcesses.useRecord(`${options.checkout}.runtime`);
       try {
         const store = createPlanningStore(options.checkout);
         const seat = await loadDeveloperSeat(store, options.seatId);
@@ -434,6 +437,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       }
       recordRunningBuild(`${options.checkout}.runtime`, import.meta.url);
       if (options.readyNonce) useHeadedMarker(headedMarkerFile(options.checkout, options.readyNonce));
+      if (options.readyNonce) ownedProcesses.useRecord(`${options.checkout}.runtime`);
       const chat = services.chat(await hostedToken(options.checkout, options.readyNonce, readChickToken));
       await joinTeamHome(options.checkout, options.readyNonce, store, chat, CHICK_USERNAME);
       const bridge = await createPlanningBridge(store, chat, services.runtime(process.cwd()));

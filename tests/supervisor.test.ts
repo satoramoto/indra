@@ -1,9 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import { copyFile, mkdir, mkdtemp, writeFile, readFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readdir, rm, utimes, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { PlanningStore, type PlanningGoal } from "../src/planning.js";
-import { signalReady, TmuxHost, turnLockFile, type TmuxRunner } from "../src/tmux-host.js";
+import { signalReady, sweepHostFiles, TmuxHost, turnLockFile, type TmuxRunner } from "../src/tmux-host.js";
 import { withFileLock } from "../src/state-commit.js";
 import { activityRecordName, CliGoalStarter, Supervisor } from "../src/supervisor.js";
 import { ImplementationRecorder } from "../src/implementation-facts.js";
@@ -66,7 +66,7 @@ async function fixture(goals: PlanningGoal[] = []) {
   await copyFile("schema/v1/state.schema.json", join(dir, "schema/v1/state.schema.json"));
   const tmux = new FakeTmux();
   tmux.onStart = async (_session, nonce) => { await signalReady(dir, nonce); };
-  return { dir, tmux, supervisor: new Supervisor(dir, tmux, dir, 1000, new PlanningStore(dir, undefined, READY)) };
+  return { dir, tmux, supervisor: new Supervisor(dir, tmux, dir, 1000, new PlanningStore(dir, undefined, READY), undefined, { restartDebounceMs: 0 }) };
 }
 
 describe("seat process supervisor", () => {
@@ -222,6 +222,83 @@ describe("seat process supervisor", () => {
     expect(tmux.kills()).toHaveLength(3);
     expect(tmux.launches()).toHaveLength(6);
     expect(Object.values(await supervisor.read()).map((item) => [item.process, item.updatePending])).toEqual([["running", undefined], ["running", undefined], ["running", undefined]]);
+  });
+
+  it("debounces update restarts: a burst of builds restarts each process once, and never one with a headed run going", async () => {
+    const { dir, tmux } = await fixture();
+    const reaped: string[] = [];
+    const supervisor = new Supervisor(dir, tmux, dir, 1000, new PlanningStore(dir, undefined, READY), undefined, { restartDebounceMs: 60_000, reap: async (runtime) => { reaped.push(runtime); return 0; } });
+    const stamp = (id: string) => writeFile(join(dir, "dist", "build-stamp.json"), JSON.stringify({ id, sha: "abc1234", builtAt: "now" }));
+    const runtime = `${dir}.runtime`;
+    const records = async () => (await readdir(runtime)).filter((name) => /^tmux-(host|seat-.*)\.json$/.test(name));
+    const age = async () => {
+      for (const name of await records()) {
+        const record = JSON.parse(await readFile(join(runtime, name), "utf8"));
+        await writeFile(join(runtime, name), JSON.stringify({ ...record, startedAt: new Date(Date.now() - 120_000).toISOString() }));
+      }
+    };
+    await stamp("build-1");
+    await supervisor.ensureAll();
+    expect(reaped).toEqual([runtime]);
+    // Builds land every few seconds: processes that just started wait instead of restarting once per build.
+    for (const id of ["build-2", "build-3", "build-4"]) {
+      await stamp(id);
+      expect(await supervisor.upgrade()).toEqual({ pending: ["bridge", "seat-002", "seat-003"], problems: [] });
+    }
+    expect(tmux.kills()).toHaveLength(0);
+    // Once they have been up long enough, each restarts once, onto the newest build; George has a headed run going.
+    await age();
+    const george = JSON.parse(await readFile(join(runtime, "tmux-seat-seat-002.json"), "utf8"));
+    await writeFile(join(runtime, `headed-${george.readyNonce}.json`), JSON.stringify({ pid: process.pid, engine: "claude", startedAt: "now" }));
+    expect(await supervisor.upgrade()).toEqual({ pending: ["seat-002"], problems: [] });
+    expect(tmux.kills().map((args) => args[args.indexOf("-t") + 1])).toEqual([expect.stringMatching(/^=chick-/), expect.stringMatching(/^=dev-seat-003-/)]);
+    await stamp("build-5");
+    expect(await supervisor.upgrade()).toEqual({ pending: ["bridge", "seat-002", "seat-003"], problems: [] });
+    expect(tmux.kills()).toHaveLength(2);
+    // The headed run ended: George restarts too.
+    await rm(join(runtime, `headed-${george.readyNonce}.json`));
+    expect(await supervisor.upgrade()).toEqual({ pending: ["bridge", "seat-003"], problems: [] });
+    expect(tmux.kills()).toHaveLength(3);
+    expect(reaped.length).toBeGreaterThan(1);
+  });
+
+  it("runs one stop or restart at a time per process", async () => {
+    const { tmux, supervisor } = await fixture();
+    await supervisor.ensureAll();
+    const [first, second] = await Promise.allSettled([supervisor.restart("seat-002"), supervisor.restart("seat-002")]);
+    expect(first.status).toBe("fulfilled");
+    expect(second).toMatchObject({ status: "rejected", reason: expect.objectContaining({ message: expect.stringContaining("already being stopped or restarted") }) });
+    expect(tmux.kills()).toHaveLength(1);
+    expect(tmux.launches()).toHaveLength(4);
+  });
+
+  it("removes a replaced process's readiness signal and headed marker, so host-ready records do not accumulate", async () => {
+    const { dir, supervisor } = await fixture();
+    const runtime = `${dir}.runtime`;
+    const readyFiles = async () => (await readdir(runtime)).filter((name) => name.startsWith("host-ready-")).sort();
+    await supervisor.ensureAll();
+    expect(await readyFiles()).toHaveLength(3);
+    const before = JSON.parse(await readFile(join(runtime, "tmux-seat-seat-002.json"), "utf8"));
+    await writeFile(join(runtime, `headed-${before.readyNonce}.json`), "{}");
+    for (let restart = 0; restart < 5; restart++) await supervisor.restart("seat-002");
+    const after = JSON.parse(await readFile(join(runtime, "tmux-seat-seat-002.json"), "utf8"));
+    expect(await readyFiles()).toHaveLength(3);
+    expect(await readyFiles()).toContain(`host-ready-${after.readyNonce}.json`);
+    expect(await readyFiles()).not.toContain(`host-ready-${before.readyNonce}.json`);
+    expect((await readdir(runtime)).filter((name) => name.startsWith("headed-"))).toEqual([]);
+
+    // Left by an older build: swept at start-up once no record names it; a brand-new one is kept.
+    const stale = join(runtime, "host-ready-00000000-0000-4000-8000-000000000000.json");
+    const fresh = join(runtime, "host-ready-11111111-1111-4111-8111-111111111111.json");
+    await writeFile(stale, "{}"); await writeFile(fresh, "{}");
+    const old = new Date(Date.now() - 10 * 60_000);
+    await utimes(stale, old, old);
+    expect(await sweepHostFiles(runtime)).toBe(1);
+    expect(await readyFiles()).toHaveLength(4);
+    expect(await readyFiles()).toContain(basename(fresh));
+    await utimes(fresh, old, old);
+    await supervisor.ensureAll();
+    expect(await readyFiles()).toHaveLength(3);
   });
 
   it("reads the held assignment and newest thread activity", async () => {
