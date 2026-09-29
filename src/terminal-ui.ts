@@ -1,6 +1,7 @@
 import type { StateInventory, StateSeat, StateSnapshot, StateTeam } from "./state-domain.js";
 import type { AssignmentRetry, GoalStarter, SeatLive, SeatProcessPort, SprintAction } from "./supervisor.js";
-import { missingTeamHome, missingTeamMessage } from "./planning.js";
+import { isFinishedSprint } from "./finished-sprint.js";
+import { missingTeamHome,missingTeamMessage } from "./planning.js";
 import type { StateSyncResult } from "./state-commit.js";
 import type { BuildStamp } from "./build-stamp.js";
 import type { RollbackPlan, UpdateResult } from "./self-update.js";
@@ -461,7 +462,7 @@ export class TerminalUiModel {
 
   /** Team history includes every planning sprint, independent of which seat currently holds work. */
   sprintsForTeam(): TerminalSprint[] {
-    const sessions = this.sessionResult.sessions.filter((session) => session.teamId === this.teamId && session.loop);
+    const sessions = this.sessionResult.sessions.filter((session) => session.teamId === this.teamId && session.loop && !isFinishedSprint(session.loop));
     return [
       ...sessions.map((session) => ({ id: session.id, goal: session.goal, loop: session.loop! })),
       ...(this.snapshot?.sprints ?? []).filter((sprint) => sprint.teamId === this.teamId && !sessions.some((session) => session.id === sprint.id)).map((sprint): TerminalSprint => ({
