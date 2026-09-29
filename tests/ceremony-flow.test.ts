@@ -470,7 +470,7 @@ describe("failure boundaries", () => {
     for (const call of calls) expect(call.options).not.toHaveProperty("previousSessionUsage");
     const record = await store.readRuntimeFile<BridgeCeremonyRecord>(ceremonyRuntimeName(goal.id));
     expect(record?.invocations).toHaveLength(2);
-    expect(record?.invocations.map((item) => item.usage)).toEqual([{ inputTokens: 7, outputTokens: 3 }, { inputTokens: 7, outputTokens: 3 }]);
+    expect(record?.invocations?.map((item) => item.usage)).toEqual([{ inputTokens: 7, outputTokens: 3 }, { inputTokens: 7, outputTokens: 3 }]);
     expect(record?.facts.sessions).toHaveLength(2);
     expect(record?.stageEvents?.map((event) => event.stage)).toEqual(["planning", "proposal"]);
   });
