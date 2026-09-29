@@ -457,7 +457,7 @@ export class TerminalUiModel {
   get seat(): StateSeat | undefined { return this.team?.seats.find((seat) => seat.id === this.seatId); }
 
   sessionsFor(seatId: string): TerminalSession[] {
-    return this.sessionResult.sessions.filter((session) => session.teamId === this.teamId && session.seatId === seatId && !isFinishedSprint(session.loop));
+    return this.sessionResult.sessions.filter((session) => session.teamId === this.teamId && session.seatId === seatId);
   }
 
   /** Team history includes every planning sprint, independent of which seat currently holds work. */
