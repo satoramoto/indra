@@ -11,6 +11,7 @@ import { advanceCeremony } from "../src/ceremony.js";
 import { ImplementationRecorder, implementationWallTime } from "../src/implementation-facts.js";
 import { AgentRunError } from "../src/runtime-facts.js";
 import { parseOptions } from "../src/cli.js";
+import type { SeatRecord, TeamRecord } from "../src/state-domain.js";
 
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
@@ -188,6 +189,39 @@ async function retainRecord(store: PlanningStore, shell: FakeShell, changes: Par
 const reviewing = (): Assignment => ({ outcomeId: "outcome-1", seatId: "seat-002", status: "in-review", updatedAt: "2026-01-01T00:00:00Z", prUrl: PR });
 
 describe("developer seat", () => {
+  it("finishes previously queued work after retirement is requested", async () => {
+    const { store, seat, assignment, codex } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
+    await store.update((state) => { (state.teams as TeamRecord[])[0].seats[1].status = "retiring"; }, "Request removal");
+    await expect(loadDeveloperSeat(store, "seat-002")).resolves.toMatchObject({ id: "seat-002" });
+    expect(await seat.tick()).toBe("worked");
+    expect((await assignment("outcome-1")).status).toBe("merged");
+    expect(codex.runs.length).toBeGreaterThan(0);
+    expect(((await store.read()).teams as TeamRecord[])[0].seats[1].status).toBe("retiring");
+  });
+
+  it.each(["running", "in-review"] as const)("recovers existing %s work for a retiring seat after restart", async (status) => {
+    const { store, shell, make, assignment } = await setup([{ ...reviewing(), status }]);
+    await retainRecord(store, shell);
+    await store.update((state) => { (state.teams as TeamRecord[])[0].seats[1].status = "retiring"; }, "Request removal");
+    expect(await make().tick()).toBe("worked");
+    expect((await assignment("outcome-1")).status).toBe("merged");
+    expect(shell.calls.some((call) => call.startsWith("gh pr merge"))).toBe(true);
+  });
+
+  it("refuses pending and retired runners before maintenance or agent work", async () => {
+    const { store, shell, codex, chat } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
+    const record: SeatRecord = { id: "seat-pending", displayName: "New seat", roles: ["Developer"], status: "pending", externalIdentities: { mattermost: { username: "newseat" } } };
+    await store.update((state) => { (state.teams as TeamRecord[])[0].seats.push(record); }, "Add pending seat");
+    const runner = new DeveloperSeat(store, { id: record.id, displayName: record.displayName, roles: record.roles, username: "newseat" }, chat, shell, codex.factory);
+    await expect(loadDeveloperSeat(store, record.id)).rejects.toThrow("pending");
+    expect(await runner.tick()).toBe("idle");
+    await store.update((state) => { (state.teams as TeamRecord[])[0].seats.at(-1)!.status = "retired"; }, "Cancel pending seat");
+    await expect(loadDeveloperSeat(store, record.id)).rejects.toThrow("retired");
+    expect(await runner.tick()).toBe("idle");
+    expect(shell.calls).toEqual([]);
+    expect(codex.runs).toEqual([]);
+  });
+
   it.each([1, 128])("records a checked-command exit %s as a SeatError without command output", async (code) => {
     const { store, shell, codex, seat, chat, assignment } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
     const run = shell.run.bind(shell);

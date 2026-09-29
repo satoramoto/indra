@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { join, resolve } from "node:path";
-import { developerSeats, PlanningStore, type PlanningDocument } from "./planning.js";
+import { PlanningStore, type PlanningDocument } from "./planning.js";
 import { defaultAppDir, hostedProcessFor, NoChannelError, NoCredentialError, SystemTmux, TmuxHost, turnLockFile, type HostRecord, type TmuxRunner } from "./tmux-host.js";
 import { readBuildStamp } from "./build-stamp.js";
 import { withFileLock } from "./state-commit.js";
@@ -8,6 +8,7 @@ import { ImplementationRecorder, implementationEligible } from "./implementation
 import { ownsSeatRecord, seatRecordName } from "./developer-maintenance.js";
 import { redactSecrets } from "./redact.js";
 import { childEnv } from "./op-env.js";
+import { seatStatus, type SeatRecord, type TeamRecord } from "./state-domain.js";
 
 /** `no channel`: the seat's bot could not join its team's Mattermost team or home channel. */
 export type ProcessState = "running" | "stopped" | "no credential" | "no channel";
@@ -31,6 +32,8 @@ export interface SeatLive {
 export interface SeatProcessPort {
   /** Hosts every missing process; returns short problems to show, never throws for one seat. */
   ensureAll(): Promise<string[]>;
+  /** Idempotent activation/recovery; never stops an already hosted process. */
+  start?(seatId: string): Promise<void>;
   read(): Promise<Record<string, SeatLive>>;
   stop(seatId: string): Promise<void>;
   restart(seatId: string): Promise<void>;
@@ -57,12 +60,16 @@ export const activityRecordName = (seatId: string) => `activity-${seatId}`;
 /** A hosted process that exited for a missing credential or an unjoinable home channel; the seat shows why, so it is not a notice. */
 const shownOnSeat = (error: unknown) => error instanceof NoCredentialError || error instanceof NoChannelError;
 
-type SeatRow = { id: string; roles: string[] };
+type SeatRow = SeatRecord;
 const ACTIVE = ["running", "in-review"];
 
 function seatsOf(state: PlanningDocument): SeatRow[] {
-  return (state.teams as { seats: SeatRow[] }[]).flatMap((team) => team.seats);
+  return (state.teams as TeamRecord[]).flatMap((team) => team.seats);
 }
+
+const runnable = (seat: SeatRow) => ["active", "retiring"].includes(seatStatus(seat));
+const canRetry = (state: PlanningDocument, teamId: string, seatId: string) => (state.teams as TeamRecord[])
+  .find((team) => team.id === teamId)?.seats.some((seat) => seat.id === seatId && seat.roles.includes("Developer") && runnable(seat));
 
 /** Active assignments keep a process busy, including legacy work awaiting migration. */
 function holdsWork(state: PlanningDocument, seatId: string): boolean {
@@ -71,7 +78,7 @@ function holdsWork(state: PlanningDocument, seatId: string): boolean {
 
 function newestFailedAssignment(state: PlanningDocument, seatId: string): AssignmentRetry | undefined {
   return (state.planningGoals ?? [])
-    .filter((goal) => implementationEligible(goal) && developerSeats(state, goal.teamId).some((seat) => seat.id === seatId))
+    .filter((goal) => implementationEligible(goal) && canRetry(state, goal.teamId, seatId))
     .flatMap((goal) => (goal.assignments ?? []).filter((item) => item.seatId === seatId && item.status === "failed").map((assignment) => ({
       seatId, goalId: goal.id, goal: goal.goal, outcomeId: assignment.outcomeId,
       title: goal.proposal!.outcomes.find((item) => item.id === assignment.outcomeId)!.title, updatedAt: assignment.updatedAt,
@@ -126,15 +133,36 @@ export class Supervisor implements SeatProcessPort {
     const started = new Set<string>();
     // Sequential: tmux starts one owned server for the socket, and each host waits for its own readiness.
     for (const seat of seatsOf(await this.store.read())) {
+      if (!runnable(seat)) continue;
       const host = this.host(seat);
       if (started.has(host.session)) continue;
       started.add(host.session);
-      try { await host.start(); }
+      try { await this.startHost(seat.id); }
       catch (error) {
         if (!shownOnSeat(error)) problems.push(`${seat.id}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
     return problems;
+  }
+
+  /** Serialize process controls with retirement; re-read status so an earlier snapshot cannot resurrect a seat. */
+  private async processControl<T>(seat: SeatRow, work: () => Promise<T>): Promise<T> {
+    const hosted = hostedProcessFor(seat);
+    return withFileLock(join(this.store.runtimeDir, hosted.kind === "bridge" ? "process-bridge.lock" : `process-${seat.id}.lock`), work);
+  }
+
+  async start(seatId: string): Promise<void> {
+    const problem = await this.credential();
+    await this.startHost(seatId);
+    if (problem) throw new Error(problem);
+  }
+
+  private async startHost(seatId: string): Promise<void> {
+    const seat = await this.seat(seatId);
+    await this.processControl(seat, async () => {
+      if (!runnable(await this.seat(seatId))) return;
+      await this.host(seat).start();
+    });
   }
 
   async processState(host: TmuxHost): Promise<{ process: ProcessState; problem?: string; target?: string; record?: HostRecord }> {
@@ -177,7 +205,7 @@ export class Supervisor implements SeatProcessPort {
       const validate = (state: PlanningDocument) => {
         const goal = state.planningGoals?.find((item) => item.id === target.goalId);
         if (!goal || goal.stage !== "approved") throw new Error(`Goal ${target.goalId} is no longer approved or available.`);
-        if (!developerSeats(state, goal.teamId).some((seat) => seat.id === target.seatId)) throw new Error(`Seat ${target.seatId} is not a Developer on this goal's team.`);
+        if (!canRetry(state, goal.teamId, target.seatId)) throw new Error(`Seat ${target.seatId} is not a Developer eligible to retry on this goal's team.`);
         if (!goal.integration) throw new Error(`Goal ${goal.id} has no sprint integration branch; it cannot be retried.`);
         if (goal.ceremony?.stage !== "implement" || goal.ceremony.closure) throw new Error(`Goal ${goal.id} is not in implement; it cannot be retried.`);
         if (goal.integration.branch !== `sprint/${goal.id}`) throw new Error("Retry requires this goal's sprint branch.");
@@ -220,6 +248,7 @@ export class Supervisor implements SeatProcessPort {
     if (!stamp) return { pending, problems };
     const seen = new Set<string>();
     for (const seat of seatsOf(await this.store.read())) {
+      if (!runnable(seat)) continue;
       const host = this.host(seat);
       if (seen.has(host.session)) continue;
       seen.add(host.session);
@@ -231,29 +260,34 @@ export class Supervisor implements SeatProcessPort {
         await withFileLock(turnLockFile(this.checkout, host.hosted), async () => {
           // Read under the lock: a seat runner claims work only while it holds this lock.
           if (host.hosted.kind === "seat" && holdsWork(await this.store.read(), seat.id)) return;
-          stopped = await host.stop();
+          stopped = await this.processControl(seat, () => host.stop());
         }, 1000);
       } catch { /* The turn lock is held: a poll or step is in flight. */ }
       if (!stopped) { pending.push(label); continue; }
-      try { await host.start(); }
+      try { await this.start(seat.id); }
       catch (error) { if (!shownOnSeat(error)) problems.push(`${label}: ${error instanceof Error ? error.message : String(error)}`); }
     }
     return { pending, problems };
   }
 
   async stop(seatId: string): Promise<void> {
-    await this.host(await this.seat(seatId)).stop();
+    const seat = await this.seat(seatId);
+    await this.processControl(seat, async () => { await this.host(seat).stop(); });
   }
 
   async restart(seatId: string): Promise<void> {
-    const host = this.host(await this.seat(seatId));
-    // A seat that exited for a missing credential may hold a revoked token: read a fresh one.
-    const noCredential = (await this.processState(host)).process === "no credential";
-    const credentialProblem = await this.credential(true, noCredential);
-    await host.stop();
-    try { await host.start(); }
-    catch (error) { if (!shownOnSeat(error)) throw error; }
-    if (credentialProblem) throw new Error(credentialProblem);
+    const seat = await this.seat(seatId);
+    await this.processControl(seat, async () => {
+      if (!runnable(await this.seat(seatId))) throw new Error("Only active or retiring seats can restart.");
+      const host = this.host(seat);
+      // A seat that exited for a missing credential may hold a revoked token: read a fresh one.
+      const noCredential = (await this.processState(host)).process === "no credential";
+      const credentialProblem = await this.credential(true, noCredential);
+      await host.stop();
+      try { await host.start(); }
+      catch (error) { if (!shownOnSeat(error)) throw error; }
+      if (credentialProblem) throw new Error(credentialProblem);
+    });
   }
 }
 
