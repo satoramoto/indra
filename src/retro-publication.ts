@@ -201,8 +201,9 @@ export class RetroPublication {
         }
         if (pr.state === "OPEN" && pr.reviewed && pr.checksPassed) {
           await this.verifyPosts(context, record);
-          await this.archive.mergeRetroPr(record.github, context.goal.id, frozen.markdown, pr.url, pr.headSha);
+          const merge = await this.archive.mergeRetroPr(record.github, context.goal.id, frozen.markdown, pr.url, pr.headSha);
           pr = await this.archive.inspectRetroPr(record.github, context.goal.id, frozen.markdown, record.prUrl);
+          if (!merge.merged && pr.state !== "MERGED") return pending(merge.reason);
         }
         if (pr.state !== "MERGED") return pending(!pr.reviewed ? "The retrospective archive needs a fresh review on its current head." : !pr.checksPassed ? "The retrospective archive is waiting for passing CI." : "The archival merge is pending verification.");
       }

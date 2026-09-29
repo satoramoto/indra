@@ -58,6 +58,15 @@ class GitHub implements Shell {
     const line = `${command} ${args.join(" ")}`; this.calls.push(line);
     let stdout = "";
     if (args[0] === "api") { stdout = mainSha; this.branch = args[1].split("heads/")[1] ?? this.branch; }
+    if (args[0] === "api" && args.includes("--method") && !args.includes("--paginate")) {
+      const endpoint = args[1]; const owners = "* @satori-miyamoto\n";
+      if (/\/pulls\/\d+$/.test(endpoint)) stdout = JSON.stringify({ state: "open", draft: false, auto_merge: null, head: { sha: mainSha }, base: { ref: "main", sha: mainSha, repo: { full_name: "test/project" } } });
+      if (endpoint.endsWith("/protection")) stdout = JSON.stringify({ enforce_admins: { enabled: true }, required_status_checks: { contexts: ["checks"] }, required_pull_request_reviews: { required_approving_review_count: 1, require_code_owner_reviews: true, dismiss_stale_reviews: true } });
+      if (endpoint.endsWith("/permission")) stdout = JSON.stringify({ permission: "write", user: { login: "satori-miyamoto", permissions: { push: true } } });
+      if (endpoint.includes("/git/trees/")) stdout = JSON.stringify({ truncated: false, tree: [{ path: ".github/CODEOWNERS", type: "blob", mode: "100644", sha: mainSha }] });
+      if (endpoint.includes("/git/blobs/")) stdout = JSON.stringify({ sha: mainSha, encoding: "base64", content: Buffer.from(owners).toString("base64"), size: Buffer.byteLength(owners) });
+      if (endpoint.includes("/codeowners/errors?")) stdout = JSON.stringify({ errors: [] });
+    }
     if (args[0] === "pr" && args[1] === "list") stdout = this.open && !this.merged ? "https://github.com/test/project/pull/1" : "";
     if (args[0] === "pr" && args[1] === "create") { this.open = true; stdout = "https://github.com/test/project/pull/1"; }
     if (args[0] === "pr" && args[1] === "merge" && !args.includes("--disable-auto")) this.merged = true;

@@ -67,6 +67,17 @@ async function fixture() {
 }
 
 describe("recoverable retro publication", () => {
+  it("surfaces the protected merge setup blocker while retaining the open retrospective", async () => {
+    const f = await fixture();
+    const reason = "Automatic merge blocked: The target must require approving Code Owner reviews and dismiss stale approvals. See docs/remodel-contract.md for the required server-side Code Owner policy.";
+    vi.mocked(f.archive.mergeRetroPr).mockResolvedValue({ merged: false, reason });
+    expect(await f.restart().poll(f.context)).toEqual({ status: "pending", reason });
+    expect(f.archive.mergeRetroPr).toHaveBeenCalledTimes(1);
+    expect(f.pr.state).toBe("OPEN"); expect(f.state.planningGoals[0]).toEqual(goalAtRetro());
+    expect(f.record().verifiedAt).toBeUndefined();
+    await expect(f.restart().merge(f.context)).rejects.toThrow(reason);
+  });
+
   it("wires production review to a new read-only runtime at the archive head without resuming Chick", async () => {
     const f = await fixture(); f.pr.checksPassed = false; await f.restart().poll(f.context); f.pr.reviewed = false;
     try {

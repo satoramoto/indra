@@ -59,6 +59,15 @@ class FakeGh implements Shell {
     if (line === "gh api repos/satoramoto/indra/git/ref/heads/main --jq .object.sha") return this.failBranch ? { code: 1, stdout: "", stderr: "HTTP 502" } : ok(`${MAIN_SHA}\n`);
     if (line.startsWith("gh api repos/satoramoto/indra/git/ref/heads/")) { const branch = args[1].split("/heads/")[1]; return this.branches.has(branch) ? ok(`${MAIN_SHA}\n`) : { code: 1, stdout: "", stderr: "HTTP 404" }; }
     if (line.startsWith("gh api -X POST repos/satoramoto/indra/git/refs")) { this.branches.add(flag("-f").replace("ref=refs/heads/", "")); return ok(); }
+    if (args[0] === "api" && args.includes("--method") && !args.includes("--paginate")) {
+      const endpoint = args[1]; const owners = "* @satori-miyamoto\n";
+      if (/\/pulls\/\d+$/.test(endpoint)) return ok(JSON.stringify({ state: "open", draft: false, auto_merge: null, head: { sha: MAIN_SHA }, base: { ref: "main", sha: MAIN_SHA, repo: { full_name: "satoramoto/indra" } } }));
+      if (endpoint.endsWith("/protection")) return ok(JSON.stringify({ enforce_admins: { enabled: true }, required_status_checks: { contexts: ["checks"] }, required_pull_request_reviews: { required_approving_review_count: 1, require_code_owner_reviews: true, dismiss_stale_reviews: true } }));
+      if (endpoint.endsWith("/permission")) return ok(JSON.stringify({ permission: "write", user: { login: "satori-miyamoto", permissions: { push: true } } }));
+      if (endpoint.includes("/git/trees/")) return ok(JSON.stringify({ truncated: false, tree: [{ path: ".github/CODEOWNERS", type: "blob", mode: "100644", sha: MAIN_SHA }] }));
+      if (endpoint.includes("/git/blobs/")) return ok(JSON.stringify({ sha: MAIN_SHA, encoding: "base64", content: Buffer.from(owners).toString("base64"), size: Buffer.byteLength(owners) }));
+      if (endpoint.includes("/codeowners/errors?")) return ok(JSON.stringify({ errors: [] }));
+    }
     if (line.startsWith("gh pr list")) { const pr = this.prs.get(flag("--head")); return ok(pr?.state === "OPEN" ? `${pr.url}\n` : "\n"); }
     if (line.startsWith("gh pr create")) { const url = `https://github.com/satoramoto/indra/pull/${++this.next}`; this.prs.set(flag("--head"), { url, state: "OPEN" }); return ok(`${url}\n`); }
     if (line.startsWith("gh pr view")) { const pr = byUrl(); return ok(JSON.stringify({ state: pr?.state ?? "UNKNOWN", mergeCommit: pr?.sha ? { oid: pr.sha } : null, headRefOid: MAIN_SHA, isDraft: false, author: { login: "owner" }, reviewDecision: "" })); }
@@ -666,10 +675,10 @@ describe("sprint integration", () => {
     await bridge.poll();
     expect(await sprintOf(store)).toMatchObject({ status: "merged", mergedSha: MERGE_SHA });
     expect(gh.calls.filter((line) => line.startsWith("gh pr create"))).toHaveLength(1);
-    expect(gh.calls.filter((line) => line.includes("--auto"))).toEqual([`gh pr merge https://github.com/satoramoto/indra/pull/101 --auto --squash --match-head-commit ${MAIN_SHA}`]);
+    expect(gh.calls.filter((line) => line.startsWith("gh pr merge"))).toEqual([`gh pr merge https://github.com/satoramoto/indra/pull/101 --squash --match-head-commit ${MAIN_SHA}`]);
     expect((await store.runtime(goal.id)) as object).not.toHaveProperty("mergeApproval");
     await bridge.poll();
-    expect(gh.calls.filter((line) => line.includes("--auto"))).toHaveLength(1);
+    expect(gh.calls.filter((line) => line.startsWith("gh pr merge"))).toHaveLength(1);
     expect(chat.posts.some((post) => post.message.includes("merged into main"))).toBe(true);
   });
 

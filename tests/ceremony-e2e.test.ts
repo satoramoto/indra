@@ -58,6 +58,15 @@ class Services implements Shell, RetroArchive {
   async run(_command: string, args: string[]) {
     let stdout = "";
     if (args[0] === "api") stdout = "a".repeat(40);
+    if (args[0] === "api" && args.includes("--method") && !args.includes("--paginate")) {
+      const endpoint = args[1]; const head = "a".repeat(40); const owners = "* @satori-miyamoto\n";
+      if (/\/pulls\/\d+$/.test(endpoint)) stdout = JSON.stringify({ state: "open", draft: false, auto_merge: null, head: { sha: head }, base: { ref: "main", sha: head, repo: { full_name: "test/project" } } });
+      if (endpoint.endsWith("/protection")) stdout = JSON.stringify({ enforce_admins: { enabled: true }, required_status_checks: { contexts: ["checks"] }, required_pull_request_reviews: { required_approving_review_count: 1, require_code_owner_reviews: true, dismiss_stale_reviews: true } });
+      if (endpoint.endsWith("/permission")) stdout = JSON.stringify({ permission: "write", user: { login: "satori-miyamoto", permissions: { push: true } } });
+      if (endpoint.includes("/git/trees/")) stdout = JSON.stringify({ truncated: false, tree: [{ path: ".github/CODEOWNERS", type: "blob", mode: "100644", sha: head }] });
+      if (endpoint.includes("/git/blobs/")) stdout = JSON.stringify({ sha: head, encoding: "base64", content: Buffer.from(owners).toString("base64"), size: Buffer.byteLength(owners) });
+      if (endpoint.includes("/codeowners/errors?")) stdout = JSON.stringify({ errors: [] });
+    }
     if (args[1]?.includes("/reviews?")) stdout = JSON.stringify([[{ id: 1, user: { login: "satori-miyamoto" }, state: "APPROVED", commit_id: "a".repeat(40) }]]);
     if (args[1] === "checks") stdout = JSON.stringify([{ name: "checks", bucket: "pass" }]);
     if (args[0] === "pr" && args[1] === "list") stdout = this.integrationOpen ? integrationUrl : "";

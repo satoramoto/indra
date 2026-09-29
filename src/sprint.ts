@@ -108,24 +108,82 @@ export class SprintGitHub implements RetroArchive {
       ...(SHA.test(before.mergeCommit?.oid ?? "") ? { mergedSha: before.mergeCommit!.oid } : {}) };
   }
 
+  /**
+   * Read-only preflight for the narrowly supported server-enforced bot gate. A client-side review snapshot
+   * cannot prevent a same-head dismissal racing the merge; GitHub must require this particular Code Owner.
+   * Undefined means the policy was verified, not that the PR itself is approved or mergeable.
+   */
+  async serverMergeBlocker(prUrl: string, headSha: string): Promise<string | undefined> {
+    const blocked = (reason: string) => `Automatic merge blocked: ${reason} See docs/remodel-contract.md for the required server-side Code Owner policy.`;
+    if (!PR_URL.test(prUrl) || !SHA.test(headSha)) return blocked("The PR identity or head is invalid.");
+    const github = prUrl.split("/").slice(3, 5).join("/"); const number = prUrl.split("/").at(-1)!;
+    if (!GITHUB_REPO.test(github)) return blocked("The PR repository is invalid.");
+    type Json = Record<string, unknown>;
+    const object = (value: unknown): value is Json => !!value && typeof value === "object" && !Array.isArray(value);
+    const require = (condition: unknown, message: string): void => { if (!condition) throw new SprintError(message); };
+    const read = async (endpoint: string): Promise<Json> => {
+      const result = await this.run("gh", ["api", endpoint, "--method", "GET"]);
+      if (result.code !== 0) throw new SprintError("GitHub policy evidence is unavailable; repository administration read access may be required.");
+      let parsed: unknown;
+      try { parsed = JSON.parse(result.stdout); } catch { throw new SprintError("GitHub policy evidence is unreadable."); }
+      if (!object(parsed)) throw new SprintError("GitHub policy evidence has an unknown shape.");
+      return parsed;
+    };
+    try {
+      const pr = await read(`repos/${github}/pulls/${number}`);
+      const base = object(pr.base) ? pr.base : {}; const head = object(pr.head) ? pr.head : {};
+      const repo = object(base.repo) ? base.repo : {};
+      require(pr.state === "open" && pr.draft === false && head.sha === headSha && typeof repo.full_name === "string" && repo.full_name.toLowerCase() === github.toLowerCase(), "The open PR no longer matches the inspected project and head.");
+      require(pr.auto_merge === null, "Disable the existing deferred auto-merge request before using the protected merge gate.");
+      require(typeof base.ref === "string" && !!base.ref && typeof base.sha === "string" && SHA.test(base.sha), "The target branch and commit are unverified.");
+      const protection = await read(`repos/${github}/branches/${encodeURIComponent(base.ref as string)}/protection`);
+      const reviews = object(protection.required_pull_request_reviews) ? protection.required_pull_request_reviews : {};
+      const admins = object(protection.enforce_admins) ? protection.enforce_admins : {};
+      const checks = object(protection.required_status_checks) ? protection.required_status_checks : {};
+      require(admins.enabled === true, "The target must enforce branch protection for administrators and bypass-capable roles.");
+      require(Number.isSafeInteger(reviews.required_approving_review_count) && Number(reviews.required_approving_review_count) >= 1 && reviews.require_code_owner_reviews === true && reviews.dismiss_stale_reviews === true,
+        "The target must require approving Code Owner reviews and dismiss stale approvals.");
+      const bypass = reviews.bypass_pull_request_allowances;
+      require(bypass === undefined || (object(bypass) && Object.keys(bypass).every((key) => ["users", "teams", "apps"].includes(key)) && ["users", "teams", "apps"].every((key) => Array.isArray(bypass[key]) && bypass[key].length === 0)), "Required reviews must have no bypass allowances.");
+      require((Array.isArray(checks.contexts) && checks.contexts.includes("checks")) || (Array.isArray(checks.checks) && checks.checks.some((check) => object(check) && check.context === "checks")), "The target must require the checks CI job.");
+      const permission = await read(`repos/${github}/collaborators/satori-miyamoto/permission`);
+      const user = object(permission.user) ? permission.user : {}; const rights = object(user.permissions) ? user.permissions : {};
+      require(user.login === "satori-miyamoto" && rights.push === true && ["write", "maintain", "admin"].includes(String(permission.permission)), "satori-miyamoto must have write access to be an enforceable Code Owner.");
+      // Inspect Git mode as well as bytes: the Contents API can dereference a symlink and present it as a file.
+      const tree = await read(`repos/${github}/git/trees/${base.sha}?recursive=1`);
+      require(tree.truncated === false && Array.isArray(tree.tree), "The target tree cannot be completely inspected for CODEOWNERS.");
+      const owners = (tree.tree as unknown[]).filter((entry) => object(entry) && entry.path === ".github/CODEOWNERS");
+      const owner = owners[0];
+      require(owners.length === 1 && object(owner) && owner.type === "blob" && owner.mode === "100644" && typeof owner.sha === "string" && SHA.test(owner.sha), "The target must contain a regular .github/CODEOWNERS file.");
+      const blob = await read(`repos/${github}/git/blobs/${(owner as Json).sha}`);
+      require(blob.sha === (owner as Json).sha && blob.encoding === "base64" && typeof blob.content === "string" && typeof blob.size === "number" && blob.size > 0 && blob.size <= 10_000, "The target CODEOWNERS content cannot be verified.");
+      const bytes = Buffer.from(blob.content as string, "base64");
+      require(bytes.length === blob.size, "The target CODEOWNERS content is incomplete.");
+      const rules = bytes.toString("utf8").split(/\r?\n/).map((line) => line.split("#")[0].trim()).filter(Boolean);
+      require(rules.length === 1 && /^\*[ \t]+@satori-miyamoto$/.test(rules[0]), "The only target CODEOWNERS rule must be '* @satori-miyamoto', with no alternative owners or overrides.");
+      const errors = await read(`repos/${github}/codeowners/errors?ref=${base.sha}`);
+      require(Array.isArray(errors.errors) && errors.errors.length === 0, "GitHub reports invalid or unreadable target CODEOWNERS rules.");
+      return undefined;
+    } catch (error) {
+      return blocked(error instanceof SprintError ? error.message : "GitHub policy verification did not complete.");
+    }
+  }
+
   /** Current-head bot approval and green CI gate release; a request alone never proves a merge. */
   async merge(prUrl: string): Promise<MergeResult> {
     const before = await this.inspectMerge(prUrl);
     if (!before.reviewed || !before.checksPassed) return { merged: false, reason: `Current-head satori-miyamoto approval and passing CI are required on ${prUrl}` };
     if (before.state === "MERGED" && before.mergedSha) return { merged: true, sha: before.mergedSha };
     if (before.state !== "OPEN") return { merged: false, reason: `${prUrl} is ${before.state.toLowerCase()}` };
-    let verified = false;
-    try {
-      await this.run("gh", ["pr", "merge", prUrl, "--auto", "--squash", "--match-head-commit", before.headSha]);
-      const after = await this.inspectMerge(prUrl);
-      if (after.state === "MERGED" && after.mergedSha && after.headSha === before.headSha && after.reviewed && after.checksPassed) {
-        verified = true; return { merged: true, sha: after.mergedSha };
-      }
-    } finally {
-      // Also cancel after a lost command response; an unverified future head must not remain armed.
-      if (!verified) await this.must("gh", ["pr", "merge", prUrl, "--disable-auto"]);
-    }
-    return { merged: false, reason: "Auto-merge requested but no reviewed merge verified; wait for the next workflow event." };
+    const blocker = await this.serverMergeBlocker(prUrl, before.headSha);
+    if (blocker) return { merged: false, reason: blocker };
+    // GitHub enforces the Code Owner verdict at mutation time; the SHA precondition pins this attempt.
+    // Never arm deferred auto-merge, which can outlive this process and its inspected head.
+    try { await this.run("gh", ["pr", "merge", prUrl, "--squash", "--match-head-commit", before.headSha]); }
+    catch { /* A lost command response is reconciled from GitHub below. */ }
+    const after = await this.inspectMerge(prUrl);
+    if (after.state === "MERGED" && after.mergedSha && after.headSha === before.headSha && after.reviewed && after.checksPassed) return { merged: true, sha: after.mergedSha };
+    return { merged: false, reason: "Protected merge is not verified; wait for the next workflow event." };
   }
 
   async mergeVerification(prUrl: string): Promise<MergeVerification | undefined> {
@@ -320,14 +378,12 @@ export class SprintGitHub implements RetroArchive {
     if (before.headSha !== headSha || !before.reviewed || !before.checksPassed) return { merged: false, reason: "The archive needs a current-head review and passing CI." };
     if (before.state === "MERGED" && before.mergedSha) return { merged: true, sha: before.mergedSha };
     if (before.state !== "OPEN") return { merged: false, reason: "The retrospective PR is closed without a merge." };
-    let verified = false;
-    try {
-      await this.run("gh", ["pr", "merge", prUrl, "--auto", "--squash", "--match-head-commit", headSha]);
-      const after = await this.inspectRetroPr(github, goalId, markdown, prUrl);
-      if (after.state === "MERGED" && after.mergedSha && after.headSha === headSha && after.reviewed && after.checksPassed) {
-        verified = true; return { merged: true, sha: after.mergedSha };
-      }
-    } finally { if (!verified) await this.must("gh", ["pr", "merge", prUrl, "--disable-auto"]); }
+    const blocker = await this.serverMergeBlocker(prUrl, headSha);
+    if (blocker) return { merged: false, reason: blocker };
+    try { await this.run("gh", ["pr", "merge", prUrl, "--squash", "--match-head-commit", headSha]); }
+    catch { /* Reconcile a lost response without leaving a deferred merge request. */ }
+    const after = await this.inspectRetroPr(github, goalId, markdown, prUrl);
+    if (after.state === "MERGED" && after.mergedSha && after.headSha === headSha && after.reviewed && after.checksPassed) return { merged: true, sha: after.mergedSha };
     return { merged: false, reason: "Retrospective merge is not verified; wait for the next workflow event." };
   }
 

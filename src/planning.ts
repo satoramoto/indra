@@ -172,10 +172,15 @@ export function validatePlanningDocument(state: PlanningDocument): void {
       if (goal.goalProposal && !(team.seats as SeatRecord[]).find((seat) => seat.id === goal.goalProposal!.productSeatId && Array.isArray(seat.roles) && seat.roles.includes("Product"))) throw new Error("Proposal provenance must name the team's Product seat.");
       if (goal.goalAssignment && !developers.has(goal.goalAssignment.seatId)) throw new Error("A whole goal must be assigned to a Developer on its team.");
     }
-    const outcome = goal.proposal?.outcomes.find((item) => !developers.has(item.seatId));
-    if (outcome) throw new Error(`Outcome ${outcome.id} seat ${outcome.seatId} is not a Developer seat on the team.`);
+    // Closed historical outcomes identify the seat that did the work, not its present-day role.
+    // Still require that exact seat to exist; closure never grants eligibility for another assignment.
+    const closedLegacy = goal.workflowModel !== "goals-v1" && Boolean(goal.ceremony?.closure);
+    const outcome = goal.proposal?.outcomes.find((item) => !seats.has(item.seatId) || (!closedLegacy && !developers.has(item.seatId)));
+    if (outcome) throw new Error(closedLegacy ? `Historical outcome ${outcome.id} seat ${outcome.seatId} is outside the team.` : `Outcome ${outcome.id} seat ${outcome.seatId} is not a Developer seat on the team.`);
     const assignment = goal.assignments?.find((item) => !seats.has(item.seatId));
     if (assignment) throw new Error(`Assignment seat ${assignment.seatId} is outside the team.`);
+    const ineligible = !closedLegacy && goal.assignments?.find((item) => !developers.has(item.seatId));
+    if (ineligible) throw new Error(`Assignment seat ${ineligible.seatId} is not a Developer seat on the team.`);
     if (goal.ceremony) {
       const home = requireTeamHome(state, goal.teamId);
       if (goal.mattermost.channelId !== home.channelId || !goal.projectRefs.includes(home.github)) throw new Error("Ceremony goal home channel and project must come from its team in state.");
