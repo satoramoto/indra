@@ -42,7 +42,7 @@ function activityLine(model: TerminalUiModel, seat: StateSeat, limit: number): s
   if (!session) return model.sessionResult.connection === "connected" ? "No recent runtime activity." : "Live activity unavailable.";
   const latest = session.recentActivity.at(-1);
   if (latest) return (model.sessionResult.connection === "connected" ? "Latest: " : "Recorded: ") + displayText(latest, limit);
-  return "Planning goal: " + displayText(session.goal, limit) + " · stage: " + displayText(session.stage, 30);
+  return "Planning goal: " + displayText(session.goal, limit) + " · stage: " + displayText((session.ceremony ?? session.loop?.ceremony)?.stage ?? "not recorded", 30);
 }
 
 const processColor: Record<SeatLive["process"], string> = { running: theme.running, stopped: theme.idle, "no credential": theme.error, "no channel": theme.error };
