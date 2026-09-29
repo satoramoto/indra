@@ -120,6 +120,17 @@ describe("sprint checked commands", () => {
 });
 
 describe("retrospective-only GitHub archival", () => {
+  it("rechecks authorization immediately before the archival write", async () => {
+    const { github, shell } = await fixture();
+    await github.ensureRetroPr("test/project", goal, content);
+    shell.approve();
+    const policy = vi.fn(async () => { throw new Error("Policy disabled"); });
+    await expect(github.mergeRetroPr("test/project", goal, content, url, shell.head(), policy)).rejects.toThrow("Policy disabled");
+    expect(policy).toHaveBeenCalledTimes(1);
+    expect(shell.calls.some((call) => call.args[1] === "merge")).toBe(false);
+    expect(shell.state).toBe("OPEN");
+  });
+
   it.each([false, true])("posts the fresh review's line comments and verdict, recovering lost responses (findings: %s)", async (findings) => {
     const { github, shell, runtimeDir } = await fixture();
     await github.ensureRetroPr("test/project", goal, content);

@@ -9,6 +9,7 @@ import type { AgentRuntime, AgentResult } from "../src/codex-runtime.js";
 import type { Shell } from "../src/developer-seat.js";
 import { stateCheckout } from "./state-checkout.js";
 
+vi.setConfig({ testTimeout: 30_000 });
 const ready: CeremonyWriteReadiness = { version: 1, consumers: { planning: 1, developer: 1, release: 1, retro: 1, tui: 1 } };
 const mainSha = "a".repeat(40);
 const mergeSha = "b".repeat(40);
@@ -52,6 +53,9 @@ class GitHub implements Shell {
   branch = "";
   reviewDecision = "";
   reviews = [{ author: { login: "reviewer" }, state: "APPROVED", submittedAt: "2026-01-01T00:00:00Z" }];
+  headSha = mainSha;
+  reviewedHead = mainSha;
+  checks = [{ name: "checks", bucket: "pass" }];
   beforeProof?: () => Promise<void>;
   async run(command: string, args: string[]) {
     const line = `${command} ${args.join(" ")}`; this.calls.push(line);
@@ -60,7 +64,10 @@ class GitHub implements Shell {
     if (args[0] === "pr" && args[1] === "list") stdout = this.open && !this.merged ? "https://github.com/test/project/pull/1" : "";
     if (args[0] === "pr" && args[1] === "create") { this.open = true; stdout = "https://github.com/test/project/pull/1"; }
     if (args[0] === "pr" && args[1] === "merge") this.merged = true;
-    if (args[0] === "pr" && args[1] === "view") stdout = JSON.stringify({ state: this.merged ? "MERGED" : "OPEN", mergeCommit: this.merged ? { oid: mergeSha } : null });
+    if (args[0] === "pr" && args[1] === "view") stdout = JSON.stringify({ state: this.merged ? "MERGED" : "OPEN", mergeCommit: this.merged ? { oid: mergeSha } : null,
+      headRefName: args[2].endsWith("/13") ? this.branch.replace("sprint/", "revert/") : this.branch, baseRefName: "main", headRefOid: this.headSha, isCrossRepository: false, isDraft: false, author: { login: "owner" } });
+    if (args[0] === "api" && args[1].includes("/reviews?")) stdout = JSON.stringify([[{ id: 1, user: { login: "satori-miyamoto" }, state: "APPROVED", commit_id: this.reviewedHead }]]);
+    if (args[0] === "pr" && args[1] === "checks" && args.includes("--json")) stdout = JSON.stringify(this.checks);
     if (args.some((arg) => arg.startsWith("state,baseRefName,mergeCommit,reviewDecision"))) { await this.beforeProof?.(); stdout = JSON.stringify({ state: "MERGED", baseRefName: this.branch, mergeCommit: { oid: mainSha }, reviewDecision: this.reviewDecision, ...(args.some((arg) => arg.split(",").includes("reviews")) ? { reviews: this.reviews } : {}) }); }
     return { code: 0, stdout, stderr: "" };
   }
