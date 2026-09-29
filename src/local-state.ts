@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { SEAT_ROLES } from "./state-domain.js";
 import type { DraftSprint, ProposedAllocation, ProposedWork, StateRepository, StateSnapshot, StateTeam } from "./state-domain.js";
+import { validatePlanningDocument, type PlanningDocument } from "./planning.js";
 
 export class StateDataError extends Error {
   constructor(message: string) {
@@ -190,6 +191,8 @@ export function parseState(raw: unknown): StateSnapshot {
       }
     }
   }
+  try { validatePlanningDocument(data as unknown as PlanningDocument); }
+  catch (error) { throw new StateDataError(error instanceof Error ? error.message : "Invalid planning goals."); }
   return { teams, sprints };
 }
 
