@@ -10,7 +10,7 @@
 
 ## The schema belongs to the indra repository
 
-The JSON Schema for `state.json` lives in this repository at `schema/v1/state.schema.json` and ships with every build. Each time Indra starts, including after a self-update reload, it compares that file with the copy in the state checkout. When they differ, Indra writes its copy into the checkout, commits only that file (`Update state schema from Indra <short-sha>`) and pushes it through the same sync as `state.json`. A change to the state shape therefore changes the schema here, in the same pull request. `state.json` keeps `"$schema": "./schema/v1/state.schema.json"`.
+The JSON Schema for `state.json` lives in this repository at `schema/v1/state.schema.json` and ships with every build. Each time Indra starts, including after a self-update reload, it compares that file with the copy in the state checkout. When they differ, Indra writes its copy into the checkout, commits only that file (`Update state schema from Indra <full-sha>`) and pushes it through the same sync as `state.json`. It never downgrades: when the checkout's schema was last written by an Indra build that the running build does not include (checked with `git merge-base --is-ancestor` in the indra checkout), or when that can't be determined, Indra leaves it alone and says so. A change to the state shape therefore changes the schema here, in the same pull request. `state.json` keeps `"$schema": "./schema/v1/state.schema.json"`.
 
 ## Credentials
 
@@ -27,4 +27,4 @@ Supply it when starting Indra:
 INDRA_STATE_GITHUB_TOKEN=github_pat_… npm start
 ```
 
-Indra removes the variable from its environment at start-up, so no child process inherits it: not agents, tmux panes, seat runners, `gh`, `npm`, `op`, nor git in project checkouts. Only the state checkout's `git fetch` and `git push` receive it, in their own environment, through a credential helper passed on the command line that reads it from there. The token never appears in arguments, logs, error messages, the remote URL or git config, and it is never stored by a credential helper.
+Indra removes the variable from its environment at start-up, so no child process inherits it: not agents, tmux panes, seat runners, `gh`, `npm`, `op`, nor git in project checkouts. Only the state checkout's `git fetch` and `git push` receive it, in their own environment, through a credential helper passed on the command line that reads it from there. The helper answers only requests for `https://github.com/satoramoto/indra-state`; if the remote points anywhere else, or a request is redirected, it gives nothing. The token never appears in arguments, logs, error messages, the remote URL or git config, and it is never stored by a credential helper.

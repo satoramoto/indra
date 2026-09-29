@@ -28,9 +28,18 @@ const gitEnv = () => ({ ...childEnv(), GIT_TERMINAL_PROMPT: "0" });
 /**
  * Replaces the machine's credential helpers, for this one git process, with one that answers from the process's
  * own environment. The token itself never appears in arguments, remotes or git config; only the variable name does.
- * The helper ignores `store` and `erase`, so the token is never saved anywhere.
+ * The helper ignores `store` and `erase`, so the token is never saved anywhere. It answers only a request for
+ * `https://github.com/satoramoto/indra-state(.git)` (`useHttpPath` makes git always send the path); for any other
+ * protocol, host or repository, for example after a changed origin or a redirect, it says nothing.
  */
-const TOKEN_HELPER = `!f() { cat >/dev/null; test "$1" = get || exit 0; echo username=x-access-token; echo "password=$${STATE_TOKEN_VARIABLE}"; }; f`;
+const TOKEN_HELPER = "!f() { test \"$1\" = get || { cat >/dev/null; exit 0; }; p=; h=; u=; "
+  + "while IFS= read -r line; do case \"$line\" in protocol=*) p=\"${line#protocol=}\";; host=*) h=\"${line#host=}\";; path=*) u=\"${line#path=}\";; esac; done; "
+  + "test \"$p\" = https && test \"$h\" = github.com || exit 0; "
+  + "case \"$u\" in satoramoto/indra-state|satoramoto/indra-state.git) ;; *) exit 0;; esac; "
+  + `echo username=x-access-token; echo "password=$${STATE_TOKEN_VARIABLE}"; }; f`;
+
+/** The `-c` options that make one git process authenticate with the state token, and only to the state repository. */
+export const STATE_CREDENTIAL_CONFIG = ["-c", "credential.helper=", "-c", `credential.helper=${TOKEN_HELPER}`, "-c", "credential.useHttpPath=true"];
 
 /**
  * The git arguments and environment for one command in the state checkout. Fetches and pushes authenticate with
@@ -40,7 +49,7 @@ const TOKEN_HELPER = `!f() { cat >/dev/null; test "$1" = get || exit 0; echo use
 function gitInvocation(checkout: string, args: string[]): { args: string[]; env: NodeJS.ProcessEnv; token?: string } {
   const token = stateRepoToken();
   if (!token || (args[0] !== "fetch" && args[0] !== "push")) return { args: ["-C", checkout, ...args], env: gitEnv() };
-  return { args: ["-C", checkout, "-c", "credential.helper=", "-c", `credential.helper=${TOKEN_HELPER}`, ...args], env: { ...gitEnv(), [STATE_TOKEN_VARIABLE]: token }, token };
+  return { args: ["-C", checkout, ...STATE_CREDENTIAL_CONFIG, ...args], env: { ...gitEnv(), [STATE_TOKEN_VARIABLE]: token }, token };
 }
 
 /** `text` with every occurrence of `token` removed, for messages that might echo what git saw. */
@@ -111,6 +120,11 @@ export class StateGit {
   /** Commits only the state file, whatever else is staged. */
   async commit(message: string): Promise<void> {
     await this.run(["commit", "--quiet", "--only", "-m", message, "--", this.path]);
+  }
+
+  /** The subject of the last commit that changed the file, or "" when none did. */
+  async lastSubject(): Promise<string> {
+    return (await this.run(["log", "-1", "--format=%s", "--", this.path])).trim();
   }
 
   /** Stages the file, so a file git does not track yet can be committed with `commit`. */
