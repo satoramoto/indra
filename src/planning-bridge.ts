@@ -91,9 +91,24 @@ const ownerApprovalKey = (goalId: string) => `owner-approve:${goalId}`;
 const ownerProposalKey = (goalId: string, requestedAt: number) => `owner-propose:${goalId}:${requestedAt}`;
 const reviewing = (goal: PlanningGoal) => goal.stage === "awaiting-review" || goal.stage === "approved";
 
+/** Chick's prompts are contracts: the outcome and its acceptance, what Indra does next, the constraints and the schema. */
 function prompt(goal: PlanningGoal, input: string, drafting: boolean, developers: Seat[]): string {
   const seats = developers.map((seat) => `${seat.id} (${seat.displayName})`).join(", ");
-  return `You are Chick Corea, the Team Lead seat in Indra. This is planning only. Read referenced projects when useful, but do not edit files, run implementation, deploy, or claim approval. Return only JSON. ${drafting ? `Create a proposed outcome-based roadmap with keys summary, outcomes (title, description and seatId), risks, openQuestions. This is a draft for human review. Keep each outcome small, focused on one concern, and independently verifiable; state its acceptance criteria and targeted tests. In each outcome's description, list every file it will touch, including test files. Outcomes assigned to different seats must not touch the same file. Name each dependency by outcome title and owning seat ID, and state the order in which dependent work must land. For any shared-file wiring, name one owning outcome and seat; list its files only under that owner and make the other outcomes depend on it. Assign every outcome to one of these Developer seats by its seat ID: ${seats || "none"}. Give each seat at most one outcome; only when there are more outcomes than seats may a seat take more, spread as evenly as possible.` : "Respond to the message and update the durable brief. Keys: reply, summary, decisions (agreed facts only), openQuestions. Ask focused clarification where useful."}\nGoal: ${goal.goal}\nProjects: ${goal.projectRefs.join(", ")}\nCurrent brief: ${JSON.stringify(goal.brief)}\nHuman message: ${input}`;
+  const task = drafting
+    ? `Outcome: a proposed outcome-based roadmap for this goal. This is a draft for human review.
+Acceptance: each outcome is small, focused on one concern, and independently verifiable; its description states its acceptance criteria and targeted tests. In each outcome's description, list every file it will touch, including test files. Outcomes assigned to different seats must not touch the same file. Name each dependency by outcome title and owning seat ID, and state the order in which dependent work must land. For any shared-file wiring, name one owning outcome and seat; list its files only under that owner and make the other outcomes depend on it. Assign every outcome to one of these Developer seats by its seat ID: ${seats || "none"}. Give each seat at most one outcome; only when there are more outcomes than seats may a seat take more, spread as evenly as possible.
+Afterwards Indra posts the draft in the goal thread. Nothing starts until a person approves it; then Indra queues each outcome for its Developer seat.
+Return only JSON with keys summary, outcomes (title, description and seatId), risks, openQuestions.`
+    : `Outcome: a reply to the human message and an updated durable brief. Acceptance: decisions hold agreed facts only, and openQuestions names what is still unclear.
+Afterwards Indra posts your reply in the goal thread and keeps the brief for the next message and the draft.
+Return only JSON with keys reply, summary, decisions (agreed facts only), openQuestions.`;
+  return `You are Chick Corea, the Team Lead seat in Indra. This is planning only.
+${task}
+Constraints: do not edit files, run implementation, deploy, or claim approval. Never put credentials in your output.
+Goal: ${goal.goal}
+Projects: ${goal.projectRefs.join(", ")}
+Current brief: ${JSON.stringify(goal.brief)}
+Human message: ${input}`;
 }
 
 /** One process serializes each seat. Poll cursors, handled posts and handled reactions survive restart. */

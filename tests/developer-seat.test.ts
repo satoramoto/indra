@@ -197,6 +197,23 @@ describe("developer seat", () => {
     const write = ["--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true", "--add-dir", join(project, ".git")];
     expect(codex.runs.map((run) => [run.schema.split("/").at(-1), run.sessionId, run.sandbox])).toEqual([["developer.json", undefined, write], ["review.json", undefined, ["--sandbox", "read-only"]], ["developer.json", undefined, write]]);
     expect(codex.runs[2].prompt).toContain("Bug in foo");
+    // Each prompt is a contract: where to deliver, what Indra does next, the hard constraints and the schema; no method.
+    const [build, review, fix] = codex.runs.map((run) => run.prompt);
+    expect(build).toContain(`git push -u origin HEAD:refs/heads/${BRANCH}`);
+    expect(build).toContain("gh pr create --base main");
+    for (const prompt of [build, fix]) {
+      expect(prompt).toMatch(/Do not merge/);
+      expect(prompt).toMatch(/do not mark it ready or draft/);
+      expect(prompt).toMatch(/Return only JSON: prUrl/);
+      expect(prompt).toMatch(/Never put credentials/);
+      expect(prompt).toMatch(/AGENTS\.md rules/);
+    }
+    expect(fix).toContain(`git push origin HEAD:refs/heads/${BRANCH}`);
+    expect(review).toContain(PR);
+    expect(review).toContain("AGENTS.md review checklist");
+    expect(review).toMatch(/read-only without network/);
+    expect(review).toMatch(/Return only JSON: findings/);
+    for (const prompt of [build, review, fix]) expect(prompt).not.toMatch(/feedback loop|test:watch|once each|run the targeted tests/i);
     const record = JSON.parse(await readFile(join(store.runtimeDir, "seat-seat-002-goal-abc-outcome-1.json"), "utf8")) as SeatTaskRecord;
     expect(record.sessions.map((item) => [item.role, item.sessionId])).toEqual([["developer", "session-1"], ["reviewer", "session-2"], ["fix", "session-3"]]);
     expect(await readFile(join(store.checkout, "state.json"), "utf8")).not.toContain("session-");
@@ -307,6 +324,11 @@ describe("developer seat", () => {
     expect(codex.runs).toHaveLength(3);
     expect(codex.runs[2]).toMatchObject({ cwd: worktree, sandbox: write, sessionId: undefined });
     expect(codex.runs[2].prompt).toContain("keeping the intent of both sides");
+    expect(codex.runs[2].prompt).toContain("origin/main is an ancestor of HEAD");
+    expect(codex.runs[2].prompt).toMatch(/Do not push or merge/);
+    expect(codex.runs[2].prompt).toMatch(/do not rebase, reset, force-push or abort the merge/);
+    expect(codex.runs[2].prompt).toMatch(/Return only JSON: prUrl/);
+    expect(codex.runs[2].prompt).not.toMatch(/once each|run the same targeted tests/i);
     expect(chat.messages.some((message) => message.includes("conflicts with main; resolving (round 1 of 2)"))).toBe(true);
     expect((await assignment("outcome-1")).status).toBe("merged");
     const record = JSON.parse(await readFile(join(store.runtimeDir, "seat-seat-002-goal-abc-outcome-1.json"), "utf8")) as SeatTaskRecord;
