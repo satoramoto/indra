@@ -34,11 +34,12 @@ export type ProgressKind = keyof typeof PROGRESS_MARK;
 /** Status tokens that follow the mark on command, tool and file lines. */
 export const STATUS = { ok: "✓", failed: "✗", running: "…" } as const;
 
-type Json = Record<string, unknown>;
-const isObject = (value: unknown): value is Json => typeof value === "object" && value !== null && !Array.isArray(value);
-const str = (value: unknown): string | undefined => (typeof value === "string" ? value : undefined);
-const oneLine = (text: string) => text.split("\n").map((line) => line.trim()).find((line) => line) ?? "";
-const line = (kind: ProgressKind, text: string) => `${PROGRESS_MARK[kind]} ${text}`;
+export type Json = Record<string, unknown>;
+export const isObject = (value: unknown): value is Json => typeof value === "object" && value !== null && !Array.isArray(value);
+export const str = (value: unknown): string | undefined => (typeof value === "string" ? value : undefined);
+export const oneLine = (text: string) => text.split("\n").map((line) => line.trim()).find((line) => line) ?? "";
+/** A progress line's mark and text, before the time is added. */
+export const line = (kind: ProgressKind, text: string) => `${PROGRESS_MARK[kind]} ${text}`;
 
 /** Splits a stream of text chunks into complete lines, holding back a trailing partial line until it completes. */
 export class LineSplitter {
@@ -72,7 +73,7 @@ export function shellCommand(value: unknown): string {
   return oneLine(wrapped[3] ?? "");
 }
 
-function relative(path: string, cwd?: string): string {
+export function relative(path: string, cwd?: string): string {
   return cwd && path.startsWith(`${cwd}/`) ? path.slice(cwd.length + 1) : path;
 }
 
@@ -180,7 +181,7 @@ export interface CodexProgressOptions {
 
 let stdoutGuarded = false;
 /** An async EPIPE on a closed pane would otherwise be an unhandled `error` event and crash the process. */
-function guardStdout(): void {
+export function guardStdout(): void {
   if (stdoutGuarded) return;
   stdoutGuarded = true;
   process.stdout.on("error", () => { /* progress output is best effort */ });
