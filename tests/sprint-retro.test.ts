@@ -1,10 +1,14 @@
-import { access, readdir } from "node:fs/promises";
+import { access, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { EventEmitter } from "node:events";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { spawn } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentResult, AgentRuntime } from "../src/codex-runtime.js";
+import { CODEX_CONFIG, engineHome, seatHarnessDir } from "../src/harness-home.js";
 import type { PlanningGoal } from "../src/planning.js";
+import { SeatRuntime } from "../src/seat-runtime.js";
 import {
   buildRetroSnapshot, draftSprintRetro, renderSprintRetro, retroPrompt, validateRetroNarrative,
   RETRO_LIMITS, RetroGenerationError, type RetroEvidenceSnapshot, type RetroGeneration, type RetroInput, type RetroNarrative,
@@ -55,6 +59,7 @@ function run(snapshot = buildRetroSnapshot(input()), response: unknown = narrati
 describe("bounded retro evidence and numeric accounting", () => {
   it("computes known tables, includes generation usage and preserves the cutoff rather than guessing closure", async () => {
     const snapshot = buildRetroSnapshot(input());
+    expect(snapshot.missing).toEqual([]);
     expect(snapshot.stages.map((stage) => [stage.stage, stage.elapsedMs])).toEqual([
       ["planning", 10_000], ["proposal", 10_000], ["implement", 10_000], ["release", 10_000], ["retro", 10_000],
     ]);
@@ -121,6 +126,29 @@ describe("bounded retro evidence and numeric accounting", () => {
     expect(markdown).toContain("| seat-one | unknown | 5000 | unknown |");
     expect(markdown).toContain("| retro | unknown | " + at(50) + " | unknown |");
     for (const text of ["Historical attempts were not recorded", "review history is unavailable", "Failure/retry history is unavailable", "does not establish zero"]) expect(markdown).toContain(text);
+  });
+
+  it.each(["seat-one", "seat-two"])("marks missing session history for %s even when another seat has complete records", async (seatId) => {
+    const data = input();
+    data.facts.sessions = data.facts.sessions.filter((session) => session.seatId !== seatId);
+    const snapshot = buildRetroSnapshot(data);
+    const gap = `${seatId}: session history is unavailable; token usage is unknown.`;
+    expect(snapshot.missing).toEqual([gap]);
+    expect(snapshot.seats.find((seat) => seat.seatId === seatId)?.wallTimeMs).toBe(seatId === "seat-one" ? 8_000 : 20_000);
+    expect(snapshot.sessions).toHaveLength(1);
+    expect(snapshot.choices.observations).toContainEqual({ evidenceId: "missing", kind: "went-poorly", text: "Historical evidence is incomplete; unavailable measurements remain unknown." });
+    expect(retroPrompt(snapshot)).toContain(gap);
+    const markdown = await renderSprintRetro(snapshot, narrative(snapshot), generation());
+    expect(markdown).toContain(gap);
+    expect(markdown).not.toContain("No gaps identified");
+  });
+
+  it("does not let a post-cutoff session fill a seat's missing historical coverage", () => {
+    const data = input();
+    Object.assign(data.facts.sessions[0], { startedAt: at(51), finishedAt: at(55) });
+    const snapshot = buildRetroSnapshot(data);
+    expect(snapshot.sessions.map((session) => session.seatId)).toEqual(["seat-one"]);
+    expect(snapshot.missing).toContain("seat-two: session history is unavailable; token usage is unknown.");
   });
 
   it("excludes post-cutoff facts and never prorates unfinished usage", () => {
@@ -201,6 +229,12 @@ describe("Chick's evidence-bound narrative", () => {
 });
 
 describe("fresh read-only retro generation", () => {
+  it("requires Chick's configured runtime instead of falling back to the owner's runtime", async () => {
+    // @ts-expect-error A caller must supply Chick's configured, isolated runtime factory.
+    await expect(draftSprintRetro(input())).rejects.toThrow("Chick's configured isolated runtime is required");
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
   it("supplies only the bounded snapshot in an empty repository, never resumes, and adds returned usage before rendering", async () => {
     const data = input(); const snapshot = buildRetroSnapshot(data); let directory = "";
     const message = vi.fn<AgentRuntime["message"]>().mockResolvedValue(run(snapshot));
@@ -226,22 +260,30 @@ describe("fresh read-only retro generation", () => {
     expect(draft.markdown).toContain("| Total |  | 3 | 308 | 217 | 61 | 30 | 61 | 15 | 369 |");
   });
 
-  it("runs the default Codex process with an enforced read-only sandbox, no resume and no writable directories", async () => {
+  it("runs Chick's configured Codex runtime in its isolated harness with a read-only sandbox and no resume", async () => {
+    const runtimeDir = await mkdtemp(join(tmpdir(), "indra-retro-harness-"));
+    const harness = seatHarnessDir(runtimeDir, input().goal.seatId);
     const child = Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), kill: vi.fn(() => true) });
     vi.mocked(spawn).mockReturnValue(child as unknown as ReturnType<typeof spawn>);
-    const draft = draftSprintRetro(input());
-    await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
-    const args = vi.mocked(spawn).mock.calls[0][1] as string[];
-    expect(args.slice(0, 4)).toEqual(["exec", "--json", "--sandbox", "read-only"]);
-    expect(args).not.toContain("resume"); expect(args).not.toContain("--add-dir"); expect(args.join(" ")).not.toContain("network_access=true");
-    const snapshot = buildRetroSnapshot(input());
-    child.stdout.write([
-      { type: "thread.started", thread_id: "new-retro" },
-      { type: "turn.completed", usage: { input_tokens: 10, cached_input_tokens: 4, output_tokens: 2 } },
-      { type: "item.completed", item: { type: "agent_message", text: JSON.stringify(narrative(snapshot)) } },
-    ].map((event) => JSON.stringify(event)).join("\n") + "\n");
-    child.stdout.end(); child.emit("close", 0);
-    expect((await draft).generation.usage).toMatchObject({ inputTokens: 10, outputTokens: 2 });
+    try {
+      const draft = draftSprintRetro(input(), (cwd) => new SeatRuntime("codex", cwd, undefined, undefined, undefined, harness));
+      await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+      const args = vi.mocked(spawn).mock.calls[0][1] as string[];
+      expect(args.slice(0, 4)).toEqual(["exec", "--json", "--sandbox", "read-only"]);
+      expect(args).not.toContain("resume"); expect(args).not.toContain("--add-dir"); expect(args.join(" ")).not.toContain("network_access=true");
+      const configuredHome = engineHome(harness, "codex");
+      expect(vi.mocked(spawn).mock.calls[0][2]?.env?.CODEX_HOME).toBe(configuredHome);
+      expect(await readdir(configuredHome)).toEqual(["auth.json", "config.toml"]);
+      expect(await readFile(join(configuredHome, "config.toml"), "utf8")).toBe(CODEX_CONFIG);
+      const snapshot = buildRetroSnapshot(input());
+      child.stdout.write([
+        { type: "thread.started", thread_id: "new-retro" },
+        { type: "turn.completed", usage: { input_tokens: 10, cached_input_tokens: 4, output_tokens: 2 } },
+        { type: "item.completed", item: { type: "agent_message", text: JSON.stringify(narrative(snapshot)) } },
+      ].map((event) => JSON.stringify(event)).join("\n") + "\n");
+      child.stdout.end(); child.emit("close", 0);
+      expect((await draft).generation.usage).toMatchObject({ inputTokens: 10, outputTokens: 2 });
+    } finally { await rm(runtimeDir, { recursive: true, force: true }); }
   });
 
   it("fails without a document, withholds provider diagnostics, preserves failed usage and removes the cwd", async () => {

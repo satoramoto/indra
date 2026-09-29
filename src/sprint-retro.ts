@@ -5,7 +5,7 @@ import { execFile } from "node:child_process";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import { CEREMONY_STAGES, validateCeremony, type CeremonyStage } from "./ceremony.js";
 import type { CeremonyRuntimeFacts } from "./ceremony-ports.js";
-import { CodexRuntime, type AgentResult, type AgentRuntime } from "./codex-runtime.js";
+import type { AgentResult, AgentRuntime } from "./codex-runtime.js";
 import type { PlanningGoal } from "./planning.js";
 import { childEnv } from "./op-env.js";
 import { redactSecrets } from "./redact.js";
@@ -174,11 +174,13 @@ export function buildRetroSnapshot(input: RetroInput): RetroEvidenceSnapshot {
   if (count > RETRO_LIMITS.records) throw new Error("Retro evidence exceeds its record bound.");
   const missing = new Set((input.missing ?? []).map(safeText));
   const sessions = sessionRows(facts.sessions, cutoffAt, missing);
+  const sessionSeatIds = new Set(sessions.map((session) => session.seatId));
   const seatIds = new Set([goal.seatId, ...goal.participantSeatIds, ...(goal.assignments ?? []).map((item) => item.seatId), ...facts.seats.map((item) => item.seatId), ...sessions.map((item) => item.seatId)]);
   const seats = [...seatIds].sort(compare).map((seatId) => {
     const values = [...new Set(facts.seats.filter((item) => item.seatId === seatId).map((item) => number(item.wallTimeMs)))];
     const wallTimeMs = values.length === 1 ? values[0] : null;
     if (wallTimeMs === null) missing.add(`${identity(seatId)}: historical wall time is missing or ambiguous.`);
+    if (!sessionSeatIds.has(seatId)) missing.add(`${identity(seatId)}: session history is unavailable; token usage is unknown.`);
     return { seatId: identity(seatId), wallTimeMs };
   });
   const reviews = ordered(facts.reviews.map((review) => {
@@ -323,8 +325,12 @@ export async function renderSprintRetro(snapshot: RetroEvidenceSnapshot, value: 
   ].join("\n\n") + "\n";
 }
 
-/** A new empty repository and no session handle/write grant. The factory obeys the read-only runtime contract. */
-export async function draftSprintRetro(input: RetroInput, runtimeFor: (cwd: string) => AgentRuntime = (cwd) => new CodexRuntime(cwd)): Promise<SprintRetroDraft> {
+/**
+ * A new empty repository and no session handle/write grant. The caller must supply Chick's configured runtime
+ * factory using the seat's engine and isolated harness, read-only in the supplied cwd. No owner-runtime fallback.
+ */
+export async function draftSprintRetro(input: RetroInput, runtimeFor: (cwd: string) => AgentRuntime): Promise<SprintRetroDraft> {
+  if (typeof runtimeFor !== "function") throw new RetroGenerationError("Chick's configured isolated runtime is required for retro generation.");
   const snapshot = buildRetroSnapshot(input);
   const priorSessions = new Set(input.facts.sessions.map((row) => row.sessionId));
   const cwd = await mkdtemp(join(tmpdir(), "indra-retro-"));
