@@ -609,9 +609,18 @@ export class PlanningBridge {
    * and by the owner's `planning merge`. It merges only once CI is green, records the result, and posts it.
    * Merging a PR that already merged changes nothing. Returns what happened, and whether it was merged.
    */
-  private async mergeGate(id: string, kind: BridgeMergeKind | undefined, metadata: BridgeRecord, approval: HumanApproval): Promise<{ message: string; merged: boolean; post: boolean }> {
+  private async mergeGate(id: string, kind: BridgeMergeKind | undefined, metadata: BridgeRecord, approval: HumanApproval): Promise<{ message: string; merged: boolean; post: boolean; recorded?: boolean }> {
     const goal = this.approvedGoal((await this.store.read()).planningGoals?.find((item) => item.id === id), id);
     const integration = goal.integration!;
+    // A sprint merged by a pre-ceremony build and migrated into release has no recorded merge approval; a fresh human
+    // merge approval records it so release can complete. It merges nothing.
+    if ((kind === undefined || kind === "integration") && goal.ceremony?.stage === "release" && !goal.ceremony.closure && integration.status === "merged" && !integration.revertPrUrl && !metadata.mergeApproval) {
+      const mergePost = metadata.mergePosts?.find((item) => item.kind === "integration" && (approval.source !== "reaction" || item.id === approval.postId));
+      if (!mergePost) throw new Error("The merge PR must be posted before human merge approval.");
+      metadata.mergeApproval = { postId: mergePost.id, approval };
+      await this.store.saveRuntime(id, metadata);
+      return { message: `Sprint ${id} was already merged into main as ${integration.mergedSha!.slice(0, 7)}; recorded your merge approval so release can complete.`, merged: false, post: true, recorded: true };
+    }
     const target: BridgeMergeKind | undefined = kind ?? (integration.status === "pr-open" ? "integration" : integration.status === "merged" && integration.revertPrUrl ? "revert" : goal.ceremony?.stage === "retro" ? "retro" : undefined);
     if (target === "retro") {
       if (goal.ceremony?.stage !== "retro" || goal.ceremony.closure) throw new Error("Retro merge requires an open goal at retro.");
@@ -656,7 +665,7 @@ export class PlanningBridge {
       if (metadata.pending) await this.deliver(goal, metadata);
       await this.recoverMilestonePosts(goal, metadata);
       const result = await this.mergeGate(id, undefined, metadata, { source: "owner-command", command: "planning merge", at: new Date().toISOString() });
-      if (!result.merged) throw new Error(result.message);
+      if (!result.merged && !result.recorded) throw new Error(result.message);
       metadata.pending = { inputPostId: `owner-merge:${id}:${Date.now()}`, since: Date.now(), message: result.message };
       await this.store.saveRuntime(id, metadata);
       await this.deliver(goal, metadata);

@@ -134,6 +134,7 @@ async function implemented(adapters: CeremonyAdapters = {}) {
   await f.bridge.poll();
   return f;
 }
+const approvalOf = async (store: PlanningStore, id: string) => ((await store.runtime(id)) as { mergeApproval?: { postId: string; approval: { source: string } } }).mergeApproval;
 const stages = (chat: Chat) => chat.posts.flatMap((post) => [...post.message.matchAll(/\*\*Stage: (\w+)\*\*/g)].map((match) => match[1]));
 
 describe("ordered gates and evidence", () => {
@@ -240,7 +241,8 @@ describe("ordered gates and evidence", () => {
   it("keeps merge approval in release until a running-build adapter verifies it", async () => {
     const { store, bridge, restart, goal, chat } = await implemented();
     expect((await store.read()).planningGoals![0].ceremony?.stage).toBe("release");
-    await bridge.merge(goal.id);
+    await expect(bridge.merge(goal.id)).resolves.toContain("merged into main");
+    expect((await approvalOf(store, goal.id))?.approval).toMatchObject({ source: "owner-command" });
     await restart().poll();
     const saved = (await store.read()).planningGoals![0];
     expect(saved.integration?.status).toBe("merged");
@@ -318,6 +320,39 @@ describe("ordered gates and evidence", () => {
     expect((await store.read()).planningGoals![0].ceremony?.closure).toBeDefined();
     await restart().start("Next");
     expect((await store.read()).planningGoals).toHaveLength(2);
+  });
+
+  it("records a fresh human merge approval for a sprint merged before the ceremony, then completes release", async () => {
+    const release = vi.fn(async (context: Parameters<NonNullable<CeremonyAdapters["release"]>["poll"]>[0]) => {
+      if (!context.mergeApproval) return { status: "pending" as const, reason: "Waiting for the recorded human integration merge approval." };
+      return { status: "complete" as const, evidence: { kind: "release-running" as const, prUrl: context.goal.integration!.prUrl!, mergedSha: mergeSha,
+        mergePostId: context.mergeApproval.postId, approval: context.mergeApproval.approval, checksPassed: true as const, buildSha: mergeSha, runningSha: mergeSha, runningAt: new Date().toISOString() } };
+    });
+    const { store, github, bridge, restart, goal, chat } = await implemented({ release: { poll: release } });
+    // Reproduce the migrated shape: merged by a pre-ceremony build, at release, with no recorded approval.
+    await store.update((state) => { const found = state.planningGoals![0]; found.integration = { ...found.integration!, status: "merged", mergedSha: mergeSha }; }, "Pre-ceremony build merges the sprint");
+    await bridge.poll();
+    const migrated = await store.runtime(goal.id);
+    expect(await approvalOf(store, goal.id)).toBeUndefined();
+    expect((await store.read()).planningGoals![0].ceremony?.stage).toBe("release");
+    const merges = () => github.calls.filter((call) => call.includes("pr merge")).length;
+    const integrationPost = migrated.mergePosts!.find((item) => item.kind === "integration")!;
+    chat.react(integrationPost.id, "white_check_mark", "bot");
+    await restart().poll();
+    expect((await approvalOf(store, goal.id))).toBeUndefined();
+    expect((await store.read()).planningGoals![0].ceremony?.stage).toBe("release");
+    const message = await restart().merge(goal.id);
+    expect(message).toContain("recorded your merge approval");
+    expect(merges()).toBe(0);
+    expect((await approvalOf(store, goal.id))).toMatchObject({ postId: integrationPost.id, approval: { source: "owner-command", command: "planning merge" } });
+    expect(chat.posts.filter((post) => post.message.includes("recorded your merge approval"))).toHaveLength(1);
+    const recorded = (await approvalOf(store, goal.id));
+    await expect(restart().merge(goal.id)).rejects.toThrow("Nothing to merge");
+    expect((await approvalOf(store, goal.id))).toEqual(recorded);
+    await restart().poll();
+    expect((await store.read()).planningGoals![0].ceremony?.stage).toBe("retro");
+    expect(merges()).toBe(0);
+    expect(chat.posts.filter((post) => post.message.includes("recorded your merge approval"))).toHaveLength(1);
   });
 
   it("closes a sprint whose integration is reverted during release, before the new build runs", async () => {
