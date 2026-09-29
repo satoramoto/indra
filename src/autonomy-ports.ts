@@ -11,6 +11,8 @@ export type OwnerSettingsPort = Pick<PlanningStore, "updateOwnerSettings">;
 export interface SeatLifecyclePorts {
   /** Verify the existing bot account with its credential; never create Mattermost accounts. */
   credentialIdentity(team: TeamRecord, seat: SeatRecord): Promise<{ userId: string; username: string; isBot: true } | undefined>;
+  /** True only after GitHub confirms this source branch has no PR in any state; unknown results refuse transfer. */
+  branchHasNoPr(team: TeamRecord, branch: string): Promise<boolean>;
   /** Check local running work as well as durable assignments before recording retirement. */
   workSettled(teamId: string, seatId: string): Promise<boolean>;
   startSeat(team: TeamRecord, seat: SeatRecord): Promise<void>;

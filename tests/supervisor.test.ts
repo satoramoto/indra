@@ -77,7 +77,7 @@ describe("seat process supervisor", () => {
     const { dir, tmux, supervisor } = await fixture();
     const store = new PlanningStore(dir, undefined, READY);
     const identity = vi.fn<SeatLifecyclePorts["credentialIdentity"]>(async () => undefined);
-    const lifecycle = new SeatLifecycle(store, { credentialIdentity: identity, workSettled: async () => true,
+    const lifecycle = new SeatLifecycle(store, { credentialIdentity: identity, branchHasNoPr: async () => false, workSettled: async () => true,
       startSeat: async (_team, seat) => supervisor.start(seat.id), retireSeat: async (_team, seat) => supervisor.stop(seat.id) });
     await lifecycle.add({ teamId: "team-001", displayName: "Product", username: "newproduct", role: "Product" });
     const pending = ((await store.read()).teams as TeamRecord[])[0].seats.at(-1)!;
@@ -117,7 +117,7 @@ describe("seat process supervisor", () => {
     const host = new TmuxHost(dir, tmux, dir, 1000, { kind: "seat", seatId: "seat-002" });
     if (kind === "replaced") tmux.sessions.set(host.session, { pane: "%99", identity: "999:999" });
     else await rm(host.recordFile);
-    const lifecycle = new SeatLifecycle(store, { credentialIdentity: async () => undefined, workSettled: async () => true,
+    const lifecycle = new SeatLifecycle(store, { credentialIdentity: async () => undefined, branchHasNoPr: async () => false, workSettled: async () => true,
       startSeat: async (_team, seat) => supervisor.start(seat.id), retireSeat: async (_team, seat) => supervisor.stop(seat.id) });
     const expected = ((await store.read()).teams as TeamRecord[])[0].seats[1];
     await lifecycle.remove({ teamId: "team-001", seatId: expected.id, expected });

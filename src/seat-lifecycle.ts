@@ -128,10 +128,21 @@ export class SeatLifecycle implements SeatLifecycleControls {
     const from = seatOf(await this.store.read(), request.teamId, request.fromSeatId);
     const done = await this.betweenTurns(from, async () => this.store.withGoalLock(request.goalId, async () => {
       const saved = await this.store.readRuntimeFile(seatRecordName(from.id, request.goalId, request.outcomeId));
-      if (saved && (!ownsSeatRecord(this.store.runtimeDir, from.id, request.goalId, request.outcomeId, saved) || saved.prUrl || saved.retainedPrUrl)) {
-        throw new Error("Resolve the seat's retained PR or uncertain runtime record before reassigning its work.");
+      let branch = `${from.id}/${request.goalId}-${request.outcomeId}`;
+      if (saved !== undefined) {
+        if (!ownsSeatRecord(this.store.runtimeDir, from.id, request.goalId, request.outcomeId, saved) || saved.prUrl || saved.retainedPrUrl) {
+          throw new Error("Resolve the seat's retained PR or uncertain runtime record before reassigning its work.");
+        }
+        branch = saved.branch;
+      }
+      const team = teamOf(await this.store.read(), request.teamId);
+      const github = team.project?.github;
+      // Keep the source turn and goal locked through the lookup and commit so its runner cannot open a PR between them.
+      if (await this.ports.branchHasNoPr(team, branch).catch(() => false) !== true) {
+        throw new Error("Cannot verify the source branch has no PR; resolve its PR state before reassigning its work.");
       }
       await this.store.update((state) => {
+        if (teamOf(state, request.teamId).project?.github !== github) throw new Error("Team project changed; check its PR state again before reassigning work.");
         const source = seatOf(state, request.teamId, from.id);
         const target = seatOf(state, request.teamId, request.toSeatId);
         const goal = state.planningGoals?.find((item) => item.id === request.goalId && item.teamId === request.teamId);

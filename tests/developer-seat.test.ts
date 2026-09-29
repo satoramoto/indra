@@ -12,6 +12,8 @@ import { ImplementationRecorder, implementationWallTime } from "../src/implement
 import { AgentRunError } from "../src/runtime-facts.js";
 import { parseOptions } from "../src/cli.js";
 import type { SeatRecord, TeamRecord } from "../src/state-domain.js";
+import { SeatLifecycle } from "../src/seat-lifecycle.js";
+import { branchHasNoPr } from "../src/seat-provisioning.js";
 
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
@@ -237,6 +239,44 @@ describe("developer seat", () => {
     expect(codex.runs).toHaveLength(1);
     expect(shell.calls.some((call) => call.startsWith("gh pr merge"))).toBe(false);
     expect(chat.messages.join("\n")).not.toMatch(/private stdout|private stderr/);
+  });
+
+  it("prevents reassignment and retirement when pr edit fails after a PR opens but before its URL is saved", async () => {
+    const { store, shell, seat, assignment } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
+    const run = shell.run.bind(shell);
+    let opened = false;
+    const calls = vi.spyOn(shell, "run").mockImplementation(async (command, args, cwd) => {
+      if (command === "gh" && args[0] === "pr" && args[1] === "edit") {
+        opened = true;
+        return { code: 1, stdout: "", stderr: "" };
+      }
+      if (command === "gh" && args[0] === "api" && args[1] === "repos/satoramoto/indra/pulls") {
+        return { code: 0, stdout: JSON.stringify(opened ? [{ html_url: PR, state: "open", head: { ref: BRANCH }, base: { ref: "main" } }] : []), stderr: "" };
+      }
+      return await run(command, args, cwd);
+    });
+    await seat.tick();
+    const failed = await assignment("outcome-1");
+    const record = await store.readRuntimeFile<SeatTaskRecord>(RECORD);
+    expect(opened).toBe(true);
+    expect(failed.status).toBe("failed");
+    expect(failed.prUrl).toBeUndefined();
+    expect(record).toMatchObject({ branch: BRANCH, step: "build" });
+    expect(record!.prUrl).toBeUndefined();
+    const retireSeat = vi.fn(async () => {});
+    const lifecycle = new SeatLifecycle(store, { credentialIdentity: async () => undefined, workSettled: async () => true,
+      branchHasNoPr: (team, branch) => branchHasNoPr(store.checkout, team, branch, shell), startSeat: async () => {}, retireSeat });
+    const expected = ((await store.read()).teams as TeamRecord[])[0].seats[1];
+    await lifecycle.remove({ teamId: "team-001", seatId: expected.id, expected });
+    const before = await store.read();
+    await expect(lifecycle.reassign({ teamId: "team-001", goalId: "goal-abc", outcomeId: "outcome-1", fromSeatId: "seat-002",
+      toSeatId: "seat-003", updatedAt: failed.updatedAt, reason: "Move remaining work" })).rejects.toThrow("source branch");
+    await lifecycle.reconcile();
+    expect(calls).toHaveBeenCalledWith("gh", ["api", "repos/satoramoto/indra/pulls", "--method", "GET",
+      "-f", "state=all", "-f", `head=satoramoto:${BRANCH}`, "-f", "per_page=1"], store.checkout);
+    expect(await store.read()).toEqual(before);
+    expect(await store.readRuntimeFile(RECORD)).toEqual(record);
+    expect(retireSeat).not.toHaveBeenCalled();
   });
 
   it("rechecks implement under the goal lock when release wins the claim race", async () => {

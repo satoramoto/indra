@@ -2,9 +2,10 @@ import { randomUUID } from "node:crypto";
 import { copyFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import type { Shell } from "../src/command-shell.js";
 import { PlanningStore } from "../src/planning.js";
 import { botTokenRef } from "../src/planning-mattermost.js";
-import { createOwnerControls, credentialIdentity } from "../src/seat-provisioning.js";
+import { branchHasNoPr, createOwnerControls, credentialIdentity } from "../src/seat-provisioning.js";
 import type { SeatRecord, TeamRecord } from "../src/state-domain.js";
 import { stateCheckout } from "./state-checkout.js";
 
@@ -12,6 +13,42 @@ const pending: SeatRecord = { id: "seat-new", displayName: "Product", roles: ["P
 const me = { id: "bot-user-id", username: "yahaha-product", is_bot: true, delete_at: 0 };
 const credential = async () => ({});
 const unused = async () => randomUUID();
+
+describe("source branch PR reconciliation", () => {
+  const team: TeamRecord = { id: "team-001", slug: "yahaha", displayName: "Yahaha", project: { github: "o/r" },
+    externalIdentities: { mattermost: { teamId: "mm-team" } }, seats: [pending] };
+  const branch = "seat-002/goal-test-outcome-1-attempt-00000000-0000-4000-8000-000000000001";
+
+  it("confirms absence with an owner GET for the exact repository and head across all PR states and bases", async () => {
+    const run = vi.fn<Shell["run"]>(async () => ({ code: 0, stdout: "[]", stderr: "" }));
+    expect(await branchHasNoPr("/state", team, branch, { run })).toBe(true);
+    expect(run).toHaveBeenCalledExactlyOnceWith("gh", ["api", "repos/o/r/pulls", "--method", "GET",
+      "-f", "state=all", "-f", `head=o:${branch}`, "-f", "per_page=1"], "/state");
+  });
+
+  it.each(["open", "closed", "merged"])("keeps work with a remote %s PR, including a PR still targeting main", async (state) => {
+    const run = vi.fn<Shell["run"]>(async () => ({ code: 0, stderr: "", stdout: JSON.stringify([
+      { html_url: "https://github.com/o/r/pull/1", state: state === "open" ? "open" : "closed", merged_at: state === "merged" ? "2026-01-01T00:00:00Z" : null,
+        head: { ref: branch }, base: { ref: "main" } },
+    ]) }));
+    expect(await branchHasNoPr("/state", team, branch, { run })).toBe(false);
+  });
+
+  it.each([
+    ["failed command", 1, "[]"], ["empty response", 0, ""], ["malformed JSON", 0, "private diagnostics"],
+    ["unexpected object", 0, "{}"], ["null", 0, "null"],
+  ])("refuses transfer on %s", async (_name, code, stdout) => {
+    expect(await branchHasNoPr("/state", team, branch, { run: async () => ({ code: Number(code), stdout: String(stdout), stderr: "private diagnostics" }) })).toBe(false);
+  });
+
+  it("refuses missing or invalid projects and transport errors without exposing diagnostics", async () => {
+    const run = vi.fn<Shell["run"]>(async () => { throw new Error("private diagnostics"); });
+    expect(await branchHasNoPr("/state", { ...team, project: undefined }, branch, { run })).toBe(false);
+    expect(await branchHasNoPr("/state", { ...team, project: { github: "../r" } }, branch, { run })).toBe(false);
+    expect(run).not.toHaveBeenCalled();
+    expect(await branchHasNoPr("/state", team, branch, { run })).toBe(false);
+  });
+});
 
 describe("credential identity verification", () => {
   it("reads the exact bot's item and only GETs the authenticated user, refusing redirects", async () => {
