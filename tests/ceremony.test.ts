@@ -338,7 +338,7 @@ describe("legacy migration", () => {
   it("validates a migration against the original record and keeps unknown times unknown", async () => {
     const item = staged("retro"); delete item.ceremony;
     const persistence = await store([item]);
-    const result = migrateLegacyCeremony(item, at(10));
+    const result = migrateLegacyCeremony(item, at(10), false);
     if (result.status !== "ready") throw new Error("Expected migration");
     for (const mutate of [
       (goal: PlanningGoal) => { goal.proposal!.summary = "Replace the approved plan"; },
@@ -351,13 +351,14 @@ describe("legacy migration", () => {
       }, "Rewrite legacy history")).rejects.toThrow();
     }
     expect((await persistence.read()).planningGoals![0]).toEqual(item);
-    await persistence.migrateLegacyGoals(at(10));
+    await persistence.migrateLegacyGoals(at(10), async () => false);
     expect((await persistence.read()).planningGoals![0]).toEqual({ ...item, ceremony: result.ceremony });
   });
   it("closes an approved, merged legacy goal at release without claiming a human approval, running build or retro", () => {
     const item = staged("retro"); delete item.ceremony;
     const before = structuredClone(item);
-    const migrated = migrateLegacyCeremony(item, at(10));
+    expect(migrateLegacyCeremony(item, at(10))).toMatchObject({ status: "conflict", reason: expect.stringContaining("could not be inspected") });
+    const migrated = migrateLegacyCeremony(item, at(10), false);
     if (migrated.status !== "ready") throw new Error("Expected migration");
     expect(migrated.ceremony.stage).toBe("release");
     expect(migrated.ceremony.history.map((entry) => entry.stage === "implement" || entry.stage === "release" ? entry.evidence.kind : entry.stage)).toEqual(["planning", "proposal", "legacy-approval", "legacy-implementation"]);
@@ -391,7 +392,7 @@ describe("legacy migration", () => {
     const persistence = await store([first, second]);
     expect(await persistence.teamConflicts()).toEqual([{ teamId: "team-one", goalIds: ["goal-one", "goal-two"] }]);
     await expect(persistence.createGoal(goal("goal-three"))).rejects.toThrow("goal-one, goal-two");
-    await persistence.migrateLegacyGoals(at(10));
+    await persistence.migrateLegacyGoals(at(10), async () => false);
     expect(git(persistence.checkout, "rev-list", "--count", "HEAD").trim()).toBe("3");
     expect(openGoalConflicts((await persistence.read()).planningGoals!)).toEqual([]);
     expect((await persistence.read()).planningGoals?.map((item) => [item.id, item.ceremony?.stage, !!item.ceremony?.closure])).toEqual([["goal-one", "release", true], ["goal-two", "planning", false]]);

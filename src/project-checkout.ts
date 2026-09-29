@@ -44,3 +44,26 @@ export async function ensureProjectCheckout(shell: Shell, runtimeDir: string, gi
     return dir;
   }, 30 * 60_000); // Another seat may be cloning a large project.
 }
+
+/** The file whose presence in a merge commit shows that the commit carries the sprint ceremony. */
+export const CEREMONY_SOURCE = "src/ceremony.ts";
+
+/**
+ * Whether commit `sha` in the Git checkout `dir` contains the ceremony code. Undefined when the commit itself is not
+ * available there, so the caller can report it instead of guessing.
+ */
+export async function commitHasCeremony(shell: Shell, dir: string, sha: string): Promise<boolean | undefined> {
+  if (!/^[0-9a-f]{40}$/.test(sha)) return undefined;
+  const commit = await shell.run("git", ["cat-file", "-e", `${sha}^{commit}`], dir);
+  if (commit.code !== 0) return undefined;
+  return (await shell.run("git", ["cat-file", "-e", `${sha}:${CEREMONY_SOURCE}`], dir)).code === 0;
+}
+
+/**
+ * Whether a legacy sprint's merged integration commit was released with the ceremony: fetches Indra's clone of the
+ * team's project, then inspects the commit. Undefined when the clone, the fetch or the commit is unavailable.
+ */
+export async function mergedWithCeremony(shell: Shell, runtimeDir: string, github: string, sha: string): Promise<boolean | undefined> {
+  try { return await commitHasCeremony(shell, await ensureProjectCheckout(shell, runtimeDir, github), sha); }
+  catch { return undefined; }
+}

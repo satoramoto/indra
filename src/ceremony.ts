@@ -315,14 +315,18 @@ export function closeRevertedRelease(goal: PlanningGoal, at: string): CeremonyRe
 
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 /** Store-level guard: legacy workflow changes need migration; durable history cannot be erased or rewritten. */
-export function validateCeremonyMutation(before: PlanningGoal, after: PlanningGoal | undefined): void {
+/**
+ * `releasedWithCeremony` is the store's check of a legacy goal's merged integration commit (see `migrateLegacyCeremony`);
+ * without it, a merged legacy sprint cannot be migrated.
+ */
+export function validateCeremonyMutation(before: PlanningGoal, after: PlanningGoal | undefined, releasedWithCeremony?: boolean): void {
   requireThat(after && after.teamId === before.teamId && after.createdAt === before.createdAt, "A ceremony goal cannot be removed or moved to another team.");
   if (!before.ceremony) {
     requireThat((["stage", "proposal", "assignments", "integration"] as const).every((key) => same(before[key], after[key])), "Legacy goals require evidence-based migration before workflow changes; migration must preserve the original workflow.");
     const next = after.ceremony;
     if (!next) return;
     requireThat(next.migratedAt, "Existing goals require explicit evidence-based migration.");
-    const migration = migrateLegacyCeremony(before, next.migratedAt);
+    const migration = migrateLegacyCeremony(before, next.migratedAt, releasedWithCeremony);
     requireThat(migration.status === "ready" && same(migration.ceremony, next), "Migration must preserve known history and leave unproven history unknown.");
     return;
   }
@@ -332,6 +336,9 @@ export function validateCeremonyMutation(before: PlanningGoal, after: PlanningGo
   if (CEREMONY_STAGES.indexOf(old.stage) >= 2) requireThat(same(before.proposal, after.proposal), "An approved proposal is immutable.");
   if (CEREMONY_STAGES.indexOf(old.stage) >= 3) requireThat(same(before.assignments, after.assignments), "Implementation assignments are frozen once release starts.");
   requireThat(next.history.length >= old.history.length && next.history.length <= old.history.length + 1 && old.history.every((entry, i) => same(entry, next.history[i])), "Ceremony history is append-only, one stage at a time.");
+  // Legacy evidence exists only in a whole-ceremony migration; a live transition must bring native proof.
+  const appended = next.history[old.history.length];
+  if (appended && "evidence" in appended) requireThat(appended.evidence.kind !== "legacy-approval" && appended.evidence.kind !== "legacy-implementation", "Only legacy migration records legacy evidence.");
   if (old.closure) requireThat(same(old, next), "A closed ceremony is immutable.");
   if (old.stage === "release" && next.stage === "retro") requireThat(after.integration?.status === "merged", "A running release requires a merged integration PR that has not been reverted.");
   if (next.closure && !old.closure) {
@@ -348,11 +355,13 @@ export type LegacyMigration = { status: "ready"; ceremony: CeremonyRecord } | { 
  * - clarifying → planning; drafting or awaiting-review → proposal;
  * - approved with one assignment per outcome → implement, while the sprint is collecting or has no integration yet;
  * - every assignment merged or failed (one merged at least) with an integration PR → release;
- * - finished goals close at release, marked as a legacy migration: a merged integration with no revert PR open, a
- *   reverted integration, or no integration at all with every assignment merged.
+ * - finished goals close at release, marked as a legacy migration: a merged integration with no revert PR open whose
+ *   merge commit lacks the ceremony code (`releasedWithCeremony` false), a reverted integration, or no integration at
+ *   all with every assignment merged. A merge commit that contains the ceremony leaves the goal open in release, and
+ *   one that could not be inspected (`releasedWithCeremony` undefined) is a conflict.
  * Evidence that does not fit these shapes is reported as a conflict and the goal is left untouched.
  */
-export function migrateLegacyCeremony(goal: PlanningGoal, at: string): LegacyMigration {
+export function migrateLegacyCeremony(goal: PlanningGoal, at: string, releasedWithCeremony?: boolean): LegacyMigration {
   requireThat(!goal.ceremony, "Goal already has a ceremony.");
   const conflict = (reason: string): LegacyMigration => ({ status: "conflict", reason });
   const history: CeremonyEntry[] = [{ stage: "planning", enteredAt: goal.createdAt }];
@@ -386,7 +395,12 @@ export function migrateLegacyCeremony(goal: PlanningGoal, at: string): LegacyMig
   release();
   const recorded = { prUrl: integration.prUrl, mergedSha: integration.mergedSha };
   if (integration.status === "reverted") return done({ kind: "legacy-migration", integration: "reverted", ...recorded, revertPrUrl: integration.revertPrUrl });
-  if (integration.status === "merged" && !integration.revertPrUrl) return done({ kind: "legacy-migration", integration: "merged", ...recorded });
+  if (integration.status === "merged" && !integration.revertPrUrl) {
+    // A sprint whose merge commit already carries the ceremony was released by it: its running-build check and retro still follow.
+    if (releasedWithCeremony === undefined) return conflict(`its integration ${integration.prUrl} merged as ${integration.mergedSha}, but that commit could not be inspected in the project checkout to tell whether it contains the ceremony (src/ceremony.ts).`);
+    if (releasedWithCeremony) return done();
+    return done({ kind: "legacy-migration", integration: "merged", ...recorded });
+  }
   // An open integration PR, or a merged one with its revert PR open, still needs the owner: it enters release.
   return done();
 }

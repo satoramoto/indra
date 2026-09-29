@@ -18,10 +18,17 @@ export function legacyMigrationSummary(ceremony: CeremonyRecord): string {
 export function legacyMigrationBlocker(goal: PlanningGoal, at = new Date().toISOString()): string | undefined {
   if (goal.ceremony) return undefined;
   try {
-    const result = migrateLegacyCeremony(goal, at);
-    return result.status === "conflict" ? `evidence conflicts: ${result.reason} Fix it in indra-state; Indra will not guess.` : "not migrated yet; restart Indra to migrate it.";
+    const results = [false, true].map((released) => migrateLegacyCeremony(goal, at, released));
+    const integration = goal.integration;
+    // A merged sprint also depends on inspecting its merge commit, which only start-up migration does.
+    if (results.some((result) => result.status === "ready")) return integration?.status === "merged" && !integration.revertPrUrl
+      ? "not migrated yet, or its merge commit could not be inspected in the project checkout; restart Indra to migrate it." : "not migrated yet; restart Indra to migrate it.";
+    const conflict = results.find((result) => result.status === "conflict");
+    return `evidence conflicts: ${conflict?.status === "conflict" ? conflict.reason : "unknown"} Fix it in indra-state; Indra will not guess.`;
   } catch (error) { return `evidence conflicts: ${error instanceof Error ? error.message : String(error)}`; }
 }
+/** Whether a legacy sprint's merged integration commit contains the ceremony code; undefined when it cannot be inspected. */
+export type CeremonyReleaseCheck = (goal: PlanningGoal, mergedSha: string) => Promise<boolean | undefined>;
 
 export interface PlanningGoal {
   id: string; teamId: string; seatId: string; participantSeatIds: string[]; goal: string; projectRefs: string[];
@@ -227,25 +234,37 @@ export class PlanningStore {
    * commit per goal through the normal write path. Goals whose evidence conflicts, or whose write fails, are left
    * unchanged and reported. Running it again changes nothing.
    */
-  async migrateLegacyGoals(at = new Date().toISOString()): Promise<LegacyGoalMigration[]> {
-    const legacy = ((await this.read()).planningGoals ?? []).filter((goal) => !goal.ceremony).map((goal) => goal.id);
-    if (!legacy.length) return [];
+  async migrateLegacyGoals(at = new Date().toISOString(), releasedWithCeremony: CeremonyReleaseCheck = async () => undefined): Promise<LegacyGoalMigration[]> {
+    const goals = ((await this.read()).planningGoals ?? []).filter((goal) => !goal.ceremony);
+    if (!goals.length) return [];
     assertCeremonyReady(this.ceremonyWrites);
     const results: LegacyGoalMigration[] = [];
-    for (const id of legacy) {
+    for (const legacy of goals) {
+      const id = legacy.id;
       let result: LegacyMigration | undefined;
       try {
+        // Only a merged integration without a revert PR needs its merge commit inspected; the answer is fixed for this write.
+        const integration = legacy.integration;
+        const released = integration?.status === "merged" && !integration.revertPrUrl && integration.mergedSha
+          ? await releasedWithCeremony(legacy, integration.mergedSha).catch(() => undefined) : undefined;
+        this.releaseFacts.set(id, released);
         await this.update((state) => {
           const goal = state.planningGoals?.find((item) => item.id === id);
-          if (!goal || goal.ceremony) return;
-          result = migrateLegacyCeremony(goal, at);
+          if (!goal || goal.ceremony || JSON.stringify(goal.integration) !== JSON.stringify(integration)) return;
+          result = migrateLegacyCeremony(goal, at, released);
           if (result.status === "ready") goal.ceremony = result.ceremony;
         }, () => `Migrate legacy goal ${id} into the ceremony: ${result?.status === "ready" ? legacyMigrationSummary(result.ceremony) : "unchanged"}`);
-      } catch (error) { result = { status: "conflict", reason: `its migration could not be written: ${error instanceof Error ? error.message : String(error)}` }; }
+      } catch (error) {
+        // Someone's uncommitted edits block every write alike: one start-up error, not a conflict per goal.
+        if (await new StateGit(this.checkout).dirty()) throw error;
+        result = { status: "conflict", reason: `its migration could not be written: ${error instanceof Error ? error.message : String(error)}` };
+      } finally { this.releaseFacts.delete(id); }
       if (result) results.push({ goalId: id, ...(result.status === "ready" ? { status: "migrated", summary: legacyMigrationSummary(result.ceremony) } : { status: "conflict", reason: result.reason }) });
     }
     return results;
   }
+  /** Start-up migration's merge-commit checks, keyed by goal, for the write guard of that one migration. */
+  private readonly releaseFacts = new Map<string, boolean | undefined>();
   async teamConflicts(): Promise<TeamGoalConflict[]> { return openGoalConflicts((await this.read()).planningGoals ?? []); }
   /**
    * Applies one change to state.json and commits it in the checkout with `message`, under a lock
@@ -319,7 +338,7 @@ export class PlanningStore {
     let changed = false;
     for (const old of oldGoals) {
       const next = nextGoals.find((goal) => goal.id === old.id);
-      if (active) validateCeremonyMutation(old, next);
+      if (active) validateCeremonyMutation(old, next, this.releaseFacts.get(old.id));
       if ((old.ceremony || next?.ceremony) && JSON.stringify(old) !== JSON.stringify(next)) changed = true;
     }
     const added = nextGoals.filter((goal) => !oldGoals.some((old) => old.id === goal.id));
