@@ -155,12 +155,46 @@ describe("self-update", () => {
     expect(await npmCalls()).toEqual([]);
   });
 
-  it("leaves a checkout on another branch alone", async () => {
+  it("follows origin/main on main", async () => {
+    const { app, updater, merge } = await fixture();
+    await merge("code.ts", "export const version = 2;\n");
+    expect(await updater.check()).toMatchObject({ outcome: "built", following: "origin/main" });
+    expect(await readFile(join(app, "code.ts"), "utf8")).toBe("export const version = 2;\n");
+  });
+
+  it("follows another branch's upstream and ignores origin/main", async () => {
+    const { app, remote, updater, merge } = await fixture();
+    const other = join(app, "..", "other");
+    execFileSync("git", ["clone", "--quiet", remote, other]);
+    git(other, "checkout", "--quiet", "-b", "hotfix");
+    git(other, "push", "--quiet", "-u", "origin", "hotfix");
+    git(app, "fetch", "--quiet", "origin");
+    git(app, "checkout", "--quiet", "--track", "origin/hotfix");
+    await merge("code.ts", "export const version = 2;\n");
+    await writeFile(join(other, "code.ts"), "export const version = 3;\n");
+    git(other, "commit", "--quiet", "-am", "Hotfix");
+    git(other, "push", "--quiet");
+    expect(await updater.check()).toMatchObject({ outcome: "built", following: "origin/hotfix" });
+    expect(head(app)).toBe(head(other));
+    expect(await readFile(join(app, "code.ts"), "utf8")).toBe("export const version = 3;\n");
+  });
+
+  it("leaves a branch with no upstream alone", async () => {
     const { app, updater, npmCalls, merge } = await fixture();
     git(app, "checkout", "--quiet", "-b", "feature");
     const before = head(app);
     await merge("code.ts", "export const version = 2;\n");
-    expect(await updater.check()).toMatchObject({ outcome: "blocked", message: "the Indra checkout is on feature, not main" });
+    expect(await updater.check()).toMatchObject({ outcome: "blocked", message: "not following a branch: feature has no upstream on origin" });
+    expect(head(app)).toBe(before);
+    expect(await npmCalls()).toEqual([]);
+  });
+
+  it("leaves a detached HEAD alone", async () => {
+    const { app, updater, npmCalls, merge } = await fixture();
+    git(app, "checkout", "--quiet", "--detach");
+    const before = head(app);
+    await merge("code.ts", "export const version = 2;\n");
+    expect(await updater.check()).toMatchObject({ outcome: "blocked", message: "not following a branch: the Indra checkout has a detached HEAD" });
     expect(head(app)).toBe(before);
     expect(await npmCalls()).toEqual([]);
   });

@@ -15,7 +15,7 @@ export { IN_USE, processStart, recordRunningBuild, type RunningBuildReceipt } fr
  * says what is waiting.
  */
 export type UpdateOutcome = "up-to-date" | "built" | "blocked" | "failed" | "paused";
-export interface UpdateResult { outcome: UpdateOutcome; message: string; at: string; /** `npm ci` failed: node_modules may be broken, so nothing is restarted until an install succeeds. */ installFailed?: boolean }
+export interface UpdateResult { outcome: UpdateOutcome; message: string; at: string; /** `npm ci` failed: node_modules may be broken, so nothing is restarted until an install succeeds. */ installFailed?: boolean; /** The upstream being followed, e.g. `origin/hotfix`. */ following?: string }
 
 /** The owner's auto-update setting, kept in `<runtimeDir>/self-update.json` so it survives reloads and restarts. */
 export interface UpdateSettings {
@@ -109,19 +109,22 @@ export class SelfUpdater {
 
   private async checkCheckout(): Promise<UpdateResult> {
     const at = new Date().toISOString();
-    const result = (outcome: UpdateOutcome, message: string): UpdateResult => ({ outcome, message, at });
-    if (await this.paused()) return this.pausedCheck(at);
+    let following: string | undefined;
+    const result = (outcome: UpdateOutcome, message: string): UpdateResult => ({ outcome, message, at, ...(following ? { following } : {}) });
     try {
-      const branch = await this.git("rev-parse", "--abbrev-ref", "HEAD");
-      if (branch !== "main") return result("blocked", `the Indra checkout is on ${branch}, not main`);
+      const target = await this.upstream();
+      if (typeof target === "string") return result(await this.paused() ? "paused" : "blocked", target);
+      const { local, branch } = target;
+      following = `origin/${branch}`;
+      if (await this.paused()) return this.pausedCheck(at, branch);
       if (await this.git("--no-optional-locks", "status", "--porcelain", "--untracked-files=no")) return result("blocked", "the Indra checkout has uncommitted changes");
-      try { await this.git("fetch", "--quiet", "origin", "main"); }
-      catch (error) { return result("blocked", `could not fetch origin/main: ${reason(error)}`); }
-      const [ahead, behind] = (await this.git("rev-list", "--left-right", "--count", "HEAD...origin/main")).split(/\s+/).map(Number);
-      if (ahead > 0 && behind > 0) return result("blocked", "main has diverged from origin/main");
+      try { await this.git("fetch", "--quiet", "origin", branch); }
+      catch (error) { return result("blocked", `could not fetch ${following}: ${reason(error)}`); }
+      const [ahead, behind] = (await this.git("rev-list", "--left-right", "--count", `HEAD...${following}`)).split(/\s+/).map(Number);
+      if (ahead > 0 && behind > 0) return result("blocked", `${local} has diverged from ${following}`);
       if (behind > 0) {
-        try { await this.git("pull", "--ff-only", "--quiet", "origin", "main"); }
-        catch (error) { return result("blocked", `could not fast-forward main: ${reason(error)}`); }
+        try { await this.git("pull", "--ff-only", "--quiet", "origin", branch); }
+        catch (error) { return result("blocked", `could not fast-forward ${local}: ${reason(error)}`); }
       }
       const head = await this.git("rev-parse", "HEAD");
       const built = await readBuildStamp(this.appDir);
@@ -152,14 +155,25 @@ export class SelfUpdater {
     } catch (error) { return result("blocked", `update check failed: ${reason(error)}`); }
   }
 
-  /** While paused, a check only fetches and says how many commits wait on origin/main; it never pulls, builds or switches. */
-  private async pausedCheck(at: string): Promise<UpdateResult> {
-    const done = (message: string): UpdateResult => ({ outcome: "paused", message, at });
+  /** The checkout's branch and its upstream branch on origin, or why there is nothing to follow. */
+  private async upstream(): Promise<{ local: string; branch: string } | string> {
+    const local = await this.git("rev-parse", "--abbrev-ref", "HEAD");
+    if (local === "HEAD") return "not following a branch: the Indra checkout has a detached HEAD";
+    const remote = await this.git("config", "--get", `branch.${local}.remote`).catch(() => "");
+    const merge = await this.git("config", "--get", `branch.${local}.merge`).catch(() => "");
+    if (remote !== "origin" || !merge.startsWith("refs/heads/")) return `not following a branch: ${local} has no upstream on origin`;
+    return { local, branch: merge.slice("refs/heads/".length) };
+  }
+
+  /** While paused, a check only fetches and says how many commits wait upstream; it never pulls, builds or switches. */
+  private async pausedCheck(at: string, branch: string): Promise<UpdateResult> {
+    const following = `origin/${branch}`;
+    const done = (message: string): UpdateResult => ({ outcome: "paused", message, at, following });
     try {
-      await this.git("fetch", "--quiet", "origin", "main");
-      const behind = Number(await this.git("rev-list", "--count", "HEAD..origin/main"));
-      return done(behind ? `${behind} new commit${behind === 1 ? "" : "s"} waiting on origin/main` : "no new commits on origin/main");
-    } catch (error) { return done(`could not check origin/main: ${reason(error)}`); }
+      await this.git("fetch", "--quiet", "origin", branch);
+      const behind = Number(await this.git("rev-list", "--count", `HEAD..${following}`));
+      return done(behind ? `${behind} new commit${behind === 1 ? "" : "s"} waiting on ${following}` : `no new commits on ${following}`);
+    } catch (error) { return done(`could not check ${following}: ${reason(error)}`); }
   }
 
   async paused(): Promise<boolean> { return (await readUpdateSettings(this.runtimeDir)).paused; }
