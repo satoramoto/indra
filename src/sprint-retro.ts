@@ -1,17 +1,18 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { execFile } from "node:child_process";
+import { execCommand } from "./command-shell.js";
+import { gitCommand } from "./git-gh.js";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import { CEREMONY_STAGES, validateCeremony, type CeremonyStage } from "./ceremony.js";
 import type { CeremonyRuntimeFacts } from "./ceremony-ports.js";
 import type { AgentResult, AgentRuntime } from "./codex-runtime.js";
 import { implementationSeatWallTimes, type ImplementationFacts } from "./implementation-facts.js";
 import type { PlanningGoal } from "./planning.js";
-import { childEnv } from "./op-env.js";
 import { redactSecrets } from "./redact.js";
 import { schemaPathOf } from "./reload.js";
 import { normalizeUsage } from "./runtime-facts.js";
+import { releaseRounds, type ReleaseFacts } from "./release-facts.js";
 
 const schema = schemaPathOf(import.meta.url, "retro.json");
 export const RETRO_LIMITS = { records: 2_000, text: 2_000, snapshotBytes: 128_000 } as const;
@@ -25,7 +26,7 @@ type RuntimeSession = CeremonyRuntimeFacts["sessions"][number] & {
 export interface RetroInput {
   goal: PlanningGoal;
   /** Aggregate facts must be captured at cutoffAt; the shared port has no per-review/seat timestamps. */
-  facts: CeremonyRuntimeFacts & { sessions: RuntimeSession[] };
+  facts: CeremonyRuntimeFacts & { sessions: RuntimeSession[]; releaseFacts?: ReleaseFacts };
   cutoffAt: string;
   /** Coverage gaps reported by the recording adapter, including unavailable historical attempts. */
   missing?: readonly string[];
@@ -324,14 +325,15 @@ function phaseFacts(input: RetroInput, stages: RetroEvidenceSnapshot["stages"], 
 
   const work = implementationPhase(input, reviews, rounds, missing);
   const release = goal.ceremony!.history.find((entry) => entry.stage === "retro")!.evidence;
-  // No recorder captures integration PR conflict or merge rounds yet; the phase table shows them as unknown.
+  const integration = releaseRounds(input.facts.releaseFacts, goal.id, release.prUrl, input.cutoffAt);
+  for (const gap of integration.missing) missing.add(gap);
   const running = Date.parse(time(release.runningAt)) - Date.parse(time(release.approval.at));
   return [
     { phase: "planning", facts: [fact("planning-turns", "Clarification turns", turns), fact("planning-failures", "Failed clarification turns", failed(CLARIFY_FAILURE, turns))] },
     { phase: "proposal", facts: [fact("proposal-drafts", "Draft attempts", drafts), fact("proposal-draft-failures", "Failed draft attempts", failed(DRAFT_FAILURE, drafts)),
       fact("proposal-approval-wait", "Draft waiting for plan approval", wait !== null && wait >= 0 ? wait : null, "ms")] },
     work,
-    { phase: "release", facts: [fact("release-integration-conflicts", "Integration PR conflict rounds", null), fact("release-merge-rounds", "Integration PR merge rounds", null),
+    { phase: "release", facts: [fact("release-integration-conflicts", "Integration PR conflict rounds", integration.conflict), fact("release-merge-rounds", "Integration PR merge rounds", integration.merge),
       fact("release-approval-to-running", "From merge approval to the new build running (includes CI wait, merge and build)", running >= 0 ? running : null, "ms")] },
     { phase: "retro", facts: [fact("retro-drafts", "Draft attempts, including this one", retro.failed + 1), fact("retro-failed-drafts", "Failed or aborted draft attempts", retro.failed),
       fact("retro-first-error", "First failed attempt's error kind", retro.firstErrorKind, "text"), fact("retro-last-error", "Last failed attempt's error kind", retro.lastErrorKind, "text")] },
@@ -424,7 +426,11 @@ function phaseChoices(stages: RetroEvidenceSnapshot["stages"], phases: RetroPhas
     }
     if (name === "release") {
       if (get("release-approval-to-running") !== null) measured(name, "release-approval-to-running", `The new build was recorded running ${duration(get("release-approval-to-running"))} after the merge approval (includes CI wait, merge and build).`);
-      add(name, "release-integration-conflicts", "unknown", "Integration PR conflict and merge rounds are not recorded.");
+      const conflicts = get("release-integration-conflicts"); const merges = get("release-merge-rounds");
+      if (conflicts === null) add(name, "release-integration-conflicts", "unknown", "Integration PR conflict rounds are unknown because the recorded history is incomplete.");
+      else add(name, "release-integration-conflicts", conflicts ? "slowed" : "worked", `Integration PR observations recorded ${conflicts} conflict episode(s); repeated polling is counted once per episode.`);
+      if (merges === null) add(name, "release-merge-rounds", "unknown", "Integration PR merge rounds are unknown because the recorded attempt history is incomplete.");
+      else measured(name, "release-merge-rounds", `Integration PR merging recorded ${merges} command attempt(s), including failed attempts; repeated polling is not a merge round.`);
     }
     if (name === "retro") {
       const failed = get("retro-failed-drafts")!;
@@ -442,7 +448,11 @@ function phaseProposals(phases: RetroPhase[]): RetroProposal[] {
   if (numeric(phase("planning"), "planning-failures")) add("planning", "planning-failures", "Consider investigating the recorded clarification failures.");
   if (numeric(phase("proposal"), "proposal-draft-failures")) add("proposal", "proposal-draft-failures", "Consider investigating the recorded proposal draft failures.");
   if ((phase("implement").seats?.length ?? 0) > 1 && valueOf(phase("implement"), "implement-slowest-seat") !== null) add("implement", "implement-slowest-seat", "Consider balancing outcome size across seats in future proposals.");
-  add("release", "release-integration-conflicts", "Consider recording integration PR conflict and merge rounds.");
+  if (numeric(phase("release"), "release-integration-conflicts") === null || numeric(phase("release"), "release-merge-rounds") === null) {
+    add("release", "release-integration-conflicts", "Consider improving the incomplete integration PR conflict and merge history.");
+  } else if (numeric(phase("release"), "release-integration-conflicts")) {
+    add("release", "release-integration-conflicts", "Consider reviewing integration timing to reduce the recorded conflict episodes.");
+  }
   if (numeric(phase("retro"), "retro-failed-drafts")) add("retro", "retro-failed-drafts", "Consider investigating the recorded retro draft failures.");
   return result;
 }
@@ -590,10 +600,8 @@ export async function draftSprintRetro(input: RetroInput, runtimeFor: (cwd: stri
   let run: AgentResult; let generation: RetroGeneration | undefined;
   try {
     // Codex requires a Git cwd. No source checkout, history, hooks or repository instructions are copied.
-    await new Promise<void>((resolve, reject) => {
-      execFile("git", ["init", "--quiet", "--template="], { cwd, env: childEnv() }, (error) => error
-        ? reject(new RetroGenerationError("Could not prepare the isolated retro workspace.", undefined, "workspace")) : resolve());
-    });
+    const prepared = await execCommand(gitCommand(["init", "--quiet", "--template="]), { cwd });
+    if (prepared.error) throw new RetroGenerationError("Could not prepare the isolated retro workspace.", undefined, "workspace");
     const failedKind = (value?: RetroGeneration): RetroErrorKind => value?.status === "timed-out" || value?.status === "interrupted" ? value.status : "runtime-failed";
     try { run = await runtimeFor(cwd).message(retroPrompt(snapshot), schema, undefined, { purpose: "retro" }); }
     catch (error) { const failed = generationOf(error, false); throw new RetroGenerationError("Retro generation failed; no retrospective was rendered.", failed, failedKind(failed)); }
