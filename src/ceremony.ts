@@ -216,8 +216,7 @@ function validateApproval(goal: PlanningGoal, evidence: ApprovalEvidence): void 
   requireThat(goal.proposal?.id === evidence.proposalId, "Approval evidence must reference this goal's proposal.");
   validateProvenance(goal, evidence.approval, "proposal", evidence.proposalPostId);
   notBefore(evidence.approval.at, goal.proposal.createdAt);
-  const outcomes = goal.proposal.outcomes;
-  requireThat(goal.assignments?.length === outcomes.length && outcomes.every((outcome) => goal.assignments?.some((assignment) => assignment.outcomeId === outcome.id && (assignment.reassignments?.[0]?.fromSeatId ?? assignment.seatId) === outcome.seatId)), "Approval requires one assignment per proposed outcome, on its proposed seat.");
+  requireThat(assignmentsMatchOutcomes(goal, true), "Approval requires one assignment per proposed outcome, on its proposed seat.");
   requireThat(goal.integration?.branch === `sprint/${goal.id}`, "Approval requires this goal's sprint branch.");
 }
 function validateImplementation(goal: PlanningGoal, evidence: ImplementationEvidence): void {
@@ -235,12 +234,13 @@ function validateImplementation(goal: PlanningGoal, evidence: ImplementationEvid
     requireThat(outcome && assignment?.seatId === item.seatId && assignment.status === "failed", "Only terminal, unmerged outcomes may be explicitly omitted by the owner.");
   }
 }
-function assignmentsMatchOutcomes(goal: PlanningGoal): boolean {
+/** Migration checks current assignments; approval history continues to refer to the original seats after transfers. */
+function assignmentsMatchOutcomes(goal: PlanningGoal, useOriginalSeats = false): boolean {
   const outcomes = goal.proposal?.outcomes ?? [];
-  return outcomes.length > 0 && goal.assignments?.length === outcomes.length && outcomes.every((outcome) => goal.assignments?.some((assignment) => assignment.outcomeId === outcome.id && assignment.seatId === outcome.seatId));
+  return outcomes.length > 0 && goal.assignments?.length === outcomes.length && outcomes.every((outcome) => goal.assignments?.some((assignment) => assignment.outcomeId === outcome.id && (useOriginalSeats ? assignment.reassignments?.[0]?.fromSeatId ?? assignment.seatId : assignment.seatId) === outcome.seatId));
 }
 function validateLegacyApproval(goal: PlanningGoal, evidence: LegacyApprovalEvidence): void {
-  requireThat(goal.stage === "approved" && goal.proposal?.id === evidence.proposalId && assignmentsMatchOutcomes(goal), "Legacy approval requires the approved proposal with one assignment per outcome, on its proposed seat.");
+  requireThat(goal.stage === "approved" && goal.proposal?.id === evidence.proposalId && assignmentsMatchOutcomes(goal, true), "Legacy approval requires the approved proposal with one assignment per outcome, on its proposed seat.");
 }
 function validateLegacyImplementation(goal: PlanningGoal, evidence: LegacyImplementationEvidence): void {
   const outcomes = goal.proposal?.outcomes ?? [];

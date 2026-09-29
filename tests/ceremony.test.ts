@@ -159,9 +159,20 @@ describe("durable autonomy and seat history", () => {
     expect((await persistence.read()).planningGoals![0].automaticApprovals).toEqual([first, next]);
     await expect(persistence.update((state) => { state.planningGoals![0].automaticApprovals!.push({ ...next, at: at(9) }); }, "Duplicate authorization")).rejects.toThrow("once per policy revision");
   });
-  it("keeps retired identities and approved seats while reassigning unfinished work", async () => {
-    const persistence = await store([staged("implement")]);
-    const original = (await persistence.read()).planningGoals![0].proposal;
+  it.each(["native", "legacy"] as const)("keeps retired identities and approved seats while reassigning unfinished work with %s approval", async (approvalKind) => {
+    const item = staged("implement");
+    if (approvalKind === "legacy") delete item.ceremony;
+    const persistence = await store([item]);
+    if (approvalKind === "legacy") {
+      await persistence.migrateLegacyGoals(at(3));
+      expect((await persistence.read()).planningGoals![0].ceremony).toMatchObject({
+        stage: "implement", migratedAt: at(3), history: [
+          { stage: "planning", enteredAt: at(0) }, { stage: "proposal", enteredAt: null },
+          { stage: "implement", enteredAt: null, evidence: { kind: "legacy-approval", proposalId: "proposal-one" } },
+        ],
+      });
+    }
+    const original = (await persistence.read()).planningGoals![0];
     await persistence.update((state) => {
       const team = (state.teams as TeamRecord[])[0];
       team.seats.push({ id: "seat-next", displayName: "Next", roles: ["Developer"], status: "pending", externalIdentities: { mattermost: { username: "next" } } });
@@ -172,6 +183,13 @@ describe("durable autonomy and seat history", () => {
     await persistence.update((state) => {
       const seat = (state.teams as TeamRecord[])[0].seats[2]; seat.status = "active"; seat.externalIdentities.mattermost.userId = "next-bot";
     }, "Activate verified identity");
+    for (const fromSeatId of [undefined, "seat-next"]) {
+      await expect(persistence.update((state) => {
+        const assignment = state.planningGoals![0].assignments![0];
+        assignment.seatId = "seat-next"; assignment.updatedAt = at(4);
+        if (fromSeatId) assignment.reassignments = [{ fromSeatId, toSeatId: "seat-next", at: at(4), reason: "Invalid transfer" }];
+      }, "Reassign without the approved seat")).rejects.toThrow();
+    }
     await persistence.update((state) => {
       const item = state.planningGoals![0].assignments![0];
       item.seatId = "seat-next"; item.updatedAt = at(4); item.status = "queued";
@@ -179,7 +197,9 @@ describe("durable autonomy and seat history", () => {
       (state.teams as TeamRecord[])[0].seats[1].status = "retired";
     }, "Reassign work and retire seat");
     const retired = await persistence.read();
-    expect(retired.planningGoals![0].proposal).toEqual(original);
+    expect(retired.planningGoals![0].proposal).toEqual(original.proposal);
+    expect(retired.planningGoals![0].ceremony).toEqual(original.ceremony);
+    expect(retired.planningGoals![0].assignments![0]).toMatchObject({ seatId: "seat-next", reassignments: [{ fromSeatId: "seat-two", toSeatId: "seat-next", at: at(4), reason: "Retiring seat" }] });
     expect((retired.teams as TeamRecord[])[0].seats[1]).toMatchObject({ id: "seat-two", status: "retired", externalIdentities: { mattermost: { userId: "seat-two" } } });
     for (const mutate of [
       (state: PlanningDocument) => { (state.teams as TeamRecord[])[0].seats.splice(1, 1); },
@@ -191,7 +211,10 @@ describe("durable autonomy and seat history", () => {
       const item = state.planningGoals![0]; prepare(item, "release");
       item.ceremony = advanceCeremony(item, { to: "release", at: at(5), evidence: { ...implementation, outcomes: [{ ...implementation.outcomes[0], seatId: "seat-next" }] } });
     }, "Integrate reassigned work");
-    expect((await persistence.read()).planningGoals![0].ceremony!.history[3]).toMatchObject({ evidence: { outcomes: [{ seatId: "seat-next" }] } });
+    const released = (await persistence.read()).planningGoals![0];
+    expect(released.ceremony!.history[3]).toMatchObject({ evidence: { outcomes: [{ seatId: "seat-next" }] } });
+    expect(released.ceremony!.history.slice(0, 3)).toEqual(original.ceremony!.history);
+    expect(released.proposal).toEqual(original.proposal);
   });
 });
 
@@ -415,6 +438,14 @@ describe("ceremony persistence and team lock", () => {
 });
 
 describe("legacy migration", () => {
+  it("requires the recorded assignees to match the proposal before migration", () => {
+    const item = staged("implement"); delete item.ceremony;
+    Object.assign(item.assignments![0], { seatId: "seat-next", updatedAt: at(4),
+      reassignments: [{ fromSeatId: "seat-two", toSeatId: "seat-next", at: at(4), reason: "Transfer before migration" }],
+    });
+    expect(migrateLegacyCeremony(item, at(5))).toEqual({ status: "conflict", reason: "it is approved, but its assignments do not match its proposed outcomes one to one." });
+    expect(item.ceremony).toBeUndefined();
+  });
   it("requires migration before an activated writer changes a legacy workflow", async () => {
     const item = staged("proposal"); delete item.ceremony;
     const persistence = await store([item]);
