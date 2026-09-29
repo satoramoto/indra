@@ -10,6 +10,10 @@ import {
   type CiState, type PipelineStep, type StageState,
 } from "./hub-format.js";
 import type { TokenUsage } from "./runtime-facts.js";
+import { burnBuckets, paintHex, sparkline, sprintProgress, STAGE_COLOR, type TokenBurn } from "./hub-paint.js";
+import { ProgressBar } from "./hub-canvas.js";
+
+const SPARK_COLOR = "#7DD3FC";
 
 /**
  * The hub's building blocks. Layout target: a 720×720 logical-pixel window (a vertical ultrawide at half height) with a
@@ -149,6 +153,8 @@ export function seatState(model: TerminalUiModel, seat: StateSeat): HubState {
 export interface SeatInfo {
   state: HubState; name: string; role: string; process?: string; harness: string;
   usage?: TokenUsage; claimedAt?: string; endedAt?: string;
+  /** Recorded sessions' tokens by finish time, for the burn sparkline; live rises fill in where there are none. */
+  burn: { at: number; tokens: number }[];
   task?: { title: string; status: string; prUrl?: string; steps: PipelineStep[]; ci?: CiState };
   second: { text: string; color: string };
   activity: string;
@@ -174,6 +180,7 @@ export function seatInfo(model: TerminalUiModel, seat: StateSeat): SeatInfo {
     ...(usage ? { usage } : {}),
     ...(facts?.claimedAt ? { claimedAt: facts.claimedAt } : {}),
     ...(facts?.endedAt ? { endedAt: facts.endedAt } : {}),
+    burn: (facts?.burn ?? []).map((point) => ({ at: Date.parse(point.at), tokens: point.tokens })),
     ...(held ? { task: { title: displayText(held.title, 200), status: displayText(held.status, 20), prUrl: held.prUrl, ci: facts?.ci,
       steps: pipelineSteps({ status: held.status, step: facts?.step, fixRounds: facts?.fixRounds }) } } : {}),
     second,
@@ -189,8 +196,15 @@ const elapsedText = (info: { claimedAt?: string; endedAt?: string }, now: number
 };
 
 /** Two rows per seat: who and how it runs, then what it is doing. */
-export function SeatRow(props: { model: TerminalUiModel; seat: StateSeat; revision: Accessor<number>; pulse: Accessor<boolean>; now: Accessor<number>; width: Accessor<number>; open?: (url: string) => void }) {
+export function SeatRow(props: { model: TerminalUiModel; seat: StateSeat; revision: Accessor<number>; pulse: Accessor<boolean>; now: Accessor<number>; width: Accessor<number>; open?: (url: string) => void; burn?: TokenBurn; truecolor?: boolean }) {
   const info = createMemo(() => { props.revision(); return seatInfo(props.model, props.seat); });
+  // The last hour of token burn in eight 7.5-minute buckets: recorded sessions where the seat has them, else the rises
+  // in its running total the hub has seen.
+  const spark = createMemo(() => {
+    const current = info(); const now = props.now();
+    props.burn?.observe(props.seat.id, totalTokens(current.usage), now);
+    return sparkline(burnBuckets(current.burn.length ? current.burn : props.burn?.live(props.seat.id) ?? [], now, 8));
+  });
   const selected = createMemo(() => { props.revision(); return props.model.seatId === props.seat.id; });
   // The second row's own text comes first; the latest activity gets what is left of the row.
   const secondWidth = () => Math.max(10, props.width() - 8);
@@ -210,12 +224,13 @@ export function SeatRow(props: { model: TerminalUiModel; seat: StateSeat; revisi
       <text>
         <span style={{ fg: selected() ? theme.accent : theme.muted }}>{selected() ? "▶ " : "  "}</span>
         <span style={{ fg: stateColor(info().state, props.pulse()) }}>{HUB_STATE[info().state].icon + " "}</span>
-        <span style={{ fg: selected() ? theme.accent : theme.regular }}>{pad(info().name, 15)}</span>
+        <span style={{ fg: selected() ? theme.accent : theme.regular }}>{pad(info().name, 14)}</span>
         <span style={{ fg: theme.muted }}>{" " + pad(info().role, 9)}</span>
         <span style={{ fg: stateColor(info().state, props.pulse()) }}>{" " + pad(info().process ?? HUB_STATE[info().state].word.toUpperCase(), 13)}</span>
         <span style={{ fg: theme.heading }}>{showHarness() ? " 🤖 " + pad(info().harness, 22) : ""}</span>
-        <span style={{ fg: theme.idle }}>{showElapsed() ? " ⌛ " + pad(elapsedText(info(), props.now()), 6) : ""}</span>
-        <span style={{ fg: theme.accent }}>{" 🧮 Σ" + formatTokens(totalTokens(info().usage))}</span>
+        <span style={{ fg: theme.idle }}>{showElapsed() ? " ⌛ " + pad(elapsedText(info(), props.now()), 5) : ""}</span>
+        <span style={{ fg: paintHex(SPARK_COLOR, props.truecolor ?? true) }}>{" " + spark()}</span>
+        <span style={{ fg: theme.accent }}>{" Σ" + formatTokens(totalTokens(info().usage))}</span>
       </text>
       <box flexDirection="row" height={1}>
         <Show when={info().task} fallback={<text fg={info().second.color} flexShrink={0}>{"     " + clip(info().second.text, secondWidth()) + " "}</text>}>
@@ -313,7 +328,7 @@ function LinkRow(props: { links: SprintLinks; open?: (url: string) => void }) {
 }
 
 /** The sprint panel on the team screen: the whole ceremony at a glance, one or two rows per part. */
-export function SprintCard(props: { sprint: TerminalSprint; model: TerminalUiModel; team?: StateTeam; session?: TerminalSession; pulse: Accessor<boolean>; now: Accessor<number>; open?: (url: string) => void }) {
+export function SprintCard(props: { sprint: TerminalSprint; model: TerminalUiModel; team?: StateTeam; session?: TerminalSession; pulse: Accessor<boolean>; now: Accessor<number>; open?: (url: string) => void; truecolor?: boolean }) {
   const loop = () => props.sprint.loop;
   const stage = () => loop().ceremony?.stage;
   const closedAt = () => loop().ceremony?.closure?.closedAt ?? loop().closedAt;
@@ -322,6 +337,8 @@ export function SprintCard(props: { sprint: TerminalSprint; model: TerminalUiMod
   const merged = () => loop().tickets.filter((ticket) => ticket.status === "merged").length;
   const seatName = (seatId: string) => displayText(props.team?.seats.find((seat) => seat.id === seatId)?.displayName ?? seatId, 30);
   const integrationUrl = () => loop().integration?.prUrl ?? loop().release?.prUrl;
+  const progress = () => sprintProgress({ stage: stage(), closed: !!closedAt(), merged: merged(), tickets: loop().tickets.length });
+  const fill = () => closedAt() ? STAGE_COLOR.closed : STAGE_COLOR[stage() ?? "planning"];
   return <box flexDirection="column" flexShrink={0} paddingLeft={1} paddingRight={1} border borderColor={theme.border} backgroundColor={theme.panel}
     title={" 🏁 SPRINT · " + displayText(props.sprint.id, 40) + " "} titleColor={theme.heading}>
     <text wrapMode="word">
@@ -329,7 +346,14 @@ export function SprintCard(props: { sprint: TerminalSprint; model: TerminalUiMod
       <span style={{ fg: closedAt() ? theme.running : theme.idle }}>{" · Closure: " + (closedAt() ? "closed " + displayText(closedAt()) + " · completed sprint history" : "open")}</span>
       <span style={{ fg: theme.muted }}>{" · " + merged() + "/" + loop().tickets.length + " merged"}</span>
     </text>
-    <StageCycle loop={loop()} pulse={props.pulse} />
+    {/* The bar sits beside the stage cycle on a wide screen and wraps below it on a narrow one. */}
+    <box flexDirection="row" flexShrink={0} flexWrap="wrap" columnGap={2}>
+      <box flexGrow={1} flexShrink={0} maxWidth="100%"><StageCycle loop={loop()} pulse={props.pulse} /></box>
+      <box flexDirection="row" flexShrink={0} height={1} gap={1}>
+        <ProgressBar fraction={progress} color={fill} width={24} truecolor={props.truecolor ?? true} background={theme.panel} />
+        <text fg={theme.muted} flexShrink={0}>{String(Math.round(progress() * 100)).padStart(3) + "%"}</text>
+      </box>
+    </box>
     <Show when={!stage()}><text fg={theme.idle} wrapMode="word">Persisted ceremony unavailable; awaiting migration before ceremony actions.</text></Show>
     <text fg={theme.regular} wrapMode="word">🎯 {displayText(props.sprint.goal, 180)}</text>
     <LinkRow links={sprintLinks(props.team, props.session)} open={props.open} />
