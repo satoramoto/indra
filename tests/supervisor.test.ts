@@ -7,7 +7,18 @@ import { signalReady, TmuxHost, turnLockFile, type TmuxRunner } from "../src/tmu
 import { withFileLock } from "../src/state-commit.js";
 import { activityRecordName, CliGoalStarter, Supervisor } from "../src/supervisor.js";
 import { ImplementationRecorder } from "../src/implementation-facts.js";
+import { main } from "../src/cli.js";
+import { runTerminalUi } from "../src/terminal-ui-solid.js";
 import { git, stateCheckout } from "./state-checkout.js";
+
+const rollout = vi.hoisted(() => ({ ready: true }));
+vi.mock("../src/release-activation.js", async (original) => ({
+  ...await original<typeof import("../src/release-activation.js")>(),
+  get ceremonyReadiness() {
+    return rollout.ready ? { version: 1, consumers: { planning: 1, developer: 1, release: 1, retro: 1, tui: 1 } } : undefined;
+  },
+}));
+vi.mock("../src/terminal-ui-solid.js", () => ({ runTerminalUi: vi.fn(async () => 0) }));
 
 /** A tmux server with several sessions. `onStart` decides how a new hosted process behaves. */
 class FakeTmux implements TmuxRunner {
@@ -260,6 +271,27 @@ async function retryFixture(goals = [failedGoal()]) {
 }
 
 describe("failed assignment retries", () => {
+  it.each([true, false])("passes rollout readiness through the production UI supervisor (ready: %s)", async (ready) => {
+    const { dir, store, target } = await retryFixture();
+    const before = git(dir, "rev-list", "--count", "HEAD");
+    rollout.ready = ready;
+    vi.mocked(runTerminalUi).mockClear();
+    try {
+      expect(await main(["--ui", "--state", dir])).toBe(0);
+      expect(runTerminalUi).toHaveBeenCalledOnce();
+      const processes = vi.mocked(runTerminalUi).mock.calls[0][2]!.processes!;
+      // Exercise the real Supervisor and Git transaction supplied by main, without starting tmux or a renderer.
+      expect(processes).toBeInstanceOf(Supervisor);
+      if (ready) await expect(processes.retry!(target)).resolves.toBe("Re-queued goal-retry/outcome-1 for seat-002.");
+      else await expect(processes.retry!(target)).rejects.toThrow("Ceremony writes are disabled");
+      const goal = (await store.read()).planningGoals![0];
+      expect(goal.assignments![0]).toMatchObject({ seatId: target.seatId, status: ready ? "queued" : "failed", prUrl: "https://github.com/o/r/pull/1" });
+      expect(goal.assignments![0].note).toBe(ready ? undefined : "Interrupted");
+      expect(goal.integration!.branch).toBe(`sprint/${target.goalId}`);
+      expect(Number(git(dir, "rev-list", "--count", "HEAD")) - Number(before)).toBe(ready ? 1 : 0);
+    } finally { rollout.ready = true; }
+  });
+
   it("offers the newest eligible failure for each Developer, skipping other statuses and missing or closed sprints", async () => {
     const old = failedGoal("goal-old", "2026-01-01T00:00:00Z");
     const legacy = failedGoal("goal-legacy", "2026-01-07T00:00:00Z");
