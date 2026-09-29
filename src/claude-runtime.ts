@@ -58,10 +58,13 @@ async function readOnlyWritePaths(cwd: string): Promise<string[]> {
   } catch { throw new Error("Could not determine Claude read-only filesystem boundaries."); }
 }
 
-/** No inherited tool grants, hooks or MCP servers. Managed policy still applies. */
+/**
+ * No inherited tool grants, hooks, MCP servers, settings, slash commands (skills) or auto-memory. Managed policy
+ * still applies. Claude keeps the owner's config directory, where its login lives: see the README's engine section.
+ */
 export async function claudePermissionArgs(cwd: string, write?: WriteAccess): Promise<string[]> {
   const settings = {
-    disableAllHooks: true,
+    disableAllHooks: true, autoMemoryEnabled: false,
     permissions: { disableBypassPermissionsMode: "disable", disableAutoMode: "disable" },
     sandbox: {
       enabled: true, failIfUnavailable: true, allowUnsandboxedCommands: false,

@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { codexProgress } from "./codex-progress.js";
+import { ensureCodexHome } from "./harness-home.js";
 import { childEnv } from "./op-env.js";
 
 export interface AgentResult { sessionId: string; response: unknown; usage?: unknown; startedAt: string; finishedAt: string }
@@ -28,19 +29,24 @@ export function sandboxArgs(write?: WriteAccess): string[] {
   return write ? ["--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true", ...write.extraDirs.flatMap((dir) => ["--add-dir", dir])] : ["--sandbox", "read-only"];
 }
 
-/** Uses the logged-in Codex CLI and an explicit session id; never uses --last. Read-only unless given write access. */
+/**
+ * Uses the logged-in Codex CLI and an explicit session id; never uses --last. Read-only unless given write access.
+ * With `home`, Codex runs with `CODEX_HOME` set to that Indra-owned seat home (see harness-home.ts), so it loads
+ * none of the owner's personal configuration and keeps its sessions there.
+ */
 export class CodexRuntime implements AgentRuntime {
-  constructor(private readonly cwd: string, private readonly timeoutMs = CLARIFY_TIMEOUT_MS, private readonly write?: WriteAccess) {}
+  constructor(private readonly cwd: string, private readonly timeoutMs = CLARIFY_TIMEOUT_MS, private readonly write?: WriteAccess, private readonly home?: string) {}
   async message(prompt: string, schemaPath: string, sessionId?: string, options: MessageOptions = {}): Promise<AgentResult> {
     const timeoutMs = options.timeoutMs ?? this.timeoutMs; const signal = options.signal; let timedOut = false;
     const startedAt = new Date().toISOString();
+    const env = this.home ? { ...childEnv(), CODEX_HOME: await ensureCodexHome(this.home) } : childEnv();
     const sandbox = sandboxArgs(this.write);
     const args = sessionId ? ["exec", "resume", sessionId, "--json", "-c", "sandbox_mode=\"read-only\"", "-"] : ["exec", "--json", ...sandbox, "--output-schema", schemaPath, "-"];
     const controller = new AbortController();
     const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs);
     signal?.addEventListener("abort", () => controller.abort(), { once: true });
     try {
-      const child = spawn("codex", args, { cwd: this.cwd, stdio: ["pipe", "pipe", "pipe"], signal: controller.signal, env: childEnv() });
+      const child = spawn("codex", args, { cwd: this.cwd, stdio: ["pipe", "pipe", "pipe"], signal: controller.signal, env });
       child.stdin.end(prompt);
       let output = ""; let stderr = "";
       child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
@@ -50,6 +56,7 @@ export class CodexRuntime implements AgentRuntime {
       child.stderr.on("data", (part: string) => { stderr += part; if (stderr.length > 100_000) controller.abort(); });
       const code = await new Promise<number | null>((resolve, reject) => { child.on("error", reject); child.on("close", resolve); }).catch((error: unknown) => { if (timedOut) throw new Error(`Codex run timed out after ${minutes(timeoutMs)}.`); throw error; });
       if (timedOut) throw new Error(`Codex run timed out after ${minutes(timeoutMs)}.`);
+      if (code !== 0 && sessionId && this.home && /no rollout found/i.test(stderr)) throw new Error(`Codex session ${sessionId} is not in this seat's harness home (it was started before seat harness isolation, or the home was removed); it cannot be resumed. Start a new goal.`);
       if (code !== 0) throw new Error(`Codex run failed (${code ?? "cancelled"}). ${stderr.slice(-500)}`);
       let id = sessionId; let response: unknown; let usage: unknown;
       for (const line of output.split("\n")) {
