@@ -8,8 +8,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentResult, AgentRuntime } from "../src/codex-runtime.js";
 import { CEREMONY_STAGES } from "../src/ceremony.js";
 import type { ImplementationFacts } from "../src/implementation-facts.js";
+import { ReleaseRecorder, type ReleaseFacts } from "../src/release-facts.js";
+import { recordedRetroInput } from "../src/retro-publication.js";
+import { ceremonyRuntimeName } from "../src/planning-bridge.js";
 import { CODEX_CONFIG, engineHome, seatHarnessDir } from "../src/harness-home.js";
-import type { PlanningGoal } from "../src/planning.js";
+import { PlanningStore, type PlanningGoal } from "../src/planning.js";
 import { SeatRuntime } from "../src/seat-runtime.js";
 import {
   buildRetroSnapshot, draftSprintRetro, renderSprintRetro, retroPrompt, validateRetroNarrative,
@@ -21,6 +24,12 @@ afterEach(() => vi.mocked(spawn).mockReset());
 
 const at = (seconds: number) => new Date(Date.UTC(2026, 8, 1, 0, 0, seconds)).toISOString();
 const pr = "https://github.com/owner/project/pull/1";
+const releaseFacts = (): ReleaseFacts => ({ version: 1, goalId: "goal-one", events: [
+  { kind: "tracking-started", key: "tracking", at: at(30), prUrl: pr },
+  { kind: "observation", key: "observation", at: at(31), prUrl: pr, headSha: "a".repeat(40), state: "OPEN", conflicting: false },
+  { kind: "merge-started", key: "merge-started", attemptId: "attempt-one", at: at(35), prUrl: pr, headSha: "a".repeat(40) },
+  { kind: "merge-finished", key: "merge-finished", attemptId: "attempt-one", at: at(36), prUrl: pr, headSha: "a".repeat(40), result: "merged" },
+] });
 const counters = (input = 100, output = 20) => ({ inputTokens: input, uncachedInputTokens: input - Math.floor(input / 5) - Math.floor(input / 10), cachedInputTokens: Math.floor(input / 5), cacheWriteInputTokens: Math.floor(input / 10), outputTokens: output, reasoningOutputTokens: Math.floor(output / 4) });
 function goal(): PlanningGoal {
   return {
@@ -39,7 +48,7 @@ function goal(): PlanningGoal {
   };
 }
 function input(): RetroInput {
-  return { goal: goal(), cutoffAt: at(50), facts: {
+  return { goal: goal(), cutoffAt: at(50), facts: { releaseFacts: releaseFacts(),
     seats: [{ seatId: "seat-two", wallTimeMs: 20_000 }, { seatId: "seat-one", wallTimeMs: 8_000 }],
     sessions: [
       { seatId: "seat-two", sessionId: "developer-session", startedAt: at(20), finishedAt: at(25), usage: counters() },
@@ -323,6 +332,7 @@ const pr2 = "https://github.com/owner/project/pull/2";
 /** Two developer seats, a failed clarification turn and draft, a retried outcome and two failed retro drafts. */
 function realistic(): RetroInput {
   const data = input(); const g = data.goal;
+  delete data.facts.releaseFacts;
   g.participantSeatIds = ["seat-three", "seat-two"]; g.updatedAt = at(5600);
   g.proposal = { ...g.proposal!, createdAt: at(900), outcomes: [
     { id: "outcome-one", title: "Change", description: "Done", seatId: "seat-two" }, { id: "outcome-two", title: "Docs", description: "Done", seatId: "seat-three" },
@@ -369,6 +379,66 @@ const lateGeneration = (): RetroGeneration => ({ ...generation(), startedAt: at(
 const phaseValue = (snapshot: RetroEvidenceSnapshot, phase: string, id: string) => snapshot.phases.find((item) => item.phase === phase)!.facts.find((item) => item.evidenceId === id)!.value;
 
 describe("per-phase process reflection", () => {
+  it("carries the durable release ledger through the standard retro reader without replacing other ceremony facts", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "indra-retro-release-"));
+    try {
+      const store = new PlanningStore(join(directory, "state")); const data = input();
+      const ledger = data.facts.releaseFacts!; delete data.facts.releaseFacts;
+      await store.saveRuntime(ceremonyRuntimeName(data.goal.id), { facts: data.facts, deliveredStages: ["release"] });
+      const recorder = new ReleaseRecorder(store, data.goal.id);
+      for (const event of ledger.events) await recorder.record(event);
+      const captured = await recordedRetroInput({ store, goal: data.goal, runtime: { message: vi.fn() },
+        post: vi.fn(), recordRun: vi.fn(), recordSession: vi.fn() });
+      expect(captured.facts.releaseFacts).toEqual(ledger);
+      expect(captured.facts.sessions).toEqual(data.facts.sessions);
+      expect((await store.readRuntimeFile<{ deliveredStages: string[] }>(recorder.name))!.deliveredStages).toEqual(["release"]);
+      const snapshot = buildRetroSnapshot({ ...captured, cutoffAt: data.cutoffAt });
+      expect(phaseValue(snapshot, "release", "release-integration-conflicts")).toBe(0);
+      expect(phaseValue(snapshot, "release", "release-merge-rounds")).toBe(1);
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+
+  it("renders recorded conflict and merge rounds with their evidence and explicit zeros", async () => {
+    const data = input(); const events = data.facts.releaseFacts!.events;
+    events.splice(2, 0,
+      { kind: "observation", key: "conflict", at: at(32), prUrl: pr, headSha: "a".repeat(40), state: "OPEN", conflicting: true },
+      { kind: "observation", key: "resolved", at: at(33), prUrl: pr, headSha: "a".repeat(40), state: "OPEN", conflicting: false },
+      { kind: "merge-started", key: "failed-start", at: at(33), prUrl: pr, headSha: "a".repeat(40), attemptId: "failed-attempt" },
+      { kind: "merge-finished", key: "failed-finish", at: at(34), prUrl: pr, headSha: "a".repeat(40), attemptId: "failed-attempt", result: "failed" });
+    const snapshot = buildRetroSnapshot(data);
+    const response = narrative(snapshot);
+    response.phaseReflections = response.phaseReflections.filter((item) => item.phase !== "release")
+      .concat(snapshot.choices.phaseReflections.filter((item) => item.phase === "release"));
+    const markdown = await renderSprintRetro(snapshot, response, generation());
+    expect(markdown).toContain("| Integration PR conflict rounds | 1 | release-integration-conflicts |");
+    expect(markdown).toContain("| Integration PR merge rounds | 2 | release-merge-rounds |");
+    expect(markdown).toContain("repeated polling is counted once per episode. [release-integration-conflicts]");
+    expect(markdown).toContain("including failed attempts; repeated polling is not a merge round. [release-merge-rounds]");
+    expect(snapshot.choices.ownerProposals).not.toEqual(expect.arrayContaining([expect.objectContaining({ text: "Consider improving the incomplete integration PR conflict and merge history." })]));
+    const zero = input(); zero.facts.releaseFacts!.events.splice(2);
+    const zeroSnapshot = buildRetroSnapshot(zero);
+    expect(await renderSprintRetro(zeroSnapshot, narrative(zeroSnapshot), generation())).toContain("| Integration PR merge rounds | 0 | release-merge-rounds |");
+    expect(phaseValue(zeroSnapshot, "release", "release-integration-conflicts")).toBe(0);
+  });
+
+  it("keeps an interrupted merge unknown at cutoff and never changes an already frozen snapshot", async () => {
+    const data = input(); data.facts.releaseFacts!.events.at(-1)!.at = at(51);
+    const frozen = buildRetroSnapshot(data);
+    const response = narrative(frozen);
+    const markdown = await renderSprintRetro(frozen, response, generation());
+    expect(markdown).toContain("| Integration PR merge rounds | unknown | release-merge-rounds |");
+    expect(frozen.missing).toContain("Integration PR merge attempts are incomplete; merge rounds are unknown.");
+    data.cutoffAt = at(52);
+    expect(phaseValue(buildRetroSnapshot(data), "release", "release-merge-rounds")).toBe(1);
+    expect(await renderSprintRetro(frozen, response, generation())).toBe(markdown);
+    const legacy = input(); delete legacy.facts.releaseFacts;
+    const oldSnapshot = buildRetroSnapshot(legacy);
+    const oldMarkdown = await renderSprintRetro(oldSnapshot, narrative(oldSnapshot), generation());
+    legacy.facts.releaseFacts = releaseFacts();
+    expect(phaseValue(buildRetroSnapshot(legacy), "release", "release-merge-rounds")).toBe(1);
+    expect(await renderSprintRetro(oldSnapshot, narrative(oldSnapshot), generation())).toBe(oldMarkdown);
+  });
+
   it("computes each phase's facts from a realistic recorded fixture", () => {
     const snapshot = buildRetroSnapshot(realistic());
     expect(snapshot.phases.map((phase) => phase.phase)).toEqual(["planning", "proposal", "implement", "release", "retro"]);

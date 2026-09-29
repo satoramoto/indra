@@ -1,4 +1,4 @@
-import type { StateSnapshot, StateTeam } from "./state-domain.js";
+import { seatStatus, type StateSnapshot, type StateTeam } from "./state-domain.js";
 
 /** One active account in a live chat team, as the consistency check needs it. */
 export interface LiveMember {
@@ -39,6 +39,13 @@ export function compareTeam(team: StateTeam, live: LiveMember[]): Mismatch[] {
   for (const seat of team.seats) {
     const label = `${seat.id} (${seat.displayName})`;
     claimed.add(seat.mattermostUserId);
+    if (["pending", "retired"].includes(seatStatus(seat))) {
+      // An expected but not yet verified bot, or a historical bot, need not be a current team member.
+      if (!seat.mattermostUserId) for (const member of live) {
+        if (member.isBot && member.username === seat.handle) claimed.add(member.userId);
+      }
+      continue;
+    }
     const member = byId.get(seat.mattermostUserId);
     if (!member) {
       mismatches.push({

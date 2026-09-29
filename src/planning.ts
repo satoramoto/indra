@@ -445,7 +445,7 @@ export class PlanningStore {
   private readonly releaseFacts = new Map<string, boolean | undefined>();
   async teamConflicts(): Promise<TeamGoalConflict[]> { return openGoalConflicts((await this.read()).planningGoals ?? []); }
   /** Trusted owner/TUI capability. Do not expose this method to agent tools or apply settings parsed from agent output. */
-  async updateOwnerSettings(teamId: string, patch: { mission?: string; autoMode?: boolean }, at = new Date().toISOString()): Promise<void> {
+  async updateOwnerSettings(teamId: string, patch: { mission?: string; autoMode?: boolean }, at?: string): Promise<void> {
     if (Object.keys(patch).some((key) => key !== "mission" && key !== "autoMode")) throw new Error("Unknown owner setting.");
     await this.commitUpdate((state) => {
       const team = (state.teams as TeamRecord[]).find((item) => item.id === teamId);
@@ -453,7 +453,12 @@ export class PlanningStore {
       if (patch.mission !== undefined) team.mission = patch.mission;
       if (patch.autoMode !== undefined && patch.autoMode !== (team.standingPolicy?.revisions.at(-1)?.enabled ?? false)) {
         const revisions = team.standingPolicy?.revisions ?? [];
-        const revision: StandingPolicyRevision = { revision: revisions.length + 1, enabled: patch.autoMode, source: "owner-command", at };
+        // Compute under state.lock so approvals committed while this command waited precede its revocation.
+        const times = [revisions.at(-1)?.at,
+          ...(state.planningGoals ?? []).filter((goal) => goal.teamId === teamId).flatMap((goal) => (goal.automaticApprovals ?? []).map((approval) => approval.at)),
+        ].filter((time): time is string => !!time).map((time) => Date.parse(time) + 1);
+        const revision: StandingPolicyRevision = { revision: revisions.length + 1, enabled: patch.autoMode, source: "owner-command",
+          at: at ?? new Date(Math.max(Date.now(), ...times)).toISOString() };
         team.standingPolicy = { revisions: [...revisions, revision] };
       }
     }, `Update owner settings for ${teamId}`, true);

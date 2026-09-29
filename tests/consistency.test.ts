@@ -52,6 +52,17 @@ describe("Mattermost vs state comparison", () => {
     ]);
   });
 
+  it("does not require pending or retired seats to be members, while still checking retiring seats", () => {
+    const lifecycle: StateTeam = { ...team, seats: [team.seats[0], { ...team.seats[1], status: "retired" }, { ...team.seats[2], status: "retiring" },
+      { id: "seat-new", displayName: "Product", handle: "yahaha-product", mattermostUserId: "", roles: ["Product"], status: "pending" }] };
+    const product = { userId: "new-bot", username: "yahaha-product", isBot: true, position: "" };
+    expect(compareTeam(lifecycle, [matching[0], matching[2], product])).toEqual([]);
+    expect(compareTeam(lifecycle, [...matching, product])).toEqual([]);
+    expect(compareTeam(lifecycle, [matching[0]])).toEqual([expect.objectContaining({ kind: "missing", seatId: "seat-003" })]);
+    expect(compareTeam(lifecycle, [matching[0], matching[2], { ...product, username: "unclaimed" }])).toEqual([expect.objectContaining({ kind: "unexpected" })]);
+    expect(unclaimedHumans(lifecycle, [matching[0], { ...product, isBot: false }])).toEqual([{ ...product, isBot: false }]);
+  });
+
   it("prints the report and exits non-zero only when something differs", async () => {
     const snapshot: StateSnapshot = { teams: [team] };
     const state = new StateInventory({ read: async () => snapshot });
