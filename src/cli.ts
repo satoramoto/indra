@@ -17,6 +17,8 @@ import { CHICK_USERNAME, MattermostAccessError, MattermostPlanningChat, readBotT
 import { opCredential, stageServiceToken } from "./service-account.js";
 import { captureOpEnvironment } from "./op-env.js";
 import { DeveloperSeat, loadDeveloperSeat, processShell } from "./developer-seat.js";
+import { shellWithEnv } from "./command-shell.js";
+import { withSeatGit } from "./seat-git.js";
 import { DEVELOPER_SESSION_TIMEOUT_MS, type AgentRuntime, type WriteAccess } from "./codex-runtime.js";
 import { loadSeatEngines, SeatRuntime } from "./seat-runtime.js";
 import { seatHarnessDir } from "./harness-home.js";
@@ -196,7 +198,7 @@ const isGoalAction = (action: string | undefined): action is GoalAction => (GOAL
 /** All model and posting paths use the seat from state, local engine selection and optional Indra profiles. */
 async function seatServices(store: PlanningStore, username: string, seatId?: string) {
   const state = await store.read();
-  const teams = state.teams as { slug: string; seats: { id: string; roles?: string[]; externalIdentities: { mattermost: { username: string } } }[] }[];
+  const teams = state.teams as { slug: string; seats: { id: string; displayName: string; roles?: string[]; externalIdentities: { mattermost: { username: string } } }[] }[];
   const seats = teams.flatMap((team) => team.seats);
   const candidates = seatId === undefined ? teams.find((team) => team.slug === "yahaha")?.seats ?? [] : seats.filter((item) => item.id === seatId);
   const seat = candidates.find((item) => item.externalIdentities.mattermost.username === username);
@@ -207,7 +209,7 @@ async function seatServices(store: PlanningStore, username: string, seatId?: str
   const engine = Object.hasOwn(engines, seat.id) ? engines[seat.id] : "codex";
   return {
     chat: (token: string) => withPersonaChat(new MattermostPlanningChat(token, username), profile),
-    runtime: (cwd: string, timeoutMs?: number, write?: WriteAccess) => withPersonaRuntime(new SeatRuntime(engine, cwd, timeoutMs, write, undefined, seatHarnessDir(store.runtimeDir, seat.id), seat.roles), profile),
+    runtime: (cwd: string, timeoutMs?: number, write?: WriteAccess) => withPersonaRuntime(new SeatRuntime(engine, cwd, timeoutMs, write, undefined, seatHarnessDir(store.runtimeDir, seat.id), seat.roles, (env) => withSeatGit(env, { displayName: seat.displayName, username })), profile),
   };
 }
 
@@ -299,7 +301,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         const chat = services.chat(await hostedToken(options.checkout, options.readyNonce, (tokenOptions) => readBotToken(seat.username, tokenOptions)));
         await joinTeamHome(options.checkout, options.readyNonce, store, chat, seat.username);
         if (options.readyNonce) await signalReady(options.checkout, options.readyNonce);
-        const runner = new DeveloperSeat(store, seat, chat, processShell, (cwd, write) => services.runtime(cwd, DEVELOPER_SESSION_TIMEOUT_MS, write), (line) => console.log(`[${new Date().toISOString()}] ${line}`));
+        const runner = new DeveloperSeat(store, seat, chat, shellWithEnv((env) => withSeatGit(env, seat)), (cwd, write) => services.runtime(cwd, DEVELOPER_SESSION_TIMEOUT_MS, write), (line) => console.log(`[${new Date().toISOString()}] ${line}`));
         console.log(`Developer seat ${seat.id} (@${seat.username}) running. Stop with Ctrl-C.`);
         while (true) {
           // Each step holds the turn lock, so the supervisor only restarts this runner for an update between steps.

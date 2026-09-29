@@ -83,7 +83,7 @@ export class CodexRuntime implements AgentRuntime {
    * the interactive CLI there (see headed-session.ts). Read-only sessions stay headless: Codex's read-only sandbox
    * cannot write the result file.
    */
-  constructor(private readonly cwd: string, private readonly timeoutMs = CLARIFY_TIMEOUT_MS, private readonly write?: WriteAccess, private readonly home?: string, private readonly config: string = DEVELOPER_CODEX_CONFIG, private readonly headed = headedAvailable()) {}
+  constructor(private readonly cwd: string, private readonly timeoutMs = CLARIFY_TIMEOUT_MS, private readonly write?: WriteAccess, private readonly home?: string, private readonly config: string = DEVELOPER_CODEX_CONFIG, private readonly headed = headedAvailable(), private readonly envFor: (env: NodeJS.ProcessEnv) => NodeJS.ProcessEnv = (env) => env) {}
   async message(prompt: string, schemaPath: string, sessionId?: string, options: MessageOptions = {}): Promise<RecordedAgentResult> {
     const release = this.headed && sessionId === undefined && this.write && this.home ? claimHeaded() : undefined;
     if (release) {
@@ -107,7 +107,7 @@ export class CodexRuntime implements AgentRuntime {
       catch { throw new RuntimeStop("Codex output schema could not be read as JSON."); }
       if (!jsonObject(schema)) throw new RuntimeStop("Codex output schema must be a JSON Schema object.");
       checkPromptSize(prompt);
-      const env = { ...childEnv(), CODEX_HOME: await ensureCodexHome(home, this.config) };
+      const env = { ...this.envFor(childEnv()), CODEX_HOME: await ensureCodexHome(home, this.config) };
       const files = await prepareTaskFiles(this.cwd);
       await writeFile(files.task, taskDocument(prompt, schema, files), { mode: 0o600 });
       const cwds = [resolve(this.cwd), await realpath(this.cwd).catch(() => resolve(this.cwd))];
@@ -151,7 +151,8 @@ export class CodexRuntime implements AgentRuntime {
       if (signal?.aborted) throw new RuntimeStop("Codex run cancelled.", "interrupted");
       if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new RuntimeStop("Codex timeout must be a positive number of milliseconds.");
       checkPromptSize(prompt);
-      const env = this.home ? { ...childEnv(), CODEX_HOME: await ensureCodexHome(this.home, this.config) } : childEnv();
+      const base = this.envFor(childEnv());
+      const env = this.home ? { ...base, CODEX_HOME: await ensureCodexHome(this.home, this.config) } : base;
       const sandbox = sandboxArgs(this.write);
       const args = sessionId ? ["exec", "resume", sessionId, "--json", "-c", "sandbox_mode=\"read-only\"", "-"] : ["exec", "--json", ...sandbox, "--output-schema", schemaPath, "-"];
       if (signal?.aborted) throw new RuntimeStop("Codex run cancelled.", "interrupted");
