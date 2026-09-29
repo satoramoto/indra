@@ -286,6 +286,8 @@ describe("fresh read-only retro generation", () => {
       ].map((event) => JSON.stringify(event)).join("\n") + "\n");
       child.stdout.end(); child.emit("close", 0);
       expect((await draft).generation.usage).toMatchObject({ inputTokens: 10, outputTokens: 2 });
+      // The post-run refresh keeps the Team Lead's config rather than resetting it to the Developer default.
+      expect(await readFile(join(configuredHome, "config.toml"), "utf8")).toBe(TEAM_LEAD_CODEX_CONFIG);
     } finally { await rm(runtimeDir, { recursive: true, force: true }); }
   });
 

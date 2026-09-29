@@ -7,6 +7,7 @@ import { createCeremonyAdapters, RetroPublication, retroRetryDelayMs, retroRunti
 import { buildRetroSnapshot, renderSprintRetro, RetroGenerationError, type RetroPriorAttempt, type SprintRetroDraft } from "../src/sprint-retro.js";
 import { SprintGitHub, type RetroArchive, type RetroPr } from "../src/sprint.js";
 import { SeatRuntime } from "../src/seat-runtime.js";
+import { TEAM_LEAD_CODEX_CONFIG, codexConfigForRoles } from "../src/harness-home.js";
 import * as mattermost from "../src/planning-mattermost.js";
 
 afterEach(() => { vi.useRealTimers(); });
@@ -26,7 +27,7 @@ function goalAtRetro(): PlanningGoal {
 }
 async function fixture() {
   const goal = goalAtRetro();
-  const state = { planningGoals: [goal], teams: [{ id: goal.teamId, project: { github: "test/project" }, seats: [{ id: goal.seatId }], externalIdentities: { mattermost: { homeChannelId: "home" } } }] };
+  const state = { planningGoals: [goal], teams: [{ id: goal.teamId, project: { github: "test/project" }, seats: [{ id: goal.seatId, roles: ["Team Lead"] }], externalIdentities: { mattermost: { homeChannelId: "home" } } }] };
   const records = new Map<string, object>();
   const deliveries = new Map<string, { id: string; message: string; mergePost?: string }>();
   let lostPost = false;
@@ -78,6 +79,8 @@ describe("recoverable retro publication", () => {
       const reviewer = vi.spyOn(SeatRuntime.prototype, "message").mockImplementation(async function (this: SeatRuntime, prompt, schema, session, options) {
         expect((this as unknown as { cwd: string }).cwd).toBe("/managed/review");
         expect((this as unknown as { write?: unknown }).write).toBeUndefined();
+        // The seat's roles from state select the Team Lead's harness config.
+        expect(codexConfigForRoles((this as unknown as { roles?: string[] }).roles)).toBe(TEAM_LEAD_CODEX_CONFIG);
         expect(session).toBeUndefined(); expect(options?.purpose).toBe("review");
         expect(schema).toMatch(/schemas\/retro-review.json$/);
         expect(prompt).toContain(f.pr.headSha);

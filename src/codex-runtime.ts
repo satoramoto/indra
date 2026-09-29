@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { codexProgress } from "./codex-progress.js";
-import { ensureCodexHome } from "./harness-home.js";
+import { DEVELOPER_CODEX_CONFIG, ensureCodexHome } from "./harness-home.js";
 import { childEnv } from "./op-env.js";
 import { RuntimeEventStream, RuntimeFacts, RuntimeStop, jsonObject, recordedError, type RuntimeSessionFacts, type TokenUsage } from "./runtime-facts.js";
 
@@ -38,7 +38,7 @@ export function sandboxArgs(write?: WriteAccess): string[] {
  * none of the owner's personal configuration and keeps its sessions there.
  */
 export class CodexRuntime implements AgentRuntime {
-  constructor(private readonly cwd: string, private readonly timeoutMs = CLARIFY_TIMEOUT_MS, private readonly write?: WriteAccess, private readonly home?: string, private readonly config?: string) {}
+  constructor(private readonly cwd: string, private readonly timeoutMs = CLARIFY_TIMEOUT_MS, private readonly write?: WriteAccess, private readonly home?: string, private readonly config: string = DEVELOPER_CODEX_CONFIG) {}
   async message(prompt: string, schemaPath: string, sessionId?: string, options: MessageOptions = {}): Promise<RecordedAgentResult> {
     const evidence = new RuntimeFacts("codex", sessionId, options.previousSessionUsage);
     let response: unknown; let failed = false;
@@ -59,7 +59,7 @@ export class CodexRuntime implements AgentRuntime {
     try {
       if (signal?.aborted) throw new RuntimeStop("Codex run cancelled.", "interrupted");
       if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new RuntimeStop("Codex timeout must be a positive number of milliseconds.");
-      const env = this.home ? { ...childEnv(), CODEX_HOME: await ensureCodexHome(this.home, undefined, this.config) } : childEnv();
+      const env = this.home ? { ...childEnv(), CODEX_HOME: await ensureCodexHome(this.home, this.config) } : childEnv();
       const sandbox = sandboxArgs(this.write);
       const args = sessionId ? ["exec", "resume", sessionId, "--json", "-c", "sandbox_mode=\"read-only\"", "-"] : ["exec", "--json", ...sandbox, "--output-schema", schemaPath, "-"];
       if (signal?.aborted) throw new RuntimeStop("Codex run cancelled.", "interrupted");
@@ -118,7 +118,7 @@ export class CodexRuntime implements AgentRuntime {
       if (!ownsProcessGroup) clearTimeout(killTimer);
       signal?.removeEventListener("abort", abort);
       progress?.end();
-      if (this.home) await ensureCodexHome(this.home).catch(() => undefined);
+      if (this.home) await ensureCodexHome(this.home, this.config).catch(() => undefined);
     }
   }
 }

@@ -105,7 +105,7 @@ export async function promoteSeatAuth(home: string, auth = ownerCodexAuth()): Pr
  * refreshes write through to it. A regular file at `auth.json` is first promoted (see promoteSeatAuth); anything else
  * there is replaced by the link. Codex runs call it before and after each run.
  */
-export async function ensureCodexHome(home: string, auth = ownerCodexAuth(), config = DEVELOPER_CODEX_CONFIG): Promise<string> {
+export async function ensureCodexHome(home: string, config: string, auth = ownerCodexAuth()): Promise<string> {
   await mkdir(home, { recursive: true, mode: 0o700 });
   for (const dir of [join(home, "..", ".."), join(home, ".."), home]) await chmod(dir, 0o700);
   await writeFileAtomic(join(home, "config.toml"), config);

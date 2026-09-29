@@ -49,7 +49,7 @@ describe("seat harness homes", () => {
     const home = engineHome(seatHarnessDir(runtimeDir, "seat-001"), "codex");
     expect(ownerCodexAuth()).toBe(join(owner, ".codex", "auth.json"));
     for (let run = 0; run < 2; run++) {
-      await ensureCodexHome(home);
+      await ensureCodexHome(home, CODEX_CONFIG);
       for (const dir of [join(runtimeDir, "harness"), join(runtimeDir, "harness", "seat-001"), home]) expect(await mode(dir)).toBe(0o700);
       expect((await readdir(home)).sort()).toEqual(["auth.json", "config.toml"]);
       expect(await readFile(join(home, "config.toml"), "utf8")).toBe(CODEX_CONFIG);
@@ -70,9 +70,9 @@ describe("seat harness homes", () => {
 
   it("rewrites an existing home's config when the seat's role config changes", async () => {
     const home = engineHome(seatHarnessDir(runtimeDir, "seat-002"), "codex");
-    await ensureCodexHome(home, undefined, TEAM_LEAD_CODEX_CONFIG);
+    await ensureCodexHome(home, TEAM_LEAD_CODEX_CONFIG);
     expect(await readFile(join(home, "config.toml"), "utf8")).toBe(TEAM_LEAD_CODEX_CONFIG);
-    await ensureCodexHome(home, undefined, codexConfigForRoles(["Developer"]));
+    await ensureCodexHome(home, codexConfigForRoles(["Developer"]));
     expect(await readFile(join(home, "config.toml"), "utf8")).toBe(CODEX_CONFIG);
   });
 
@@ -81,11 +81,11 @@ describe("seat harness homes", () => {
     await mkdir(home, { recursive: true, mode: 0o755 });
     await writeFile(join(home, "auth.json"), "copied credentials");
     await writeFile(join(home, "config.toml"), "# earlier run\nmodel = \"personal\"\n[mcp_servers.personal]\ncommand = \"x\"\n");
-    await ensureCodexHome(home);
+    await ensureCodexHome(home, CODEX_CONFIG);
     expect(await mode(home)).toBe(0o700);
     expect(await readlink(join(home, "auth.json"))).toBe(join(owner, ".codex", "auth.json"));
     expect(await readFile(join(home, "config.toml"), "utf8")).toBe(CODEX_CONFIG);
-    await ensureCodexHome(home, join(root, "other-auth.json"));
+    await ensureCodexHome(home, CODEX_CONFIG, join(root, "other-auth.json"));
     expect(await readlink(join(home, "auth.json"))).toBe(join(root, "other-auth.json"));
   });
 
@@ -141,7 +141,7 @@ describe("seat auth promotion and config writes", () => {
   const seatHome = () => engineHome(seatHarnessDir(runtimeDir, "dev-1"), "codex");
 
   it("promotes a newer regular seat auth.json over the owner's and restores the symlink", async () => {
-    const home = await ensureCodexHome(seatHome(), ownerAuth());
+    const home = await ensureCodexHome(seatHome(), CODEX_CONFIG, ownerAuth());
     await writeFile(join(owner, ".codex", "auth.json"), JSON.stringify({ last_refresh: "2026-01-01T00:00:00Z" }));
     await utimes(ownerAuth(), new Date("2026-01-01"), new Date("2026-01-01"));
     await unlink(join(home, "auth.json"));
@@ -149,18 +149,18 @@ describe("seat auth promotion and config writes", () => {
     expect(await promoteSeatAuth(home, ownerAuth())).toBe("promoted");
     expect(JSON.parse(await readFile(ownerAuth(), "utf8"))).toMatchObject({ fake: "rotated" });
     expect(await mode(ownerAuth())).toBe(0o600);
-    await ensureCodexHome(home, ownerAuth());
+    await ensureCodexHome(home, CODEX_CONFIG, ownerAuth());
     expect((await lstat(join(home, "auth.json"))).isSymbolicLink()).toBe(true);
     expect(await readlink(join(home, "auth.json"))).toBe(ownerAuth());
   });
 
   it("discards an older regular seat auth.json and keeps the owner's", async () => {
-    const home = await ensureCodexHome(seatHome(), ownerAuth());
+    const home = await ensureCodexHome(seatHome(), CODEX_CONFIG, ownerAuth());
     await writeFile(ownerAuth(), JSON.stringify({ last_refresh: "2026-09-01T00:00:00Z", fake: "owner" }));
     await unlink(join(home, "auth.json"));
     await writeFile(join(home, "auth.json"), JSON.stringify({ last_refresh: "2026-01-01T00:00:00Z", fake: "stale", tokens: { refresh_token: "fake-old" } }));
     await utimes(join(home, "auth.json"), new Date("2026-01-01"), new Date("2026-01-01"));
-    await ensureCodexHome(home, ownerAuth());
+    await ensureCodexHome(home, CODEX_CONFIG, ownerAuth());
     expect(JSON.parse(await readFile(ownerAuth(), "utf8"))).toMatchObject({ fake: "owner" });
     expect(await readlink(join(home, "auth.json"))).toBe(ownerAuth());
   });
@@ -170,7 +170,7 @@ describe("seat auth promotion and config writes", () => {
     ["a corrupt seat file", "{\"tokens\": {"],
     ["valid JSON without tokens", JSON.stringify({ last_refresh: "2030-01-01T00:00:00Z" })],
   ])("discards %s and leaves the owner's file untouched", async (_name, content) => {
-    const home = await ensureCodexHome(seatHome(), ownerAuth());
+    const home = await ensureCodexHome(seatHome(), CODEX_CONFIG, ownerAuth());
     const ownerBefore = await readFile(ownerAuth(), "utf8");
     await unlink(join(home, "auth.json"));
     await writeFile(join(home, "auth.json"), content);
@@ -179,7 +179,7 @@ describe("seat auth promotion and config writes", () => {
   });
 
   it("discards an invalid seat file when the owner's file is unreadable, leaving the owner's untouched", async () => {
-    const home = await ensureCodexHome(seatHome(), ownerAuth());
+    const home = await ensureCodexHome(seatHome(), CODEX_CONFIG, ownerAuth());
     await unlink(join(home, "auth.json"));
     await writeFile(join(home, "auth.json"), "not json");
     await chmod(ownerAuth(), 0o000);
@@ -189,21 +189,21 @@ describe("seat auth promotion and config writes", () => {
   });
 
   it("leaves the symlink alone", async () => {
-    const home = await ensureCodexHome(seatHome(), ownerAuth());
+    const home = await ensureCodexHome(seatHome(), CODEX_CONFIG, ownerAuth());
     expect(await promoteSeatAuth(home, ownerAuth())).toBe("none");
   });
 
   it("writes config.toml by temp file and rename, and skips identical content", async () => {
-    const home = await ensureCodexHome(seatHome(), ownerAuth());
+    const home = await ensureCodexHome(seatHome(), CODEX_CONFIG, ownerAuth());
     const config = join(home, "config.toml");
     await writeFile(config, "stale");
     const before = (await stat(config)).ino;
-    await ensureCodexHome(home, ownerAuth());
+    await ensureCodexHome(home, CODEX_CONFIG, ownerAuth());
     expect(await readFile(config, "utf8")).toBe(CODEX_CONFIG);
     const replaced = (await stat(config)).ino;
     expect(replaced).not.toBe(before);
     expect((await readdir(home)).some((name) => name.endsWith(".tmp"))).toBe(false);
-    await ensureCodexHome(home, ownerAuth());
+    await ensureCodexHome(home, CODEX_CONFIG, ownerAuth());
     expect((await stat(config)).ino).toBe(replaced);
     await writeFileAtomic(config, "x");
     expect(await readFile(config, "utf8")).toBe("x");

@@ -8,7 +8,7 @@ import { ensureCodexHome } from "../src/harness-home.js";
 
 vi.mock("node:child_process", () => ({ spawn: vi.fn(), execFile: vi.fn() }));
 vi.mock("../src/codex-progress.js", () => ({ codexProgress: () => ({ push: vi.fn(), end: vi.fn() }) }));
-vi.mock("../src/harness-home.js", () => ({ ensureCodexHome: vi.fn(async (home: string) => home) }));
+vi.mock("../src/harness-home.js", () => ({ DEVELOPER_CODEX_CONFIG: "developer config", ensureCodexHome: vi.fn(async (home: string) => home) }));
 
 // Reduced codex-cli 0.156.1 exec --json capture shapes; thread usage is cumulative.
 const id = "0199a213-81c0-7800-8aa1-bbab2a035a53";
