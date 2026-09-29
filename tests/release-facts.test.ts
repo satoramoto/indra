@@ -60,6 +60,18 @@ describe("recorded integration rounds", () => {
     }
   });
 
+  it("uses a recovered receipt for the same interrupted attempt only from its recorded recovery time", async () => {
+    const { store, recorder } = await fixture();
+    for (const event of [begin(), observe(1, false), start(2), finish(3, "unknown")]) await recorder.record(event);
+    const restart = new ReleaseRecorder(store, "goal-one");
+    await restart.record({ ...finish(5, "merged"), key: "attempt-one:recovered" });
+    const facts = await restart.read();
+    expect(rounds(facts, 4).merge).toBeNull();
+    expect(rounds(facts, 5).merge).toBe(1);
+    await restart.record({ ...finish(6, "failed"), key: "contradictory-receipt" });
+    expect(rounds(await restart.read()).merge).toBeNull();
+  });
+
   it("excludes later attempts and resolutions at the cutoff, without completing a pending attempt early", () => {
     const facts = history(begin(), observe(1, true), start(2), finish(3, "failed"), observe(4, false), observe(5, true),
       start(6, "attempt-two"), finish(7, "merged", "attempt-two"));

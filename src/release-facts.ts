@@ -130,8 +130,10 @@ export function releaseRounds(value: ReleaseFacts | undefined, goalId: string, p
         if (attempt.start && (attempt.start.headSha !== event.headSha || attempt.start.at !== event.at)) ambiguous = true;
         attempt.start ??= event;
       } else {
-        if (attempt.finish && (attempt.finish.headSha !== event.headSha || attempt.finish.result !== event.result)) ambiguous = true;
-        attempt.finish ??= event;
+        if (attempt.finish && (attempt.finish.headSha !== event.headSha
+          || (attempt.finish.result !== "unknown" && event.result !== "unknown" && attempt.finish.result !== event.result))) ambiguous = true;
+        // A later receipt may resolve an interrupted attempt. Its earlier unknown remains visible at earlier cutoffs.
+        if (!attempt.finish || attempt.finish.result === "unknown") attempt.finish = event;
       }
       attempts.set(event.attemptId, attempt);
     }
