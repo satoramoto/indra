@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type { SeatTaskRecord, Shell } from "./developer-seat.js";
 import { teamProject, type PlanningAssignment, type PlanningGoal, type PlanningStore } from "./planning.js";
+import { ImplementationRecorder } from "./implementation-facts.js";
 import { projectCheckoutPath } from "./project-checkout.js";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -63,11 +64,13 @@ export async function retainSeatRecord(store: PlanningStore, name: string, value
 /** Unknown fields may carry unique recovery data. They are never eligible for retirement. */
 function knownRecord(store: PlanningStore, seatId: string, goal: PlanningGoal, assignment: PlanningAssignment, github: string, value: unknown): value is SeatTaskRecord {
   if (!ownsSeatRecord(store.runtimeDir, seatId, goal.id, assignment.outcomeId, value)) return false;
-  const keys = ["goalId", "outcomeId", "step", "branch", "worktree", "gitDir", "prUrl", "retainedPrUrl", "findings", "conflictRounds", "sessions"];
+  const keys = ["goalId", "outcomeId", "step", "branch", "worktree", "gitDir", "prUrl", "retainedPrUrl", "findings", "conflictRounds", "reviewFixRounds", "attemptId", "sessions"];
   if (Object.keys(value).some((key) => !keys.includes(key))) return false;
   if (value.gitDir !== undefined && value.gitDir !== join(projectCheckoutPath(store.runtimeDir, github), ".git")) return false;
   if ([value.prUrl, value.retainedPrUrl].some((url) => url !== undefined && typeof url !== "string")) return false;
   if (value.findings !== undefined && (!Array.isArray(value.findings) || value.findings.some((item) => typeof item !== "string"))) return false;
+  if (value.attemptId !== undefined && (typeof value.attemptId !== "string" || !UUID.test(value.attemptId))) return false;
+  if (value.reviewFixRounds !== undefined && (!Number.isInteger(value.reviewFixRounds) || value.reviewFixRounds < 0)) return false;
   if (value.conflictRounds !== undefined && (!Number.isInteger(value.conflictRounds) || value.conflictRounds < 0)) return false;
   return value.sessions.every((session) => object(session) && Object.keys(session).every((key) => ["role", "sessionId", "startedAt", "finishedAt", "usage"].includes(key))
     && ["developer", "reviewer", "fix"].includes(session.role) && [session.sessionId, session.startedAt, session.finishedAt].every((text) => typeof text === "string"));
@@ -75,10 +78,11 @@ function knownRecord(store: PlanningStore, seatId: string, goal: PlanningGoal, a
 
 /** The primary history must retain every piece of the archive's information. */
 function superseded(archive: SeatTaskRecord, primary: SeatTaskRecord): boolean {
-  return ["goalId", "outcomeId", "branch", "worktree", "prUrl", "gitDir", "retainedPrUrl", "findings"].every((key) => {
+  return ["goalId", "outcomeId", "branch", "worktree", "prUrl", "gitDir", "retainedPrUrl", "findings", "attemptId"].every((key) => {
     const field = key as keyof SeatTaskRecord;
     return archive[field] === undefined || isDeepStrictEqual(archive[field], primary[field]);
-  }) && (archive.conflictRounds ?? 0) <= (primary.conflictRounds ?? 0)
+  }) && (archive.reviewFixRounds ?? 0) <= (primary.reviewFixRounds ?? 0)
+    && (archive.conflictRounds ?? 0) <= (primary.conflictRounds ?? 0)
     && archive.sessions.every((session, index) => isDeepStrictEqual(session, primary.sessions[index]));
 }
 
@@ -111,6 +115,13 @@ export async function maintainDeveloperSeat(store: PlanningStore, seatId: string
       let expected = structuredClone(goal);
       const matches = (current: PlanningGoal | undefined, repository: string | undefined) => repository === github && isDeepStrictEqual(current, expected);
       try {
+        const facts = new ImplementationRecorder(store, seatId, goal.id, assignment.outcomeId);
+        // Persist interpreted facts before any archive can be retired, even after release or worktree removal.
+        for (const file of [...archives, ...(primary ? [primary] : [])]) await facts.retain(file.value as SeatTaskRecord);
+        if (primary) {
+          const id = await facts.recover(primary.value as SeatTaskRecord);
+          await facts.finish(id, assignment.status as "failed" | "merged", assignment.updatedAt);
+        }
         if (assignment.status === "failed" && assignment.prUrl) {
           // An existing but unusable primary is not permission to revive a different attempt.
           const candidates = primary ? [primary] : saved.primaryExists ? [] : archives;
@@ -119,7 +130,7 @@ export async function maintainDeveloperSeat(store: PlanningStore, seatId: string
           const url = /^https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/pull\/([1-9]\d*)$/.exec(assignment.prUrl);
           if (record && url?.[1] === github && matching.every((file) => (file.value as SeatTaskRecord).branch === (record.value as SeatTaskRecord).branch)) {
             const result = await shell.run("gh", ["api", `repos/${github}/pulls/${url[2]}`, "--method", "GET"], store.checkout);
-            if (result.code === 0 && verifiedMerged(JSON.parse(result.stdout), github, assignment.prUrl, Number(url[2]), goal.integration?.branch ?? "main", (record.value as SeatTaskRecord).branch)) {
+            if (result.code === 0 && verifiedMerged(JSON.parse(result.stdout), github, assignment.prUrl, Number(url[2]), goal.integration?.branch ?? "", (record.value as SeatTaskRecord).branch)) {
               // Even a refused/pending persistence attempt must not fall through to execution this tick.
               handled = true;
               let changed = false;
@@ -136,6 +147,10 @@ export async function maintainDeveloperSeat(store: PlanningStore, seatId: string
                 expected = structuredClone(targetGoal!);
                 changed = true;
               }, `Seat ${seatId} reconciles ${goal.id}/${assignment.outcomeId}: merged`);
+              if (changed) {
+                const id = await facts.recover(record.value as SeatTaskRecord);
+                await facts.event(id, { kind: "merge", result: "recovered", prUrl: assignment.prUrl }, `reconciled:${assignment.prUrl}`);
+              }
               if (changed) log(`Reconciled ${goal.id}/${assignment.outcomeId} as merged.`);
             }
           }

@@ -310,11 +310,12 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       await rm(viewFile, { force: true });
       recordRunningBuild(`${options.checkout}.runtime`, import.meta.url);
       const updater = new SelfUpdater(defaultAppDir, undefined, undefined, `${resolve(options.checkout)}.runtime`);
+      const store = createPlanningStore(options.checkout);
       return await runTerminalUi(new StateInventory(new LocalStateRepository(options.checkout)), new LocalSessionReader(options.checkout), {
-        processes: new Supervisor(options.checkout, undefined, undefined, undefined, undefined, (force) => stageServiceToken(options.checkout, { force })),
+        processes: new Supervisor(options.checkout, undefined, undefined, undefined, store, (force) => stageServiceToken(options.checkout, { force })),
         goals: new CliGoalStarter(options.checkout),
         paneTail: new TmuxPaneTail(options.checkout),
-        sync: createPlanningStore(options.checkout),
+        sync: store,
         update: {
           running: await readBuildStamp(defaultAppDir),
           canReload: process.env[LAUNCHER_ENV] === "1",
