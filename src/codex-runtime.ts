@@ -113,7 +113,7 @@ export class CodexRuntime implements AgentRuntime {
       const cwds = [resolve(this.cwd), await realpath(this.cwd).catch(() => resolve(this.cwd))];
       const response = await runHeaded({
         label: "Codex", cwd: this.cwd, files, validate: resultValidator(schema), launch: { command: "codex", args: codexHeadedArgs(this.cwd, write, firstMessage(files)), env },
-        started: async () => !!(rollout ??= await codexRollout(home, cwds, since)), timeoutMs: options.timeoutMs ?? this.timeoutMs, signal: options.signal,
+        started: async () => (rollout ??= await codexRollout(home, cwds, since)), timeoutMs: options.timeoutMs ?? this.timeoutMs, signal: options.signal,
       });
       rollout ??= await codexRollout(home, cwds, since);
       await readLog(rollout, evidence);

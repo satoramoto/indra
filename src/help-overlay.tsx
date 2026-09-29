@@ -13,6 +13,7 @@ export const HELP_SECTIONS: HelpSection[] = [
   ] },
   { title: "A seat", keys: [
     ["a", "watch the seat's live process (read-only)"],
+    ["D", "drive the seat's live agent session: your keys reach it (only during a headed run; otherwise it watches)"],
     ["t", "read the seat's session transcript as it happens (read-only)"],
     ["s  x", "restart or stop the seat's process"],
     ["T", "retry a failed assignment (asks first)"],
@@ -21,6 +22,10 @@ export const HELP_SECTIONS: HelpSection[] = [
     [RETURN_KEY, "back to Indra"],
     ["wheel  PgUp", "scroll back; q, Esc or scrolling to the bottom returns to live"],
     ["typing", "never reaches the run"],
+  ] },
+  { title: "While driving a seat", keys: [
+    [RETURN_KEY, "back to Indra; the task keeps running and Indra still waits for its result"],
+    ["typing", "goes straight to the live agent session"],
   ] },
   { title: "In the transcript", keys: [
     ["↑ ↓  PgUp PgDn", "scroll"],

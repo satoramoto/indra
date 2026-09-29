@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ClaudeRuntime } from "../src/claude-runtime.js";
 import { CodexRuntime } from "../src/codex-runtime.js";
-import { claimHeaded, headedAvailable, headedTiming } from "../src/headed-session.js";
+import { claimHeaded, headedAvailable, headedMarkerFile, headedTiming, HELD_LINES, holdConsole, prepareTaskFiles, readHeadedMarker, runHeaded } from "../src/headed-session.js";
 import { AgentRunError } from "../src/runtime-facts.js";
 
 vi.mock("node:child_process", () => ({ spawn: vi.fn(), spawnSync: vi.fn(), execFile: vi.fn() }));
@@ -200,5 +200,61 @@ describe("headed Codex", () => {
     piped.stdout.write('{"type":"thread.started","thread_id":"t1"}\n{"type":"item.completed","item":{"type":"agent_message","text":"{\\"summary\\":\\"ok\\"}"}}\n');
     piped.emit("close", 0);
     await expect(run).resolves.toMatchObject({ sessionId: "t1" });
+  });
+});
+
+describe("the pane during a headed run", () => {
+  const sink = () => {
+    const lines: string[] = [];
+    const out = (level: string) => (...args: unknown[]) => { lines.push(`${level} ${args.join(" ")}`); };
+    return { lines, console: { log: out("log"), info: out("info"), warn: out("warn"), error: out("error") } };
+  };
+
+  it("holds this process's log lines while the CLI owns the pane and prints them in order once it ends", async () => {
+    const child = new Headed(); vi.mocked(spawn).mockReturnValue(child as unknown as ReturnType<typeof spawn>);
+    const out = sink();
+    const files = await prepareTaskFiles(dir);
+    const marker = join(dir, "runtime", "headed-0123.json");
+    let log: string | undefined;
+    const run = runHeaded({ label: "Codex", cwd: dir, files, validate: () => true, launch: { command: "codex", args: [], env: {} },
+      started: async () => log, timeoutMs: 60_000, marker, console: out.console });
+    await launched();
+    out.console.log("seat: claimed", 2); out.console.error("seat: warning"); out.console.info("seat: step");
+    expect(out.lines).toEqual([]);
+    // The marker says a headed run owns the pane, then where its session log is once the CLI started.
+    await vi.waitFor(async () => expect(await readHeadedMarker(marker)).toMatchObject({ pid: process.pid, engine: "codex" }));
+    expect((await readHeadedMarker(marker))?.log).toBeUndefined();
+    log = join(dir, "rollout-x.jsonl");
+    await vi.waitFor(async () => expect((await readHeadedMarker(marker))?.log).toBe(log));
+    await writeFile(files.result, JSON.stringify({ summary: "Done" }));
+    await expect(run).resolves.toEqual({ summary: "Done" });
+    expect(out.lines).toEqual(["log seat: claimed 2", "error seat: warning", "info seat: step"]);
+    // The console is the process's own again, and the marker is gone.
+    out.console.log("after");
+    expect(out.lines.at(-1)).toBe("log after");
+    await expect(readFile(marker, "utf8")).rejects.toThrow();
+  });
+
+  it("keeps at most HELD_LINES held lines, counts the rest, and releases once", () => {
+    const out = sink();
+    const release = holdConsole(out.console);
+    for (let index = 0; index < HELD_LINES + 3; index++) out.console.warn("line", index);
+    expect(out.lines).toEqual([]);
+    release(); release();
+    expect(out.lines).toHaveLength(HELD_LINES + 1);
+    expect(out.lines[0]).toBe("warn line 0");
+    expect(out.lines.at(-1)).toBe("log (3 more log lines from the headed run were dropped.)");
+  });
+
+  it("ignores a marker left by a process that is gone, and names markers only by a ready nonce", async () => {
+    const file = headedMarkerFile(dir, "0123abcd-0000-4000-8000-000000000000");
+    expect(file).toBe(`${dir}.runtime/headed-0123abcd-0000-4000-8000-000000000000.json`);
+    expect(() => headedMarkerFile(dir, "../x")).toThrow();
+    await mkdir(`${dir}.runtime`, { recursive: true });
+    try {
+      await writeFile(file, JSON.stringify({ pid: 99, engine: "claude", startedAt: "t", log: "/x/s.jsonl" }));
+      expect(await readHeadedMarker(file, () => true)).toEqual({ pid: 99, engine: "claude", startedAt: "t", log: "/x/s.jsonl" });
+      expect(await readHeadedMarker(file, () => false)).toBeUndefined();
+    } finally { await rm(`${dir}.runtime`, { recursive: true, force: true }); }
   });
 });

@@ -105,7 +105,7 @@ export class ClaudeRuntime implements AgentRuntime {
       const transcript = () => claudeTranscript(id);
       const response = await runHeaded({
         label: "Claude", cwd: this.cwd, files, validate: resultValidator(schema), launch: { command: "claude", args, env },
-        started: async () => (started = !!await transcript()), timeoutMs: options.timeoutMs ?? this.timeoutMs, signal: options.signal,
+        started: async () => { const path = await transcript(); started = !!path; return path; }, timeoutMs: options.timeoutMs ?? this.timeoutMs, signal: options.signal,
       });
       await readLog(await transcript(), evidence);
       const facts = evidence.finish("succeeded");

@@ -6,6 +6,9 @@ import type { StateSyncResult } from "./state-commit.js";
 import type { BuildStamp } from "./build-stamp.js";
 import type { RollbackPlan, UpdateResult } from "./self-update.js";
 import type { SessionSnapshot, SprintLoop } from "./session-snapshot.js";
+import type { LiveUsage, LiveUsagePort } from "./live-usage.js";
+import type { TokenUsage } from "./runtime-facts.js";
+import { sumUsage } from "./hub-format.js";
 
 /** Keeps Indra's own code current: pulls and builds new commits, and says when `dist/` holds a newer build. */
 export interface UpdatePort {
@@ -62,7 +65,7 @@ export interface StateSyncPort {
 }
 
 export type UiPage = "teams" | "team" | "seat";
-export type UiAction = "none" | "refresh" | "quit" | "attach" | "stop" | "restart" | "retry" | "submit" | "approve" | "propose" | "sprint" | "pause" | "ask-rollback" | "rollback";
+export type UiAction = "none" | "refresh" | "quit" | "attach" | "drive" | "stop" | "restart" | "retry" | "submit" | "approve" | "propose" | "sprint" | "pause" | "ask-rollback" | "rollback";
 /** Longest goal the new-goal input accepts; a Mattermost post (~16k) holds it with room to spare. */
 export const GOAL_INPUT_LIMIT = 8000;
 /** The multi-line text input for a new planning goal. The channel and project come from the team in state. */
@@ -122,6 +125,10 @@ export class TerminalUiModel {
   revision = 0;
   /** Live process, assignment and thread activity per seat ID; empty without a process supervisor. */
   live: Record<string, SeatLive> = {};
+  /** Running token totals of the headed runs still going, per seat ID of the open team; read at most every few seconds. */
+  liveUsage: Record<string, LiveUsage> = {};
+  /** Reads those totals; set by the UI runner. */
+  liveUsagePort?: LiveUsagePort;
   input?: UiInput;
   /** Set while a y/n confirmation is open. */
   confirm?: UiApproval | UiRollback | UiRetry;
@@ -600,9 +607,35 @@ export class TerminalUiModel {
       this.confirm = undefined;
       staleConfirmation = true;
     }
-    const changed = staleConfirmation || previous !== JSON.stringify([this.snapshot, this.stateError, this.sessionResult, this.live]);
+    const liveChanged = await this.readLiveUsage();
+    const changed = staleConfirmation || liveChanged || previous !== JSON.stringify([this.snapshot, this.stateError, this.sessionResult, this.live]);
     if (changed) this.revision++;
     return changed;
+  }
+
+  /**
+   * A seat's recorded usage plus its headed run's live totals, unless that session is already recorded (a live total
+   * read just before the run finished must not count twice). Undefined `recorded` with no live run stays undefined.
+   */
+  withLiveUsage(seatId: string, recorded: TokenUsage | undefined, recordedIds: (string | undefined)[]): TokenUsage | undefined {
+    const live = this.liveUsage[seatId];
+    if (!live || (live.sessionId && recordedIds.includes(live.sessionId))) return recorded;
+    return sumUsage([recorded, live.usage]);
+  }
+
+  /** Reads the open team's live token totals (the port throttles each seat); true when any changed. */
+  private async readLiveUsage(): Promise<boolean> {
+    const port = this.liveUsagePort;
+    if (!port) return false;
+    const next: Record<string, LiveUsage> = {};
+    await Promise.all((this.team?.seats ?? []).map(async (seat) => {
+      const hosted = seat.roles.includes("Team Lead") ? { kind: "bridge" as const } : seat.roles.includes("Developer") ? { kind: "seat" as const, seatId: seat.id } : undefined;
+      const found = hosted ? await port.read(hosted).catch(() => undefined) : undefined;
+      if (found) next[seat.id] = found;
+    }));
+    if (JSON.stringify(next) === JSON.stringify(this.liveUsage)) return false;
+    this.liveUsage = next;
+    return true;
   }
 
   /** `text` is the key's raw character, used only while the text input is open. */
@@ -711,6 +744,10 @@ export class TerminalUiModel {
     } else if (input === "enter" || input === "return" || input === "right") {
       if (this.page === "teams" && this.team) this.page = "team";
       else if (this.page === "team" && this.seat) this.page = "seat";
+    } else if (text === "D" || (text === undefined && value === "D")) {
+      if (this.page !== "seat") this.notice = "Open a seat first to drive its live session.";
+      else if (!this.attachTarget()) this.notice = "No live session to drive for this seat; its process is not running under Indra.";
+      else return "drive";
     } else if (input === "a") {
       if (this.page !== "seat") this.notice = "Open a seat first to watch its live process.";
       else if (!this.attachTarget()) this.notice = "No live view is available for this seat; its process is not running under Indra.";

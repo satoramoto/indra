@@ -14,5 +14,14 @@ export const SCROLL_HINT = "mouse wheel or PgUp scrolls back · q, Esc or scroll
 /** Shown in Indra before it switches the screen to a seat, and at the bottom of the watched seat. */
 export const WATCH_HINT = `${RETURN_HINT} · ${SCROLL_HINT}`;
 
+/** At the bottom of a seat the owner drives. */
+export const DRIVE_HINT = `${RETURN_HINT} · the task keeps running and Indra still waits for its result`;
+
+/** Shown in Indra before it switches the screen to a seat the owner drives. */
+export const driveWarning = (seat: string) => `You're driving ${seat}'s live session. ${RETURN_KEY} returns to Indra.`;
+
+/** Shown instead when drive falls back to watching: the seat has no headed run to type into. */
+export const driveFallback = (seat: string) => `${seat} is not in a headed run, so there is nothing to drive; watching read-only instead · ${WATCH_HINT}`;
+
 /** How long Indra shows the hint before it switches the screen to the seat. */
 export const WATCH_HINT_MS = 1200;

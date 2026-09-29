@@ -28,6 +28,8 @@ export interface AssignmentFacts {
   /** Summed over every recorded session of every attempt: the assignment's running cost. */
   usage?: TokenUsage;
   sessions: number;
+  /** The recorded session handles, so a live total is never added on top of the same session's recorded one. */
+  sessionIds?: string[];
   /** The engine of the newest recorded session. */
   engine?: RuntimeEngine;
   /** When the newest attempt was claimed, and when it ended if it has. */
@@ -61,12 +63,15 @@ export function assignmentFacts(record: SeatTaskRecord | undefined, ledger: Impl
   const latestEvents = latest && Array.isArray(latest.events) ? latest.events : [];
   const ci = [...latestEvents].reverse().find((event) => event.kind === "ci" || (event.kind === "merge" && event.result === "passed"));
   const step = record && STEPS.includes(record.step) ? record.step : undefined;
+  const sessionIds = [...new Set([...sessions.map((event) => event.session?.sessionId), ...(record?.sessions ?? []).map((session) => session.sessionId)]
+    .filter((id): id is string => typeof id === "string" && !!id))];
   return {
     ...(step ? { step } : {}),
     ...(typeof record?.reviewFixRounds === "number" ? { fixRounds: record.reviewFixRounds } : {}),
     ...(ci ? { ci: ci.result === "passed" ? "passed" : ci.result === "failed" ? "failed" : "pending" } : {}),
     ...(usage ? { usage } : {}),
     sessions: sessions.length || record?.sessions?.length || 0,
+    ...(sessionIds.length ? { sessionIds } : {}),
     ...(sessions.at(-1)?.session?.engine ? { engine: sessions.at(-1)!.session!.engine } : {}),
     ...(latest?.claimedAt ? { claimedAt: latest.claimedAt } : {}),
     ...(latest?.terminal?.at ? { endedAt: latest.terminal.at } : {}),
