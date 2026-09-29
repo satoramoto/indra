@@ -1,13 +1,16 @@
-import { join } from "node:path";
-import type { PlanningStore } from "./planning.js";
-import { ceremonyRuntimeName, type BridgeCeremonyRecord } from "./planning-bridge.js";
+import { createHash, randomUUID } from "node:crypto";
+import { dirname, join } from "node:path";
+import { processShell, type Shell } from "./command-shell.js";
+import { runGh } from "./git-gh.js";
+import { requireTeamHome, type PlanningStore } from "./planning.js";
+import { ceremonyRuntimeName, type BridgeCeremonyRecord, type CeremonyAdapters, type CeremonyContext, type ReleaseEvent } from "./planning-bridge.js";
 import { redactSecrets } from "./redact.js";
 import { withFileLock } from "./state-commit.js";
 
 interface ReleaseFactBase { key: string; at: string; prUrl: string }
 export type ReleaseFact = ReleaseFactBase & (
   | { kind: "tracking-started" }
-  | { kind: "observation"; headSha: string; state: "OPEN" | "CLOSED" | "MERGED"; conflicting: boolean | null }
+  | { kind: "observation"; headSha: string; state: "OPEN" | "CLOSED" | "MERGED" | "UNKNOWN"; conflicting: boolean | null }
   | { kind: "merge-started"; headSha: string; attemptId: string }
   | { kind: "merge-finished"; headSha: string; attemptId: string; result: "failed" | "merged" | "unknown" }
 );
@@ -38,9 +41,9 @@ function fact(value: unknown): ReleaseFact {
   if (value.kind === "tracking-started") return { ...base, kind: value.kind };
   if (!validSha(value.headSha)) throw new Error("Invalid release fact head.");
   const headSha = value.headSha;
-  if (value.kind === "observation" && ["OPEN", "CLOSED", "MERGED"].includes(String(value.state))
+  if (value.kind === "observation" && ["OPEN", "CLOSED", "MERGED", "UNKNOWN"].includes(String(value.state))
     && (typeof value.conflicting === "boolean" || value.conflicting === null)) {
-    return { ...base, kind: value.kind, headSha, state: value.state as "OPEN" | "CLOSED" | "MERGED", conflicting: value.conflicting };
+    return { ...base, kind: value.kind, headSha, state: value.state as Extract<ReleaseFact, { kind: "observation" }>["state"], conflicting: value.conflicting };
   }
   if (!validId(value.attemptId)) throw new Error("Invalid release merge attempt.");
   if (value.kind === "merge-started") return { ...base, kind: value.kind, headSha, attemptId: value.attemptId };
@@ -65,23 +68,101 @@ export class ReleaseRecorder {
   }
   async record(event: ReleaseFact): Promise<void> {
     const next = fact(event);
+    await this.update(() => [next]);
+  }
+  /** A poll records a new observation only when the observed state changes, at its actual read time. */
+  async observe(event: Extract<ReleaseFact, { kind: "observation" }>, fromOpening: boolean): Promise<void> {
+    const next = fact(event);
+    await this.update((history) => {
+      const prior = [...history.events].reverse().find((item) => item.kind === "observation");
+      if (prior && JSON.stringify({ ...prior, key: next.key, at: next.at }) === JSON.stringify(next)) return [];
+      return [...(!history.events.length && fromOpening ? [{ kind: "tracking-started" as const, key: "tracking", at: next.at, prUrl: next.prUrl }] : []), next];
+    });
+  }
+  private async update(events: (history: ReleaseFacts) => ReleaseFact[]): Promise<void> {
     await withFileLock(join(this.store.runtimeDir, `${this.name}.lock`), async () => {
       const record = await this.store.readRuntimeFile<ReleaseRuntimeRecord>(this.name) ?? {
         facts: { seats: [], sessions: [], reviews: [], rounds: [], failures: [] }, deliveredStages: [],
       };
       const history = record.facts.releaseFacts ? ledger(record.facts.releaseFacts, this.goalId) : { version: 1 as const, goalId: this.goalId, events: [] };
-      const prior = history.events.find((item) => item.key === next.key);
-      if (prior) {
-        // A replay may be delivered later; its first recorded timestamp remains the cutoff boundary.
-        if (JSON.stringify({ ...prior, at: next.at }) !== JSON.stringify(next)) throw new Error("Conflicting release event replay.");
-        return;
+      let changed = false;
+      for (const next of events(history).map(fact)) {
+        const prior = history.events.find((item) => item.key === next.key);
+        if (prior) {
+          // A replay may be delivered later; its first recorded timestamp remains the cutoff boundary.
+          if (JSON.stringify({ ...prior, at: next.at }) !== JSON.stringify(next)) throw new Error("Conflicting release event replay.");
+          continue;
+        }
+        if (history.events.length >= MAX_EVENTS) throw new Error("Release history exceeds its record bound.");
+        history.events.push(next); changed = true;
       }
-      if (history.events.length >= MAX_EVENTS) throw new Error("Release history exceeds its record bound.");
-      history.events.push(next);
+      if (!changed) return;
       record.facts.releaseFacts = history;
       await this.store.saveRuntime(this.name, record);
     });
   }
+}
+
+export const controlServices = ["releaseFacts"] as const;
+// Hash hook identities into bounded segments: neither arbitrary hook text nor token-shaped UUIDs enter the ledger.
+const hookId = (prefix: string, key: string) => `${prefix}:${createHash("sha256").update(key).digest("hex").match(/.{8}/g)!.join(".")}`;
+
+/** The shared head hook identifies a verified PR, but omits its mergeability. Read it without changing the gate. */
+async function observation(context: CeremonyContext, event: ReleaseEvent, shell: Shell): Promise<Extract<ReleaseFact, { kind: "observation" }>> {
+  const { github } = requireTeamHome(await context.store.read(), context.goal.teamId);
+  if (!event.prUrl?.startsWith(`https://github.com/${github}/pull/`) || !validSha(event.headSha)) throw new Error("Invalid integration observation target.");
+  let state: Extract<ReleaseFact, { kind: "observation" }>["state"] = "UNKNOWN";
+  let conflicting: boolean | null = null;
+  try {
+    const result = await runGh(shell, ["pr", "view", event.prUrl, "--json", "state,headRefName,baseRefName,headRefOid,isCrossRepository,mergeable"], dirname(context.store.runtimeDir));
+    const pr: unknown = JSON.parse(result.stdout);
+    if (result.code === 0 && object(pr) && pr.headRefOid === event.headSha && pr.headRefName === context.goal.integration?.branch
+      && pr.baseRefName === "main" && pr.isCrossRepository === false && ["OPEN", "CLOSED", "MERGED"].includes(String(pr.state))) {
+      state = pr.state as typeof state;
+      conflicting = pr.mergeable === "CONFLICTING" ? true : pr.mergeable === "MERGEABLE" ? false : null;
+    }
+  } catch { /* A failed or moving read cannot resolve a conflict. Never retain its diagnostics. */ }
+  return { kind: "observation", key: hookId("observation", randomUUID()), at: new Date().toISOString(), prUrl: event.prUrl, headSha: event.headSha, state, conflicting };
+}
+
+/** Discovered by the owner-control composition. Gate requests are not counted until a matching result exists. */
+export function createCeremonyAdapters(_services: { store: PlanningStore }, shell: Shell = processShell): CeremonyAdapters {
+  // Only an uninterrupted request can be paired with merge-blocked: that hook can also mean a pre-command check failed.
+  const active = new Map<string, Extract<ReleaseFact, { kind: "merge-started" }>>();
+  return { releaseEvent: async (context, event) => {
+    if (event.gate !== "integration" || !event.prUrl) return;
+    const recorder = new ReleaseRecorder(context.store, context.goal.id);
+    const identity = join(context.store.runtimeDir, context.goal.id);
+    if (event.kind === "head-observed") {
+      active.delete(identity);
+      await recorder.observe(await observation(context, event, shell), context.goal.integration?.status === "collecting");
+    } else if (event.kind === "merge-requested") {
+      const attemptId = hookId("merge", event.key);
+      const started = fact({ kind: "merge-started", key: attemptId, attemptId, at: event.at, prUrl: event.prUrl, headSha: event.headSha }) as Extract<ReleaseFact, { kind: "merge-started" }>;
+      await recorder.record(started);
+      active.set(identity, started);
+    } else if (event.kind === "merge-blocked") {
+      const started = active.get(identity);
+      if (started?.prUrl === event.prUrl && started.headSha === event.headSha) {
+        await recorder.record({ kind: "merge-finished", key: `${started.attemptId}:failed`, at: new Date().toISOString(), prUrl: started.prUrl, headSha: started.headSha, attemptId: started.attemptId, result: "failed" });
+      }
+      active.delete(identity);
+    } else if (event.kind === "merged" && validSha(event.headSha) && validSha(event.mergedSha)) {
+      const integration = context.goal.integration;
+      if (integration?.status !== "merged" || integration.prUrl !== event.prUrl || integration.headSha !== event.headSha || integration.mergedSha !== event.mergedSha) return;
+      const events = (await recorder.read())?.events ?? [];
+      const matching = events.filter((item) => item.prUrl === event.prUrl && "headSha" in item && item.headSha === event.headSha).reverse();
+      // A receipt confirms the latest request, including one whose command response was lost. Earlier unresolved requests stay unknown.
+      const started = matching.find((item) => item.kind === "merge-started");
+      const unrecorded = hookId("unrecorded", event.mergedSha);
+      const finished = matching.find((item) => item.kind === "merge-finished" && item.attemptId === (started?.kind === "merge-started" ? started.attemptId : unrecorded));
+      if (finished?.kind === "merge-finished" && finished.result === "merged") return;
+      const attemptId = started?.kind === "merge-started" && (!finished || (finished.kind === "merge-finished" && finished.result === "unknown"))
+        ? started.attemptId : unrecorded;
+      await recorder.record({ kind: "merge-finished", key: `${attemptId}:merged`, at: new Date().toISOString(), prUrl: event.prUrl, headSha: event.headSha, attemptId, result: "merged" });
+      active.delete(identity);
+    }
+  } };
 }
 
 /** Missing files, unreadable history and legacy events cannot establish a recorded zero. */

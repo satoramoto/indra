@@ -402,14 +402,16 @@ describe("per-phase process reflection", () => {
     const data = input(); const events = data.facts.releaseFacts!.events;
     events.splice(2, 0,
       { kind: "observation", key: "conflict", at: at(32), prUrl: pr, headSha: "a".repeat(40), state: "OPEN", conflicting: true },
-      { kind: "observation", key: "resolved", at: at(33), prUrl: pr, headSha: "a".repeat(40), state: "OPEN", conflicting: false });
+      { kind: "observation", key: "resolved", at: at(33), prUrl: pr, headSha: "a".repeat(40), state: "OPEN", conflicting: false },
+      { kind: "merge-started", key: "failed-start", at: at(33), prUrl: pr, headSha: "a".repeat(40), attemptId: "failed-attempt" },
+      { kind: "merge-finished", key: "failed-finish", at: at(34), prUrl: pr, headSha: "a".repeat(40), attemptId: "failed-attempt", result: "failed" });
     const snapshot = buildRetroSnapshot(data);
     const response = narrative(snapshot);
     response.phaseReflections = response.phaseReflections.filter((item) => item.phase !== "release")
       .concat(snapshot.choices.phaseReflections.filter((item) => item.phase === "release"));
     const markdown = await renderSprintRetro(snapshot, response, generation());
     expect(markdown).toContain("| Integration PR conflict rounds | 1 | release-integration-conflicts |");
-    expect(markdown).toContain("| Integration PR merge rounds | 1 | release-merge-rounds |");
+    expect(markdown).toContain("| Integration PR merge rounds | 2 | release-merge-rounds |");
     expect(markdown).toContain("repeated polling is counted once per episode. [release-integration-conflicts]");
     expect(markdown).toContain("including failed attempts; repeated polling is not a merge round. [release-merge-rounds]");
     expect(snapshot.choices.ownerProposals).not.toEqual(expect.arrayContaining([expect.objectContaining({ text: "Consider improving the incomplete integration PR conflict and merge history." })]));
