@@ -8,8 +8,9 @@ export interface PaneTailSize { lines: number; width: number }
 export type PaneTail = { status: "ok"; lines: string[] } | { status: "no-session" } | { status: "error"; message: string };
 export interface PaneTailSource { capture(seat: PaneTailSeat, size: PaneTailSize): Promise<PaneTail> }
 
-// CSI, OSC (BEL or ST terminated), DCS/SOS/PM/APC strings, and two-byte escapes.
-const ESCAPES = /\u001b\[[0-?]*[ -/]*[@-~]|\u009b[0-?]*[ -/]*[@-~]|\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)?|\u009d[^\u0007\u009c]*[\u0007\u009c]?|\u001b[PX^_][^\u001b]*(?:\u001b\\)?|\u001b[ -/]*[0-~]/g;
+// CSI, OSC (BEL or ST terminated), DCS/SOS/PM/APC strings, and two-byte escapes. A string escape ends at its
+// terminator or at the end of its line, so an unterminated one hides only the rest of that line, not the pane.
+const ESCAPES = /\u001b\[[0-?]*[ -/]*[@-~]|\u009b[0-?]*[ -/]*[@-~]|\u001b\][^\u0007\u001b\n]*(?:\u0007|\u001b\\)?|\u009d[^\u0007\u009c\n]*[\u0007\u009c]?|\u001b[PX^_][^\u001b\n]*(?:\u001b\\)?|\u001b[ -/]*[0-~]/g;
 
 function truncate(line: string, width: number): string {
   const chars = Array.from(line);
@@ -70,7 +71,8 @@ const systemTimers: PaneTailTimers = {
 
 /**
  * Captures the selected seat's pane about once a second while started. A tick is skipped while the previous
- * capture is still running, and a result is dropped if the view stopped or the seat changed meanwhile.
+ * capture is still running, and a result is dropped if the view stopped or the seat changed meanwhile; when the
+ * seat changed, the new seat is captured as soon as the previous capture ends rather than on the next tick.
  */
 export class PaneTailPoller {
   private handle: unknown;
@@ -108,5 +110,7 @@ export class PaneTailPoller {
       const tail = await this.source.capture(seat, this.size()).catch((error: unknown): PaneTail => ({ status: "error", message: redactSecrets(error instanceof Error ? error.message : String(error)) }));
       if (this.running && this.seat()?.id === seat.id) this.onResult(seat.id, tail);
     } finally { this.busy = false; }
+    const next = this.running ? this.seat() : undefined;
+    if (next && next.id !== seat.id) await this.tick();
   }
 }
