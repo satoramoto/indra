@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentRuntime } from "../src/codex-runtime.js";
 import type { Shell } from "../src/command-shell.js";
+import { controlModules, registerCeremonyAdapters } from "../src/control-adapters.js";
 import { PlanningBridge, type CeremonyAdapters, type PlanningChat, type Post } from "../src/planning-bridge.js";
 import { PlanningStore } from "../src/planning.js";
 import { ReleaseRecorder, createCeremonyAdapters, readReleaseFacts, releaseRounds, type ReleaseFact, type ReleaseFacts } from "../src/release-facts.js";
@@ -199,10 +200,12 @@ async function gateFixture(recording = true) {
   let running = false;
   const makeBridge = (record = true, wrap?: (adapters: CeremonyAdapters) => CeremonyAdapters) => {
     const recorder = record ? createCeremonyAdapters({ store }, github) : {};
-    return new PlanningBridge(store, chat, runtime, 20, github, { ...(wrap ? wrap(recorder) : recorder), release: { poll: async ({ goal, mergeApproval }) => running ? { status: "complete", evidence: {
+    const adapters: CeremonyAdapters = { release: { poll: async ({ goal, mergeApproval }) => running ? { status: "complete", evidence: {
       kind: "release-running", prUrl, mergedSha: goal.integration!.mergedSha!, buildSha: goal.integration!.mergedSha!, runningSha: goal.integration!.mergedSha!,
       runningAt: new Date().toISOString(), checksPassed: true, approval: mergeApproval!.approval, mergePostId: mergeApproval!.postId,
-    } } : { status: "pending", reason: "Build not running yet" } } });
+    } } : { status: "pending", reason: "Build not running yet" } } };
+    registerCeremonyAdapters(adapters, wrap ? wrap(recorder) : recorder);
+    return new PlanningBridge(store, chat, runtime, 20, github, adapters);
   };
   const bridge = makeBridge(recording);
   const goal = await bridge.start("Ship one change");
@@ -217,6 +220,8 @@ async function gateFixture(recording = true) {
 
 describe("shared release gates through the recording adapter", () => {
   it("records resolved conflict episodes on the same or changed head without counting repeated observations", async () => {
+    expect(controlModules["./release-facts.ts"]?.createCeremonyAdapters).toBe(createCeremonyAdapters);
+    expect(controlModules["./release-facts.ts"]?.controlServices).toEqual(["releaseFacts"]);
     const f = await gateFixture();
     expect(await f.totals()).toEqual({ conflict: 0, merge: 0, missing: [] });
     const firstRead = (await f.facts())!.events.at(-1)!.at;
