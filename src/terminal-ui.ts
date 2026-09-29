@@ -1,4 +1,7 @@
 import type { StateInventory, StateSeat, StateSnapshot, StateTeam } from "./state-domain.js";
+import { autoModeEnabled, INITIAL_TEAM_MISSION, seatStatus } from "./state-domain.js";
+import { removalRequest, type AddSeatRequest, type OwnerControls, type RemoveSeatRequest } from "./control-adapters.js";
+import { redactSecrets } from "./redact.js";
 import type { AssignmentRetry, GoalStarter, SeatLive, SeatProcessPort, SprintAction } from "./supervisor.js";
 import { isFinishedSprint } from "./finished-sprint.js";
 import { missingTeamHome,missingTeamMessage } from "./planning.js";
@@ -61,8 +64,8 @@ export interface StateSyncPort {
   sync(): Promise<StateSyncResult>;
 }
 
-export type UiPage = "teams" | "team" | "seat";
-export type UiAction = "none" | "refresh" | "quit" | "attach" | "stop" | "restart" | "retry" | "submit" | "approve" | "propose" | "sprint" | "pause" | "ask-rollback" | "rollback";
+export type UiPage = "teams" | "team" | "seat" | "controls";
+export type UiAction = "none" | "refresh" | "quit" | "attach" | "stop" | "restart" | "retry" | "submit" | "approve" | "propose" | "sprint" | "pause" | "ask-rollback" | "rollback" | "team-control";
 /** Longest goal the new-goal input accepts; a Mattermost post (~16k) holds it with room to spare. */
 export const GOAL_INPUT_LIMIT = 8000;
 /** The multi-line text input for a new planning goal. The channel and project come from the team in state. */
@@ -84,6 +87,17 @@ const sprintActions: Record<string, SprintAction> = { integrate: "integrate", me
 /** A rollback (`R`) from the running build's short SHA to the previous build's. */
 export interface UiRollback { action: "rollback"; from: string; to: string }
 export interface UiRetry extends AssignmentRetry { action: "retry" }
+export type TeamChange = { kind: "mission"; value: string } | { kind: "auto"; enabled: boolean }
+  | { kind: "add"; request: AddSeatRequest } | { kind: "remove"; request: RemoveSeatRequest };
+export interface UiTeamConfirmation { action: "team"; teamId: string; expected: string; change: TeamChange }
+export type TeamInput = { kind: "mission"; teamId: string; expected: string; value: string }
+  | { kind: "add"; teamId: string; expected: string; field: "displayName" | "username" | "role"; request: AddSeatRequest };
+
+function teamVersion(team: StateTeam, change: TeamChange): string {
+  const value = change.kind === "mission" ? team.mission : change.kind === "auto" ? team.standingPolicy
+    : change.kind === "remove" ? removalRequest(team, change.request.seatId) : team.seats;
+  return JSON.stringify([team.id, value]);
+}
 
 const shortSha = (sha?: string) => sha?.slice(0, 7) || "unknown build";
 
@@ -124,7 +138,11 @@ export class TerminalUiModel {
   live: Record<string, SeatLive> = {};
   input?: UiInput;
   /** Set while a y/n confirmation is open. */
-  confirm?: UiApproval | UiRollback | UiRetry;
+  confirm?: UiApproval | UiRollback | UiRetry | UiTeamConfirmation;
+  teamInput?: TeamInput;
+  private teamChanging?: UiTeamConfirmation;
+  private teamPending = false;
+  private controlsPolling = false;
   private retrying?: UiRetry;
   private retryPending = false;
   /** The approval the owner confirmed, until `approveConfirmed` runs it. */
@@ -157,7 +175,7 @@ export class TerminalUiModel {
   /** Settles when the update in progress (install, build, switch and restarts) ends. */
   private updateRun?: Promise<void>;
 
-  constructor(private readonly state: StateInventory, private readonly sessions: SessionReadPort, private readonly processes?: SeatProcessPort, private readonly goals?: GoalStarter, private readonly stateSync?: StateSyncPort, private readonly update?: UpdatePort) {}
+  constructor(private readonly state: StateInventory, private readonly sessions: SessionReadPort, private readonly processes?: SeatProcessPort, private readonly goals?: GoalStarter, private readonly stateSync?: StateSyncPort, private readonly update?: UpdatePort, readonly controls: OwnerControls = {}) {}
 
   private bump(): void { this.revision++; this.changed?.(); }
 
@@ -179,6 +197,7 @@ export class TerminalUiModel {
   /** Syncs the state checkout first, then hosts the processes, so they start from the remote's state; then checks for new code. */
   async start(): Promise<void> {
     await this.syncState();
+    await this.pollControls();
     await this.ensureProcesses();
     await this.checkLaunch();
     await this.updateCode();
@@ -264,7 +283,7 @@ export class TerminalUiModel {
     else {
       const plan = await update.rollbackPlan().catch(() => undefined);
       if (!plan) this.notice = "No previous build to roll back to; nothing changed.";
-      else if (!this.input && !this.confirm) this.confirm = { action: "rollback", from: shortSha(plan.from?.sha), to: shortSha(plan.to?.sha) };
+      else if (!this.input && !this.teamInput && !this.confirm) this.confirm = { action: "rollback", from: shortSha(plan.from?.sha), to: shortSha(plan.to?.sha) };
     }
     this.bump();
   }
@@ -305,14 +324,14 @@ export class TerminalUiModel {
 
   /** A reload is due and nothing is in flight: no typing, confirmation, state sync, update or action. */
   readyToReload(): boolean {
-    return this.reloadWanted && !!this.update?.canReload && !this.updateResult?.installFailed && !this.input && !this.confirm && !this.syncing && !this.updating && this.busy === 0;
+    return this.reloadWanted && !!this.update?.canReload && !this.updateResult?.installFailed && !this.input && !this.teamInput && !this.confirm && !this.syncing && !this.updating && this.busy === 0;
   }
 
   view(): UiView { return { page: this.page, ...(this.teamId ? { teamId: this.teamId } : {}), ...(this.seatId ? { seatId: this.seatId } : {}) }; }
 
   /** Restores a view saved before a reload; the next refresh drops a team or seat that no longer exists. */
   restore(view: UiView): void {
-    if (!["teams", "team", "seat"].includes(view.page)) return;
+    if (!["teams", "team", "seat", "controls"].includes(view.page)) return;
     this.page = view.page;
     this.teamId = typeof view.teamId === "string" ? view.teamId : undefined;
     this.seatId = typeof view.seatId === "string" ? view.seatId : undefined;
@@ -354,6 +373,137 @@ export class TerminalUiModel {
     if (!last) return { text: "State sync: syncing with the remote…", ok: true };
     const ok = last.outcome === "synced" || last.outcome === "skipped";
     return { text: "State sync " + last.at.slice(11, 19) + " UTC · " + (ok ? "" : last.outcome.toUpperCase() + " · ") + last.message + (this.syncing ? " · syncing…" : ""), ok };
+  }
+
+  /** Lifecycle retries are separate from read-only refreshes and do not start during an owner change. */
+  async pollControls(): Promise<void> {
+    if (!this.controls.lifecycle || this.controlsPolling || this.teamPending) return;
+    this.controlsPolling = true;
+    try {
+      await this.tracked(async () => {
+        try { await this.controls.lifecycle!.reconcile(); }
+        catch (error) { this.notice = "Team lifecycle could not refresh: " + redactSecrets(error instanceof Error ? error.message : String(error)); }
+      });
+      await this.refresh();
+    } finally { this.controlsPolling = false; this.bump(); }
+  }
+
+  teamControlBlocked(kind: TeamChange["kind"], team = this.team): string | undefined {
+    if (!team || this.stateError) return "Team settings unavailable: refresh current state first.";
+    if (this.teamPending) return "A team change is in progress.";
+    if ((kind === "add" || kind === "remove") && !this.controls.lifecycle) return "Seat lifecycle unavailable: its adapter is not installed.";
+    if ((kind === "mission" || kind === "auto") && !this.controls.settings) return "Owner settings unavailable from this screen.";
+    if (kind === "auto" && !autoModeEnabled(team) && !this.controls.autoMode) return "Auto mode unavailable: its policy and automation adapter is not installed.";
+    return undefined;
+  }
+
+  private teamConfirmationCurrent(target: UiTeamConfirmation): boolean {
+    const team = this.teams.find((item) => item.id === target.teamId);
+    if (!team || this.stateError || teamVersion(team, target.change) !== target.expected) return false;
+    const kind = target.change.kind;
+    return kind === "add" || kind === "remove" ? !!this.controls.lifecycle
+      : !!this.controls.settings && (kind !== "auto" || !target.change.enabled || !!this.controls.autoMode);
+  }
+
+  /** Re-read after waiting for code updates. The adapter must also recheck retirement identity in its transaction. */
+  async teamConfirmed(): Promise<void> {
+    const target = this.teamChanging; this.teamChanging = undefined;
+    if (!target || this.teamPending) return;
+    this.teamPending = true;
+    try {
+      await this.tracked(async () => {
+        await this.refresh();
+        if (!this.teamConfirmationCurrent(target)) {
+          this.notice = "Team confirmation expired; review the refreshed settings and confirm again.";
+          return;
+        }
+        const change = target.change;
+        try {
+          if (change.kind === "add") {
+            await this.controls.lifecycle!.add(change.request);
+            this.notice = `Seat requested for @${change.request.username}. Follow the provisioning instructions in team controls.`;
+          } else if (change.kind === "remove") {
+            await this.controls.lifecycle!.remove(change.request);
+            this.notice = `Removal requested for ${change.request.expected.displayName}; retirement waits for finished or reassigned work.`;
+          } else if (change.kind === "mission") {
+            await this.controls.settings!.updateOwnerSettings(target.teamId, { mission: change.value });
+            this.notice = "Team mission saved.";
+          } else {
+            if (change.enabled) await this.controls.autoMode!.enable(target.teamId);
+            else await this.controls.settings!.updateOwnerSettings(target.teamId, { autoMode: false });
+            this.notice = change.enabled ? "Auto mode enabled under the owner's standing policy; existing gates still apply."
+              : "Auto mode off; the next approval gate waits for the owner.";
+          }
+        } catch (error) { this.notice = "Team change failed: " + redactSecrets(error instanceof Error ? error.message : String(error)); }
+        await this.refresh();
+      });
+    } finally { this.teamPending = false; this.bump(); }
+  }
+
+  private teamInputKey(value: string, text?: string): UiAction {
+    const input = this.teamInput!;
+    const name = value.toLowerCase();
+    if (name === "escape") { this.teamInput = undefined; this.notice = "Team edit cancelled; nothing changed."; }
+    else if (name === "return" || name === "enter") {
+      const change: TeamChange = input.kind === "mission" ? { kind: "mission", value: input.value.trim() }
+        : { kind: "add", request: { ...input.request, displayName: input.request.displayName.trim(), username: input.request.username.trim() } };
+      const invalid = change.kind === "mission" ? !change.value ? "Enter a mission." : undefined
+        : change.kind === "add" && (!change.request.displayName || !/^[a-z0-9][a-z0-9._-]{0,63}$/.test(change.request.username))
+          ? "Enter a display name and a bot username (lowercase letters, digits, dot, underscore or hyphen)." : undefined;
+      const blocked = this.teamControlBlocked(change.kind);
+      if (invalid || blocked) this.notice = invalid ?? blocked;
+      else {
+        this.confirm = { action: "team", teamId: input.teamId, expected: input.expected, change };
+        this.teamInput = undefined;
+      }
+    } else if (input.kind === "add" && name === "tab") {
+      input.field = input.field === "displayName" ? "username" : input.field === "username" ? "role" : "displayName";
+    } else if (input.kind === "add" && input.field === "role") {
+      if (["left", "right", "up", "down", "space"].includes(name)) input.request.role = input.request.role === "Developer" ? "Product" : "Developer";
+    } else {
+      const field = input.kind === "mission" ? "value" : input.field;
+      const old = input.kind === "mission" ? input.value : input.request[field as "displayName" | "username"];
+      const printable = text && !/^\u001b/.test(text) ? text.replace(/[\r\n\t]/g, " ").replace(/[\u0000-\u001f\u007f-\u009f]/g, "") : "";
+      const next = name === "backspace" ? old.slice(0, -1) : (old + printable).slice(0, input.kind === "mission" ? GOAL_INPUT_LIMIT : field === "username" ? 64 : 160);
+      if (input.kind === "mission") input.value = next;
+      else input.request[field as "displayName" | "username"] = next;
+    }
+    this.revision++;
+    return "none";
+  }
+
+  private teamControlKey(value: string, text?: string): UiAction {
+    const kind = text === "+" ? "add" : text === "-" ? "remove" : value === "e" ? "mission" : value === "o" ? "auto" : undefined;
+    if (kind) {
+      const blocked = this.teamControlBlocked(kind);
+      if (blocked) this.notice = blocked;
+      else {
+        const team = this.team!;
+        let change: TeamChange;
+        if (kind === "mission") change = { kind, value: team.mission ?? INITIAL_TEAM_MISSION };
+        else if (kind === "auto") change = { kind, enabled: !autoModeEnabled(team) };
+        else if (kind === "add") change = { kind, request: { teamId: team.id, displayName: "", username: "", role: "Developer" } };
+        else {
+          const request = this.seat && removalRequest(team, this.seat.id);
+          if (!request || ["retiring", "retired"].includes(seatStatus(request.expected)) || request.expected.roles.includes("Team Lead")) {
+            this.notice = "Select a pending or active Developer or Product seat to remove.";
+            this.revision++;
+            return "none";
+          }
+          change = { kind, request };
+        }
+        const expected = teamVersion(team, change);
+        if (change.kind === "mission") this.teamInput = { kind: "mission", teamId: team.id, expected, value: change.value };
+        else if (change.kind === "add") this.teamInput = { kind: "add", teamId: team.id, expected, field: "displayName", request: change.request };
+        else this.confirm = { action: "team", teamId: team.id, expected, change };
+      }
+    } else if (["up", "down", "j", "k"].includes(value)) {
+      const seats = this.team?.seats ?? [];
+      const index = seats.findIndex((seat) => seat.id === this.seatId);
+      this.seatId = seats[Math.max(0, Math.min(seats.length - 1, index + (value === "up" || value === "k" ? -1 : 1)))]?.id;
+    } else if (["b", "escape", "left"].includes(value)) this.page = "team";
+    this.revision++;
+    return "none";
   }
 
   /** Hosts the bridge and seat runners that are not already running; problems become the notice. */
@@ -593,7 +743,12 @@ export class TerminalUiModel {
     if (sessions.status === "fulfilled") this.sessionResult = sessions.value;
     else this.sessionResult = { connection: "error", sessions: [], message: sessions.reason instanceof Error ? sessions.reason.message : "Session reader failed." };
     let staleConfirmation = false;
-    if (this.confirm && this.confirm.action !== "retry" && this.confirm.action !== "rollback" && !this.confirmationCurrent(this.confirm)) {
+    if (this.confirm?.action === "team" && !this.teamConfirmationCurrent(this.confirm)) {
+      this.notice = "Team confirmation expired; review the refreshed settings and confirm again.";
+      this.confirm = undefined;
+      staleConfirmation = true;
+    }
+    if (this.confirm && this.confirm.action !== "team" && this.confirm.action !== "retry" && this.confirm.action !== "rollback" && !this.confirmationCurrent(this.confirm)) {
       this.notice = `Confirmation for ${this.confirm.goalId} expired: its operation changed or is unavailable. Review the refreshed ceremony and confirm again.`;
       this.confirm = undefined;
       staleConfirmation = true;
@@ -605,6 +760,7 @@ export class TerminalUiModel {
 
   /** `text` is the key's raw character, used only while the text input is open. */
   key(value: string, text?: string): UiAction {
+    if (this.teamInput) return this.teamInputKey(value, text);
     if (this.input) {
       const name = value.toLowerCase();
       if (name === "escape") this.input = undefined;
@@ -623,6 +779,7 @@ export class TerminalUiModel {
       this.confirm = undefined;
       this.revision++;
       if ((text ?? value).toLowerCase() === "y") {
+        if (target.action === "team") { this.teamChanging = target; return "team-control"; }
         if (target.action === "retry") { this.retrying = target; return "retry"; }
         if (target.action === "rollback") return "rollback";
         if (target.action === "propose") { this.proposing = target; return "propose"; }
@@ -630,7 +787,7 @@ export class TerminalUiModel {
         this.sprinting = target;
         return "sprint";
       }
-      this.notice = (target.action === "retry" ? "Retry" : target.action === "rollback" ? "Rollback" : target.action === "propose" ? "Proposal request" : target.action === "approve" ? "Approval" : "Sprint " + target.action) + " cancelled; nothing changed.";
+      this.notice = (target.action === "team" ? "Team change" : target.action === "retry" ? "Retry" : target.action === "rollback" ? "Rollback" : target.action === "propose" ? "Proposal request" : target.action === "approve" ? "Approval" : "Sprint " + target.action) + " cancelled; nothing changed.";
       return "none";
     }
     this.notice = undefined;
@@ -644,6 +801,13 @@ export class TerminalUiModel {
       this.revision++;
       return "refresh";
     }
+    if (text === "C") {
+      if (!this.team || this.page === "teams") this.notice = "Open a team to manage its owner settings.";
+      else this.page = "controls";
+      this.revision++;
+      return "none";
+    }
+    if (this.page === "controls") return this.teamControlKey(input, text);
     if (text === "T") {
       const seat = this.seat;
       const target = seat && this.live[seat.id]?.retry;

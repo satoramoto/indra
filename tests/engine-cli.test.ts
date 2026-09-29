@@ -8,6 +8,7 @@ import { processShell, type RuntimeFactory } from "../src/developer-seat.js";
 import { createPlanningBridge, createPlanningStore, main } from "../src/cli.js";
 import { PlanningStore } from "../src/planning.js";
 import { loadSeatPersonas, type SeatPersona } from "../src/seat-persona.js";
+import type { ProductRunnerServices } from "../src/control-adapters.js";
 
 const fakes = vi.hoisted(() => ({
   calls: [] as { engine: string; cwd: string; timeout?: number; write?: WriteAccess; home?: string; prompt: string; schema: string; session?: string; options?: MessageOptions }[],
@@ -93,6 +94,44 @@ const configure = (value: unknown) => writeFile(join(`${checkout}.runtime`, "sea
 const planning = (action: string) => main(["planning", action, ...(action === "serve" ? [] : ["--goal", "goal-1"]), "--state", checkout]);
 
 describe("every CLI runtime/chat construction path", () => {
+  async function productSeat(status = "active") {
+    const state = await new PlanningStore(checkout).read();
+    (state.teams[0] as { seats: unknown[] }).seats.push({ id: "seat-product", displayName: "Product", roles: ["Product"], status,
+      externalIdentities: { mattermost: { username: "productbot", userId: "product-id" } } });
+  }
+
+  it("dispatches Product to its own runner with isolated engine/persona and no owner settings or write runtime", async () => {
+    await productSeat(); await configure({ "seat-product": "claude" });
+    vi.mocked(loadSeatPersonas).mockResolvedValue({ "seat-product": { ...developer, voice: "Explore the mission" } });
+    const factory = vi.fn(async (services: ProductRunnerServices) => {
+      expect(services.seat.id).toBe("seat-product"); expect(services.team.id).toBe("team-001");
+      expect(services.store).not.toHaveProperty("updateOwnerSettings");
+      return { tick: async () => {
+        await services.runtimeFor("/product-research").message("Groom the backlog.", "product-schema");
+        await services.chat.post("home", "Research update.");
+        throw new Error("End fake Product loop");
+      } };
+    });
+    await main(["seat", "run", "--seat", "seat-product", "--state", checkout], { product: { createProductRunner: factory } });
+    expect(factory).toHaveBeenCalledOnce(); expect(fakes.calls).toHaveLength(1);
+    expect(fakes.calls[0]).toMatchObject({ engine: "claude", cwd: "/product-research", write: undefined, prompt: expect.stringContaining("Explore the mission"), schema: "product-schema" });
+    expect(fakes.posts[0]).toMatchObject({ username: "productbot", message: expect.stringContaining("Research update.") });
+    expect(fakes.actions).toEqual([]);
+  });
+
+  it("refuses Product before token reads when its optional runner is absent", async () => {
+    await productSeat();
+    expect(await main(["seat", "run", "--seat", "seat-product", "--state", checkout], {})).toBe(1);
+    expect(console.error).toHaveBeenCalledWith(expect.stringContaining("Product runner unavailable"));
+    expect(fakes.token).not.toHaveBeenCalled(); expect(fakes.calls).toEqual([]); expect(fakes.posts).toEqual([]);
+  });
+
+  it.each(["pending", "retired"])("refuses a %s seat before credentials or a runner", async (status) => {
+    await productSeat(status); const factory = vi.fn();
+    expect(await main(["seat", "run", "--seat", "seat-product", "--state", checkout], { product: { createProductRunner: factory } })).toBe(1);
+    expect(fakes.token).not.toHaveBeenCalled(); expect(factory).not.toHaveBeenCalled();
+  });
+
   it.each(["start", "serve", "approve", "integrate", "merge", "rollback"])("routes planning %s through Chick's state ID and both decorators", async (action) => {
     await configure({ "seat-lead": "claude", "seat-dev": "codex" });
     vi.mocked(loadSeatPersonas).mockResolvedValue({ "seat-lead": chick, "seat-dev": developer });
@@ -188,6 +227,31 @@ describe("every CLI runtime/chat construction path", () => {
     expect(fakes.adapters).toEqual([{}]);
     const module = { createCeremonyAdapters: () => ({ release: { poll: async () => ({ status: "pending" as const, reason: "Reload" }) } }) };
     await expect(createPlanningBridge(store, {} as PlanningChat, runtime, { a: module, b: module })).rejects.toThrow("Multiple ceremony adapters");
+  });
+
+  it("passes every optional workflow hook through composition without executing it", async () => {
+    const hooks = {
+      grooming: vi.fn(async () => {}), closedSprint: vi.fn(async () => {}), releaseEvent: vi.fn(async () => {}),
+      automaticGate: vi.fn(async () => undefined), integrationReview: vi.fn(async () => {}),
+      release: { poll: vi.fn(async () => ({ status: "pending" as const, reason: "No running build" })) },
+    };
+    const store = new PlanningStore(checkout); const runtime = new (fakeRuntime("codex"))("/project");
+    await createPlanningBridge(store, {} as PlanningChat, runtime, { workflow: { createCeremonyAdapters: () => hooks } });
+    expect(fakes.adapters).toEqual([hooks]);
+    for (const hook of [hooks.grooming, hooks.closedSprint, hooks.releaseEvent, hooks.automaticGate, hooks.integrationReview, hooks.release.poll]) expect(hook).not.toHaveBeenCalled();
+  });
+
+  it("gives next-sprint adapters a deferred checked bridge start and refuses eager starts", async () => {
+    const store = new PlanningStore(checkout); const runtime = new (fakeRuntime("codex"))("/project");
+    let start: ((goal: string) => Promise<unknown>) | undefined;
+    const chat = { post: vi.fn() } as unknown as PlanningChat;
+    await createPlanningBridge(store, chat, runtime, { next: { createCeremonyAdapters: async (services) => {
+      expect(services.chat).toBe(chat); start = services.start;
+      await expect(services.start("Too early")).rejects.toThrow("during composition");
+      return {};
+    } } });
+    expect(fakes.actions).toEqual([]); await start!("Next candidate");
+    expect(fakes.actions).toEqual(["start"]);
   });
 
   it("refuses incomplete rollout declarations before any posting or model invocation", () => {

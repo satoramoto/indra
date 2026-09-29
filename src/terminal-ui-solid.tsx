@@ -2,8 +2,11 @@ import { createCliRenderer, type ScrollBoxRenderable } from "@opentui/core";
 import { render, useKeyboard, usePaste, useTerminalDimensions } from "@opentui/solid";
 import { createMemo, createSignal, For, Show, type Accessor } from "solid-js";
 import type { StateInventory, StateSeat } from "./state-domain.js";
+import { seatStatus } from "./state-domain.js";
+import type { OwnerControls } from "./control-adapters.js";
+import { TeamControlInput, TeamControls, teamConfirmationText } from "./team-controls.js";
 import { attachTmux } from "./tmux-attach.js";
-import { currentSession, displayText, GOAL_INPUT_LIMIT, newestPlanningRecord, TerminalUiModel, type SessionReadPort, type StateSyncPort, type TerminalSession, type TerminalSprint, type UiApproval, type UiRetry, type UiRollback, type UiView, type UpdatePort } from "./terminal-ui.js";
+import { currentSession, displayText, GOAL_INPUT_LIMIT, newestPlanningRecord, TerminalUiModel, type SessionReadPort, type StateSyncPort, type TerminalSession, type TerminalSprint, type UiApproval, type UiRetry, type UiRollback, type UiTeamConfirmation, type UiView, type UpdatePort } from "./terminal-ui.js";
 import { CEREMONY_STAGES, engineLabel, type SprintBuild, type SprintLoop } from "./session-snapshot.js";
 import type { GoalStarter, SeatLive, SeatProcessPort } from "./supervisor.js";
 import type { PaneTailSource } from "./pane-tail.js";
@@ -143,7 +146,8 @@ function SprintCard(props: { sprint: TerminalSprint; model: TerminalUiModel }) {
   </box>;
 }
 
-function confirmText(confirm: UiApproval | UiRollback | UiRetry, width: number): string {
+function confirmText(confirm: UiApproval | UiRollback | UiRetry | UiTeamConfirmation, width: number): string {
+  if (confirm.action === "team") return teamConfirmationText(confirm);
   if (confirm.action === "rollback") return `Roll back from ${displayText(confirm.from, 20)} to ${displayText(confirm.to, 20)} and pause auto-update? y roll back`;
   if (confirm.action === "retry") {
     const goal = "Retry goal " + displayText(confirm.goalId, 40) + ": ";
@@ -194,6 +198,7 @@ export function TerminalApp(props: TerminalAppProps) {
   const update = createMemo(() => { props.revision(); return props.model.updateLine(); });
 
   const input = createMemo(() => { props.revision(); return props.model.input ? { ...props.model.input } : undefined; });
+  const teamInput = createMemo(() => { props.revision(); return props.model.teamInput ? structuredClone(props.model.teamInput) : undefined; });
   const confirm = createMemo(() => { props.revision(); return props.model.confirm ? { ...props.model.confirm } : undefined; });
   const paused = createMemo(() => { props.revision(); return props.model.paused; });
   const sprints = createMemo(() => { props.revision(); return props.model.sprintsForTeam(); });
@@ -209,14 +214,15 @@ export function TerminalApp(props: TerminalAppProps) {
   let teamScroll: ScrollBoxRenderable | undefined;
   let sprintScroll: ScrollBoxRenderable | undefined;
   let detailScroll: ScrollBoxRenderable | undefined;
+  let controlsScroll: ScrollBoxRenderable | undefined;
   useKeyboard((key) => {
-    if (!props.model.input && !props.model.confirm && (key.name === "pageup" || key.name === "pagedown")) {
-      const target = page() === "seat" ? detailScroll : page() === "team" ? wide() ? sprintScroll : teamScroll : undefined;
+    if (!props.model.input && !props.model.teamInput && !props.model.confirm && (key.name === "pageup" || key.name === "pagedown")) {
+      const target = page() === "controls" ? controlsScroll : page() === "seat" ? detailScroll : page() === "team" ? wide() ? sprintScroll : teamScroll : undefined;
       target?.scrollBy(key.name === "pageup" ? -1 : 1, "viewport");
     } else props.onKey(key.name, key.ctrl, key.sequence);
   });
   // A bracketed paste arrives as one event; only the goal input takes text, so a paste elsewhere is ignored.
-  usePaste((event) => { if (props.model.input) props.onKey("paste", false, new TextDecoder().decode(event.bytes)); });
+  usePaste((event) => { if (props.model.input || props.model.teamInput) props.onKey("paste", false, new TextDecoder().decode(event.bytes)); });
   const paneTail = (panelWidth: () => number) => (
     <Show when={props.paneTail && seat()}>
       <PaneTailPanel source={props.paneTail!} seat={seat} width={panelWidth} lines={() => paneTailLines(dimensions().height)} />
@@ -234,9 +240,10 @@ export function TerminalApp(props: TerminalAppProps) {
       <box flexDirection="column" gap={1} padding={1} backgroundColor={theme.panel} border borderColor="#42536B" title="SEAT DETAIL" titleColor={theme.accent}>
         <text fg={theme.heading}>{displayText(selected.displayName)}  @{displayText(selected.handle)}</text>
         <text fg={theme.regular}>Role: {displayText(selected.roles.join(", ") || "none")}</text>
+        <text fg={theme.muted}>Seat status: {seatStatus(selected)}</text>
         {live ? (
           <box flexDirection="column" gap={0}>
-            <text fg={processColor[live.process]}>Process: {live.process}{live.updatePending ? " · update pending (restarts when idle)" : ""}{isDeveloper(selected) ? " (seat runner)" : " (planning bridge)"}  ·  s restart  ·  x stop</text>
+            <text fg={processColor[live.process]}>Process: {live.process}{live.updatePending ? " · update pending (restarts when idle)" : ""}{selected.roles.includes("Product") ? " (Product runner)" : isDeveloper(selected) ? " (seat runner)" : " (planning bridge)"}  ·  s restart  ·  x stop</text>
             <Show when={live.problem}><text fg={theme.error}>{displayText(live.problem, 300)}</text></Show>
             <Show when={isDeveloper(selected)}>
               <text fg={theme.regular}>Assignment: {assignmentLine(live, 160)}</text>
@@ -351,9 +358,13 @@ export function TerminalApp(props: TerminalAppProps) {
         <scrollbox id="detail-scroll" ref={detailScroll} flexGrow={1} scrollY>{paneTail(() => dimensions().width - 8)}{seatDetail()}</scrollbox>
       </Show>
 
+      <Show when={page() === "controls"}>
+        <scrollbox id="controls-scroll" ref={controlsScroll} flexGrow={1} scrollY><TeamControls model={props.model} revision={props.revision} /></scrollbox>
+      </Show>
+
       <box flexShrink={0} flexDirection="column">
         <Show when={hasPlanningLoops() && page() !== "teams"}><text fg={theme.muted}>PgUp/PgDn scroll sprint history</text></Show>
-        <Show when={newGoalHint()}><text fg={theme.idle} wrapMode="word">{displayText(newGoalHint(), 240)}</text></Show>
+        <Show when={page() !== "controls" && newGoalHint()}><text fg={theme.idle} wrapMode="word">{displayText(newGoalHint(), 240)}</text></Show>
         <Show when={launchWarning()}><text fg={theme.error} wrapMode="word">{displayText(launchWarning())}</text></Show>
         <Show when={notice()}><text fg={theme.idle} wrapMode="word">{displayText(notice())}</text></Show>
         <Show when={input()}>
@@ -364,13 +375,17 @@ export function TerminalApp(props: TerminalAppProps) {
             {(input()?.value.length ?? 0) >= GOAL_INPUT_LIMIT ? `Limit reached (${GOAL_INPUT_LIMIT} characters); extra characters are ignored.` : `${input()?.value.length ?? 0}/${GOAL_INPUT_LIMIT}`}
           </text>
         </Show>
+        <Show when={teamInput()}>{(current) => <TeamControlInput input={current()} width={dimensions().width} />}</Show>
         <Show when={confirm()}>
           <text fg={theme.heading} wrapMode="word">{confirmText(confirm()!, dimensions().width)}{confirm()?.action === "retry" ? " · n/Esc cancel" : " · any other key cancels"}</text>
         </Show>
         <text fg={theme.accent} wrapMode="word">
-          {input() ? (newGoalBlocked() ? "Start blocked · Esc cancel" : "Enter start · Esc cancel") + " · " + displayText(team()?.project?.github, 80) + " · home channel"
-            : [page() === "teams" ? "↑↓ choose team · Enter open" : page() === "team" ? "↑↓ seat · Enter details · T retry · s restart · x stop · b teams" : "a attach · T retry · s restart · x stop · b team",
-              ...ceremonyKeys(), ...(newGoalBlocked() ? [] : ["n new goal"]), "q quit"].join(" · ")}
+          {teamInput() ? "Team changes require confirmation; Esc cancels."
+            : confirm()?.action === "team" ? "y confirm · Esc cancel"
+            : page() === "controls" ? "↑↓ seat · + add · - remove · e mission · o auto mode · b team · q quit"
+            : input() ? (newGoalBlocked() ? "Start blocked · Esc cancel" : "Enter start · Esc cancel") + " · " + displayText(team()?.project?.github, 80) + " · home channel"
+            : [page() === "teams" ? "↑↓ choose team · Enter open" : page() === "team" ? "↑↓ seat · Enter open · T retry · s/x run/stop · b back" : "a attach · T retry · s/x run/stop · b team",
+              ...(page() === "teams" ? [] : ["C controls"]), ...ceremonyKeys(), ...(newGoalBlocked() ? [] : ["n new goal"]), "q quit"].join(" · ")}
         </text>
         <text fg={theme.muted}>{paused() ? "Auto-update paused  ·  U resumes" : "Auto-update  ·  U pauses"}  ·  r checks now  ·  R rolls back  ·  q leaves seat processes running</text>
       </box>
@@ -385,6 +400,7 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
   signal?: AbortSignal;
   /** Hosts and controls the bridge and seat runners; they keep running after the UI quits. */
   processes?: SeatProcessPort;
+  controls?: OwnerControls;
   goals?: GoalStarter;
   /** Syncs the state checkout with its remote before hosting processes, then every `syncMs`. */
   sync?: StateSyncPort;
@@ -402,7 +418,7 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
   launchCheck?: () => Promise<string | undefined>;
 } = {}): Promise<number> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error("The terminal UI needs an interactive TTY. Use --once for redirected output.");
-  const model = new TerminalUiModel(state, sessions, options.processes, options.goals, options.sync, options.update);
+  const model = new TerminalUiModel(state, sessions, options.processes, options.goals, options.sync, options.update, options.controls);
   model.launchCheck = options.launchCheck;
   if (options.view) model.restore(options.view);
   await model.refresh();
@@ -415,6 +431,7 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
   let timer: ReturnType<typeof setInterval> | undefined;
   let syncTimer: ReturnType<typeof setInterval> | undefined;
   let updateTimer: ReturnType<typeof setInterval> | undefined;
+  let controlsTimer: ReturnType<typeof setInterval> | undefined;
   let reloadNow = () => {};
   const refresh = async () => {
     if (!active || refreshing || attaching) return;
@@ -440,6 +457,7 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
       if (timer) clearInterval(timer);
       if (syncTimer) clearInterval(syncTimer);
       if (updateTimer) clearInterval(updateTimer);
+      if (controlsTimer) clearInterval(controlsTimer);
       options.signal?.removeEventListener("abort", finish);
       renderer.destroy();
       return true;
@@ -465,6 +483,7 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
       else if (action === "propose") void model.proposeConfirmed();
       else if (action === "sprint") void model.sprintConfirmed();
       else if (action === "retry") void model.retryConfirmed();
+      else if (action === "team-control") void model.teamConfirmed();
       else if (action === "stop" || action === "restart") void model.control(action);
       else if (action === "attach") {
         const target = model.attachTarget();
@@ -491,6 +510,7 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
         void model.start();
         if (options.sync) syncTimer = setInterval(() => { if (active && !attaching) void model.syncState(); }, Math.max(5_000, options.syncMs ?? 60_000));
         if (options.update) updateTimer = setInterval(() => { if (active && !attaching) void model.updateCode(); }, Math.max(5_000, options.updateMs ?? 60_000));
+        if (options.controls?.lifecycle) controlsTimer = setInterval(() => { if (active && !attaching) void model.pollControls(); }, 30_000);
         options.signal?.addEventListener("abort", finish, { once: true });
         if (options.signal?.aborted) finish();
       })

@@ -6,12 +6,11 @@ import { Inventory, InventoryError, type Seat, type Team } from "./domain.js";
 import { LocalStateRepository, StateDataError } from "./local-state.js";
 import { MattermostClient, MattermostInventory } from "./mattermost.js";
 import { printState } from "./state-cli.js";
-import { StateInventory } from "./state-domain.js";
+import { StateInventory, seatStatus, type TeamRecord } from "./state-domain.js";
 import { botTeamHome, PlanningStore, teamProject } from "./planning.js";
 import { mergedWithCeremony } from "./project-checkout.js";
 import { PlanningBridge, type CeremonyAdapters, type PlanningChat } from "./planning-bridge.js";
-import { assertCeremonyReady, type CeremonyWriteReadiness } from "./ceremony-ports.js";
-import type { ReleaseActivationOptions, ReleaseActivationReadPort } from "./release-activation.js";
+import { assertCeremonyReady } from "./ceremony-ports.js";
 import { CHICK_USERNAME, MattermostAccessError, MattermostPlanningChat, readBotToken, readChickToken, type BotTokenOptions } from "./planning-mattermost.js";
 import { opCredential, stageServiceToken } from "./service-account.js";
 import { captureOpEnvironment } from "./op-env.js";
@@ -33,32 +32,34 @@ import { LocalSessionReader } from "./session-snapshot.js";
 import { CliGoalStarter, Supervisor } from "./supervisor.js";
 import { TmuxPaneTail } from "./pane-tail.js";
 import { checkConsistency, printConsistency, type TeamMemberReader } from "./consistency.js";
+import { controlModules, createOwnerControls, productRunnerFactory, registerCeremonyAdapters, type ControlAdapterModule, type ControlModules, type ProductRunner } from "./control-adapters.js";
+import { runGh } from "./git-gh.js";
+import { redactSecrets } from "./redact.js";
 
 /**
  * Optional release-activation.ts and retro-publication.ts modules export this contract. Vite includes only
  * modules that exist in the build. The final adapter may advertise readiness after every consumer and the
  * companion schema have landed; without it, the store keeps its legacy rollout gate.
  */
-export interface CeremonyAdapterModule {
-  LocalReleaseActivationReader?: new (checkout: string, options?: ReleaseActivationOptions) => ReleaseActivationReadPort;
-  ceremonyReadiness?: CeremonyWriteReadiness;
-  createCeremonyAdapters?(services: { store: PlanningStore; runtime: AgentRuntime; appDir: string }): CeremonyAdapters | Promise<CeremonyAdapters>;
-}
-const ceremonyModules = import.meta.glob<CeremonyAdapterModule>(["./release-activation.ts", "./retro-publication.ts"], { eager: true });
-export function createPlanningStore(checkout: string, modules: Record<string, CeremonyAdapterModule> = ceremonyModules): PlanningStore {
+export type CeremonyAdapterModule = ControlAdapterModule;
+export function createPlanningStore(checkout: string, modules: ControlModules = controlModules): PlanningStore {
   const readiness = Object.values(modules).flatMap((module) => module.ceremonyReadiness ? [module.ceremonyReadiness] : []);
   for (const item of readiness) assertCeremonyReady(item);
   return new PlanningStore(checkout, undefined, readiness[0]);
 }
-export async function createPlanningBridge(store: PlanningStore, chat: PlanningChat, runtime: AgentRuntime, modules: Record<string, CeremonyAdapterModule> = ceremonyModules): Promise<PlanningBridge> {
+export async function createPlanningBridge(store: PlanningStore, chat: PlanningChat, runtime: AgentRuntime, modules: ControlModules = controlModules): Promise<PlanningBridge> {
   const adapters: CeremonyAdapters = {};
+  let bridge: PlanningBridge | undefined;
   for (const module of Object.values(modules)) {
-    let supplied = await module.createCeremonyAdapters?.({ store, runtime, appDir: defaultAppDir });
+    let supplied = await module.createCeremonyAdapters?.({ store, runtime, chat, appDir: defaultAppDir, start: async (goal, participants) => {
+      if (!bridge) throw new Error("Adapters cannot start a sprint during composition.");
+      return bridge.start(goal, participants);
+    } });
     if (!supplied?.release && module.LocalReleaseActivationReader) {
       const reader = new module.LocalReleaseActivationReader(store.checkout, { appDir: defaultAppDir, runtimeDir: store.runtimeDir });
       supplied = { ...supplied, release: { poll: async ({ goal, mergeApproval }) => {
-        if (!goal.integration?.prUrl || !mergeApproval) return { status: "pending", reason: "Waiting for the recorded human integration merge approval." };
-        const checks = await processShell.run("gh", ["pr", "checks", goal.integration.prUrl], store.checkout);
+        if (!goal.integration?.prUrl || !mergeApproval) return { status: "pending", reason: "Waiting for the recorded integration merge approval." };
+        const checks = await runGh(processShell, ["pr", "checks", goal.integration.prUrl], store.checkout);
         if (checks.code !== 0) return { status: "pending", reason: "The integration's CI is not confirmed green." };
         const result = await reader.read(goal.integration);
         if (result.status !== "running") return { status: "pending", reason: result.reason };
@@ -72,12 +73,10 @@ export async function createPlanningBridge(store: PlanningStore, chat: PlanningC
         } };
       } } };
     }
-    for (const key of ["implementation", "release", "retro"] as const) if (supplied?.[key]) {
-      if (adapters[key]) throw new Error(`Multiple ceremony adapters provide ${key}.`);
-      Object.assign(adapters, { [key]: supplied[key] });
-    }
+    registerCeremonyAdapters(adapters, supplied);
   }
-  return new PlanningBridge(store, chat, runtime, 20, processShell, adapters);
+  bridge = new PlanningBridge(store, chat, runtime, 20, processShell, adapters);
+  return bridge;
 }
 
 export const SERVER = "https://mattermost.newegypt.io";
@@ -276,7 +275,7 @@ export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_
   return once ? { mode: "state", checkout: stateCheckout, once } : { mode: "ui", checkout: stateCheckout };
 }
 
-export async function main(args: string[] = process.argv.slice(2)): Promise<number> {
+export async function main(args: string[] = process.argv.slice(2), modules: ControlModules = controlModules): Promise<number> {
   // OP_SERVICE_ACCOUNT_TOKEN and other OP_* variables go to `op` only; no other child process inherits them.
   captureOpEnvironment();
   try {
@@ -288,20 +287,33 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
     if (options.mode === "seat") {
       recordRunningBuild(`${options.checkout}.runtime`, import.meta.url);
       try {
-        const store = createPlanningStore(options.checkout);
-        const seat = await loadDeveloperSeat(store, options.seatId);
+        const store = createPlanningStore(options.checkout, modules);
+        const team = ((await store.read()).teams as TeamRecord[]).find((item) => item.seats.some((seat) => seat.id === options.seatId));
+        const record = team?.seats.find((seat) => seat.id === options.seatId);
+        if (!team || !record) throw new StateDataError(`Seat '${options.seatId}' is not in state.`);
+        if (!["active", "retiring"].includes(seatStatus(record))) throw new StateDataError(`Seat '${record.id}' is ${seatStatus(record)}; its runner cannot start.`);
+        const product = record.roles[0] === "Product";
+        const productFactory = product ? productRunnerFactory(modules) : undefined;
+        if (product && !productFactory) throw new StateDataError("Product runner unavailable: its adapter is not installed.");
+        const seat = product ? { id: record.id, displayName: record.displayName, roles: record.roles, username: record.externalIdentities.mattermost.username }
+          : await loadDeveloperSeat(store, options.seatId);
         const services = await seatServices(store, seat.username, seat.id);
         const chat = services.chat(await hostedToken(options.checkout, options.readyNonce, (tokenOptions) => readBotToken(seat.username, tokenOptions)));
         await joinTeamHome(options.checkout, options.readyNonce, store, chat, seat.username);
+        const log = (line: string) => console.log(`[${new Date().toISOString()}] ${redactSecrets(line)}`);
+        const runner: ProductRunner = productFactory ? await productFactory({
+          store: { read: () => store.read(), update: (mutator, message) => store.update(mutator, message), runtimeDir: store.runtimeDir,
+            readRuntimeFile: (name) => store.readRuntimeFile(name), saveRuntime: (name, value) => store.saveRuntime(name, value) },
+          team, seat: record, chat, runtimeFor: (cwd) => services.runtime(cwd), log,
+        }) : new DeveloperSeat(store, seat, chat, processShell, (cwd, write) => services.runtime(cwd, DEVELOPER_SESSION_TIMEOUT_MS, write), log);
         if (options.readyNonce) await signalReady(options.checkout, options.readyNonce);
-        const runner = new DeveloperSeat(store, seat, chat, processShell, (cwd, write) => services.runtime(cwd, DEVELOPER_SESSION_TIMEOUT_MS, write), (line) => console.log(`[${new Date().toISOString()}] ${line}`));
-        console.log(`Developer seat ${seat.id} (@${seat.username}) running. Stop with Ctrl-C.`);
+        console.log(`${product ? "Product" : "Developer"} seat ${seat.id} (@${seat.username}) running. Stop with Ctrl-C.`);
         while (true) {
           // Each step holds the turn lock, so the supervisor only restarts this runner for an update between steps.
           if (await withFileLock(turnLockFile(options.checkout, { kind: "seat", seatId: seat.id }), () => runner.tick(), 24 * 60 * 60_000) === "idle") await new Promise((resolve) => setTimeout(resolve, 30_000));
         }
       } catch (error) {
-        console.error(`Seat error: ${error instanceof Error ? error.message : String(error)}`);
+        console.error(`Seat error: ${redactSecrets(error instanceof Error ? error.message : String(error))}`);
         return 1;
       }
     }
@@ -314,7 +326,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       recordRunningBuild(`${options.checkout}.runtime`, import.meta.url);
       await syncStateSchema(options.checkout).then((result) => { if (result.outcome !== "unchanged") console.log(result.message); });
       const updater = new SelfUpdater(defaultAppDir, undefined, undefined, `${resolve(options.checkout)}.runtime`);
-      const store = createPlanningStore(options.checkout);
+      const store = createPlanningStore(options.checkout, modules);
       // After the schema sync, so the checkout's schema accepts migrated ceremonies. Conflicts also show on the team screen.
       // A merged legacy sprint whose merge commit already has the ceremony was released by it and stays open for its retro.
       const releasedWithCeremony = async (goal: { teamId: string }, sha: string) => {
@@ -326,8 +338,10 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       }, (error: unknown) => console.log(`Legacy goals were not migrated: ${error instanceof Error ? error.message : String(error)}`));
       await store.retireLegacySprints().then((removed) => { if (removed) console.log("Retired the legacy draft sprints in state.json."); },
         (error: unknown) => console.log(`Legacy draft sprints were not retired: ${error instanceof Error ? error.message : String(error)}`));
+      const processes = new Supervisor(options.checkout, undefined, undefined, undefined, store, (force) => stageServiceToken(options.checkout, { force }));
+      const controls = await createOwnerControls({ store, processes, appDir: defaultAppDir }, modules);
       return await runTerminalUi(new StateInventory(new LocalStateRepository(options.checkout)), new LocalSessionReader(options.checkout), {
-        processes: new Supervisor(options.checkout, undefined, undefined, undefined, store, (force) => stageServiceToken(options.checkout, { force })),
+        processes, controls,
         goals: new CliGoalStarter(options.checkout),
         paneTail: new TmuxPaneTail(options.checkout),
         launchCheck: () => checkLaunch(options.checkout, new SystemTmux(), new TmuxHost(options.checkout).socket),
@@ -369,7 +383,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         console.log(JSON.stringify(await new LocalSessionReader(options.checkout).readSessions(), null, 2));
         return 0;
       }
-      const store = createPlanningStore(options.checkout);
+      const store = createPlanningStore(options.checkout, modules);
       if (options.action === "propose") {
         // Run by the terminal UI: records the request for the bridge, which drafts through the 📝 path. No credential is read.
         try {
@@ -387,7 +401,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         try {
           const chat = services.chat(await readChickToken({ ...await opCredential(options.checkout), headless: true }));
           await joinTeamHome(options.checkout, undefined, store, chat, CHICK_USERNAME);
-          const { goal, alreadyApproved } = await (await createPlanningBridge(store, chat, services.runtime(process.cwd()))).approve(options.goal!);
+          const { goal, alreadyApproved } = await (await createPlanningBridge(store, chat, services.runtime(process.cwd()), modules)).approve(options.goal!);
           console.log(alreadyApproved ? `Goal ${goal.id} was already approved; no new assignments.` : `Approved goal ${goal.id}: ${goal.assignments?.length ?? 0} outcome(s) queued for Developer seats.`);
           return 0;
         } catch (error) {
@@ -400,7 +414,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         try {
           const chat = services.chat(await readChickToken({ ...await opCredential(options.checkout), headless: true }));
           await joinTeamHome(options.checkout, undefined, store, chat, CHICK_USERNAME);
-          const bridge = await createPlanningBridge(store, chat, services.runtime(process.cwd()));
+          const bridge = await createPlanningBridge(store, chat, services.runtime(process.cwd()), modules);
           console.log(await (options.action === "integrate" ? bridge.integrate(options.goal!) : options.action === "merge" ? bridge.merge(options.goal!) : bridge.rollback(options.goal!)));
           return 0;
         } catch (error) {
@@ -412,7 +426,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         try {
           const chat = services.chat(await hostedToken(options.checkout, options.readyNonce, readChickToken));
           await joinTeamHome(options.checkout, undefined, store, chat, CHICK_USERNAME);
-          const goal = await (await createPlanningBridge(store, chat, services.runtime(process.cwd()))).start(options.goal!, options.participants);
+          const goal = await (await createPlanningBridge(store, chat, services.runtime(process.cwd()), modules)).start(options.goal!, options.participants);
           console.log(`Planning goal ${goal.id}: ${SERVER}/yahaha/pl/${goal.mattermost.rootPostId}`);
           return 0;
         } catch (error) {
@@ -423,7 +437,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       recordRunningBuild(`${options.checkout}.runtime`, import.meta.url);
       const chat = services.chat(await hostedToken(options.checkout, options.readyNonce, readChickToken));
       await joinTeamHome(options.checkout, options.readyNonce, store, chat, CHICK_USERNAME);
-      const bridge = await createPlanningBridge(store, chat, services.runtime(process.cwd()));
+      const bridge = await createPlanningBridge(store, chat, services.runtime(process.cwd()), modules);
       console.log("Chick planning bridge running. Stop with Ctrl-C.");
       let ready = false;
       while (true) {
