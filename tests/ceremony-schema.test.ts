@@ -65,4 +65,20 @@ describe("additive ceremony v1 schema contract", () => {
     expect(proof("ceremonyRelease", { kind: "release-running", mergedSha: "a".repeat(40) })).toBe(false);
     expect(proof("ceremonyRetro", { kind: "retro-published", path: "docs/retros/goal-one.md" })).toBe(false);
   });
+  it("accepts exact release builds and verified ancestry proof, rejecting incomplete or unverified proof", () => {
+    const proof = ajv.compile({ $defs: schema.$defs, $ref: "#/$defs/ceremonyRelease" });
+    const release = { kind: "release-running", prUrl: "https://github.com/owner/project/pull/2", mergedSha: "a".repeat(40), mergePostId: "merge-post",
+      approval: { source: "owner-command", command: "planning merge", at: time }, checksPassed: true, buildSha: "a".repeat(40), runningSha: "a".repeat(40), runningAt: time };
+    expect(proof(release)).toBe(true);
+    const ancestry = { ancestorSha: release.mergedSha, descendantSha: "b".repeat(40), verified: true };
+    const descendant = { ...release, buildSha: ancestry.descendantSha, runningSha: ancestry.descendantSha, ancestry };
+    expect(proof(descendant)).toBe(true);
+    for (const invalid of [
+      { ...ancestry, verified: false },
+      { ancestorSha: ancestry.ancestorSha, descendantSha: ancestry.descendantSha },
+      { ...ancestry, ancestorSha: "" },
+      { ...ancestry, descendantSha: "" },
+      { ...ancestry, sessionId: "runtime-only" },
+    ]) expect(proof({ ...descendant, ancestry: invalid })).toBe(false);
+  });
 });

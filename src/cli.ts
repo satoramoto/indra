@@ -10,6 +10,7 @@ import { StateInventory } from "./state-domain.js";
 import { botTeamHome, PlanningStore } from "./planning.js";
 import { PlanningBridge, type CeremonyAdapters, type PlanningChat } from "./planning-bridge.js";
 import { assertCeremonyReady, type CeremonyWriteReadiness } from "./ceremony-ports.js";
+import type { ReleaseActivationOptions, ReleaseActivationReadPort } from "./release-activation.js";
 import { CHICK_USERNAME, MattermostAccessError, MattermostPlanningChat, readBotToken, readChickToken, type BotTokenOptions } from "./planning-mattermost.js";
 import { opCredential, stageServiceToken } from "./service-account.js";
 import { captureOpEnvironment } from "./op-env.js";
@@ -36,6 +37,7 @@ import { checkConsistency, printConsistency, type TeamMemberReader } from "./con
  * companion schema have landed; without it, the store keeps its legacy rollout gate.
  */
 export interface CeremonyAdapterModule {
+  LocalReleaseActivationReader?: new (checkout: string, options?: ReleaseActivationOptions) => ReleaseActivationReadPort;
   ceremonyReadiness?: CeremonyWriteReadiness;
   createCeremonyAdapters?(services: { store: PlanningStore; runtime: AgentRuntime; appDir: string }): CeremonyAdapters | Promise<CeremonyAdapters>;
 }
@@ -48,7 +50,25 @@ export function createPlanningStore(checkout: string, modules: Record<string, Ce
 export async function createPlanningBridge(store: PlanningStore, chat: PlanningChat, runtime: AgentRuntime, modules: Record<string, CeremonyAdapterModule> = ceremonyModules): Promise<PlanningBridge> {
   const adapters: CeremonyAdapters = {};
   for (const module of Object.values(modules)) {
-    const supplied = await module.createCeremonyAdapters?.({ store, runtime, appDir: defaultAppDir });
+    let supplied = await module.createCeremonyAdapters?.({ store, runtime, appDir: defaultAppDir });
+    if (!supplied?.release && module.LocalReleaseActivationReader) {
+      const reader = new module.LocalReleaseActivationReader(store.checkout, { appDir: defaultAppDir, runtimeDir: store.runtimeDir });
+      supplied = { ...supplied, release: { poll: async ({ goal, mergeApproval }) => {
+        if (!goal.integration?.prUrl || !mergeApproval) return { status: "pending", reason: "Waiting for the recorded human integration merge approval." };
+        const checks = await processShell.run("gh", ["pr", "checks", goal.integration.prUrl], store.checkout);
+        if (checks.code !== 0) return { status: "pending", reason: "The integration's CI is not confirmed green." };
+        const result = await reader.read(goal.integration);
+        if (result.status !== "running") return { status: "pending", reason: result.reason };
+        const evidence = result.evidence;
+        if (evidence.buildSha !== evidence.runningSha) return { status: "pending", reason: "Wait for the application and bridge to finish reloading the same build." };
+        return { status: "complete", evidence: {
+          kind: "release-running", prUrl: goal.integration.prUrl, mergedSha: evidence.mergedSha,
+          mergePostId: mergeApproval.postId, approval: mergeApproval.approval, checksPassed: true,
+          buildSha: evidence.buildSha, runningSha: evidence.runningSha, runningAt: new Date().toISOString(),
+          ...(evidence.buildSha !== evidence.mergedSha ? { ancestry: { ancestorSha: evidence.mergedSha, descendantSha: evidence.buildSha, verified: true } } : {}),
+        } };
+      } } };
+    }
     for (const key of ["implementation", "release", "retro"] as const) if (supplied?.[key]) {
       if (adapters[key]) throw new Error(`Multiple ceremony adapters provide ${key}.`);
       Object.assign(adapters, { [key]: supplied[key] });

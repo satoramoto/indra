@@ -19,7 +19,11 @@ export function assertCeremonyReady(readiness?: CeremonyWriteReadiness): void {
 export interface CeremonyEvidencePorts {
   approval(goal: PlanningGoal): Promise<ApprovalEvidence | undefined>;
   implementation(goal: PlanningGoal): Promise<ImplementationEvidence | undefined>;
-  /** Must observe the running build after restart; a merged PR or a successful build alone is insufficient. */
+  /**
+   * Observe the running build after restart, with buildSha === runningSha. If it differs from mergedSha,
+   * verify `git merge-base --is-ancestor <mergedSha> <buildSha>` in the team's project and return ancestry
+   * for that exact pair only on exit 0. Missing commits or an unknown/failed check cannot establish release.
+   */
   runningRelease(goal: PlanningGoal): Promise<RunningReleaseEvidence | undefined>;
   /** Verify both the thread post and the merged PR containing docs/retros/<goal-id>.md. */
   publishedRetro(goal: PlanningGoal): Promise<PublishedRetroEvidence | undefined>;

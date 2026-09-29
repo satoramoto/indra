@@ -890,6 +890,26 @@
         },
         "runningAt": {
           "$ref": "#/$defs/ceremonyTime"
+        },
+        "ancestry": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ancestorSha",
+            "descendantSha",
+            "verified"
+          ],
+          "properties": {
+            "ancestorSha": {
+              "$ref": "#/$defs/ceremonySha"
+            },
+            "descendantSha": {
+              "$ref": "#/$defs/ceremonySha"
+            },
+            "verified": {
+              "const": true
+            }
+          }
         }
       }
     },

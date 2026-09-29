@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentRuntime, MessageOptions, WriteAccess } from "../src/codex-runtime.js";
 import type { CeremonyAdapters, PlanningChat } from "../src/planning-bridge.js";
-import type { RuntimeFactory } from "../src/developer-seat.js";
+import { processShell, type RuntimeFactory } from "../src/developer-seat.js";
 import { createPlanningBridge, createPlanningStore, main } from "../src/cli.js";
 import { PlanningStore } from "../src/planning.js";
 import { loadSeatPersonas, type SeatPersona } from "../src/seat-persona.js";
@@ -31,7 +31,7 @@ vi.mock("../src/codex-runtime.js", async (original) => ({ ...await original<type
 vi.mock("../src/claude-runtime.js", async (original) => ({ ...await original<typeof import("../src/claude-runtime.js")>(), ClaudeRuntime: fakeRuntime("claude") }));
 vi.mock("../src/seat-persona.js", async (original) => ({ ...await original<typeof import("../src/seat-persona.js")>(), loadSeatPersonas: vi.fn(async () => ({})) }));
 vi.mock("../src/service-account.js", () => ({ opCredential: vi.fn(async () => ({})), stageServiceToken: vi.fn() }));
-vi.mock("../src/self-update.js", () => ({ recordRunningBuild: vi.fn(), SelfUpdater: vi.fn() }));
+vi.mock("../src/self-update.js", async (original) => ({ ...await original<typeof import("../src/self-update.js")>(), recordRunningBuild: vi.fn(), SelfUpdater: vi.fn() }));
 vi.mock("../src/state-commit.js", async (original) => ({ ...await original<typeof import("../src/state-commit.js")>(), withFileLock: async (_path: string, run: () => Promise<unknown>) => run() }));
 vi.mock("../src/planning-mattermost.js", async (original) => ({
   ...await original<typeof import("../src/planning-mattermost.js")>(),
@@ -194,6 +194,30 @@ describe("every CLI runtime/chat construction path", () => {
     expect(() => createPlanningStore(checkout, { adapter: { ceremonyReadiness: { version: 1, consumers: { planning: 1 } } as never } })).toThrow("all consumers");
     expect(fakes.posts).toEqual([]);
     expect(fakes.calls).toEqual([]);
+  });
+
+
+  it("connects the release reader only after merge approval and green CI, retaining verified descendant evidence", async () => {
+    const store = new PlanningStore(checkout);
+    const runtime = new (fakeRuntime("codex"))("/project");
+    const mergedSha = "a".repeat(40); const runningSha = "b".repeat(40);
+    const read = vi.fn(async () => ({ status: "running" as const, reason: "Ready", evidence: { mergedSha, buildSha: runningSha, runningSha, runningAt: new Date().toISOString() } }));
+    const shell = vi.spyOn(processShell, "run").mockResolvedValue({ code: 1, stdout: "", stderr: "" });
+    await createPlanningBridge(store, {} as PlanningChat, runtime, { release: { LocalReleaseActivationReader: class { read = read; } } });
+    const adapter = fakes.adapters[0].release!;
+    const context: Parameters<typeof adapter.poll>[0] = { store, runtime, post: async () => "post", recordRun: async () => {}, recordSession: async () => {}, goal: {
+      id: "goal-one", teamId: "team-one", seatId: "seat-one", participantSeatIds: [], goal: "Goal", projectRefs: ["test/project"], stage: "approved", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      mattermost: { channelId: "home", rootPostId: "root" }, brief: { summary: "Goal", decisions: [], openQuestions: [] },
+      integration: { branch: "sprint/goal-one", baseSha: mergedSha, status: "merged", prUrl: "https://github.com/test/project/pull/1", mergedSha },
+    } };
+    expect(await adapter.poll(context)).toMatchObject({ status: "pending" });
+    expect(shell).not.toHaveBeenCalled();
+    context.mergeApproval = { postId: "merge-post", approval: { source: "owner-command", command: "planning merge", at: new Date().toISOString() } };
+    expect(await adapter.poll(context)).toMatchObject({ status: "pending" });
+    expect(read).not.toHaveBeenCalled();
+    shell.mockResolvedValue({ code: 0, stdout: "", stderr: "" });
+    expect(await adapter.poll(context)).toMatchObject({ status: "complete", evidence: { mergedSha, buildSha: runningSha, runningSha, mergePostId: "merge-post", ancestry: { ancestorSha: mergedSha, descendantSha: runningSha, verified: true } } });
+    expect(read).toHaveBeenCalledWith(context.goal.integration);
   });
 
 });

@@ -286,14 +286,12 @@ export class PlanningStore {
   }
   private async guardCeremonyWrite(before: PlanningDocument, after: PlanningDocument): Promise<void> {
     const oldGoals = before.planningGoals ?? []; const nextGoals = after.planningGoals ?? [];
+    const active = this.ceremonyWrites || [...oldGoals, ...nextGoals].some((goal) => goal.ceremony);
     let changed = false;
     for (const old of oldGoals) {
       const next = nextGoals.find((goal) => goal.id === old.id);
-      if (this.ceremonyWrites && (!next || next.teamId !== old.teamId)) throw new Error("An existing goal cannot be removed or moved to another team during ceremony rollout.");
-      if (old.ceremony || next?.ceremony) {
-        validateCeremonyMutation(old, next);
-        if (JSON.stringify(old) !== JSON.stringify(next)) changed = true;
-      }
+      if (active) validateCeremonyMutation(old, next);
+      if ((old.ceremony || next?.ceremony) && JSON.stringify(old) !== JSON.stringify(next)) changed = true;
     }
     const added = nextGoals.filter((goal) => !oldGoals.some((old) => old.id === goal.id));
     for (const goal of added) {

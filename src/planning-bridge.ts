@@ -4,6 +4,7 @@ import { advanceCeremony, closeCeremony, type CeremonyStage, type HumanApproval,
 import type { CeremonyRuntimeRecord } from "./ceremony-ports.js";
 import { randomUUID } from "node:crypto";
 import type { AgentRuntime } from "./codex-runtime.js";
+import type { RuntimeSessionFacts } from "./runtime-facts.js";
 import { schemaPathOf } from "./reload.js";
 import { CLARIFY_TIMEOUT_MS, DRAFT_TIMEOUT_MS, planningId } from "./codex-runtime.js";
 import { PlanningStore, developerSeats, missingTeamMessage, requireTeamHome, teamProject, validateOutcomeSeats, type MergeKind, type PlanningDocument, type PlanningGoal, type RuntimeRecord, type SprintIntegration } from "./planning.js";
@@ -57,13 +58,8 @@ export interface CeremonyAdapters {
     merge?(context: CeremonyContext, approval: HumanApproval): Promise<string>;
   };
 }
-/** Structural boundary for runtime-facts producers; missing facts are never synthesized as zero usage. */
-export interface BridgeTokenUsage { inputTokens?: number; uncachedInputTokens?: number; cachedInputTokens?: number; cacheWriteInputTokens?: number; outputTokens?: number; reasoningOutputTokens?: number }
-export interface BridgeSessionFacts {
-  invocationId: string; engine: "codex" | "claude"; sessionId?: string;
-  startedAt: string; finishedAt: string; status: "succeeded" | "failed" | "interrupted" | "timed-out";
-  usage?: BridgeTokenUsage; cumulativeUsage?: BridgeTokenUsage;
-}
+/** The producer contract is shared by successful results and AgentRunError.facts. */
+export type BridgeSessionFacts = RuntimeSessionFacts;
 function sessionFacts(value: unknown): BridgeSessionFacts | undefined {
   if (!isObject(value) || !isObject(value.facts)) return;
   const facts = value.facts;
@@ -416,7 +412,6 @@ export class PlanningBridge {
     await this.announceStages(goal, metadata);
     await this.ensureProposalAnnouncement(goal, metadata);
     await this.recoverMilestonePosts(goal, metadata);
-    if (goal.ceremony?.closure) return;
     if (metadata.mergeIntent) {
       const intent = metadata.mergeIntent;
       const result = await this.mergeGate(goal.id, intent.kind, metadata, intent.approval);
@@ -567,7 +562,6 @@ export class PlanningBridge {
 
   private approvedGoal(goal: PlanningGoal | undefined, id: string): PlanningGoal {
     if (!goal) throw new Error(`No planning goal ${id} in state.`);
-    if (goal.ceremony?.closure) throw new Error(`Goal ${id} is closed.`);
     if (goal.stage !== "approved" || !goal.integration) throw new Error(`Goal ${id} has no sprint integration branch; only goals approved with one have a sprint.`);
     return goal;
   }
@@ -643,7 +637,6 @@ export class PlanningBridge {
       const integration = goal.integration!;
       if (integration.status === "reverted") return `Sprint ${id} is already rolled back (${integration.revertPrUrl}).`;
       if (integration.status !== "merged") throw new Error(`Sprint ${id} is ${integration.status}; only a sprint merged into main can be rolled back.`);
-      if (goal.ceremony?.stage === "retro") throw new Error("Rollback is unavailable after this ceremony entered retro.");
       if (integration.revertPrUrl) return `The revert PR for sprint ${id} is already open: ${integration.revertPrUrl}`;
       const metadata = await this.metadata(id);
       if (metadata.pending) await this.deliver(goal, metadata);
@@ -792,6 +785,7 @@ export class PlanningBridge {
       try { message = (await this.mergeGate(id, gate.kind, metadata, { source: "reaction", userId: reaction.user_id, postId: reaction.post_id, emoji: "white_check_mark", verifiedHuman: true, at: new Date(reaction.create_at).toISOString() })).message; }
       catch (error) { console.error(`Sprint ${id} merge could not be confirmed.`); message = `Could not merge the sprint's PR right now; nothing changed. React :${APPROVE_EMOJI}: again (remove and re-add it) to retry.`; }
     }
+    else if (goal.ceremony?.closure) message = `Goal ${id} is closed.`;
     else if (goal.stage === "approved") message = approvalMessage(goal, seats);
     else if (!approving && goal.stage === "awaiting-review") { message = proposalMessage(goal, seats); announcesProposal = true; }
     else if (!approving && canDraft(goal)) { await this.draft(goal, metadata, key, reaction.create_at); return; }

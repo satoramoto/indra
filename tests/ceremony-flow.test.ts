@@ -228,6 +228,14 @@ describe("ordered gates and evidence", () => {
     expect((await store.read()).planningGoals![0].ceremony?.closure?.evidence.path).toBe(`docs/retros/${goal.id}.md`);
     expect(stages(chat)).toEqual(["planning", "proposal", "implement", "release", "retro"]);
     expect(chat.posts.filter((post) => post.message === "Recorded sprint retrospective")).toHaveLength(1);
+    // Closure must not disable the existing human gate for a later sprint revert.
+    await store.update((state) => { state.planningGoals![0].integration!.revertPrUrl = "https://github.com/test/project/pull/13"; }, "Owner opens a later revert");
+    await restart().poll();
+    const revert = (await store.runtime(goal.id)).mergePosts!.find((item) => item.kind === "revert")!;
+    chat.react(revert.id);
+    await restart().poll();
+    expect((await store.read()).planningGoals![0].integration!.status).toBe("reverted");
+    expect((await store.read()).planningGoals![0].ceremony?.closure).toBeDefined();
     await restart().start("Next");
     expect((await store.read()).planningGoals).toHaveLength(2);
   });
