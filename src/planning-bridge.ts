@@ -35,6 +35,8 @@ interface BridgeRecord extends Omit<RuntimeRecord, "pending" | "mergePosts"> {
   waiting?: { stage: CeremonyStage; reason: string };
   partialIntegration?: { authorizedAt: string; omissions: { outcomeId: string; seatId: string; status: string; reason: string }[] };
   initialReply?: boolean;
+  /** Keep the reply cursor from before the proposal stage announcement advances lastSeenAt. */
+  proposalRequest?: { requestedAt: number; clarificationSince?: number };
   turn?: { inputKey: string; since: number; drafting: boolean; startedAt: string; run?: Awaited<ReturnType<AgentRuntime["message"]>>; draft?: NonNullable<PlanningGoal["proposal"]>; failure?: { finishedAt: string; facts?: BridgeSessionFacts } };
 }
 interface StartIntent { goal: PlanningGoal; since: number }
@@ -153,6 +155,7 @@ const ownerProposalKey = (goalId: string, requestedAt: number) => `owner-propose
 const reviewing = (goal: PlanningGoal) => goal.stage === "awaiting-review" || goal.stage === "approved";
 const stageOf = (goal: PlanningGoal): CeremonyStage => goal.ceremony?.stage ?? (goal.stage === "approved" ? "implement" : goal.stage === "clarifying" ? "planning" : "proposal");
 const canDraft = (goal: PlanningGoal) => !goal.ceremony?.closure && !goal.proposal && ["planning", "proposal"].includes(stageOf(goal));
+const canClarify = (goal: PlanningGoal, metadata: BridgeRecord) => stageOf(goal) === "planning" || (canDraft(goal) && !!metadata.proposalRequest);
 
 /** Chick's prompts are contracts: the outcome and its acceptance, what Indra does next, the constraints and the schema. */
 function prompt(goal: PlanningGoal, input: string, drafting: boolean, developers: Seat[]): string {
@@ -420,13 +423,20 @@ export class PlanningBridge {
       await this.store.saveRuntime(goal.id, metadata);
     }
     if (metadata.turn?.failure && metadata.turn.drafting) await this.revertDraft(goal, metadata, metadata.turn.inputKey, metadata.turn.since);
+    else if (metadata.turn?.failure) {
+      await this.recordFailure(goal, metadata);
+      delete metadata.turn;
+      await this.store.saveRuntime(goal.id, metadata);
+    }
     else if (metadata.turn?.run) await this.finishTurn(goal, metadata);
     // Drafts run inside this goal's lock, so a goal still in `drafting` here was left by a crash, restart or older build.
     const current = (await this.store.read()).planningGoals?.find((item) => item.id === goal.id);
     if (current?.stage === "drafting") { await this.revertDraft(current, metadata, metadata.turn?.inputKey ?? `draft-recovery:${current.updatedAt}`, metadata.turn?.since ?? Date.now()); return; }
     let budget = this.maxQueue;
-    if (stageOf(goal) === "planning") {
-      const posts = (await this.chat.since(goal.mattermost.channelId, metadata.lastSeenAt)).filter((post) => post.root_id === goal.mattermost.rootPostId && post.user_id !== own && !metadata.processedPostIds.includes(post.id)).sort((a, b) => a.create_at - b.create_at).slice(0, budget);
+    if (canClarify(goal, metadata)) {
+      // An owner request seals the brief at requestedAt, but earlier replies still need to be consumed across polls.
+      const since = metadata.proposalRequest ? metadata.proposalRequest.clarificationSince ?? Date.parse(goal.createdAt) : metadata.lastSeenAt;
+      const posts = (await this.chat.since(goal.mattermost.channelId, since)).filter((post) => post.root_id === goal.mattermost.rootPostId && post.user_id !== own && !metadata.processedPostIds.includes(post.id) && post.create_at <= (metadata.proposalRequest?.requestedAt ?? Infinity)).sort((a, b) => a.create_at - b.create_at).slice(0, budget);
       budget -= posts.length;
       for (const post of posts) await this.enqueue(goal.seatId, () => this.handle(goal.id, post));
       if (!posts.length) { metadata.lastSeenAt = Math.max(metadata.lastSeenAt, Date.now() - 5000); await this.store.saveRuntime(goal.id, metadata); }
@@ -677,7 +687,7 @@ export class PlanningBridge {
     if (!goal) return;
     const metadata = await this.metadata(id);
     if (metadata.pending) await this.deliver(goal, metadata);
-    if (stageOf(goal) !== "planning" || metadata.processedPostIds.includes(post.id)) return;
+    if (!canClarify(goal, metadata) || post.create_at > (metadata.proposalRequest?.requestedAt ?? Infinity) || metadata.processedPostIds.includes(post.id)) return;
     await this.converse(goal, metadata, post.id, post.create_at, post.message, false);
   }
 
@@ -742,7 +752,13 @@ export class PlanningBridge {
       const draft = turn.draft ?? proposal(run.response, developers);
       turn.draft = draft;
       await this.store.saveRuntime(goal.id, metadata);
-      await this.store.update((state) => { const found = state.planningGoals!.find((item) => item.id === goal.id)!; found.proposal = draft; found.stage = "awaiting-review"; found.updatedAt = draft.createdAt; }, `Draft proposal for goal ${goal.id}: ${draft.outcomes.length} outcome${draft.outcomes.length === 1 ? "" : "s"}`);
+      await this.store.update((state) => {
+        const found = state.planningGoals!.find((item) => item.id === goal.id)!;
+        // Approval may have followed the draft commit before its delivery journal was saved.
+        if (found.proposal?.id === draft.id) return;
+        if (!canDraft(found)) throw new Error(`Goal ${goal.id} cannot restore a draft at ${stageOf(found)}.`);
+        found.proposal = draft; found.stage = "awaiting-review"; found.updatedAt = draft.createdAt;
+      }, `Draft proposal for goal ${goal.id}: ${draft.outcomes.length} outcome${draft.outcomes.length === 1 ? "" : "s"}`);
       if (!metadata.processedPostIds.includes(turn.inputKey)) metadata.processedPostIds.push(turn.inputKey);
       metadata.pending = { inputPostId: `proposal:${draft.id}`, since: turn.since, message: proposalMessage({ ...goal, proposal: draft }, teamSeats(await this.store.read(), goal.teamId)), proposal: true };
     } else {
@@ -919,9 +935,9 @@ export class PlanningBridge {
     check((await store.read()).planningGoals?.find((item) => item.id === id));
     return await store.withGoalLock(id, async () => {
       const goal = check((await store.read()).planningGoals?.find((item) => item.id === id));
-      const metadata = await store.runtime(id);
+      const metadata: BridgeRecord = await store.runtime(id);
       if (metadata.proposalRequest) return { goal, alreadyRequested: true };
-      metadata.proposalRequest = { requestedAt: Date.now() };
+      metadata.proposalRequest = { requestedAt: Date.now(), clarificationSince: metadata.lastSeenAt };
       await store.saveRuntime(id, metadata);
       if (goal.ceremony?.stage === "planning") await store.update((state) => {
         const found = state.planningGoals!.find((item) => item.id === id)!;

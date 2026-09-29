@@ -5,7 +5,7 @@ import { PlanningBridge, type PlanningChat, type Post, type Reaction, type Cerem
 import { validateCeremony } from "../src/ceremony.js";
 import { PlanningStore } from "../src/planning.js";
 import type { CeremonyWriteReadiness } from "../src/ceremony-ports.js";
-import type { AgentRuntime } from "../src/codex-runtime.js";
+import type { AgentRuntime, AgentResult } from "../src/codex-runtime.js";
 import type { Shell } from "../src/developer-seat.js";
 import { stateCheckout } from "./state-checkout.js";
 
@@ -27,11 +27,16 @@ class Chat implements PlanningChat {
   async since(channel: string, at: number) { return this.posts.filter((post) => post.channel_id === channel && post.create_at >= at); }
   async reactions(id: string) { return this.marks.filter((mark) => mark.post_id === id); }
   react(id: string, emoji = "white_check_mark", user = "human") { this.marks.push({ user_id: user, post_id: id, emoji_name: emoji, create_at: Date.now() + this.marks.length }); }
+  reply(root: string, message: string, at = Date.now()) {
+    const post: Post = { id: `post-${this.posts.length + 1}`, channel_id: "home", user_id: "human", root_id: root, message, create_at: at };
+    this.posts.push(post);
+    return post;
+  }
 }
 class Runtime implements AgentRuntime {
   calls = 0;
   failDraft = false;
-  async message(_prompt: string, schema: string, session?: string) {
+  async message(_prompt: string, schema: string, session?: string): Promise<AgentResult> {
     this.calls++;
     if (schema.endsWith("proposal.json") && this.failDraft) throw new Error("Draft failed");
     const now = new Date().toISOString();
@@ -130,6 +135,49 @@ async function implemented(adapters: CeremonyAdapters = {}) {
 const stages = (chat: Chat) => chat.posts.flatMap((post) => [...post.message.matchAll(/\*\*Stage: (\w+)\*\*/g)].map((match) => match[1]));
 
 describe("ordered gates and evidence", () => {
+  it.each([1, 20])("drains replies preceding owner P before drafting with a queue limit of %s", async (maxQueue) => {
+    const { store, chat, runtime, github, bridge } = await fixture();
+    const goal = await bridge.start("Goal");
+    const first = chat.reply(goal.mattermost.rootPostId, "Include the migration");
+    const second = chat.reply(goal.mattermost.rootPostId, "Preserve existing data");
+    await PlanningBridge.requestProposal(store, goal.id);
+    const requestedAt = (await store.runtime(goal.id)).proposalRequest!.requestedAt;
+    const later = chat.reply(goal.mattermost.rootPostId, "A later follow-up", requestedAt + 1);
+    expect((await store.read()).planningGoals![0].ceremony?.stage).toBe("proposal");
+    const message = runtime.message.bind(runtime);
+    const prompts: string[] = [];
+    vi.spyOn(runtime, "message").mockImplementation(async (prompt, schema, session) => {
+      prompts.push(prompt);
+      const run = await message(prompt, schema, session);
+      return schema.endsWith("proposal.json") ? run : { ...run, response: {
+        reply: "Recorded", summary: "Updated goal", decisions: prompt.includes(`Human message: ${first.message}`) ? [first.message] : [first.message, second.message], openQuestions: [],
+      } };
+    });
+    const poll = () => new PlanningBridge(store, chat, runtime, maxQueue, github).poll();
+    if (maxQueue === 1) {
+      await poll();
+      expect((await store.read()).planningGoals![0].proposal).toBeUndefined();
+      await poll();
+      expect((await store.read()).planningGoals![0].proposal).toBeUndefined();
+    }
+    await poll();
+    expect(prompts).toHaveLength(3);
+    expect(prompts[0]).toContain(`Human message: ${first.message}`);
+    expect(prompts[1]).toContain(`Human message: ${second.message}`);
+    expect(prompts[1]).toContain(`"decisions":["${first.message}"]`);
+    expect(prompts[2]).toContain(`"decisions":["${first.message}","${second.message}"]`);
+    expect(prompts[2]).toContain("Draft the proposal now");
+    expect(prompts.join("\n")).not.toContain(later.message);
+    const record = await store.runtime(goal.id);
+    expect(record.processedPostIds).toEqual(expect.arrayContaining([first.id, second.id]));
+    expect(record.processedPostIds).not.toContain(later.id);
+    expect(record.proposalRequest).toBeUndefined();
+    expect((await store.read()).planningGoals![0].stage).toBe("awaiting-review");
+    await poll();
+    expect(prompts).toHaveLength(3);
+    expect(stages(chat)).toEqual(["planning", "proposal"]);
+  });
+
   it.each(["owner", "reaction"])("enters implement once via %s approval and preserves that approval on replay", async (route) => {
     const { store, chat, bridge, restart, goal, proposalPost } = await proposed();
     expect((await store.read()).planningGoals![0].ceremony?.stage).toBe("proposal");
@@ -243,6 +291,59 @@ describe("ordered gates and evidence", () => {
 
 
 describe("failure boundaries", () => {
+  it("retries a malformed clarification after restart without replaying its failed response", async () => {
+    const { store, runtime, chat, bridge, restart } = await fixture();
+    const goal = await bridge.start("Goal");
+    const reply = chat.reply(goal.mattermost.rootPostId, "Preserve existing data");
+    const message = runtime.message.bind(runtime);
+    const invoke = vi.spyOn(runtime, "message").mockImplementationOnce(async (prompt, schema, session) => ({
+      ...await message(prompt, schema, session), response: { reply: "Incomplete response" },
+    }));
+    await expect(bridge.poll()).rejects.toThrow("invalid brief response");
+    expect((await store.runtime(goal.id)).processedPostIds).not.toContain(reply.id);
+    expect(await store.readRuntimeFile(goal.id)).toMatchObject({ turn: { inputKey: reply.id, failure: expect.any(Object), run: { response: null } } });
+    await restart().poll();
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(invoke.mock.calls[1][0]).toContain(`Human message: ${reply.message}`);
+    expect((await store.runtime(goal.id)).processedPostIds).toContain(reply.id);
+    expect(await store.readRuntimeFile(goal.id)).not.toHaveProperty("turn");
+    expect(chat.posts.filter((post) => post.props?.indra_delivery_id === reply.id)).toHaveLength(1);
+    const record = await store.readRuntimeFile<BridgeCeremonyRecord>(ceremonyRuntimeName(goal.id));
+    expect(record?.facts.failures).toHaveLength(1);
+    expect(record?.facts.sessions).toHaveLength(3);
+    await restart().poll();
+    expect(invoke).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves owner approval when a committed draft's delivery journal is recovered", async () => {
+    const { store, runtime, chat, bridge, restart } = await fixture();
+    const goal = await bridge.start("Goal");
+    await PlanningBridge.requestProposal(store, goal.id);
+    const save = store.saveRuntime.bind(store);
+    let interrupted = false;
+    vi.spyOn(store, "saveRuntime").mockImplementation(async (id, record) => {
+      if (!interrupted && id === goal.id && "pending" in record && (record.pending as { proposal?: boolean })?.proposal) {
+        interrupted = true;
+        throw new Error("Delivery journal interrupted");
+      }
+      await save(id, record);
+    });
+    await expect(bridge.poll()).rejects.toThrow("Delivery journal interrupted");
+    expect((await store.read()).planningGoals![0].stage).toBe("awaiting-review");
+    expect(await store.readRuntimeFile(goal.id)).toHaveProperty("turn.draft");
+    const { goal: approved } = await restart().approve(goal.id);
+    expect(approved.ceremony?.stage).toBe("implement");
+    expect(approved.assignments).toHaveLength(1);
+    const calls = runtime.calls;
+    await restart().poll();
+    await restart().poll();
+    expect((await store.read()).planningGoals![0]).toEqual(approved);
+    expect(runtime.calls).toBe(calls);
+    expect(await store.readRuntimeFile(goal.id)).not.toHaveProperty("turn");
+    expect(chat.posts.filter((post) => post.message.includes("Draft proposal"))).toHaveLength(1);
+    expect(stages(chat)).toEqual(["planning", "proposal", "implement"]);
+  });
+
   it("journals a completed draft before its state commit, then recovers without another model call", async () => {
     const { store, runtime, chat, bridge, restart } = await fixture();
     const goal = await bridge.start("Goal");
