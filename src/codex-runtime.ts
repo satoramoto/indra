@@ -73,7 +73,10 @@ export class CodexRuntime implements AgentRuntime {
       }
       if (!id || response === undefined) throw new Error("Codex returned no session id or final response.");
       return { sessionId: id, response, usage, startedAt, finishedAt: new Date().toISOString() };
-    } finally { clearTimeout(timeout); }
+    } finally {
+      clearTimeout(timeout);
+      if (this.home) await ensureCodexHome(this.home).catch(() => undefined);
+    }
   }
 }
 export const planningId = () => `goal-${randomUUID().slice(0, 8)}`;
