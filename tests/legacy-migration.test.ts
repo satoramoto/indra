@@ -6,7 +6,7 @@ import { commitHasCeremony, mergedWithCeremony } from "../src/project-checkout.j
 import { Ajv2020 } from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import { afterEach, describe, expect, it } from "vitest";
-import { advanceCeremony, closeCeremony, closeRevertedRelease, migrateLegacyCeremony, type PublishedRetroEvidence, type RunningReleaseEvidence } from "../src/ceremony.js";
+import { advanceCeremony, closeCeremony, closeRevertedRelease, migrateLegacyCeremony, proposalDigest, type PublishedRetroEvidence, type RunningReleaseEvidence } from "../src/ceremony.js";
 import type { CeremonyWriteReadiness } from "../src/ceremony-ports.js";
 import { legacyMigrationBlocker, PlanningStore, type PlanningDocument, type PlanningGoal } from "../src/planning.js";
 import { isFinishedSprint } from "../src/finished-sprint.js";
@@ -37,6 +37,22 @@ async function store(state: PlanningDocument = real): Promise<PlanningStore> {
 const commits = (persistence: PlanningStore) => git(persistence.checkout, "log", "--format=%s").trim().split("\n");
 
 describe("migrating the real legacy goals", () => {
+  it("never turns legacy approval into automatic evidence, even with an enabled standing policy", async () => {
+    const persistence = await store();
+    await persistence.updateOwnerSettings("team-001", { autoMode: true }, "2026-09-29T11:59:59.000Z");
+    await expect(persistence.update((state) => {
+      const item = goalOf(state, "goal-855701cc");
+      const migration = migrateLegacyCeremony(item, migratedAt, false);
+      if (migration.status !== "ready") throw new Error(migration.reason);
+      item.ceremony = migration.ceremony;
+      item.automaticApprovals = [{ source: "automatic", policyRevision: 1, at: migratedAt, target: { kind: "proposal", goalId: item.id, proposalId: item.proposal!.id, proposalDigest: proposalDigest(item.proposal!) } }];
+    }, "Invent automatic legacy approval")).rejects.toThrow("existing ceremony");
+    await persistence.migrateLegacyGoals(migratedAt, preCeremony);
+    const item = goalOf(await persistence.read(), "goal-855701cc");
+    expect(item.automaticApprovals).toBeUndefined();
+    expect(item.ceremony!.history[2]).toMatchObject({ enteredAt: null, evidence: { kind: "legacy-approval" } });
+    expect(validSchema(await persistence.read())).toBe(true);
+  });
   it("closes goal-855701cc: approved, every assignment merged, and no integration (it predates sprint branches)", () => {
     const result = migrateLegacyCeremony(legacy("goal-855701cc"), migratedAt);
     if (result.status !== "ready") throw new Error(result.reason);

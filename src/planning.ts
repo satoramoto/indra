@@ -5,8 +5,10 @@ import { parseState } from "./local-state.js";
 import { StateCommitError, StateGit, withFileLock, type StateSyncResult } from "./state-commit.js";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
-import { assertTeamAvailable, migrateLegacyCeremony, openGoalConflicts, startCeremony, validateCeremony, validateCeremonyMutation, type CeremonyRecord, type LegacyMigration, type TeamGoalConflict } from "./ceremony.js";
+import { assertTeamAvailable, migrateLegacyCeremony, openGoalConflicts, startCeremony, validateAutomaticApproval, validateCeremony, validateCeremonyMutation, type AutomaticApproval, type CeremonyRecord, type LegacyMigration, type TeamGoalConflict } from "./ceremony.js";
 import { assertCeremonyReady, type CeremonyWriteReadiness } from "./ceremony-ports.js";
+import { isActiveSeat, seatStatus, type SeatRecord, type StandingPolicyRevision, type TeamRecord } from "./state-domain.js";
+export type { SeatRecord, TeamRecord } from "./state-domain.js";
 
 /** What start-up migration did with one pre-ceremony goal. */
 export type LegacyGoalMigration = { goalId: string } & ({ status: "migrated"; summary: string } | { status: "conflict"; reason: string });
@@ -36,7 +38,10 @@ export interface PlanningGoal {
   mattermost: { channelId: string; rootPostId: string };
   brief: { summary: string; decisions: string[]; openQuestions: string[] };
   proposal?: { id: string; createdAt: string; summary: string; outcomes: PlanningOutcome[]; risks: string[]; openQuestions: string[] };
-  /** Present only once a human approved the proposal; one entry per outcome. */
+  source?: { candidateId: string; ticketIds: string[]; retrospectiveGoalId?: string };
+  /** Append-only authorization decisions, committed at the gate before executing automatic work. */
+  automaticApprovals?: AutomaticApproval[];
+  /** Present only once the proposal is approved; one entry per outcome. */
   assignments?: PlanningAssignment[];
   /** The sprint's integration branch, created on approval; seats' PRs target it, and one PR takes it into main. */
   integration?: SprintIntegration;
@@ -45,19 +50,18 @@ export interface PlanningGoal {
 }
 export const INTEGRATION_STATUSES = ["collecting", "pr-open", "merged", "reverted"] as const;
 /** `revertPrUrl` is the open or merged PR on main that reverts `mergedSha` (`planning rollback`). */
-export interface SprintIntegration { branch: string; baseSha: string; status: typeof INTEGRATION_STATUSES[number]; prUrl?: string; mergedSha?: string; revertPrUrl?: string }
+export interface SprintIntegration { branch: string; baseSha: string; status: typeof INTEGRATION_STATUSES[number]; prUrl?: string; headSha?: string; mergedSha?: string; revertPrUrl?: string }
 /** Which PR a merge post gates: the sprint's integration PR into main, or the PR on main that reverts it. */
 export type MergeKind = "integration" | "revert";
 export interface PlanningOutcome { id: string; title: string; description: string; seatId: string }
 export const ASSIGNMENT_STATUSES = ["queued", "running", "in-review", "merged", "failed"] as const;
-export interface PlanningAssignment { outcomeId: string; seatId: string; status: typeof ASSIGNMENT_STATUSES[number]; updatedAt: string; prUrl?: string; note?: string }
-interface SeatRecord { id: string; displayName?: string; roles?: unknown; externalIdentities?: { mattermost?: { userId?: string; username?: string } } }
-interface TeamRecord { id: string; slug: string; seats: SeatRecord[] }
+export interface SeatReassignment { fromSeatId: string; toSeatId: string; at: string; reason: string }
+export interface PlanningAssignment { outcomeId: string; seatId: string; status: typeof ASSIGNMENT_STATUSES[number]; updatedAt: string; prUrl?: string; note?: string; reassignments?: SeatReassignment[] }
 
-/** Developer seats on a team, in state order. */
+/** Active Developer seats eligible for new work, in state order. Historical references use all seats. */
 export function developerSeats(state: PlanningDocument, teamId: string): SeatRecord[] {
   const team = (state.teams as TeamRecord[]).find((item) => item.id === teamId);
-  return (team?.seats ?? []).filter((seat) => Array.isArray(seat.roles) && seat.roles.includes("Developer"));
+  return (team?.seats ?? []).filter((seat) => Array.isArray(seat.roles) && seat.roles.includes("Developer") && isActiveSeat(seat));
 }
 
 /** Every outcome needs a distinct Developer seat until the seats run out; then no seat takes more than its fair share. */
@@ -90,7 +94,7 @@ export function validatePlanningGoal(goal: PlanningGoal): void {
     if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).some((key) => !allowed.includes(key))) throw new Error("Invalid planning fields; runtime metadata belongs in runtime storage.");
   };
   const timestamp = (value: unknown) => typeof value === "string" && /^\d{4}-\d\d-\d\dT/.test(value) && !Number.isNaN(Date.parse(value));
-  fields(goal, ["id", "teamId", "seatId", "participantSeatIds", "goal", "projectRefs", "stage", "createdAt", "updatedAt", "mattermost", "brief", "proposal", "assignments", "integration", "ceremony"]);
+  fields(goal, ["id", "teamId", "seatId", "participantSeatIds", "goal", "projectRefs", "stage", "createdAt", "updatedAt", "mattermost", "brief", "proposal", "assignments", "integration", "ceremony", "source", "automaticApprovals"]);
   if (!timestamp(goal.createdAt) || !timestamp(goal.updatedAt)) throw new Error("Invalid planning timestamps.");
   fields(goal.mattermost, ["channelId", "rootPostId"]);
   fields(goal.brief, ["summary", "decisions", "openQuestions"]);
@@ -108,19 +112,43 @@ export function validatePlanningGoal(goal: PlanningGoal): void {
   if (!Array.isArray(goal.projectRefs) || goal.projectRefs.some((item) => typeof item !== "string" || !item.trim())) throw new Error("Invalid project references.");
   if (!Array.isArray(goal.participantSeatIds) || new Set(goal.participantSeatIds).size !== goal.participantSeatIds.length) throw new Error("Invalid participants.");
   const text = (value: unknown) => value === undefined || (typeof value === "string" && !!value.trim());
+  if (goal.source !== undefined) {
+    fields(goal.source, ["candidateId", "ticketIds", "retrospectiveGoalId"]);
+    if (!/^[a-z][a-z0-9-]+$/.test(goal.source.candidateId) || !Array.isArray(goal.source.ticketIds) || !goal.source.ticketIds.length || goal.source.ticketIds.some((id) => !/^[a-z][a-z0-9-]+$/.test(id)) || new Set(goal.source.ticketIds).size !== goal.source.ticketIds.length || (goal.source.retrospectiveGoalId !== undefined && !/^[a-z][a-z0-9-]+$/.test(goal.source.retrospectiveGoalId))) throw new Error("Invalid sprint candidate source.");
+  }
+  if (goal.automaticApprovals !== undefined) {
+    if (!goal.ceremony || !Array.isArray(goal.automaticApprovals)) throw new Error("Automatic approvals require a native ceremony and an approval array.");
+    for (const [index, approval] of goal.automaticApprovals.entries()) {
+      validateAutomaticApproval(goal, approval);
+      if (index && Date.parse(approval.at) < Date.parse(goal.automaticApprovals[index - 1].at)) throw new Error("Automatic approval history must be chronological.");
+    }
+    const keys = goal.automaticApprovals.map(({ policyRevision, target }) => JSON.stringify([policyRevision, target.kind, target.goalId, ...(target.kind === "proposal" ? [target.proposalId, target.proposalDigest] : [target.prUrl, target.headSha])]));
+    if (new Set(keys).size !== keys.length) throw new Error("An automatic target may be approved only once per policy revision.");
+  }
   if (goal.integration !== undefined) {
     const item = goal.integration as unknown as Record<string, unknown>;
     const sha = (value: unknown) => typeof value === "string" && /^[0-9a-f]{40}$/.test(value);
     if (goal.stage !== "approved") throw new Error("A sprint integration is allowed only at approved stage.");
-    if (!item || typeof item !== "object" || Object.keys(item).some((key) => !["branch", "baseSha", "status", "prUrl", "mergedSha", "revertPrUrl"].includes(key)) || item.branch !== `sprint/${goal.id}` || !sha(item.baseSha) || !INTEGRATION_STATUSES.includes(item.status as SprintIntegration["status"]) || !text(item.prUrl) || (item.mergedSha !== undefined && !sha(item.mergedSha)) || !text(item.revertPrUrl)) throw new Error("Invalid sprint integration.");
+    if (!item || typeof item !== "object" || Object.keys(item).some((key) => !["branch", "baseSha", "status", "prUrl", "headSha", "mergedSha", "revertPrUrl"].includes(key)) || item.branch !== `sprint/${goal.id}` || !sha(item.baseSha) || !INTEGRATION_STATUSES.includes(item.status as SprintIntegration["status"]) || !text(item.prUrl) || (item.headSha !== undefined && !sha(item.headSha)) || (item.mergedSha !== undefined && !sha(item.mergedSha)) || !text(item.revertPrUrl)) throw new Error("Invalid sprint integration.");
     if ((item.status !== "collecting" && !item.prUrl) || ((item.status === "merged" || item.status === "reverted") && !item.mergedSha) || (item.status === "reverted" && !item.revertPrUrl)) throw new Error(`Sprint integration at ${String(item.status)} is missing its PR or merge commit.`);
   }
   if (goal.assignments !== undefined) {
     const outcomeIds = new Set(goal.proposal!.outcomes.map((item) => item.id));
-    if (!Array.isArray(goal.assignments) || goal.assignments.some((item) => !item || typeof item !== "object" || Object.keys(item).some((key) => !["outcomeId", "seatId", "status", "updatedAt", "prUrl", "note"].includes(key)) || typeof item.seatId !== "string" || !/^[a-z][a-z0-9-]+$/.test(item.seatId) || !ASSIGNMENT_STATUSES.includes(item.status) || typeof item.updatedAt !== "string" || Number.isNaN(Date.parse(item.updatedAt)) || !text(item.prUrl) || !text(item.note))) throw new Error("Invalid assignment.");
+    if (!Array.isArray(goal.assignments) || goal.assignments.some((item) => !item || typeof item !== "object" || Object.keys(item).some((key) => !["outcomeId", "seatId", "status", "updatedAt", "prUrl", "note", "reassignments"].includes(key)) || typeof item.seatId !== "string" || !/^[a-z][a-z0-9-]+$/.test(item.seatId) || !ASSIGNMENT_STATUSES.includes(item.status) || typeof item.updatedAt !== "string" || Number.isNaN(Date.parse(item.updatedAt)) || !text(item.prUrl) || !text(item.note))) throw new Error("Invalid assignment.");
     const unknown = goal.assignments.find((item) => !outcomeIds.has(item.outcomeId));
     if (unknown) throw new Error(`Assignment references unknown outcome ${String(unknown.outcomeId)}.`);
     if (new Set(goal.assignments.map((item) => item.outcomeId)).size !== goal.assignments.length) throw new Error("Each outcome may have only one assignment.");
+    for (const assignment of goal.assignments) if (assignment.reassignments !== undefined) {
+      if (!Array.isArray(assignment.reassignments) || !assignment.reassignments.length) throw new Error("Reassignment history must not be empty.");
+      let seatId = goal.proposal!.outcomes.find((item) => item.id === assignment.outcomeId)!.seatId;
+      let at = goal.proposal!.createdAt;
+      for (const change of assignment.reassignments) {
+        fields(change, ["fromSeatId", "toSeatId", "at", "reason"]);
+        if (change.fromSeatId !== seatId || change.toSeatId === seatId || !/^[a-z][a-z0-9-]+$/.test(change.toSeatId) || !timestamp(change.at) || Date.parse(change.at) < Date.parse(at) || typeof change.reason !== "string" || !change.reason.trim()) throw new Error("Invalid assignment reassignment chain.");
+        seatId = change.toSeatId; at = change.at;
+      }
+      if (seatId !== assignment.seatId || Date.parse(assignment.updatedAt) < Date.parse(at)) throw new Error("Reassignment must end on the current assignment seat and precede its update.");
+    }
   }
   if (goal.ceremony !== undefined) {
     validateCeremony(goal);
@@ -137,15 +165,35 @@ export function validatePlanningDocument(state: PlanningDocument): void {
     validatePlanningGoal(goal);
     if (ids.has(goal.id)) throw new Error(`Duplicate planning goal ${goal.id}.`);
     ids.add(goal.id);
-    const team = (state.teams as { id: string; seats: { id: string }[] }[]).find((item) => item.id === goal.teamId);
+    const team = (state.teams as TeamRecord[]).find((item) => item.id === goal.teamId);
     if (!team) throw new Error(`Unknown planning team ${goal.teamId}.`);
     const seats = new Set(team.seats.map((item) => item.id));
     if (!seats.has(goal.seatId) || goal.participantSeatIds.some((id) => !seats.has(id))) throw new Error("Planning seat reference is outside the team.");
-    const developers = new Set(developerSeats(state, goal.teamId).map((seat) => seat.id));
+    const developers = new Set(team.seats.filter((seat) => seat.roles.includes("Developer")).map((seat) => seat.id));
     const outcome = goal.proposal?.outcomes.find((item) => !developers.has(item.seatId));
     if (outcome) throw new Error(`Outcome ${outcome.id} seat ${outcome.seatId} is not a Developer seat on the team.`);
     const assignment = goal.assignments?.find((item) => !seats.has(item.seatId));
     if (assignment) throw new Error(`Assignment seat ${assignment.seatId} is outside the team.`);
+    for (const assignment of goal.assignments ?? []) for (const change of assignment.reassignments ?? []) {
+      if (!developers.has(change.fromSeatId) || !developers.has(change.toSeatId)) throw new Error("Reassignment seats must be Developers on the same team.");
+    }
+    for (const seat of team.seats) {
+      const status = seatStatus(seat);
+      if (status === "pending" && (goal.proposal?.outcomes.some((item) => item.seatId === seat.id) || goal.assignments?.some((item) => item.seatId === seat.id))) throw new Error("A pending seat cannot have proposed or assigned work.");
+      if (status === "retired" && hasUnfinishedSeatWork(goal, seat.id)) throw new Error("A retired seat still has unfinished work; finish or reassign it first.");
+    }
+    if (goal.source) {
+      const candidate = team.sprintCandidates?.find((item) => item.id === goal.source!.candidateId);
+      if (!candidate || (candidate.goalId && candidate.goalId !== goal.id) || goal.source.ticketIds.some((id) => !candidate.ticketIds.includes(id))) throw new Error("Planning source must reference its team's candidate and tickets.");
+      validateRetrospectiveReference(state, goal.teamId, goal.source.retrospectiveGoalId);
+    }
+    for (const approval of goal.automaticApprovals ?? []) {
+      const revisions = team.standingPolicy?.revisions ?? [];
+      const policy = revisions.find((item) => item.revision === approval.policyRevision);
+      const next = revisions.find((item) => item.revision === approval.policyRevision + 1);
+      if (!policy?.enabled || Date.parse(approval.at) < Date.parse(policy.at) || (next && Date.parse(approval.at) >= Date.parse(next.at))) throw new Error("Automatic approval must reference the owner policy revision enabled at that time.");
+      if (approval.target.kind !== "proposal" && !approval.target.prUrl.startsWith(`https://github.com/${team.project?.github}/pull/`)) throw new Error("Automatic PR approval must belong to the team's project.");
+    }
     if (goal.ceremony) {
       const home = requireTeamHome(state, goal.teamId);
       if (goal.mattermost.channelId !== home.channelId || !goal.projectRefs.includes(home.github)) throw new Error("Ceremony goal home channel and project must come from its team in state.");
@@ -158,9 +206,122 @@ export function validatePlanningDocument(state: PlanningDocument): void {
       const project = teamProject(state, goal.teamId);
       const prs = goal.ceremony.history.flatMap((entry) => entry.stage === "release" ? entry.evidence.outcomes.map((item) => item.prUrl) : entry.stage === "retro" ? [entry.evidence.prUrl] : []);
       const closure = goal.ceremony.closure?.evidence;
+      if (closure?.kind === "retro-published" && closure.authorization?.approval.source === "reaction" && botIds.has(closure.authorization.approval.userId)) throw new Error("A team seat's reaction cannot supply human approval.");
       if (closure) prs.push(...[closure.prUrl, "revertPrUrl" in closure ? closure.revertPrUrl : undefined].filter((url): url is string => !!url));
       if (prs.some((url) => !project || !url.startsWith(`https://github.com/${project}/pull/`))) throw new Error("Ceremony PR evidence must belong to the team's project in state.");
     }
+  }
+  validateTeamReferences(state);
+}
+
+function validateRetrospectiveReference(state: PlanningDocument, teamId: string, id?: string): void {
+  if (id === undefined) return;
+  const goal = state.planningGoals?.find((goal) => goal.id === id && goal.teamId === teamId);
+  if (goal?.ceremony?.closure?.evidence.kind !== "retro-published") throw new Error("A retrospective reference must identify a published retrospective on the same team.");
+}
+function validateTeamReferences(state: PlanningDocument): void {
+  for (const team of state.teams as TeamRecord[]) {
+    const revisions = team.standingPolicy?.revisions ?? [];
+    for (const [index, revision] of revisions.entries()) {
+      if (revision.revision !== index + 1 || (index > 0 && Date.parse(revision.at) <= Date.parse(revisions[index - 1].at))) throw new Error("Standing policy revisions must be consecutive and strictly chronological.");
+    }
+    const tickets = team.backlog ?? []; const candidates = team.sprintCandidates ?? [];
+    if (new Set(tickets.map((item) => item.id)).size !== tickets.length || new Set(candidates.map((item) => item.id)).size !== candidates.length) throw new Error("Duplicate backlog ticket or sprint candidate ID.");
+    const ranked = candidates.filter((item) => item.status === "candidate");
+    if (new Set(ranked.map((item) => item.rank)).size !== ranked.length) throw new Error("Upcoming sprint candidates must have distinct ranks.");
+    for (const item of [...tickets, ...candidates]) {
+      for (const id of [item.createdBySeatId, item.updatedBySeatId]) {
+        const seat = team.seats.find((seat) => seat.id === id);
+        if (!seat || !seat.roles.some((role) => role === "Team Lead" || role === "Product")) throw new Error("Backlog and candidate authors must reference Product or Team Lead seats on the team.");
+      }
+      if (Date.parse(item.updatedAt) < Date.parse(item.createdAt)) throw new Error("Backlog and candidate timestamps must be chronological.");
+    }
+    for (const ticket of tickets) if (ticket.dependsOn?.some((id) => id === ticket.id || !tickets.some((item) => item.id === id))) throw new Error("Backlog dependencies must reference other tickets on the team.");
+    for (const candidate of candidates) {
+      if (candidate.ticketIds.some((id) => !tickets.some((item) => item.id === id))) throw new Error("Sprint candidate references an unknown backlog ticket.");
+      if (candidate.goalId && !state.planningGoals?.some((goal) => goal.id === candidate.goalId && goal.teamId === team.id)) throw new Error("Sprint candidate goal must belong to the same team.");
+      validateRetrospectiveReference(state, team.id, candidate.retrospectiveGoalId);
+    }
+  }
+}
+
+/** A failed assignment still needs reassignment or an explicit omission at release before its seat can retire. */
+export function hasUnfinishedSeatWork(goal: PlanningGoal, seatId: string): boolean {
+  if (goal.ceremony?.closure) return false;
+  if (goal.seatId === seatId) return true;
+  if (goal.stage !== "approved") return !!goal.proposal?.outcomes.some((item) => item.seatId === seatId);
+  if (goal.ceremony && ["release", "retro"].includes(goal.ceremony.stage)) return false;
+  if (goal.proposal?.outcomes.some((item) => item.seatId === seatId && !goal.assignments?.some((assignment) => assignment.outcomeId === item.id))) return true;
+  return !!goal.assignments?.some((item) => item.seatId === seatId && item.status !== "merged");
+}
+
+const same = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
+function hasDurableContracts(state: PlanningDocument): boolean {
+  return (state.teams as TeamRecord[]).some((team) => team.mission !== undefined || team.standingPolicy || team.backlog || team.sprintCandidates || team.seats.some((seat) => seat.status !== undefined || seat.roles.includes("Product")))
+    || !!state.planningGoals?.some((goal) => goal.source || goal.automaticApprovals || goal.integration?.headSha || goal.assignments?.some((item) => item.reassignments));
+}
+/** Settings are an owner capability, while identities, policy decisions and authorization history are never replaceable. */
+function guardTeamMutation(before: PlanningDocument, after: PlanningDocument, ownerSettings: boolean): void {
+  const oldTeams = before.teams as TeamRecord[]; const nextTeams = after.teams as TeamRecord[];
+  for (const team of nextTeams) {
+    const old = oldTeams.find((item) => item.id === team.id);
+    if (!ownerSettings && (!same(old?.mission, team.mission) || !same(old?.standingPolicy, team.standingPolicy))) throw new Error("Only the owner settings port may change the mission or standing policy.");
+    const previous = old?.standingPolicy?.revisions ?? []; const revisions = team.standingPolicy?.revisions ?? [];
+    if (revisions.length < previous.length || revisions.length > previous.length + 1 || previous.some((item, index) => !same(item, revisions[index]))) throw new Error("Standing policy history is append-only, one owner revision at a time.");
+    if (old && team.seats.some((seat) => !old.seats.some((previous) => previous.id === seat.id) && seatStatus(seat) !== "pending")) throw new Error("New seats must start pending identity and credential verification.");
+  }
+  for (const old of oldTeams) {
+    const next = nextTeams.find((item) => item.id === old.id);
+    if (!next) throw new Error("Teams and their historical seat identities cannot be removed.");
+    for (const seat of old.seats) {
+      const nextSeat = next.seats.find((item) => item.id === seat.id);
+      const identity = seat.externalIdentities.mattermost;
+      if (!nextSeat || !same(seat.roles, nextSeat.roles) || identity.username !== nextSeat.externalIdentities.mattermost.username || (identity.userId !== undefined && identity.userId !== nextSeat.externalIdentities.mattermost.userId)) throw new Error("Historical seat identities cannot be removed, reused or replaced; retire the seat instead.");
+      const from = seatStatus(seat); const to = seatStatus(nextSeat);
+      const allowed = { pending: ["pending", "active", "retired"], active: ["active", "retiring"], retiring: ["retiring", "retired"], retired: ["retired"] };
+      if (!allowed[from].includes(to)) throw new Error(`Invalid seat lifecycle transition ${from} to ${to}.`);
+      if (from === "retired" && !same(seat, nextSeat)) throw new Error("A retired seat identity is immutable.");
+    }
+  }
+}
+
+function guardPlanningContracts(before: PlanningDocument, after: PlanningDocument): void {
+  const oldGoals = before.planningGoals ?? [];
+  for (const old of oldGoals) {
+    const next = after.planningGoals?.find((item) => item.id === old.id);
+    if (old.automaticApprovals?.length && !next) throw new Error("Automatic approval history cannot be removed.");
+  }
+  for (const goal of after.planningGoals ?? []) {
+    const old = oldGoals.find((item) => item.id === goal.id);
+    const team = (after.teams as TeamRecord[]).find((item) => item.id === goal.teamId)!;
+    const activeDeveloper = (id: string): boolean => team.seats.some((seat) => seat.id === id && seat.roles.includes("Developer") && isActiveSeat(seat));
+    if (!old && [goal.seatId, ...goal.participantSeatIds].some((id) => !team.seats.some((seat) => seat.id === id && isActiveSeat(seat)))) throw new Error("New planning goals require active seats.");
+    if (!old || (!same(old.proposal, goal.proposal) || (old.stage !== "approved" && goal.stage === "approved"))) {
+      if (goal.proposal?.outcomes.some((item) => !activeDeveloper(item.seatId))) throw new Error("New proposals and approvals require active Developer seats.");
+    }
+    for (const assignment of goal.assignments ?? []) {
+      const previous = old?.assignments?.find((item) => item.outcomeId === assignment.outcomeId);
+      const prior = previous?.reassignments ?? []; const changes = assignment.reassignments ?? [];
+      if (changes.length < prior.length || changes.length > prior.length + 1 || prior.some((item, index) => !same(item, changes[index]))) throw new Error("Reassignment history is append-only, one transfer at a time.");
+      if (previous && previous.seatId !== assignment.seatId) {
+        if (previous.status === "merged" || goal.ceremony?.stage !== "implement" || changes.length !== prior.length + 1 || changes.at(-1)?.fromSeatId !== previous.seatId || !activeDeveloper(assignment.seatId) || assignment.status !== "queued" || assignment.prUrl !== undefined) throw new Error("Reassign unfinished implementation work to an active Developer with a new queued assignment and transfer record.");
+      } else if (changes.length !== prior.length) throw new Error("A reassignment record requires a seat change.");
+      if (!previous && !activeDeveloper(assignment.seatId)) throw new Error("New assignments require active Developer seats.");
+    }
+    for (const previous of old?.assignments ?? []) if (previous.reassignments?.length && !goal.assignments?.some((item) => item.outcomeId === previous.outcomeId)) throw new Error("Reassignment history cannot be removed.");
+    const previous = old?.automaticApprovals ?? []; const approvals = goal.automaticApprovals ?? [];
+    if (approvals.length < previous.length || approvals.length > previous.length + 1 || previous.some((item, index) => !same(item, approvals[index]))) throw new Error("Automatic approval history is append-only, one decision at a time.");
+    const added = approvals[previous.length];
+    if (!added) continue;
+    const policy = team.standingPolicy?.revisions.at(-1);
+    if (!old?.ceremony || !policy?.enabled || added.policyRevision !== policy.revision) throw new Error("New automatic approval requires the current enabled owner policy and an existing ceremony.");
+    if (added.target.kind === "proposal") {
+      if (old.ceremony.stage !== "proposal" || goal.ceremony?.stage !== "implement") throw new Error("Automatic proposal authorization must enter implementation in the same transaction.");
+      const entry = goal.ceremony.history.at(-1);
+      if (entry?.stage !== "implement" || entry.evidence.kind !== "automatic-approval" || !same(entry.evidence.approval, added)) throw new Error("Automatic proposal authorization must preserve automatic ceremony provenance.");
+    } else if (added.target.kind === "integration") {
+      if (old.ceremony.stage !== "release" || goal.integration?.status !== "pr-open" || goal.integration.headSha !== added.target.headSha) throw new Error("Automatic integration authorization requires the current open PR head at release.");
+    } else if (old.ceremony.stage !== "retro" || old.ceremony.closure) throw new Error("Automatic retro authorization requires a verified running release and an open retro.");
   }
 }
 
@@ -283,6 +444,20 @@ export class PlanningStore {
   /** Start-up migration's merge-commit checks, keyed by goal, for the write guard of that one migration. */
   private readonly releaseFacts = new Map<string, boolean | undefined>();
   async teamConflicts(): Promise<TeamGoalConflict[]> { return openGoalConflicts((await this.read()).planningGoals ?? []); }
+  /** Trusted owner/TUI capability. Do not expose this method to agent tools or apply settings parsed from agent output. */
+  async updateOwnerSettings(teamId: string, patch: { mission?: string; autoMode?: boolean }, at = new Date().toISOString()): Promise<void> {
+    if (Object.keys(patch).some((key) => key !== "mission" && key !== "autoMode")) throw new Error("Unknown owner setting.");
+    await this.commitUpdate((state) => {
+      const team = (state.teams as TeamRecord[]).find((item) => item.id === teamId);
+      if (!team) throw new Error(`Unknown settings team ${teamId}.`);
+      if (patch.mission !== undefined) team.mission = patch.mission;
+      if (patch.autoMode !== undefined && patch.autoMode !== (team.standingPolicy?.revisions.at(-1)?.enabled ?? false)) {
+        const revisions = team.standingPolicy?.revisions ?? [];
+        const revision: StandingPolicyRevision = { revision: revisions.length + 1, enabled: patch.autoMode, source: "owner-command", at };
+        team.standingPolicy = { revisions: [...revisions, revision] };
+      }
+    }, `Update owner settings for ${teamId}`, true);
+  }
   /**
    * Applies one change to state.json and commits it in the checkout with `message`, under a lock
    * shared by every Indra process. The commit contains only state.json. A change that cannot be
@@ -290,6 +465,9 @@ export class PlanningStore {
    * write fail instead of being committed. Pushing runs afterwards in the background, best effort.
    */
   async update(mutator: (state: PlanningDocument) => void, message: string | ((state: PlanningDocument) => string)): Promise<void> {
+    await this.commitUpdate(mutator, message, false);
+  }
+  private async commitUpdate(mutator: (state: PlanningDocument) => void, message: string | ((state: PlanningDocument) => string), ownerSettings: boolean): Promise<void> {
     const git = new StateGit(this.checkout);
     const file = join(this.checkout, "state.json");
     const changed = await withFileLock(join(this.runtimeDir, "state.lock"), async () => {
@@ -300,9 +478,13 @@ export class PlanningStore {
       parseState(state);
       const previous = structuredClone(state);
       mutator(state);
+      parseState(state);
+      guardTeamMutation(previous, state, ownerSettings);
+      guardPlanningContracts(previous, state);
       await this.guardCeremonyWrite(previous, state);
       parseState(state);
       if (JSON.stringify(previous) === JSON.stringify(state)) return false;
+      if (hasDurableContracts(state)) await this.validateContractSchema(state);
       const after = `${JSON.stringify(state, null, 2)}\n`;
       if (after === before) return false;
       const subject = typeof message === "function" ? message(state) : message;
@@ -345,6 +527,7 @@ export class PlanningStore {
       parseState(state);
       // Recover only a write this rollout can still validate, never commit malformed state after a restart.
       if (state.planningGoals?.some((goal) => goal.ceremony)) await this.validateCeremonySchema(state);
+      else if (hasDurableContracts(state)) await this.validateContractSchema(state);
       await git.commit(intent.message);
     }
     await rm(join(this.runtimeDir, `${COMMIT_INTENT}.json`), { force: true });
@@ -372,10 +555,13 @@ export class PlanningStore {
   }
   private async validateCeremonySchema(state: PlanningDocument): Promise<void> {
     assertCeremonyReady(this.ceremonyWrites);
+    await this.validateContractSchema(state);
+  }
+  private async validateContractSchema(state: PlanningDocument): Promise<void> {
     const schema = JSON.parse(await readFile(join(this.checkout, "schema/v1/state.schema.json"), "utf8")) as object;
     const ajv = new Ajv2020({ strict: false });
     addFormats.default(ajv);
-    if (!ajv.compile(schema)(state)) throw new Error("The checkout's v1 schema does not accept this ceremony state; land the compatible schema before activating writes.");
+    if (!ajv.compile(schema)(state)) throw new Error("The checkout's v1 schema does not accept this ceremony or team state; land the compatible schema before activating writes.");
   }
   /** Serializes work on one goal's runtime metadata across Indra processes (the bridge and `planning approve`). */
   async withGoalLock<T>(id: string, work: () => Promise<T>): Promise<T> {
