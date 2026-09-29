@@ -103,10 +103,10 @@ describe("Claude runtime", () => {
   it("grants Developer edits only in the worktree and named extras with mandatory sandboxing", async () => {
     const gitDir = join(dir, "shared.git");
     const run = new ClaudeRuntime(dir, 5000, { extraDirs: [gitDir] }).message("Build", schema); await launched();
-    expect(flag("--permission-mode")).toBe("acceptEdits"); expect(flag("--add-dir")).toBe(gitDir);
+    expect(flag("--permission-mode")).toBe("auto"); expect(flag("--add-dir")).toBe(gitDir);
     const settings = JSON.parse(flag("--settings"));
     expect(settings.sandbox).toMatchObject({ enabled: true, failIfUnavailable: true, autoAllowBashIfSandboxed: true, allowUnsandboxedCommands: false, excludedCommands: [], filesystem: { allowWrite: [gitDir] } });
-    expect(settings.permissions).toMatchObject({ disableBypassPermissionsMode: "disable", disableAutoMode: "disable" });
+    expect(settings.permissions).toMatchObject({ disableBypassPermissionsMode: "disable" }); expect(settings.permissions.disableAutoMode).toBeUndefined();
     expect(args().join(" ")).not.toContain("skip-permissions"); expect(args().join(" ")).not.toContain("bypassPermissions");
     child.close(); await run;
   });
