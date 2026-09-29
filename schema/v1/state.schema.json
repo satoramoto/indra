@@ -4,13 +4,23 @@
   "title": "Indra state v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["$schema", "schemaVersion", "teams"],
+  "required": [
+    "$schema",
+    "schemaVersion",
+    "teams"
+  ],
   "properties": {
-    "$schema": { "const": "./schema/v1/state.schema.json" },
-    "schemaVersion": { "const": 1 },
+    "$schema": {
+      "const": "./schema/v1/state.schema.json"
+    },
+    "schemaVersion": {
+      "const": 1
+    },
     "teams": {
       "type": "array",
-      "items": { "$ref": "#/$defs/team" }
+      "items": {
+        "$ref": "#/$defs/team"
+      }
     },
     "sprints": {
       "description": "Retired draft sprints from before planning goals. Ignored by Indra, which empties it at start-up; kept as [] because older builds require it.",
@@ -19,7 +29,9 @@
     },
     "planningGoals": {
       "type": "array",
-      "items": { "$ref": "#/$defs/planningGoal" }
+      "items": {
+        "$ref": "#/$defs/planningGoal"
+      }
     }
   },
   "$defs": {
@@ -34,16 +46,24 @@
     "mattermostTeam": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["teamId"],
+      "required": [
+        "teamId"
+      ],
       "properties": {
-        "teamId": { "$ref": "#/$defs/nonEmptyText" },
-        "homeChannelId": { "$ref": "#/$defs/nonEmptyText" }
+        "teamId": {
+          "$ref": "#/$defs/nonEmptyText"
+        },
+        "homeChannelId": {
+          "$ref": "#/$defs/nonEmptyText"
+        }
       }
     },
     "project": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["github"],
+      "required": [
+        "github"
+      ],
       "properties": {
         "github": {
           "type": "string",
@@ -54,54 +74,191 @@
     "mattermostSeat": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["userId", "username"],
+      "required": [
+        "userId",
+        "username"
+      ],
       "properties": {
-        "userId": { "$ref": "#/$defs/nonEmptyText" },
-        "username": { "$ref": "#/$defs/nonEmptyText" }
+        "userId": {
+          "$ref": "#/$defs/nonEmptyText"
+        },
+        "username": {
+          "$ref": "#/$defs/nonEmptyText"
+        }
       }
     },
     "team": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "slug", "displayName", "externalIdentities", "seats"],
+      "required": [
+        "id",
+        "slug",
+        "displayName",
+        "externalIdentities",
+        "seats"
+      ],
       "properties": {
-        "id": { "$ref": "#/$defs/id" },
-        "slug": { "$ref": "#/$defs/id" },
-        "displayName": { "$ref": "#/$defs/nonEmptyText" },
-        "project": { "$ref": "#/$defs/project" },
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "slug": {
+          "$ref": "#/$defs/id"
+        },
+        "displayName": {
+          "$ref": "#/$defs/nonEmptyText"
+        },
+        "project": {
+          "$ref": "#/$defs/project"
+        },
         "externalIdentities": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["mattermost"],
+          "required": [
+            "mattermost"
+          ],
           "properties": {
-            "mattermost": { "$ref": "#/$defs/mattermostTeam" }
+            "mattermost": {
+              "$ref": "#/$defs/mattermostTeam"
+            }
           }
         },
         "seats": {
           "type": "array",
-          "items": { "$ref": "#/$defs/seat" }
+          "items": {
+            "$ref": "#/$defs/seat"
+          }
+        },
+        "workflowModel": {
+          "const": "goals-v1"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "workflowModel"
+            ]
+          },
+          "then": {
+            "properties": {
+              "seats": {
+                "allOf": [
+                  {
+                    "contains": {
+                      "type": "object",
+                      "properties": {
+                        "roles": {
+                          "const": [
+                            "Team Lead"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "roles"
+                      ]
+                    },
+                    "minContains": 1,
+                    "maxContains": 1
+                  },
+                  {
+                    "contains": {
+                      "type": "object",
+                      "properties": {
+                        "roles": {
+                          "const": [
+                            "Product"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "roles"
+                      ]
+                    },
+                    "minContains": 1,
+                    "maxContains": 1
+                  },
+                  {
+                    "contains": {
+                      "type": "object",
+                      "properties": {
+                        "roles": {
+                          "const": [
+                            "Developer"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "roles"
+                      ]
+                    },
+                    "minContains": 1
+                  }
+                ]
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "seats": {
+                "not": {
+                  "contains": {
+                    "type": "object",
+                    "properties": {
+                      "roles": {
+                        "const": [
+                          "Product"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "roles"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
     },
     "seat": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "displayName", "roles", "externalIdentities"],
+      "required": [
+        "id",
+        "displayName",
+        "roles",
+        "externalIdentities"
+      ],
       "properties": {
-        "id": { "$ref": "#/$defs/id" },
-        "displayName": { "$ref": "#/$defs/nonEmptyText" },
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "displayName": {
+          "$ref": "#/$defs/nonEmptyText"
+        },
         "roles": {
           "type": "array",
           "minItems": 1,
           "maxItems": 1,
-          "items": { "enum": ["Team Lead", "Developer"] }
+          "items": {
+            "enum": [
+              "Team Lead",
+              "Product",
+              "Developer"
+            ]
+          }
         },
         "externalIdentities": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["mattermost"],
+          "required": [
+            "mattermost"
+          ],
           "properties": {
-            "mattermost": { "$ref": "#/$defs/mattermostSeat" }
+            "mattermost": {
+              "$ref": "#/$defs/mattermostSeat"
+            }
           }
         }
       }
@@ -109,113 +266,2005 @@
     "planningGoal": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "teamId", "seatId", "participantSeatIds", "goal", "projectRefs", "stage", "createdAt", "updatedAt", "mattermost", "brief"],
-      "allOf": [{
-        "if": { "properties": { "stage": { "enum": ["awaiting-review", "approved"] } }, "required": ["stage"] },
-        "then": { "required": ["proposal"] },
-        "else": { "not": { "required": ["proposal"] } }
-      }, {
-        "if": { "properties": { "stage": { "const": "approved" } }, "required": ["stage"] },
-        "else": { "not": { "anyOf": [{ "required": ["assignments"] }, { "required": ["integration"] }] } }
-      }],
+      "required": [
+        "id",
+        "teamId",
+        "seatId",
+        "participantSeatIds",
+        "goal",
+        "projectRefs",
+        "stage",
+        "createdAt",
+        "updatedAt",
+        "mattermost",
+        "brief"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "workflowModel"
+            ]
+          },
+          "then": {
+            "required": [
+              "ceremony"
+            ],
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "proposal"
+                  ]
+                },
+                {
+                  "required": [
+                    "assignments"
+                  ]
+                }
+              ]
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "stage": {
+                      "enum": [
+                        "awaiting-review",
+                        "approved"
+                      ]
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "goalProposal"
+                  ]
+                },
+                "else": {
+                  "not": {
+                    "required": [
+                      "goalProposal"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "stage": {
+                      "const": "approved"
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "ownedFiles"
+                  ]
+                },
+                "else": {
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "goalAssignment"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "integration"
+                        ]
+                      }
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "required": [
+                    "goalAssignment"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "integration"
+                  ]
+                }
+              }
+            ]
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "goalProposal"
+                  ]
+                },
+                {
+                  "required": [
+                    "goalAssignment"
+                  ]
+                },
+                {
+                  "required": [
+                    "ownedFiles"
+                  ]
+                }
+              ]
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "stage": {
+                      "enum": [
+                        "awaiting-review",
+                        "approved"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "stage"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "proposal"
+                  ]
+                },
+                "else": {
+                  "not": {
+                    "required": [
+                      "proposal"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "stage": {
+                      "const": "approved"
+                    }
+                  },
+                  "required": [
+                    "stage"
+                  ]
+                },
+                "else": {
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "assignments"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "integration"
+                        ]
+                      }
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ],
       "properties": {
-        "id": { "$ref": "#/$defs/id" },
-        "teamId": { "$ref": "#/$defs/id" },
-        "seatId": { "$ref": "#/$defs/id" },
-        "participantSeatIds": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
-        "goal": { "$ref": "#/$defs/nonEmptyText" },
-        "projectRefs": { "type": "array", "items": { "$ref": "#/$defs/nonEmptyText" } },
-        "stage": { "enum": ["clarifying", "drafting", "awaiting-review", "approved"] },
-        "createdAt": { "type": "string", "format": "date-time" },
-        "updatedAt": { "type": "string", "format": "date-time" },
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "teamId": {
+          "$ref": "#/$defs/id"
+        },
+        "seatId": {
+          "$ref": "#/$defs/id"
+        },
+        "participantSeatIds": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/id"
+          }
+        },
+        "goal": {
+          "$ref": "#/$defs/nonEmptyText"
+        },
+        "projectRefs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/nonEmptyText"
+          }
+        },
+        "stage": {
+          "enum": [
+            "clarifying",
+            "drafting",
+            "awaiting-review",
+            "approved"
+          ]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
         "mattermost": {
-          "type": "object", "additionalProperties": false, "required": ["channelId", "rootPostId"],
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "channelId",
+            "rootPostId"
+          ],
           "properties": {
-            "channelId": { "$ref": "#/$defs/nonEmptyText" },
-            "rootPostId": { "$ref": "#/$defs/nonEmptyText" }
+            "channelId": {
+              "$ref": "#/$defs/nonEmptyText"
+            },
+            "rootPostId": {
+              "$ref": "#/$defs/nonEmptyText"
+            }
           }
         },
         "brief": {
-          "type": "object", "additionalProperties": false, "required": ["summary", "decisions", "openQuestions"],
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "summary",
+            "decisions",
+            "openQuestions"
+          ],
           "properties": {
-            "summary": { "$ref": "#/$defs/nonEmptyText" },
-            "decisions": { "type": "array", "items": { "$ref": "#/$defs/nonEmptyText" } },
-            "openQuestions": { "type": "array", "items": { "$ref": "#/$defs/nonEmptyText" } }
+            "summary": {
+              "$ref": "#/$defs/nonEmptyText"
+            },
+            "decisions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/nonEmptyText"
+              }
+            },
+            "openQuestions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/nonEmptyText"
+              }
+            }
           }
         },
-        "proposal": { "$ref": "#/$defs/planningProposal" },
-        "assignments": { "type": "array", "items": { "$ref": "#/$defs/planningAssignment" } },
-        "integration": { "$ref": "#/$defs/sprintIntegration" },
-        "ceremony": { "$ref": "#/$defs/ceremony" }
+        "proposal": {
+          "$ref": "#/$defs/planningProposal"
+        },
+        "assignments": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/planningAssignment"
+          }
+        },
+        "integration": {
+          "$ref": "#/$defs/sprintIntegration"
+        },
+        "ceremony": {
+          "$ref": "#/$defs/ceremony"
+        },
+        "workflowModel": {
+          "const": "goals-v1"
+        },
+        "ownedFiles": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "\\S"
+          },
+          "minItems": 1,
+          "maxItems": 128
+        },
+        "goalProposal": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "version",
+            "goalId",
+            "proposalId",
+            "productSeatId",
+            "rank",
+            "mission",
+            "summary",
+            "outcomes",
+            "ownedFiles",
+            "risks",
+            "rationale",
+            "basedOnRetros"
+          ],
+          "properties": {
+            "version": {
+              "type": "integer",
+              "const": 1
+            },
+            "goalId": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]*$"
+            },
+            "proposalId": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]*$"
+            },
+            "productSeatId": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]*$"
+            },
+            "rank": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "mission": {
+              "type": "string",
+              "pattern": "\\S"
+            },
+            "summary": {
+              "type": "string",
+              "pattern": "\\S"
+            },
+            "outcomes": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "number",
+                  "title",
+                  "description",
+                  "reason",
+                  "currentCode"
+                ],
+                "properties": {
+                  "number": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "title": {
+                    "type": "string",
+                    "pattern": "\\S"
+                  },
+                  "description": {
+                    "type": "string",
+                    "pattern": "\\S"
+                  },
+                  "reason": {
+                    "type": "string",
+                    "pattern": "\\S"
+                  },
+                  "currentCode": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "pattern": "\\S"
+                    }
+                  }
+                }
+              },
+              "minItems": 1
+            },
+            "ownedFiles": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "\\S"
+              },
+              "minItems": 1,
+              "maxItems": 128
+            },
+            "risks": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "\\S"
+              }
+            },
+            "rationale": {
+              "type": "string",
+              "pattern": "\\S"
+            },
+            "basedOnRetros": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "\\S"
+              }
+            }
+          }
+        },
+        "goalAssignment": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "seatId",
+            "status",
+            "updatedAt"
+          ],
+          "properties": {
+            "seatId": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]*$"
+            },
+            "status": {
+              "enum": [
+                "assigned",
+                "running",
+                "reported",
+                "failed"
+              ]
+            },
+            "updatedAt": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        }
       }
     },
     "sprintIntegration": {
-      "type": "object", "additionalProperties": false,
-      "required": ["branch", "baseSha", "status"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "branch",
+        "baseSha",
+        "status"
+      ],
       "allOf": [
-        { "if": { "properties": { "status": { "enum": ["pr-open", "merged", "reverted"] } } }, "then": { "required": ["prUrl"] } },
-        { "if": { "properties": { "status": { "enum": ["merged", "reverted"] } } }, "then": { "required": ["mergedSha"] } },
-        { "if": { "properties": { "status": { "const": "reverted" } } }, "then": { "required": ["revertPrUrl"] } }
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "pr-open",
+                  "merged",
+                  "reverted"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "prUrl"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "merged",
+                  "reverted"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "mergedSha"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "reverted"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "revertPrUrl"
+            ]
+          }
+        }
       ],
       "properties": {
-        "branch": { "type": "string", "pattern": "^sprint/[a-z][a-z0-9-]+$" },
-        "baseSha": { "$ref": "#/$defs/gitSha" },
-        "status": { "enum": ["collecting", "pr-open", "merged", "reverted"] },
-        "prUrl": { "$ref": "#/$defs/nonEmptyText" },
-        "mergedSha": { "$ref": "#/$defs/gitSha" },
-        "revertPrUrl": { "$ref": "#/$defs/nonEmptyText" }
+        "branch": {
+          "type": "string",
+          "pattern": "^sprint/[a-z][a-z0-9-]+$"
+        },
+        "baseSha": {
+          "$ref": "#/$defs/gitSha"
+        },
+        "status": {
+          "enum": [
+            "collecting",
+            "pr-open",
+            "merged",
+            "reverted"
+          ]
+        },
+        "prUrl": {
+          "$ref": "#/$defs/nonEmptyText"
+        },
+        "mergedSha": {
+          "$ref": "#/$defs/gitSha"
+        },
+        "revertPrUrl": {
+          "$ref": "#/$defs/nonEmptyText"
+        }
       }
     },
-    "gitSha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "gitSha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
     "planningAssignment": {
-      "type": "object", "additionalProperties": false,
-      "required": ["outcomeId", "seatId", "status", "updatedAt"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "outcomeId",
+        "seatId",
+        "status",
+        "updatedAt"
+      ],
       "properties": {
-        "outcomeId": { "$ref": "#/$defs/id" },
-        "seatId": { "$ref": "#/$defs/id" },
-        "status": { "enum": ["queued", "running", "in-review", "merged", "failed"] },
-        "updatedAt": { "type": "string", "format": "date-time" },
-        "prUrl": { "$ref": "#/$defs/nonEmptyText" },
-        "note": { "$ref": "#/$defs/nonEmptyText" }
+        "outcomeId": {
+          "$ref": "#/$defs/id"
+        },
+        "seatId": {
+          "$ref": "#/$defs/id"
+        },
+        "status": {
+          "enum": [
+            "queued",
+            "running",
+            "in-review",
+            "merged",
+            "failed"
+          ]
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "prUrl": {
+          "$ref": "#/$defs/nonEmptyText"
+        },
+        "note": {
+          "$ref": "#/$defs/nonEmptyText"
+        }
       }
     },
     "planningProposal": {
-      "type": "object", "additionalProperties": false,
-      "required": ["id", "createdAt", "summary", "outcomes", "risks", "openQuestions"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "createdAt",
+        "summary",
+        "outcomes",
+        "risks",
+        "openQuestions"
+      ],
       "properties": {
-        "id": { "$ref": "#/$defs/id" },
-        "createdAt": { "type": "string", "format": "date-time" },
-        "summary": { "$ref": "#/$defs/nonEmptyText" },
-        "outcomes": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/planningOutcome" } },
-        "risks": { "type": "array", "items": { "$ref": "#/$defs/nonEmptyText" } },
-        "openQuestions": { "type": "array", "items": { "$ref": "#/$defs/nonEmptyText" } }
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "summary": {
+          "$ref": "#/$defs/nonEmptyText"
+        },
+        "outcomes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/planningOutcome"
+          }
+        },
+        "risks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/nonEmptyText"
+          }
+        },
+        "openQuestions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/nonEmptyText"
+          }
+        }
       }
     },
     "planningOutcome": {
-      "type": "object", "additionalProperties": false,
-      "required": ["id", "title", "description", "seatId"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "description",
+        "seatId"
+      ],
       "properties": {
-        "id": { "$ref": "#/$defs/id" },
-        "title": { "$ref": "#/$defs/nonEmptyText" },
-        "description": { "$ref": "#/$defs/nonEmptyText" },
-        "seatId": { "$ref": "#/$defs/id" }
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "title": {
+          "$ref": "#/$defs/nonEmptyText"
+        },
+        "description": {
+          "$ref": "#/$defs/nonEmptyText"
+        },
+        "seatId": {
+          "$ref": "#/$defs/id"
+        }
       }
     },
-    "ceremonyText": {"type": "string", "pattern": "\\S"},
-    "ceremonyTime": {"type": "string", "format": "date-time"},
-    "ceremonySha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
-    "ceremonyId": {"type": "string", "pattern": "^[a-z][a-z0-9-]+$"},
-    "ceremonyPr": {"type": "string", "pattern": "^https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*$"},
-    "ceremonyHumanApproval": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["source", "command", "at"], "properties": {"source": {"const": "owner-command"}, "command": {"enum": ["planning approve", "planning merge"]}, "at": {"$ref": "#/$defs/ceremonyTime"}}}, {"type": "object", "additionalProperties": false, "required": ["source", "userId", "postId", "emoji", "verifiedHuman", "at"], "properties": {"source": {"const": "reaction"}, "userId": {"$ref": "#/$defs/ceremonyText"}, "postId": {"$ref": "#/$defs/ceremonyText"}, "emoji": {"const": "white_check_mark"}, "verifiedHuman": {"const": true}, "at": {"$ref": "#/$defs/ceremonyTime"}}}]},
-    "ceremonyApproval": {"type": "object", "additionalProperties": false, "required": ["kind", "proposalId", "proposalPostId", "approval"], "properties": {"kind": {"const": "approval"}, "proposalId": {"$ref": "#/$defs/ceremonyId"}, "proposalPostId": {"$ref": "#/$defs/ceremonyText"}, "approval": {"$ref": "#/$defs/ceremonyHumanApproval"}}},
-    "ceremonyImplementation": {"type": "object", "additionalProperties": false, "required": ["kind", "outcomes"], "properties": {"kind": {"const": "implementation"}, "outcomes": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": false, "required": ["outcomeId", "seatId", "prUrl", "baseBranch", "mergedSha", "checksPassed", "reviewApproved"], "properties": {"outcomeId": {"$ref": "#/$defs/ceremonyId"}, "seatId": {"$ref": "#/$defs/ceremonyId"}, "prUrl": {"$ref": "#/$defs/ceremonyPr"}, "baseBranch": {"$ref": "#/$defs/ceremonyText"}, "mergedSha": {"$ref": "#/$defs/ceremonySha"}, "checksPassed": {"const": true}, "reviewApproved": {"const": true}}}}, "omissions": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": false, "required": ["outcomeId", "seatId", "reason"], "properties": {"outcomeId": {"$ref": "#/$defs/ceremonyId"}, "seatId": {"$ref": "#/$defs/ceremonyId"}, "reason": {"$ref": "#/$defs/ceremonyText"}}}}, "partialApproval": {"type": "object", "additionalProperties": false, "required": ["source", "command", "at"], "properties": {"source": {"const": "owner-command"}, "command": {"const": "planning integrate"}, "at": {"$ref": "#/$defs/ceremonyTime"}}}}, "allOf": [{"if": {"required": ["omissions"]}, "then": {"required": ["partialApproval"]}}, {"if": {"required": ["partialApproval"]}, "then": {"required": ["omissions"]}}]},
-    "ceremonyRelease": {"type": "object", "additionalProperties": false, "required": ["kind", "prUrl", "mergedSha", "mergePostId", "approval", "checksPassed", "buildSha", "runningSha", "runningAt"], "properties": {"kind": {"const": "release-running"}, "prUrl": {"$ref": "#/$defs/ceremonyPr"}, "mergedSha": {"$ref": "#/$defs/ceremonySha"}, "mergePostId": {"$ref": "#/$defs/ceremonyText"}, "approval": {"$ref": "#/$defs/ceremonyHumanApproval"}, "checksPassed": {"const": true}, "buildSha": {"$ref": "#/$defs/ceremonySha"}, "runningSha": {"$ref": "#/$defs/ceremonySha"}, "runningAt": {"$ref": "#/$defs/ceremonyTime"}, "ancestry": {"type": "object", "additionalProperties": false, "required": ["ancestorSha", "descendantSha", "verified"], "properties": {"ancestorSha": {"$ref": "#/$defs/ceremonySha"}, "descendantSha": {"$ref": "#/$defs/ceremonySha"}, "verified": {"const": true}}}}},
-    "ceremonyRetro": {"type": "object", "additionalProperties": false, "required": ["kind", "path", "prUrl", "baseBranch", "mergedSha", "postId", "publishedAt", "factsOnly", "suggestions"], "properties": {"kind": {"const": "retro-published"}, "path": {"type": "string", "pattern": "^docs/retros/[a-z][a-z0-9-]+\\.md$"}, "prUrl": {"$ref": "#/$defs/ceremonyPr"}, "baseBranch": {"const": "main"}, "mergedSha": {"$ref": "#/$defs/ceremonySha"}, "postId": {"$ref": "#/$defs/ceremonyText"}, "publishedAt": {"$ref": "#/$defs/ceremonyTime"}, "factsOnly": {"const": true}, "suggestions": {"const": "owner-proposals-only"}}},
-    "ceremonyLegacyApproval": {"type": "object", "additionalProperties": false, "required": ["kind", "proposalId"], "properties": {"kind": {"const": "legacy-approval"}, "proposalId": {"$ref": "#/$defs/ceremonyId"}}},
-    "ceremonyLegacyImplementation": {"type": "object", "additionalProperties": false, "required": ["kind", "outcomes"], "properties": {"kind": {"const": "legacy-implementation"}, "outcomes": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": false, "required": ["outcomeId", "seatId", "prUrl"], "properties": {"outcomeId": {"$ref": "#/$defs/ceremonyId"}, "seatId": {"$ref": "#/$defs/ceremonyId"}, "prUrl": {"$ref": "#/$defs/ceremonyPr"}}}}, "unmerged": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": false, "required": ["outcomeId", "seatId"], "properties": {"outcomeId": {"$ref": "#/$defs/ceremonyId"}, "seatId": {"$ref": "#/$defs/ceremonyId"}}}}}},
-    "ceremonyRevertedRelease": {"type": "object", "additionalProperties": false, "required": ["kind", "prUrl", "mergedSha", "revertPrUrl"], "properties": {"kind": {"const": "release-reverted"}, "prUrl": {"$ref": "#/$defs/ceremonyPr"}, "mergedSha": {"$ref": "#/$defs/ceremonySha"}, "revertPrUrl": {"$ref": "#/$defs/ceremonyPr"}}},
-    "ceremonyLegacyClosure": {"type": "object", "additionalProperties": false, "required": ["kind", "integration"], "properties": {"kind": {"const": "legacy-migration"}, "integration": {"enum": ["none", "merged", "reverted"]}, "prUrl": {"$ref": "#/$defs/ceremonyPr"}, "mergedSha": {"$ref": "#/$defs/ceremonySha"}, "revertPrUrl": {"$ref": "#/$defs/ceremonyPr"}}},
-    "ceremonyEntry": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["stage", "enteredAt"], "properties": {"stage": {"enum": ["planning", "proposal"]}, "enteredAt": {"anyOf": [{"$ref": "#/$defs/ceremonyTime"}, {"type": "null"}]}}}, {"type": "object", "additionalProperties": false, "required": ["stage", "enteredAt", "evidence"], "properties": {"stage": {"const": "implement"}, "enteredAt": {"anyOf": [{"$ref": "#/$defs/ceremonyTime"}, {"type": "null"}]}, "evidence": {"$ref": "#/$defs/ceremonyApproval"}}}, {"type": "object", "additionalProperties": false, "required": ["stage", "enteredAt", "evidence"], "properties": {"stage": {"const": "implement"}, "enteredAt": {"type": "null"}, "evidence": {"$ref": "#/$defs/ceremonyLegacyApproval"}}}, {"type": "object", "additionalProperties": false, "required": ["stage", "enteredAt", "evidence"], "properties": {"stage": {"const": "release"}, "enteredAt": {"anyOf": [{"$ref": "#/$defs/ceremonyTime"}, {"type": "null"}]}, "evidence": {"$ref": "#/$defs/ceremonyImplementation"}}}, {"type": "object", "additionalProperties": false, "required": ["stage", "enteredAt", "evidence"], "properties": {"stage": {"const": "release"}, "enteredAt": {"type": "null"}, "evidence": {"$ref": "#/$defs/ceremonyLegacyImplementation"}}}, {"type": "object", "additionalProperties": false, "required": ["stage", "enteredAt", "evidence"], "properties": {"stage": {"const": "retro"}, "enteredAt": {"anyOf": [{"$ref": "#/$defs/ceremonyTime"}, {"type": "null"}]}, "evidence": {"$ref": "#/$defs/ceremonyRelease"}}}]},
-    "ceremony": {"type": "object", "additionalProperties": false, "required": ["version", "stage", "history"], "properties": {"version": {"const": 1}, "stage": {"enum": ["planning", "proposal", "implement", "release", "retro"]}, "history": {"type": "array", "minItems": 1, "maxItems": 5, "items": {"$ref": "#/$defs/ceremonyEntry"}}, "migratedAt": {"$ref": "#/$defs/ceremonyTime"}, "closure": {"type": "object", "additionalProperties": false, "required": ["closedAt", "evidence"], "properties": {"closedAt": {"$ref": "#/$defs/ceremonyTime"}, "evidence": {"oneOf": [{"$ref": "#/$defs/ceremonyRetro"}, {"$ref": "#/$defs/ceremonyRevertedRelease"}, {"$ref": "#/$defs/ceremonyLegacyClosure"}]}}}}, "allOf": [{"if": {"properties": {"stage": {"const": "planning"}}}, "then": {"properties": {"history": {"minItems": 1, "maxItems": 1, "prefixItems": [{"properties": {"stage": {"const": "planning"}}}]}}}}, {"if": {"properties": {"stage": {"const": "proposal"}}}, "then": {"properties": {"history": {"minItems": 2, "maxItems": 2, "prefixItems": [{"properties": {"stage": {"const": "planning"}}}, {"properties": {"stage": {"const": "proposal"}}}]}}}}, {"if": {"properties": {"stage": {"const": "implement"}}}, "then": {"properties": {"history": {"minItems": 3, "maxItems": 3, "prefixItems": [{"properties": {"stage": {"const": "planning"}}}, {"properties": {"stage": {"const": "proposal"}}}, {"properties": {"stage": {"const": "implement"}}}]}}}}, {"if": {"properties": {"stage": {"const": "release"}}}, "then": {"properties": {"history": {"minItems": 4, "maxItems": 4, "prefixItems": [{"properties": {"stage": {"const": "planning"}}}, {"properties": {"stage": {"const": "proposal"}}}, {"properties": {"stage": {"const": "implement"}}}, {"properties": {"stage": {"const": "release"}}}]}}}}, {"if": {"properties": {"stage": {"const": "retro"}}}, "then": {"properties": {"history": {"minItems": 5, "maxItems": 5, "prefixItems": [{"properties": {"stage": {"const": "planning"}}}, {"properties": {"stage": {"const": "proposal"}}}, {"properties": {"stage": {"const": "implement"}}}, {"properties": {"stage": {"const": "release"}}}, {"properties": {"stage": {"const": "retro"}}}]}}}}, {"if": {"required": ["closure"], "properties": {"closure": {"properties": {"evidence": {"properties": {"kind": {"enum": ["retro-published"]}}}}}}}, "then": {"properties": {"stage": {"const": "retro"}}}}, {"if": {"required": ["closure"], "properties": {"closure": {"properties": {"evidence": {"properties": {"kind": {"enum": ["release-reverted", "legacy-migration"]}}}}}}}, "then": {"properties": {"stage": {"const": "release"}}}}, {"if": {"required": ["closure"], "properties": {"closure": {"properties": {"evidence": {"properties": {"kind": {"enum": ["legacy-migration"]}}}}}}}, "then": {"required": ["migratedAt"]}}, {"if": {"not": {"required": ["migratedAt"]}}, "then": {"properties": {"history": {"items": {"properties": {"enteredAt": {"$ref": "#/$defs/ceremonyTime"}}}}}}}]}
+    "ceremonyText": {
+      "type": "string",
+      "pattern": "\\S"
+    },
+    "ceremonyTime": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "ceremonySha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "ceremonyId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]+$"
+    },
+    "ceremonyPr": {
+      "type": "string",
+      "pattern": "^https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*$"
+    },
+    "ceremonyHumanApproval": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "source",
+            "command",
+            "at"
+          ],
+          "properties": {
+            "source": {
+              "const": "owner-command"
+            },
+            "command": {
+              "enum": [
+                "planning approve",
+                "planning merge"
+              ]
+            },
+            "at": {
+              "$ref": "#/$defs/ceremonyTime"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "source",
+            "userId",
+            "postId",
+            "emoji",
+            "verifiedHuman",
+            "at"
+          ],
+          "properties": {
+            "source": {
+              "const": "reaction"
+            },
+            "userId": {
+              "$ref": "#/$defs/ceremonyText"
+            },
+            "postId": {
+              "$ref": "#/$defs/ceremonyText"
+            },
+            "emoji": {
+              "const": "white_check_mark"
+            },
+            "verifiedHuman": {
+              "const": true
+            },
+            "at": {
+              "$ref": "#/$defs/ceremonyTime"
+            }
+          }
+        }
+      ]
+    },
+    "ceremonyApproval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "proposalId",
+        "proposalPostId",
+        "approval"
+      ],
+      "properties": {
+        "kind": {
+          "const": "approval"
+        },
+        "proposalId": {
+          "$ref": "#/$defs/ceremonyId"
+        },
+        "proposalPostId": {
+          "$ref": "#/$defs/ceremonyText"
+        },
+        "approval": {
+          "$ref": "#/$defs/ceremonyHumanApproval"
+        }
+      }
+    },
+    "ceremonyImplementation": {
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "outcomes"
+          ],
+          "properties": {
+            "kind": {
+              "const": "implementation"
+            },
+            "outcomes": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "outcomeId",
+                  "seatId",
+                  "prUrl",
+                  "baseBranch",
+                  "mergedSha",
+                  "checksPassed",
+                  "reviewApproved"
+                ],
+                "properties": {
+                  "outcomeId": {
+                    "$ref": "#/$defs/ceremonyId"
+                  },
+                  "seatId": {
+                    "$ref": "#/$defs/ceremonyId"
+                  },
+                  "prUrl": {
+                    "$ref": "#/$defs/ceremonyPr"
+                  },
+                  "baseBranch": {
+                    "$ref": "#/$defs/ceremonyText"
+                  },
+                  "mergedSha": {
+                    "$ref": "#/$defs/ceremonySha"
+                  },
+                  "checksPassed": {
+                    "const": true
+                  },
+                  "reviewApproved": {
+                    "const": true
+                  }
+                }
+              }
+            },
+            "omissions": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "outcomeId",
+                  "seatId",
+                  "reason"
+                ],
+                "properties": {
+                  "outcomeId": {
+                    "$ref": "#/$defs/ceremonyId"
+                  },
+                  "seatId": {
+                    "$ref": "#/$defs/ceremonyId"
+                  },
+                  "reason": {
+                    "$ref": "#/$defs/ceremonyText"
+                  }
+                }
+              }
+            },
+            "partialApproval": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "source",
+                "command",
+                "at"
+              ],
+              "properties": {
+                "source": {
+                  "const": "owner-command"
+                },
+                "command": {
+                  "const": "planning integrate"
+                },
+                "at": {
+                  "$ref": "#/$defs/ceremonyTime"
+                }
+              }
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "required": [
+                  "omissions"
+                ]
+              },
+              "then": {
+                "required": [
+                  "partialApproval"
+                ]
+              }
+            },
+            {
+              "if": {
+                "required": [
+                  "partialApproval"
+                ]
+              },
+              "then": {
+                "required": [
+                  "omissions"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "outcomes",
+            "goalDelivery"
+          ],
+          "properties": {
+            "kind": {
+              "const": "implementation"
+            },
+            "outcomes": {
+              "type": "array",
+              "maxItems": 0
+            },
+            "goalDelivery": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "version",
+                "goalId",
+                "teamId",
+                "seatId",
+                "sprintBranch",
+                "headSha",
+                "lanePrs",
+                "checks",
+                "decisions",
+                "followUps",
+                "neededButUnowned"
+              ],
+              "properties": {
+                "version": {
+                  "const": 1
+                },
+                "goalId": {
+                  "$ref": "#/$defs/ceremonyId"
+                },
+                "teamId": {
+                  "$ref": "#/$defs/ceremonyId"
+                },
+                "seatId": {
+                  "$ref": "#/$defs/ceremonyId"
+                },
+                "sprintBranch": {
+                  "$ref": "#/$defs/ceremonyText"
+                },
+                "headSha": {
+                  "$ref": "#/$defs/ceremonySha"
+                },
+                "lanePrs": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "laneId",
+                      "url",
+                      "headSha",
+                      "mergedSha",
+                      "reviewer",
+                      "ci"
+                    ],
+                    "properties": {
+                      "laneId": {
+                        "$ref": "#/$defs/ceremonyId"
+                      },
+                      "url": {
+                        "$ref": "#/$defs/ceremonyPr"
+                      },
+                      "headSha": {
+                        "$ref": "#/$defs/ceremonySha"
+                      },
+                      "mergedSha": {
+                        "$ref": "#/$defs/ceremonySha"
+                      },
+                      "reviewer": {
+                        "const": "satori-miyamoto"
+                      },
+                      "ci": {
+                        "const": "passed"
+                      }
+                    }
+                  }
+                },
+                "checks": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "command",
+                      "exitCode"
+                    ],
+                    "properties": {
+                      "command": {
+                        "$ref": "#/$defs/ceremonyText"
+                      },
+                      "exitCode": {
+                        "type": "integer"
+                      }
+                    }
+                  }
+                },
+                "decisions": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/ceremonyText"
+                  }
+                },
+                "followUps": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/ceremonyText"
+                  }
+                },
+                "neededButUnowned": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/ceremonyText"
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "ceremonyRelease": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "prUrl",
+        "mergedSha",
+        "checksPassed",
+        "buildSha",
+        "runningSha",
+        "runningAt"
+      ],
+      "properties": {
+        "kind": {
+          "const": "release-running"
+        },
+        "prUrl": {
+          "$ref": "#/$defs/ceremonyPr"
+        },
+        "mergedSha": {
+          "$ref": "#/$defs/ceremonySha"
+        },
+        "mergePostId": {
+          "$ref": "#/$defs/ceremonyText"
+        },
+        "approval": {
+          "$ref": "#/$defs/ceremonyHumanApproval"
+        },
+        "mergeVerification": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "headSha",
+            "reviewCommitSha",
+            "reviewer",
+            "checksPassed"
+          ],
+          "properties": {
+            "headSha": {
+              "$ref": "#/$defs/ceremonySha"
+            },
+            "reviewCommitSha": {
+              "$ref": "#/$defs/ceremonySha"
+            },
+            "reviewer": {
+              "const": "satori-miyamoto"
+            },
+            "checksPassed": {
+              "const": true
+            }
+          }
+        },
+        "checksPassed": {
+          "const": true
+        },
+        "buildSha": {
+          "$ref": "#/$defs/ceremonySha"
+        },
+        "runningSha": {
+          "$ref": "#/$defs/ceremonySha"
+        },
+        "runningAt": {
+          "$ref": "#/$defs/ceremonyTime"
+        },
+        "ancestry": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ancestorSha",
+            "descendantSha",
+            "verified"
+          ],
+          "properties": {
+            "ancestorSha": {
+              "$ref": "#/$defs/ceremonySha"
+            },
+            "descendantSha": {
+              "$ref": "#/$defs/ceremonySha"
+            },
+            "verified": {
+              "const": true
+            }
+          }
+        }
+      },
+      "anyOf": [
+        {
+          "required": [
+            "mergeVerification"
+          ]
+        },
+        {
+          "required": [
+            "mergePostId",
+            "approval"
+          ]
+        }
+      ]
+    },
+    "ceremonyRetro": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "path",
+        "prUrl",
+        "baseBranch",
+        "mergedSha",
+        "postId",
+        "publishedAt",
+        "factsOnly",
+        "suggestions"
+      ],
+      "properties": {
+        "kind": {
+          "const": "retro-published"
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^docs/retros/[a-z][a-z0-9-]+\\.md$"
+        },
+        "prUrl": {
+          "$ref": "#/$defs/ceremonyPr"
+        },
+        "baseBranch": {
+          "const": "main"
+        },
+        "mergedSha": {
+          "$ref": "#/$defs/ceremonySha"
+        },
+        "postId": {
+          "$ref": "#/$defs/ceremonyText"
+        },
+        "publishedAt": {
+          "$ref": "#/$defs/ceremonyTime"
+        },
+        "factsOnly": {
+          "const": true
+        },
+        "suggestions": {
+          "const": "owner-proposals-only"
+        }
+      }
+    },
+    "ceremonyLegacyApproval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "proposalId"
+      ],
+      "properties": {
+        "kind": {
+          "const": "legacy-approval"
+        },
+        "proposalId": {
+          "$ref": "#/$defs/ceremonyId"
+        }
+      }
+    },
+    "ceremonyLegacyImplementation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "outcomes"
+      ],
+      "properties": {
+        "kind": {
+          "const": "legacy-implementation"
+        },
+        "outcomes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "outcomeId",
+              "seatId",
+              "prUrl"
+            ],
+            "properties": {
+              "outcomeId": {
+                "$ref": "#/$defs/ceremonyId"
+              },
+              "seatId": {
+                "$ref": "#/$defs/ceremonyId"
+              },
+              "prUrl": {
+                "$ref": "#/$defs/ceremonyPr"
+              }
+            }
+          }
+        },
+        "unmerged": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "outcomeId",
+              "seatId"
+            ],
+            "properties": {
+              "outcomeId": {
+                "$ref": "#/$defs/ceremonyId"
+              },
+              "seatId": {
+                "$ref": "#/$defs/ceremonyId"
+              }
+            }
+          }
+        }
+      }
+    },
+    "ceremonyRevertedRelease": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "prUrl",
+        "mergedSha",
+        "revertPrUrl"
+      ],
+      "properties": {
+        "kind": {
+          "const": "release-reverted"
+        },
+        "prUrl": {
+          "$ref": "#/$defs/ceremonyPr"
+        },
+        "mergedSha": {
+          "$ref": "#/$defs/ceremonySha"
+        },
+        "revertPrUrl": {
+          "$ref": "#/$defs/ceremonyPr"
+        }
+      }
+    },
+    "ceremonyLegacyClosure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "integration"
+      ],
+      "properties": {
+        "kind": {
+          "const": "legacy-migration"
+        },
+        "integration": {
+          "enum": [
+            "none",
+            "merged",
+            "reverted"
+          ]
+        },
+        "prUrl": {
+          "$ref": "#/$defs/ceremonyPr"
+        },
+        "mergedSha": {
+          "$ref": "#/$defs/ceremonySha"
+        },
+        "revertPrUrl": {
+          "$ref": "#/$defs/ceremonyPr"
+        }
+      }
+    },
+    "ceremonyEntry": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "stage",
+            "enteredAt"
+          ],
+          "properties": {
+            "stage": {
+              "enum": [
+                "planning",
+                "proposal"
+              ]
+            },
+            "enteredAt": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ceremonyTime"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "stage",
+            "enteredAt",
+            "evidence"
+          ],
+          "properties": {
+            "stage": {
+              "const": "implement"
+            },
+            "enteredAt": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ceremonyTime"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "evidence": {
+              "$ref": "#/$defs/ceremonyApproval"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "stage",
+            "enteredAt",
+            "evidence"
+          ],
+          "properties": {
+            "stage": {
+              "const": "implement"
+            },
+            "enteredAt": {
+              "type": "null"
+            },
+            "evidence": {
+              "$ref": "#/$defs/ceremonyLegacyApproval"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "stage",
+            "enteredAt",
+            "evidence"
+          ],
+          "properties": {
+            "stage": {
+              "const": "release"
+            },
+            "enteredAt": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ceremonyTime"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "evidence": {
+              "$ref": "#/$defs/ceremonyImplementation"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "stage",
+            "enteredAt",
+            "evidence"
+          ],
+          "properties": {
+            "stage": {
+              "const": "release"
+            },
+            "enteredAt": {
+              "type": "null"
+            },
+            "evidence": {
+              "$ref": "#/$defs/ceremonyLegacyImplementation"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "stage",
+            "enteredAt",
+            "evidence"
+          ],
+          "properties": {
+            "stage": {
+              "const": "retro"
+            },
+            "enteredAt": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ceremonyTime"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "evidence": {
+              "$ref": "#/$defs/ceremonyRelease"
+            }
+          }
+        }
+      ]
+    },
+    "ceremony": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "stage",
+        "history"
+      ],
+      "properties": {
+        "version": {
+          "const": 1
+        },
+        "stage": {
+          "enum": [
+            "planning",
+            "proposal",
+            "implement",
+            "release",
+            "retro"
+          ]
+        },
+        "history": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 5,
+          "items": {
+            "$ref": "#/$defs/ceremonyEntry"
+          }
+        },
+        "migratedAt": {
+          "$ref": "#/$defs/ceremonyTime"
+        },
+        "closure": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "closedAt",
+            "evidence"
+          ],
+          "properties": {
+            "closedAt": {
+              "$ref": "#/$defs/ceremonyTime"
+            },
+            "evidence": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/ceremonyRetro"
+                },
+                {
+                  "$ref": "#/$defs/ceremonyRevertedRelease"
+                },
+                {
+                  "$ref": "#/$defs/ceremonyLegacyClosure"
+                },
+                {
+                  "$ref": "#/$defs/ceremonyRemodelClosure"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "stage": {
+                "const": "planning"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "history": {
+                "minItems": 1,
+                "maxItems": 1,
+                "prefixItems": [
+                  {
+                    "properties": {
+                      "stage": {
+                        "const": "planning"
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "stage": {
+                "const": "proposal"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "history": {
+                "minItems": 2,
+                "maxItems": 2,
+                "prefixItems": [
+                  {
+                    "properties": {
+                      "stage": {
+                        "const": "planning"
+                      }
+                    }
+                  },
+                  {
+                    "properties": {
+                      "stage": {
+                        "const": "proposal"
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "stage": {
+                "const": "implement"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "history": {
+                "minItems": 3,
+                "maxItems": 3,
+                "prefixItems": [
+                  {
+                    "properties": {
+                      "stage": {
+                        "const": "planning"
+                      }
+                    }
+                  },
+                  {
+                    "properties": {
+                      "stage": {
+                        "const": "proposal"
+                      }
+                    }
+                  },
+                  {
+                    "properties": {
+                      "stage": {
+                        "const": "implement"
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "stage": {
+                "const": "release"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "history": {
+                "minItems": 4,
+                "maxItems": 4,
+                "prefixItems": [
+                  {
+                    "properties": {
+                      "stage": {
+                        "const": "planning"
+                      }
+                    }
+                  },
+                  {
+                    "properties": {
+                      "stage": {
+                        "const": "proposal"
+                      }
+                    }
+                  },
+                  {
+                    "properties": {
+                      "stage": {
+                        "const": "implement"
+                      }
+                    }
+                  },
+                  {
+                    "properties": {
+                      "stage": {
+                        "const": "release"
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "stage": {
+                "const": "retro"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "history": {
+                "minItems": 5,
+                "maxItems": 5,
+                "prefixItems": [
+                  {
+                    "properties": {
+                      "stage": {
+                        "const": "planning"
+                      }
+                    }
+                  },
+                  {
+                    "properties": {
+                      "stage": {
+                        "const": "proposal"
+                      }
+                    }
+                  },
+                  {
+                    "properties": {
+                      "stage": {
+                        "const": "implement"
+                      }
+                    }
+                  },
+                  {
+                    "properties": {
+                      "stage": {
+                        "const": "release"
+                      }
+                    }
+                  },
+                  {
+                    "properties": {
+                      "stage": {
+                        "const": "retro"
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "closure"
+            ],
+            "properties": {
+              "closure": {
+                "properties": {
+                  "evidence": {
+                    "properties": {
+                      "kind": {
+                        "enum": [
+                          "retro-published"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "stage": {
+                "const": "retro"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "closure"
+            ],
+            "properties": {
+              "closure": {
+                "properties": {
+                  "evidence": {
+                    "properties": {
+                      "kind": {
+                        "enum": [
+                          "release-reverted",
+                          "legacy-migration"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "stage": {
+                "const": "release"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "closure"
+            ],
+            "properties": {
+              "closure": {
+                "properties": {
+                  "evidence": {
+                    "properties": {
+                      "kind": {
+                        "enum": [
+                          "remodel-closure"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "stage": {
+                "enum": [
+                  "implement",
+                  "release",
+                  "retro"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "closure"
+            ],
+            "properties": {
+              "closure": {
+                "properties": {
+                  "evidence": {
+                    "properties": {
+                      "kind": {
+                        "enum": [
+                          "legacy-migration"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "migratedAt"
+            ]
+          }
+        },
+        {
+          "if": {
+            "not": {
+              "required": [
+                "migratedAt"
+              ]
+            }
+          },
+          "then": {
+            "properties": {
+              "history": {
+                "items": {
+                  "properties": {
+                    "enteredAt": {
+                      "$ref": "#/$defs/ceremonyTime"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "ceremonyRemodelClosure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "goalId",
+        "stage",
+        "reason",
+        "observed"
+      ],
+      "properties": {
+        "kind": {
+          "const": "remodel-closure"
+        },
+        "goalId": {
+          "enum": [
+            "goal-2b118e79",
+            "goal-855701cc",
+            "goal-ca9dd9ed",
+            "goal-df104a26",
+            "goal-88dd199e",
+            "goal-96296dff"
+          ]
+        },
+        "stage": {
+          "enum": [
+            "implement",
+            "release",
+            "retro"
+          ]
+        },
+        "reason": {
+          "enum": [
+            "abandoned",
+            "superseded"
+          ]
+        },
+        "observed": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "planningStage",
+            "integration",
+            "assignments"
+          ],
+          "properties": {
+            "planningStage": {
+              "enum": [
+                "clarifying",
+                "drafting",
+                "awaiting-review",
+                "approved"
+              ]
+            },
+            "integration": {
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "branch",
+                    "baseSha",
+                    "status",
+                    "prUrl",
+                    "mergedSha",
+                    "revertPrUrl"
+                  ],
+                  "properties": {
+                    "branch": {
+                      "$ref": "#/$defs/ceremonyText"
+                    },
+                    "baseSha": {
+                      "$ref": "#/$defs/ceremonySha"
+                    },
+                    "status": {
+                      "enum": [
+                        "collecting",
+                        "pr-open",
+                        "merged",
+                        "reverted"
+                      ]
+                    },
+                    "prUrl": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/ceremonyPr"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "mergedSha": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/ceremonySha"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "revertPrUrl": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/ceremonyPr"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  }
+                }
+              ]
+            },
+            "assignments": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "outcomeId",
+                  "seatId",
+                  "status",
+                  "updatedAt",
+                  "prUrl",
+                  "note"
+                ],
+                "properties": {
+                  "outcomeId": {
+                    "$ref": "#/$defs/ceremonyId"
+                  },
+                  "seatId": {
+                    "$ref": "#/$defs/ceremonyId"
+                  },
+                  "status": {
+                    "enum": [
+                      "queued",
+                      "running",
+                      "in-review",
+                      "merged",
+                      "failed"
+                    ]
+                  },
+                  "updatedAt": {
+                    "$ref": "#/$defs/ceremonyTime"
+                  },
+                  "prUrl": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/$defs/ceremonyPr"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "note": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/$defs/ceremonyText"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
   }
 }

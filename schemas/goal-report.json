@@ -1,0 +1,127 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "goalId",
+    "teamId",
+    "seatId",
+    "sprintBranch",
+    "headSha",
+    "lanePrs",
+    "checks",
+    "decisions",
+    "followUps",
+    "neededButUnowned"
+  ],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1
+    },
+    "goalId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$"
+    },
+    "teamId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$"
+    },
+    "seatId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$"
+    },
+    "sprintBranch": {
+      "type": "string",
+      "pattern": "^sprint/[a-z][a-z0-9-]*$"
+    },
+    "headSha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "lanePrs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "laneId",
+          "url",
+          "headSha",
+          "mergedSha",
+          "reviewer",
+          "ci"
+        ],
+        "properties": {
+          "laneId": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]*$"
+          },
+          "url": {
+            "type": "string",
+            "pattern": "^https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*$"
+          },
+          "headSha": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$"
+          },
+          "mergedSha": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$"
+          },
+          "reviewer": {
+            "type": "string",
+            "const": "satori-miyamoto"
+          },
+          "ci": {
+            "type": "string",
+            "const": "passed"
+          }
+        }
+      },
+      "minItems": 1
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "command",
+          "exitCode"
+        ],
+        "properties": {
+          "command": {
+            "type": "string",
+            "pattern": "\\S"
+          },
+          "exitCode": {
+            "type": "integer"
+          }
+        }
+      },
+      "minItems": 1
+    },
+    "decisions": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "\\S"
+      }
+    },
+    "followUps": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "\\S"
+      }
+    },
+    "neededButUnowned": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "\\S"
+      }
+    }
+  }
+}

@@ -7,9 +7,6 @@ import { RetroPublication, ceremonyReadiness, recordedRetroInput, retroRuntimeNa
 import { draftSprintRetro, type RetroEvidenceSnapshot } from "../src/sprint-retro.js";
 import { type RetroArchive, type RetroPr, type RetroReview } from "../src/sprint.js";
 import { LocalSessionReader } from "../src/session-snapshot.js";
-import { TerminalUiModel } from "../src/terminal-ui.js";
-import { StateInventory } from "../src/state-domain.js";
-import { LocalStateRepository } from "../src/local-state.js";
 import { type AgentRuntime, type AgentResult } from "../src/codex-runtime.js";
 import { type Shell } from "../src/developer-seat.js";
 import { validateCeremony } from "../src/ceremony.js";
@@ -61,10 +58,12 @@ class Services implements Shell, RetroArchive {
   async run(_command: string, args: string[]) {
     let stdout = "";
     if (args[0] === "api") stdout = "a".repeat(40);
+    if (args[1]?.includes("/reviews?")) stdout = JSON.stringify([[{ id: 1, user: { login: "satori-miyamoto" }, state: "APPROVED", commit_id: "a".repeat(40) }]]);
+    if (args[1] === "checks") stdout = JSON.stringify([{ name: "checks", bucket: "pass" }]);
     if (args[0] === "pr" && args[1] === "list") stdout = this.integrationOpen ? integrationUrl : "";
     if (args[0] === "pr" && args[1] === "create") { this.integrationOpen = true; stdout = integrationUrl; }
-    if (args[0] === "pr" && args[1] === "merge") this.integrationMerged = true;
-    if (args[0] === "pr" && args[1] === "view") stdout = JSON.stringify({ state: this.integrationMerged ? "MERGED" : "OPEN", mergeCommit: this.integrationMerged ? { oid: releaseSha } : null });
+    if (args[0] === "pr" && args[1] === "merge" && !args.includes("--disable-auto")) this.integrationMerged = true;
+    if (args[0] === "pr" && args[1] === "view") stdout = JSON.stringify({ state: this.integrationMerged ? "MERGED" : "OPEN", mergeCommit: this.integrationMerged ? { oid: releaseSha } : null, headRefOid: "a".repeat(40), isDraft: false, author: { login: "owner" }, reviewDecision: "" });
     return { code: 0, stdout, stderr: "" };
   }
   async ensureRetroPr(project: string, goalId: string, markdown: string) {
@@ -101,7 +100,7 @@ async function fixture() {
   const adapters = (): CeremonyAdapters => ({
     implementation: async ({ goal }) => ({ status: "complete", evidence: { kind: "implementation", outcomes: goal.assignments!.map((assignment) => ({ outcomeId: assignment.outcomeId, seatId: assignment.seatId, prUrl: assignment.prUrl!, baseBranch: goal.integration!.branch, mergedSha: "a".repeat(40), checksPassed: true, reviewApproved: true })) } }),
     release: { poll: async ({ goal, mergeApproval }) => !services.running ? { status: "pending", reason: "Build not running yet" } : { status: "complete", evidence: {
-      kind: "release-running", prUrl: goal.integration!.prUrl!, mergedSha: releaseSha, mergePostId: mergeApproval!.postId, approval: mergeApproval!.approval,
+      kind: "release-running", prUrl: goal.integration!.prUrl!, mergedSha: releaseSha, mergeVerification: { headSha: "a".repeat(40), reviewCommitSha: "a".repeat(40), reviewer: "satori-miyamoto", checksPassed: true },
       checksPassed: true, buildSha: releaseSha, runningSha: releaseSha, runningAt: new Date().toISOString(),
     } } },
     retro: new RetroPublication(services, async (context) => await draftSprintRetro(await recordedRetroInput(context), () => agent), {
@@ -123,27 +122,22 @@ async function releasePending() {
 }
 
 describe("complete persisted sprint ceremony", () => {
-  it("loads the pending archival PR after restart and offers the owner's M before closure", async () => {
+  it("loads the pending archival PR after restart before closure", async () => {
     const f = await releasePending(); f.services.running = true; await f.restart().poll();
     const reader = new LocalSessionReader(f.checkout, new PlanningStore(f.checkout), {
       verifiedRecord: async () => undefined, isReady: async () => false, attachTarget: () => "unused",
     }, { read: async () => ({ status: "unavailable" }) });
     const snapshot = await reader.readSessions();
     expect(snapshot.sessions[0].retro).toEqual({ status: "pending", path: `docs/retros/${f.goal.id}.md`, prUrl: f.services.archive!.url });
-    const model = new TerminalUiModel(new StateInventory(new LocalStateRepository(f.checkout)), reader, undefined, {
-      start: vi.fn(), propose: vi.fn(), approve: vi.fn(), sprint: vi.fn(),
-    });
-    await model.refresh(); model.restore({ page: "seat", teamId: "team-one", seatId: "seat-lead" });
-    expect(model.actionGoal("merge")?.id).toBe(f.goal.id);
     expect((await f.current()).ceremony!.closure).toBeUndefined();
   });
 
-  it("resumes a persisted human merge authorization after restart without a second approval", async () => {
+  it("retries an automatic merge after restart without a second human approval", async () => {
     const f = await releasePending(); f.services.running = true; await f.restart().poll();
     f.services.archive!.checksPassed = true; f.services.loseMerge = true;
-    await expect(f.restart().merge(f.goal.id)).rejects.toThrow("Interrupted before GitHub merge");
+    await expect(f.restart().merge(f.goal.id)).rejects.toThrow("verification is pending");
     const saved = await f.store.readRuntimeFile<RetroPublicationRecord>(retroRuntimeName(f.goal.id));
-    expect(saved!.authorization?.headSha).toBe(f.services.archive!.headSha);
+    expect(saved!.authorization).toBeUndefined();
     f.services.archive!.checksPassed = false;
     await f.restart().poll(); expect(f.services.merges).toBe(1);
     await expect(f.restart().start("Too early")).rejects.toThrow("open goal");
@@ -158,7 +152,7 @@ describe("complete persisted sprint ceremony", () => {
     const f = await releasePending(); f.services.running = true;
     f.services.reviewFindings = [{ path: `docs/retros/${f.goal.id}.md`, line: 1, reason: "Recorded evidence is missing." }];
     await f.restart().poll(); f.services.archive!.checksPassed = true;
-    await expect(f.restart().merge(f.goal.id)).rejects.toThrow("fresh current-head review");
+    await expect(f.restart().merge(f.goal.id)).rejects.toThrow("fresh review");
     await f.restart().poll();
     expect((await f.current()).ceremony!.closure).toBeUndefined();
     await expect(f.restart().start("Too early")).rejects.toThrow("open goal");
@@ -193,7 +187,7 @@ describe("complete persisted sprint ceremony", () => {
     expect(f.services.publications).toBe(1);
   });
 
-  it.each(["owner", "reaction"])("keeps one open sprint through verified release and retro, then closes through %s approval", async (route) => {
+  it("keeps one open sprint through verified release and retro, then closes with bot review and CI", async () => {
     const f = await releasePending();
     expect((await f.current()).ceremony!.stage).toBe("release");
     expect(f.agent.retroCalls).toBe(0);
@@ -212,9 +206,6 @@ describe("complete persisted sprint ceremony", () => {
     expect(f.services.reviews).toBe(1);
     await expect(f.restart().merge(f.goal.id)).rejects.toThrow("passing CI");
     f.services.archive!.checksPassed = true;
-    await f.restart().poll(); expect((await f.current()).ceremony!.closure).toBeUndefined();
-    if (route === "owner") await f.restart().merge(f.goal.id);
-    else f.chat.react(record!.gate!.postId);
     await f.restart().poll();
     const closed = await f.current(); validateCeremony(closed);
     expect(closed.ceremony!.history.map((entry) => entry.stage)).toEqual(["planning", "proposal", "implement", "release", "retro"]);
@@ -273,12 +264,12 @@ describe("complete persisted sprint ceremony", () => {
     expect(f.services.publications).toBe(1); expect(f.agent.retroCalls).toBe(1);
   });
 
-  it("accepts a fresh human reaction made during a lost archival-announcement response", async () => {
+  it("recovers a lost archival announcement and merges on bot review and CI", async () => {
     const f = await releasePending(); f.services.running = true;
     f.chat.failAfter = (post) => post.message.startsWith("**Retrospective archive:");
     await f.restart().poll();
     const gate = f.chat.posts.find((post) => post.message.startsWith("**Retrospective archive:"))!;
-    f.chat.react(gate.id); f.chat.failAfter = undefined;
+    expect(gate).toBeDefined(); f.chat.failAfter = undefined;
     f.services.archive!.reviewed = true; f.services.archive!.checksPassed = true;
     await f.restart().poll();
     expect((await f.current()).ceremony!.closure).toBeDefined();

@@ -73,6 +73,7 @@ class GitHub implements Shell {
       isDraft: false, author: { login: this.author }, mergeCommit: this.state === "MERGED" ? { oid: this.head() } : null, reviewDecision: "",
     }));
     if (args[0] === "pr" && args[1] === "checks") return ok(JSON.stringify(this.checks));
+    if (args.includes("--disable-auto")) return ok();
     if (args[0] === "pr" && args[1] === "merge") {
       await this.mutateBeforeMerge?.();
       if (args[args.indexOf("--match-head-commit") + 1] !== this.head()) return ok("", 1);
@@ -190,7 +191,7 @@ describe("retrospective-only GitHub archival", () => {
     expect(await github.mergeRetroPr("test/project", goal, content, url, shell.head())).toEqual({ merged: true, sha: shell.head() });
     expect(await github.ensureRetroPr("test/project", goal, content)).toBe(url);
     expect(await github.mergeRetroPr("test/project", goal, content, url, shell.head())).toEqual({ merged: true, sha: shell.head() });
-    expect(shell.calls.filter((call) => call.args[1] === "merge")).toHaveLength(1);
+    expect(shell.calls.filter((call) => call.args[1] === "merge" && !call.args.includes("--disable-auto"))).toHaveLength(1);
   });
 
   it.each(["stale", "author", "findings", "dismissed", "missing-ci", "skipped-ci"])("blocks archival with %s evidence", async (problem) => {
@@ -203,7 +204,7 @@ describe("retrospective-only GitHub archival", () => {
     if (problem === "missing-ci") shell.checks = [];
     if (problem === "skipped-ci") shell.checks[0].bucket = "skipping";
     expect((await github.mergeRetroPr("test/project", goal, content, url, shell.head())).merged).toBe(false);
-    expect(shell.calls.some((call) => call.args[1] === "merge")).toBe(false);
+    expect(shell.calls.some((call) => call.args[1] === "merge" && !call.args.includes("--disable-auto"))).toBe(false);
   });
 
   it("leaves a closed-unmerged PR for the owner instead of creating its replacement", async () => {
@@ -248,5 +249,55 @@ describe("retrospective-only GitHub archival", () => {
     await expect(github.ensureRetroPr("test/project", "../../escape", content)).rejects.toThrow("goal ID");
     await expect(github.inspectRetroPr("test/project", goal, content, "https://github.com/other/repo/pull/1")).rejects.toThrow("outside");
     expect(shell.calls).toHaveLength(0);
+  });
+});
+
+
+describe("integration and revert automatic merge gate", () => {
+  class Gate implements Shell {
+    calls: string[][] = []; state = "OPEN"; head = "a".repeat(40); reviewHead = this.head; reviewer = "satori-miyamoto"; verdict = "APPROVED"; checks = [{ name: "checks", bucket: "pass" }]; outstanding = false; pending = false; lostResponse = false; cancelCode = 0;
+    async run(_command: string, args: string[]) {
+      this.calls.push(args);
+      let stdout = "";
+      if (args[1] === "view") stdout = JSON.stringify({ state: this.state, headRefOid: this.head, mergeCommit: this.state === "MERGED" ? { oid: "b".repeat(40) } : null, isDraft: false, author: { login: "owner" }, reviewDecision: "" });
+      if (args[1]?.includes("/reviews?")) stdout = JSON.stringify([[{ id: 1, user: { login: this.reviewer }, state: this.verdict, commit_id: this.reviewHead }, ...(this.outstanding ? [{ id: 2, user: { login: "other-reviewer" }, state: "CHANGES_REQUESTED", commit_id: this.head }] : [])]]);
+      if (args[1] === "checks") stdout = JSON.stringify(this.checks);
+      if (args.includes("--disable-auto")) return { code: this.cancelCode, stdout: "", stderr: "Cancellation failed" };
+      if (args[1] === "merge" && args.includes("--auto")) {
+        if (!this.pending) this.state = "MERGED";
+        if (this.lostResponse) throw new Error("Lost auto-merge response");
+      }
+      return { code: 0, stdout, stderr: "" };
+    }
+  }
+  it.each(["stale", "other-reviewer", "dismissed", "outstanding", "empty-ci", "failed-ci"])("refuses %s proof before requesting any merge", async (problem) => {
+    const shell = new Gate();
+    if (problem === "stale") shell.reviewHead = "c".repeat(40);
+    if (problem === "other-reviewer") shell.reviewer = "owner";
+    if (problem === "dismissed") shell.verdict = "DISMISSED";
+    if (problem === "outstanding") shell.outstanding = true;
+    if (problem === "empty-ci") shell.checks = [];
+    if (problem === "failed-ci") shell.checks[0].bucket = "fail";
+    expect((await new SprintGitHub(shell, "/tmp/indra-contract-gate.runtime").merge(url)).merged).toBe(false);
+    expect(shell.calls.some((args) => args[1] === "merge")).toBe(false);
+  });
+  it("binds the reviewed head and verifies the resulting merge", async () => {
+    const shell = new Gate();
+    expect(await new SprintGitHub(shell, "/tmp/indra-contract-gate.runtime").merge(url)).toEqual({ merged: true, sha: "b".repeat(40) });
+    expect(shell.calls).toContainEqual(["pr", "merge", url, "--auto", "--squash", "--match-head-commit", shell.head]);
+  });
+  it("cancels even when the auto request response is lost, and reports a failed cancellation", async () => {
+    const shell = new Gate(); shell.pending = true; shell.lostResponse = true;
+    const github = new SprintGitHub(shell, "/tmp/indra-contract-gate.runtime");
+    await expect(github.merge(url)).rejects.toThrow("Lost auto-merge response");
+    expect(shell.calls).toContainEqual(["pr", "merge", url, "--disable-auto"]);
+    shell.lostResponse = false; shell.cancelCode = 1;
+    await expect(github.merge(url)).rejects.toThrow("Cancellation failed");
+  });
+  it("does not mistake an accepted auto request for a merge and disarms the pending request", async () => {
+    const shell = new Gate(); shell.pending = true;
+    expect((await new SprintGitHub(shell, "/tmp/indra-contract-gate.runtime").merge(url)).merged).toBe(false);
+    expect(shell.calls).toContainEqual(["pr", "merge", url, "--disable-auto"]);
+    expect(shell.state).toBe("OPEN");
   });
 });

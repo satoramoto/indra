@@ -169,10 +169,10 @@ describe("local state checkout", () => {
     }
   });
 
-  it("accepts only the Team Lead and Developer roles, one per seat", () => {
+  it("keeps legacy teams on two roles until explicit remodel readiness", () => {
     const product = fixture();
     product.teams[0].seats[1].roles = ["Product"];
-    expect(() => parseState(product)).toThrow("teams[0].seats[1].roles[0] 'Product' is not a seat role; expected 'Team Lead' or 'Developer'");
+    expect(() => parseState(product)).toThrow("teams[0].workflowModel must be goals-v1 before a Product seat is enabled.");
     const two = fixture();
     two.teams[0].seats[1].roles = ["Developer", "Team Lead"];
     expect(() => parseState(two)).toThrow("teams[0].seats[1].roles must contain exactly one role");
@@ -185,5 +185,31 @@ describe("local state checkout", () => {
     const twoLeads = fixture();
     twoLeads.teams[0].seats[1].roles = ["Team Lead"];
     expect(() => parseState(twoLeads)).toThrow("teams[0].seats must contain exactly one 'Team Lead' seat; found 2");
+  });
+});
+
+
+describe("explicit three-role readiness", () => {
+  function remodel() {
+    const value = fixture();
+    Object.assign(value.teams[0], { workflowModel: "goals-v1" });
+    value.teams[0].seats.push({ id: "seat-product", displayName: "George Duke", roles: ["Product"], externalIdentities: { mattermost: { userId: "george", username: "georgeduke" } } });
+    return value;
+  }
+  it("reads old two-role teams and preserves existing identities when an explicitly ready team has three roles", () => {
+    expect(() => parseState(fixture())).not.toThrow();
+    const value = remodel();
+    expect(parseState(value).teams[0]).toMatchObject({ workflowModel: "goals-v1", seats: expect.arrayContaining([expect.objectContaining({ id: "seat-product", displayName: "George Duke", handle: "georgeduke", roles: ["Product"] })]) });
+  });
+  it("requires one Product and Developers without guessing a historical role", () => {
+    const value = remodel();
+    Reflect.deleteProperty(value.teams[0], "workflowModel");
+    expect(() => parseState(value)).toThrow("workflowModel");
+    Object.assign(value.teams[0], { workflowModel: "goals-v1" });
+    value.teams[0].seats[2].roles = ["Developer"];
+    expect(() => parseState(value)).toThrow("exactly one Product");
+    value.teams[0].seats[2].roles = ["Product"];
+    value.teams[0].seats[1].roles = ["Product"];
+    expect(() => parseState(value)).toThrow("exactly one Product");
   });
 });

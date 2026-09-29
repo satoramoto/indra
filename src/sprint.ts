@@ -6,6 +6,7 @@ import { withFileLock } from "./state-commit.js";
 import { GITHUB_REPO } from "./local-state.js";
 import { homedir } from "node:os";
 import { redactSecrets } from "./redact.js";
+import type { MergeVerification } from "./ceremony.js";
 
 /** A sprint GitHub problem whose message is ours and safe to post in the goal thread. */
 export class SprintError extends Error { override name = "SprintError"; }
@@ -80,29 +81,57 @@ export class SprintGitHub implements RetroArchive {
     return created;
   }
 
-  private async view(prUrl: string): Promise<{ state: string; sha?: string }> {
-    const view = await this.must("gh", ["pr", "view", prUrl, "--json", "state,mergeCommit"]);
+  /** Observe one PR head with its latest bot verdict and every required check. */
+  async inspectMerge(prUrl: string): Promise<RetroPr> {
+    if (!PR_URL.test(prUrl)) throw new SprintError("Invalid sprint PR URL.");
+    const github = prUrl.split("/").slice(3, 5).join("/"); const number = prUrl.split("/").at(-1)!;
+    const read = async () => {
+      const response = await this.must("gh", ["pr", "view", prUrl, "--json", "state,mergeCommit,headRefOid,isDraft,author,reviewDecision"]);
+      try { return JSON.parse(response.stdout) as { state: RetroPr["state"]; mergeCommit?: { oid: string }; headRefOid: string; isDraft: boolean; author: { login: string }; reviewDecision?: string }; }
+      catch { throw new SprintError("Unreadable sprint PR details."); }
+    };
+    const before = await read();
+    if (!SHA.test(before.headRefOid) || !["OPEN", "CLOSED", "MERGED"].includes(before.state) || !before.author?.login || typeof before.isDraft !== "boolean") throw new SprintError("Unverified sprint PR head or author.");
+    const reviews = await this.retroPages<{ id: number; user: { login: string }; state: string; commit_id: string }>(`repos/${github}/pulls/${number}/reviews?per_page=100`);
+    const latest = new Map<string, typeof reviews[number]>();
+    for (const review of reviews.sort((a, b) => a.id - b.id)) if (["APPROVED", "CHANGES_REQUESTED", "DISMISSED"].includes(review.state)) latest.set(review.user?.login, review);
+    const bot = latest.get("satori-miyamoto");
+    const reviewed = !before.isDraft && before.author.login !== "satori-miyamoto" && before.reviewDecision !== "CHANGES_REQUESTED" && ![...latest.values()].some((review) => review.state === "CHANGES_REQUESTED") && bot?.state === "APPROVED" && bot.commit_id === before.headRefOid;
+    const checks = await this.run("gh", ["pr", "checks", prUrl, "--json", "name,bucket"]);
+    let checksPassed = false;
     try {
-      const parsed = JSON.parse(view.stdout) as { state?: unknown; mergeCommit?: { oid?: unknown } | null };
-      const sha = typeof parsed.mergeCommit?.oid === "string" && SHA.test(parsed.mergeCommit.oid) ? parsed.mergeCommit.oid : undefined;
-      return { state: typeof parsed.state === "string" ? parsed.state : "UNKNOWN", ...(sha ? { sha } : {}) };
-    } catch { throw new SprintError(`gh pr view returned nothing readable for ${prUrl}.`); }
+      const rows = JSON.parse(checks.stdout) as { name: string; bucket: string }[];
+      checksPassed = checks.code === 0 && Array.isArray(rows) && rows.some((row) => row.name === "checks") && rows.every((row) => row.bucket === "pass");
+    } catch { /* Missing check evidence is pending. */ }
+    if (JSON.stringify(before) !== JSON.stringify(await read())) throw new SprintError("Sprint PR changed during verification.");
+    return { url: prUrl, state: before.state, headSha: before.headRefOid, reviewed, checksPassed,
+      ...(SHA.test(before.mergeCommit?.oid ?? "") ? { mergedSha: before.mergeCommit!.oid } : {}) };
   }
 
-  /**
-   * Squash-merges the PR once its CI is green, by URL. The PR's state is the success signal, not gh's exit code;
-   * a PR that already merged returns its merge commit without merging again.
-   */
+  /** Current-head bot approval and green CI gate release; a request alone never proves a merge. */
   async merge(prUrl: string): Promise<MergeResult> {
-    const before = await this.view(prUrl);
-    if (before.state === "MERGED" && before.sha) return { merged: true, sha: before.sha };
+    const before = await this.inspectMerge(prUrl);
+    if (!before.reviewed || !before.checksPassed) return { merged: false, reason: `Current-head satori-miyamoto approval and passing CI are required on ${prUrl}` };
+    if (before.state === "MERGED" && before.mergedSha) return { merged: true, sha: before.mergedSha };
     if (before.state !== "OPEN") return { merged: false, reason: `${prUrl} is ${before.state.toLowerCase()}` };
-    const checks = await this.run("gh", ["pr", "checks", prUrl]);
-    if (checks.code !== 0) return { merged: false, reason: `CI on ${prUrl} is not green yet` };
-    const merged = await this.run("gh", ["pr", "merge", prUrl, "--squash"]);
-    const after = await this.view(prUrl);
-    if (after.state === "MERGED" && after.sha) return { merged: true, sha: after.sha };
-    return { merged: false, reason: `gh pr merge failed: ${stderrExcerpt(merged.stderr)}` };
+    let verified = false;
+    try {
+      await this.run("gh", ["pr", "merge", prUrl, "--auto", "--squash", "--match-head-commit", before.headSha]);
+      const after = await this.inspectMerge(prUrl);
+      if (after.state === "MERGED" && after.mergedSha && after.headSha === before.headSha && after.reviewed && after.checksPassed) {
+        verified = true; return { merged: true, sha: after.mergedSha };
+      }
+    } finally {
+      // Also cancel after a lost command response; an unverified future head must not remain armed.
+      if (!verified) await this.must("gh", ["pr", "merge", prUrl, "--disable-auto"]);
+    }
+    return { merged: false, reason: "Auto-merge requested but no reviewed merge verified; wait for the next workflow event." };
+  }
+
+  async mergeVerification(prUrl: string): Promise<MergeVerification | undefined> {
+    const proof = await this.inspectMerge(prUrl);
+    return proof.state === "MERGED" && proof.mergedSha && proof.reviewed && proof.checksPassed
+      ? { headSha: proof.headSha, reviewCommitSha: proof.headSha, reviewer: "satori-miyamoto", checksPassed: true } : undefined;
   }
 
   private retroRepo(github: string, goalId: string, prUrl?: string): string {
@@ -192,7 +221,7 @@ export class SprintGitHub implements RetroArchive {
       const temp = await mkdtemp(join(this.runtimeDir, "retro-pr-"));
       try {
         const body = join(temp, "body.md");
-        await writeFile(body, `Archives the frozen retrospective for ${goalId} in ${path}.\n\nOnly this document may change. Requires a fresh satori-miyamoto review on the current head, passing CI, and a new human checkmark on Chick's archival post or the owner's planning merge. Process suggestions are owner proposals only.\n`, { mode: 0o600 });
+        await writeFile(body, `Archives the frozen retrospective for ${goalId} in ${path}.\n\nOnly this document may change. Requires a fresh satori-miyamoto review on the current head, passing CI. No further human approval is needed. Process suggestions are owner proposals only.\n`, { mode: 0o600 });
         const created = await this.run("gh", ["pr", "create", "--repo", github, "--base", "main", "--head", branch, "--title", `Archive retrospective for ${goalId}`, "--body-file", body]);
         const recovered = await this.findRetroPr(github, goalId);
         if (recovered) return recovered;
@@ -285,16 +314,21 @@ export class SprintGitHub implements RetroArchive {
     });
   }
 
-  /** The publication adapter persists human authorization before calling this narrowly scoped merge path. */
+  /** The publication adapter verifies delivery before this exact-head bot/CI gate. */
   async mergeRetroPr(github: string, goalId: string, markdown: string, prUrl: string, headSha: string): Promise<MergeResult> {
     const before = await this.inspectRetroPr(github, goalId, markdown, prUrl);
     if (before.headSha !== headSha || !before.reviewed || !before.checksPassed) return { merged: false, reason: "The archive needs a current-head review and passing CI." };
     if (before.state === "MERGED" && before.mergedSha) return { merged: true, sha: before.mergedSha };
     if (before.state !== "OPEN") return { merged: false, reason: "The retrospective PR is closed without a merge." };
-    await this.run("gh", ["pr", "merge", prUrl, "--squash", "--match-head-commit", headSha]);
-    const after = await this.inspectRetroPr(github, goalId, markdown, prUrl);
-    if (after.state === "MERGED" && after.mergedSha && after.headSha === headSha && after.reviewed && after.checksPassed) return { merged: true, sha: after.mergedSha };
-    return { merged: false, reason: "Retrospective merge is not verified; retry after checking the PR." };
+    let verified = false;
+    try {
+      await this.run("gh", ["pr", "merge", prUrl, "--auto", "--squash", "--match-head-commit", headSha]);
+      const after = await this.inspectRetroPr(github, goalId, markdown, prUrl);
+      if (after.state === "MERGED" && after.mergedSha && after.headSha === headSha && after.reviewed && after.checksPassed) {
+        verified = true; return { merged: true, sha: after.mergedSha };
+      }
+    } finally { if (!verified) await this.must("gh", ["pr", "merge", prUrl, "--disable-auto"]); }
+    return { merged: false, reason: "Retrospective merge is not verified; wait for the next workflow event." };
   }
 
   /**

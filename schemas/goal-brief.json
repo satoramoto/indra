@@ -1,0 +1,215 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "goalId",
+    "teamId",
+    "seatId",
+    "header",
+    "outcomes",
+    "ownedFiles",
+    "exclusions",
+    "swarm",
+    "retros",
+    "redirects",
+    "reportFormat"
+  ],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1
+    },
+    "goalId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$"
+    },
+    "teamId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$"
+    },
+    "seatId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$"
+    },
+    "header": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repo",
+        "baseBranch",
+        "baseSha",
+        "branch",
+        "prTarget"
+      ],
+      "properties": {
+        "repo": {
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "baseBranch": {
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "baseSha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "branch": {
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "prTarget": {
+          "type": "string",
+          "pattern": "\\S"
+        }
+      }
+    },
+    "outcomes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "number",
+          "title",
+          "description",
+          "reason",
+          "currentCode"
+        ],
+        "properties": {
+          "number": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "title": {
+            "type": "string",
+            "pattern": "\\S"
+          },
+          "description": {
+            "type": "string",
+            "pattern": "\\S"
+          },
+          "reason": {
+            "type": "string",
+            "pattern": "\\S"
+          },
+          "currentCode": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "\\S"
+            }
+          }
+        }
+      },
+      "minItems": 1
+    },
+    "ownedFiles": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "\\S"
+      },
+      "minItems": 1,
+      "maxItems": 128
+    },
+    "exclusions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "files",
+          "owner",
+          "reason"
+        ],
+        "properties": {
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "\\S"
+            },
+            "minItems": 1,
+            "maxItems": 128
+          },
+          "owner": {
+            "type": "string",
+            "pattern": "\\S"
+          },
+          "reason": {
+            "type": "string",
+            "pattern": "\\S"
+          }
+        }
+      }
+    },
+    "swarm": {
+      "type": "string",
+      "pattern": "\\S"
+    },
+    "retros": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "goalId",
+          "path",
+          "summary"
+        ],
+        "properties": {
+          "goalId": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]*$"
+          },
+          "path": {
+            "type": "string",
+            "pattern": "\\S"
+          },
+          "summary": {
+            "type": "string",
+            "pattern": "\\S"
+          }
+        }
+      },
+      "maxItems": 3
+    },
+    "redirects": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "postId",
+          "userId",
+          "at",
+          "message"
+        ],
+        "properties": {
+          "postId": {
+            "type": "string",
+            "pattern": "\\S"
+          },
+          "userId": {
+            "type": "string",
+            "pattern": "\\S"
+          },
+          "at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "message": {
+            "type": "string",
+            "pattern": "\\S"
+          }
+        }
+      }
+    },
+    "reportFormat": {
+      "type": "string",
+      "pattern": "\\S"
+    }
+  }
+}

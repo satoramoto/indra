@@ -8,6 +8,9 @@ import { MattermostClient, MattermostInventory } from "./mattermost.js";
 import { printState } from "./state-cli.js";
 import { StateInventory } from "./state-domain.js";
 import { botTeamHome, PlanningStore, teamProject } from "./planning.js";
+import { SprintGitHub } from "./sprint.js";
+import { closeLegacyGoals } from "./legacy-closure.js";
+import { loadProductSeat, ProductSeat } from "./product-seat.js";
 import { mergedWithCeremony } from "./project-checkout.js";
 import { PlanningBridge, type CeremonyAdapters, type PlanningChat } from "./planning-bridge.js";
 import { assertCeremonyReady, type CeremonyWriteReadiness } from "./ceremony-ports.js";
@@ -62,17 +65,17 @@ export async function createPlanningBridge(store: PlanningStore, chat: PlanningC
     let supplied = await module.createCeremonyAdapters?.({ store, runtime, appDir: defaultAppDir });
     if (!supplied?.release && module.LocalReleaseActivationReader) {
       const reader = new module.LocalReleaseActivationReader(store.checkout, { appDir: defaultAppDir, runtimeDir: store.runtimeDir });
-      supplied = { ...supplied, release: { poll: async ({ goal, mergeApproval }) => {
-        if (!goal.integration?.prUrl || !mergeApproval) return { status: "pending", reason: "Waiting for the recorded human integration merge approval." };
-        const checks = await processShell.run("gh", ["pr", "checks", goal.integration.prUrl], store.checkout);
-        if (checks.code !== 0) return { status: "pending", reason: "The integration's CI is not confirmed green." };
+      supplied = { ...supplied, release: { poll: async ({ goal }) => {
+        if (!goal.integration?.prUrl) return { status: "pending", reason: "Waiting for the integration PR." };
+        const mergeVerification = await new SprintGitHub(processShell, store.runtimeDir).mergeVerification(goal.integration.prUrl).catch(() => undefined);
+        if (!mergeVerification) return { status: "pending", reason: "The merged integration's current-head bot review and CI are not verified." };
         const result = await reader.read(goal.integration);
         if (result.status !== "running") return { status: "pending", reason: result.reason };
         const evidence = result.evidence;
         if (evidence.buildSha !== evidence.runningSha) return { status: "pending", reason: "Wait for the application and bridge to finish reloading the same build." };
         return { status: "complete", evidence: {
           kind: "release-running", prUrl: goal.integration.prUrl, mergedSha: evidence.mergedSha,
-          mergePostId: mergeApproval.postId, approval: mergeApproval.approval, checksPassed: true,
+          mergeVerification, checksPassed: true,
           buildSha: evidence.buildSha, runningSha: evidence.runningSha, runningAt: new Date().toISOString(),
           ...(evidence.buildSha !== evidence.mergedSha ? { ancestry: { ancestorSha: evidence.mergedSha, descendantSha: evidence.buildSha, verified: true } } : {}),
         } };
@@ -296,6 +299,15 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       if (options.readyNonce) useHeadedMarker(headedMarkerFile(options.checkout, options.readyNonce));
       try {
         const store = createPlanningStore(options.checkout);
+        const product = await loadProductSeat(store, options.seatId);
+        if (product) {
+          const services = await seatServices(store, product.username, product.id);
+          const runner = new ProductSeat({ store, seat: product, runtime: services.runtime(store.checkout) });
+          if (options.readyNonce) await signalReady(options.checkout, options.readyNonce);
+          const result = await runner.turn({ kind: "startup", at: new Date().toISOString(), teamId: product.teamId });
+          console.log(`Product seat ${product.id}: ${result.status}.`);
+          return 0;
+        }
         const seat = await loadDeveloperSeat(store, options.seatId);
         const services = await seatServices(store, seat.username, seat.id);
         const chat = services.chat(await hostedToken(options.checkout, options.readyNonce, (tokenOptions) => readBotToken(seat.username, tokenOptions)));
@@ -331,6 +343,9 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       await store.migrateLegacyGoals(undefined, releasedWithCeremony).then((results) => {
         for (const result of results) console.log(result.status === "migrated" ? `Legacy goal ${result.goalId}: ${result.summary}.` : `Legacy goal ${result.goalId} was not migrated: ${result.reason}`);
       }, (error: unknown) => console.log(`Legacy goals were not migrated: ${error instanceof Error ? error.message : String(error)}`));
+      await closeLegacyGoals(store).then((results) => {
+        for (const result of results) console.log(`Remodel goal ${result.goalId}: ${result.status}.`);
+      });
       await store.retireLegacySprints().then((removed) => { if (removed) console.log("Retired the legacy draft sprints in state.json."); },
         (error: unknown) => console.log(`Legacy draft sprints were not retired: ${error instanceof Error ? error.message : String(error)}`));
       return await runTerminalUi(new StateInventory(new LocalStateRepository(options.checkout)), new LocalSessionReader(options.checkout), {
