@@ -1,8 +1,14 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { SEAT_ROLES } from "./state-domain.js";
-import type { StateRepository, StateSnapshot, StateTeam } from "./state-domain.js";
+import { SEAT_ROLES, SEAT_STATUSES, seatStatus, TEAM_SCHEMA_DEFS } from "./state-domain.js";
+import type { SeatStatus, StateRepository, StateSnapshot, StateTeam, TeamFeatures } from "./state-domain.js";
 import { validatePlanningDocument, type PlanningDocument } from "./planning.js";
+import { Ajv2020 } from "ajv/dist/2020.js";
+import addFormats from "ajv-formats";
+
+const ajv = new Ajv2020({ strict: false });
+addFormats.default(ajv);
+const validFeatures = ajv.compile({ $defs: TEAM_SCHEMA_DEFS, $ref: "#/$defs/teamFeatures" });
 
 export class StateDataError extends Error {
   constructor(message: string) {
@@ -60,7 +66,9 @@ function unique(ids: string[], path: string, label = "ID"): void {
 function team(value: unknown, index: number): StateTeam {
   const path = `teams[${index}]`;
   const data = record(value, path);
-  fields(data, path, ["id", "slug", "displayName", "project", "externalIdentities", "seats"]);
+  fields(data, path, ["id", "slug", "displayName", "project", "externalIdentities", "seats", "mission", "standingPolicy", "backlog", "sprintCandidates"]);
+  const features = Object.fromEntries(["mission", "standingPolicy", "backlog", "sprintCandidates"].filter((key) => data[key] !== undefined).map((key) => [key, data[key]])) as TeamFeatures;
+  if (!validFeatures(features)) throw new StateDataError(`${path} has invalid mission, standing policy, backlog or sprint candidates.`);
   const project = data.project === undefined ? undefined : teamProject(data.project, `${path}.project`);
   const identities = record(data.externalIdentities, `${path}.externalIdentities`);
   fields(identities, `${path}.externalIdentities`, ["mattermost"]);
@@ -70,12 +78,14 @@ function team(value: unknown, index: number): StateTeam {
   const seats = array(data.seats, `${path}.seats`).map((value, index) => {
     const seatPath = `${path}.seats[${index}]`;
     const seat = record(value, seatPath);
-    fields(seat, seatPath, ["id", "displayName", "roles", "externalIdentities"]);
+    fields(seat, seatPath, ["id", "displayName", "roles", "status", "externalIdentities"]);
+    if (seat.status !== undefined && !(SEAT_STATUSES as readonly unknown[]).includes(seat.status)) throw new StateDataError(`${seatPath}.status is not a seat lifecycle status.`);
+    const status = seat.status as SeatStatus | undefined;
     const identities = record(seat.externalIdentities, `${seatPath}.externalIdentities`);
     fields(identities, `${seatPath}.externalIdentities`, ["mattermost"]);
     const mattermost = record(identities.mattermost, `${seatPath}.externalIdentities.mattermost`);
     fields(mattermost, `${seatPath}.externalIdentities.mattermost`, ["userId", "username"]);
-    const userId = string(mattermost.userId, `${seatPath}.externalIdentities.mattermost.userId`);
+    const userId = mattermost.userId === undefined && (status === "pending" || status === "retired") ? "" : string(mattermost.userId, `${seatPath}.externalIdentities.mattermost.userId`);
     const roles = strings(seat.roles, `${seatPath}.roles`);
     unique(roles, `${seatPath}.roles`, "role");
     if (roles.length !== 1) {
@@ -89,11 +99,14 @@ function team(value: unknown, index: number): StateTeam {
       displayName: string(seat.displayName, `${seatPath}.displayName`),
       handle: string(mattermost.username, `${seatPath}.externalIdentities.mattermost.username`),
       mattermostUserId: userId,
+      ...(status ? { status } : {}),
       roles,
     };
   });
   unique(seats.map((seat) => seat.id), `${path}.seats`);
-  const leads = seats.filter((seat) => seat.roles[0] === "Team Lead").length;
+  unique(seats.map((seat) => seat.handle), `${path}.seats`, "Mattermost username");
+  unique(seats.map((seat) => seat.mattermostUserId).filter(Boolean), `${path}.seats`, "Mattermost user ID");
+  const leads = seats.filter((seat) => seat.roles[0] === "Team Lead" && ["active", "retiring"].includes(seatStatus(seat))).length;
   if (leads !== 1) {
     throw new StateDataError(`${path}.seats must contain exactly one 'Team Lead' seat; found ${leads}.`);
   }
@@ -104,6 +117,7 @@ function team(value: unknown, index: number): StateTeam {
     mattermostTeamId: string(mattermost.teamId, `${path}.externalIdentities.mattermost.teamId`),
     ...(homeChannelId ? { homeChannelId } : {}),
     ...(project ? { project } : {}),
+    ...features,
     seats,
   };
 }
