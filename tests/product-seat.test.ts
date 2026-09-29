@@ -3,10 +3,13 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BacklogStore } from "../src/backlog.js";
 import { BacklogGroomer } from "../src/backlog-groomer.js";
+import { createPlanningBridge } from "../src/cli.js";
+import { controlModules, productRunnerFactory } from "../src/control-adapters.js";
 import type { AgentRuntime } from "../src/codex-runtime.js";
 import { loadDeveloperSeat, type RuntimeFactory } from "../src/developer-seat.js";
 import { PlanningStore } from "../src/planning.js";
-import { createLeadGrooming, groomingRuntimeFor, loadProductSeat, ProductSeat } from "../src/product-seat.js";
+import { createLeadGrooming, createProductRunner, groomingRuntimeFor, loadProductSeat, ProductSeat } from "../src/product-seat.js";
+import * as researchModule from "../src/product-research.js";
 import { SeatRuntime } from "../src/seat-runtime.js";
 import { isActiveSeat, type SeatRole, type SeatStatus, type TeamRecord } from "../src/state-domain.js";
 import { stateCheckout } from "./state-checkout.js";
@@ -25,6 +28,10 @@ async function fixture(role: SeatRole = "Product", status: SeatStatus = "active"
   return { store: new PlanningStore(dir), team };
 }
 const source = { url: "https://github.com/acme/demo/issues/1", text: "The owner repeats sprint planning after releases." };
+function chat() {
+  return { ownUserId: vi.fn(async () => "chick"), since: vi.fn(async () => []), reactions: vi.fn(async () => []), isBot: vi.fn(async () => true),
+    post: vi.fn(async (channel_id: string, message: string, root_id = "") => ({ id: "posted", user_id: "chick", channel_id, root_id, message, create_at: 1 })) };
+}
 function runner(store: PlanningStore, team: TeamRecord, message: AgentRuntime["message"]) {
   const runtime = vi.fn<RuntimeFactory>(() => ({ message }));
   const chat = { post: vi.fn() };
@@ -68,7 +75,11 @@ describe("Product role dispatch and isolation", () => {
       return { sessionId: "product-session", startedAt: "2026-09-29T00:00:00Z", finishedAt: "2026-09-29T00:01:00Z", response: { summary: "No justified change yet.", evidence: [], edit: { expectedRevision: snapshot.revision, ticketChanges: [], candidateChanges: [] } } };
     });
     const run = runner(f.store, f.team, message);
-    expect(await run.seat.tick()).toBe("worked");
+    expect(productRunnerFactory()).toBe(createProductRunner);
+    vi.spyOn(researchModule, "productResearchReader").mockReturnValue(run.research);
+    const productChat = chat();
+    const production = await productRunnerFactory()!({ ...run.services, chat: productChat });
+    expect(await production.tick()).toBe("worked");
     expect(run.runtime).toHaveBeenCalledWith(join(f.store.runtimeDir, "projects/acme/demo"));
     expect(run.runtime.mock.calls[0][1]).toBeUndefined();
     expect(message.mock.calls[0][0]).toContain('Current owner mission: "Let the owner steer by value."');
@@ -76,6 +87,7 @@ describe("Product role dispatch and isolation", () => {
     expect(message.mock.calls[0][0]).toContain("Do not edit files");
     expect(message.mock.calls[0][1]).toMatch(/schemas\/product\.json$/);
     expect(run.chat.post).not.toHaveBeenCalled();
+    expect(productChat.post).not.toHaveBeenCalled();
     expect(await f.store.read()).toEqual(before);
   });
 
@@ -134,5 +146,21 @@ describe("Product role dispatch and isolation", () => {
     await createLeadGrooming(f.store, identified, factory)({ teamId });
     await vi.waitFor(() => expect(identified).toHaveBeenCalled());
     expect(factory).not.toHaveBeenCalled(); expect(poll).not.toHaveBeenCalled();
+  });
+
+  it("registers Lead grooming through the CLI's actual optional module composition", async () => {
+    const f = await fixture();
+    vi.spyOn(researchModule, "productResearchReader").mockReturnValue(async () => ({ cwd: join(f.store.runtimeDir, "projects/acme/demo"), sources: [source] }));
+    const message = vi.spyOn(SeatRuntime.prototype, "message").mockImplementation(async (prompt) => {
+      const snapshot = JSON.parse(/^Current team and backlog snapshot: (.+)$/m.exec(prompt)![1]);
+      return { sessionId: "lead-session", startedAt: "2026-09-29T00:00:00Z", finishedAt: "2026-09-29T00:01:00Z", response: { summary: "No justified change.", evidence: [], edit: { expectedRevision: snapshot.revision, ticketChanges: [], candidateChanges: [] } } };
+    });
+    const module = controlModules["./product-seat.ts"];
+    expect(module.controlServices).toContain("grooming");
+    const bridge = await createPlanningBridge(f.store, chat(), { message: vi.fn() }, { product: module });
+    await bridge.poll();
+    await vi.waitFor(() => expect(message).toHaveBeenCalledOnce());
+    expect(message.mock.calls[0][0]).toContain("serving as Team Lead");
+    await vi.waitFor(async () => expect(await f.store.readRuntimeFile("grooming-team-one-seat-lead")).toMatchObject({ phase: "idle", sessionId: "lead-session" }));
   });
 });

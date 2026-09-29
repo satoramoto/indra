@@ -1,19 +1,16 @@
 import type { AgentRuntime } from "./codex-runtime.js";
-import type { AgentStatePort } from "./autonomy-ports.js";
+import type { BridgeAdapterServices, ProductRunnerServices } from "./control-adapters.js";
 import { BacklogGroomer, type GroomerOptions } from "./backlog-groomer.js";
 import type { SeatIdentity } from "./developer-seat.js";
 import { seatHarnessDir } from "./harness-home.js";
 import { requireTeamHome, PlanningStore } from "./planning.js";
-import type { CeremonyAdapters, PlanningChat } from "./planning-bridge.js";
+import type { CeremonyAdapters } from "./planning-bridge.js";
 import { productResearchReader } from "./product-research.js";
 import { loadSeatPersonas, withPersonaRuntime } from "./seat-persona.js";
 import { loadSeatEngines, SeatRuntime } from "./seat-runtime.js";
-import { isActiveSeat, type SeatRecord, type TeamRecord } from "./state-domain.js";
+import { isActiveSeat, type TeamRecord } from "./state-domain.js";
 
-export interface ProductServices {
-  store: AgentStatePort & Pick<PlanningStore, "runtimeDir" | "readRuntimeFile" | "saveRuntime">;
-  team: TeamRecord; seat: SeatRecord; runtimeFor(cwd: string): AgentRuntime; log(line: string): void;
-}
+export type ProductServices = Pick<ProductRunnerServices, "store" | "team" | "seat" | "runtimeFor" | "log">;
 
 /**
  * BacklogStore reads the Git revision from the state checkout. The CLI supplies only its standard runtime path
@@ -98,7 +95,7 @@ export function createLeadGrooming(store: PlanningStore, ownUserId: () => Promis
 }
 
 /** Picked up by the CLI's optional ceremony-module wiring once the grooming hook is present. */
-export function createCeremonyAdapters({ store, chat }: { store: PlanningStore; chat: Pick<PlanningChat, "ownUserId"> }): Pick<CeremonyAdapters, "grooming"> {
+export function createCeremonyAdapters({ store, chat }: Pick<BridgeAdapterServices, "store" | "chat">): Pick<CeremonyAdapters, "grooming"> {
   return { grooming: createLeadGrooming(store, () => chat.ownUserId()) };
 }
 
