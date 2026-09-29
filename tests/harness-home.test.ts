@@ -56,15 +56,15 @@ describe("seat harness homes", () => {
       expect((await lstat(join(home, "auth.json"))).isSymbolicLink()).toBe(true);
       expect(await readlink(join(home, "auth.json"))).toBe(join(owner, ".codex", "auth.json"));
     }
-    // Only a comment: Codex defaults apply, with no personal model, MCP, hooks, skills or profiles.
-    expect(CODEX_CONFIG.replace(/^#.*$/gm, "").trim()).toBe("");
+    // Exactly the owner's seat model and effort; no MCP, hooks, skills or profiles.
+    expect(CODEX_CONFIG).toBe("model = \"gpt-6-astra\"\nmodel_reasoning_effort = \"max\"\n");
   });
 
   it("replaces a copied auth file or a stale link with the link to the owner's login", async () => {
     const home = join(runtimeDir, "harness", "seat-001", "codex");
     await mkdir(home, { recursive: true, mode: 0o755 });
     await writeFile(join(home, "auth.json"), "copied credentials");
-    await writeFile(join(home, "config.toml"), "model = \"personal\"\n");
+    await writeFile(join(home, "config.toml"), "# earlier run\nmodel = \"personal\"\n[mcp_servers.personal]\ncommand = \"x\"\n");
     await ensureCodexHome(home);
     expect(await mode(home)).toBe(0o700);
     expect(await readlink(join(home, "auth.json"))).toBe(join(owner, ".codex", "auth.json"));

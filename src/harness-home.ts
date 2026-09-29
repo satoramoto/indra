@@ -25,15 +25,16 @@ export function ownerCodexAuth(env: NodeJS.ProcessEnv = process.env): string {
   return join(env.CODEX_HOME || join(homedir(), ".codex"), "auth.json");
 }
 
-/**
- * Model and reasoning effort are left to Codex's defaults: Indra passes neither, so the file is empty apart from
- * this note. No instructions, MCP servers, hooks, skills, plugins or profiles belong here.
- */
-export const CODEX_CONFIG = "# Indra-owned Codex home for one seat. Codex defaults apply; do not add personal configuration.\n";
+/** The owner's seat allocation: the model and reasoning effort every Codex seat runs with, so sprints stay comparable. */
+export const CODEX_MODEL = "gpt-6-astra";
+export const CODEX_REASONING_EFFORT = "max";
+
+/** The whole harness `config.toml`: model and reasoning effort only. No instructions, MCP servers, hooks, skills, plugins or profiles. */
+export const CODEX_CONFIG = `model = "${CODEX_MODEL}"\nmodel_reasoning_effort = "${CODEX_REASONING_EFFORT}"\n`;
 
 /**
- * Creates the Codex home idempotently: 0700 directories, a minimal `config.toml` (rewritten every time so nothing
- * accumulates in it), and `auth.json` as a symlink to the owner's login, so token refreshes write through to it.
+ * Creates the Codex home idempotently: 0700 directories, a minimal `config.toml` (rewritten every time, so a home
+ * from an earlier run gets the current content and nothing accumulates in it), and `auth.json` as a symlink to the owner's login, so token refreshes write through to it.
  * Anything else already at `auth.json` is replaced by the link.
  */
 export async function ensureCodexHome(home: string, auth = ownerCodexAuth()): Promise<string> {
