@@ -10,6 +10,7 @@ import { CLARIFY_TIMEOUT_MS, DRAFT_TIMEOUT_MS, planningId } from "./codex-runtim
 import { PlanningStore, developerSeats, missingTeamMessage, requireTeamHome, teamProject, validateOutcomeSeats, type MergeKind, type PlanningDocument, type PlanningGoal, type RuntimeRecord, type SprintIntegration } from "./planning.js";
 import { processShell, type Shell } from "./developer-seat.js";
 import { SprintGitHub, sprintBranch } from "./sprint.js";
+import { PROPOSE_EMOJI, APPROVE_EMOJI, rootMessage, proposalMessage, approvalMessage, outcomeLines, sprintSummary, integrationMessage, revertMessage, prompt, type Seat } from "./planning-text.js";
 
 export interface Post { id: string; user_id: string; channel_id: string; root_id: string; message: string; create_at: number; props?: { indra_delivery_id?: string } }
 export interface Reaction { user_id: string; post_id: string; emoji_name: string; create_at: number }
@@ -22,7 +23,6 @@ export interface PlanningChat {
   /** Mattermost's `is_bot` flag for the user; only a person may request or approve a proposal. */
   isBot(userId: string): Promise<boolean>;
 }
-type Seat = { id: string; displayName: string };
 
 /** Local delivery/turn journals never belong in state.json. */
 type BridgeMergeKind = MergeKind | "retro";
@@ -78,10 +78,7 @@ export interface BridgeCeremonyRecord extends CeremonyRuntimeRecord {
 export const ceremonyRuntimeName = (goalId: string) => `ceremony-${goalId}`;
 const startIntentName = (teamId: string) => `planning-start-${teamId}`;
 
-/** 📝 on Chick's goal post requests a draft proposal. */
-export const PROPOSE_EMOJI = "memo";
-/** ✅ on Chick's proposal post approves it. */
-export const APPROVE_EMOJI = "white_check_mark";
+export { PROPOSE_EMOJI, APPROVE_EMOJI } from "./planning-text.js";
 
 const briefSchema = schemaPathOf(import.meta.url, "brief.json");
 const proposalSchema = schemaPathOf(import.meta.url, "proposal.json");
@@ -103,49 +100,10 @@ function teamSeats(state: PlanningDocument, teamId: string): Map<string, string>
   const team = (state.teams as { id: string; seats: Seat[] }[]).find((item) => item.id === teamId);
   return new Map((team?.seats ?? []).map((seat) => [seat.id, seat.displayName]));
 }
-function seatLabel(seats: Map<string, string>, seatId: string): string {
-  return seats.has(seatId) ? `${seats.get(seatId)} (${seatId})` : seatId;
-}
-function rootMessage(id: string, goalText: string): string {
-  return `**Planning goal ${id} — Chick**\n**Stage: planning**\n${goalText}\n\nReply here to clarify. React :${PROPOSE_EMOJI}: on this post to request a draft proposal for review.`;
-}
-function proposalMessage(goal: PlanningGoal, seats: Map<string, string>): string {
-  const draft = goal.proposal!;
-  return `**Draft proposal ${draft.id} — awaiting review**\n${draft.summary}\n${draft.outcomes.map((item) => `- **${item.title}** → ${seatLabel(seats, item.seatId)}: ${item.description}`).join("\n")}\n\nRecorded in indra-state as ${goal.id}. No work has been approved or executed. To approve it, a person reacts :${APPROVE_EMOJI}: on this post.`;
-}
-function approvalMessage(goal: PlanningGoal, seats: Map<string, string>): string {
-  const titles = new Map(goal.proposal!.outcomes.map((item) => [item.id, item.title]));
-  return `**Proposal ${goal.proposal!.id} approved**\n${(goal.assignments ?? []).map((item) => `- ${titles.get(item.outcomeId) ?? item.outcomeId} → ${seatLabel(seats, item.seatId)}`).join("\n")}\n\nRecorded in indra-state as ${goal.id}. Each outcome is queued for its Developer seat.${goal.integration ? ` Their PRs target \`${goal.integration.branch}\`; once every outcome merges, Chick opens one PR from it into main.` : ""}`;
-}
 /** The owner-authorized omissions recorded when release began; migrated legacy goals record none. */
 function ownerOmissions(goal: PlanningGoal): ImplementationEvidence["omissions"] {
   const release = goal.ceremony?.history.find((entry) => entry.stage === "release");
   return release?.stage === "release" && release.evidence.kind === "implementation" ? release.evidence.omissions : undefined;
-}
-function outcomeLines(goal: PlanningGoal, seats: Map<string, string>): { merged: string[]; missed: string[] } {
-  const titles = new Map(goal.proposal!.outcomes.map((item) => [item.id, item.title]));
-  const merged: string[] = []; const missed: string[] = [];
-  for (const item of goal.assignments ?? []) {
-    const head = `**${titles.get(item.outcomeId) ?? item.outcomeId}** → ${seatLabel(seats, item.seatId)}`;
-    const omitted = ownerOmissions(goal)?.find((entry) => entry.outcomeId === item.outcomeId);
-    if (omitted) { missed.push(`- ${head}: omitted by owner (${omitted.reason})`); continue; }
-    if (item.status === "merged") merged.push(`- ${head}: ${item.prUrl ?? "merged"}`);
-    else missed.push(`- ${head}: ${item.status === "failed" ? `failed${item.note ? ` (${item.note})` : ""}` : `skipped (${item.status})`}${item.prUrl ? ` ${item.prUrl}` : ""}`);
-  }
-  return { merged, missed };
-}
-/** The integration PR's body: the goal, each outcome with its seat and PR, and what failed or was skipped. */
-function sprintSummary(goal: PlanningGoal, seats: Map<string, string>): string {
-  const { merged, missed } = outcomeLines(goal, seats);
-  return `Sprint integration for planning goal ${goal.id}.\n\n**Goal:** ${goal.goal}\n\n**Outcomes**\n${merged.join("\n") || "- none"}${missed.length ? `\n\n**Failed or skipped**\n${missed.join("\n")}` : ""}\n\nMerging this PR lands the whole sprint on main; \`planning rollback --goal ${goal.id}\` reverts it as a unit.`;
-}
-function integrationMessage(goal: PlanningGoal, prUrl: string): string {
-  const omissions = ownerOmissions(goal);
-  const partial = omissions?.length ? `\n\n**Owner-authorized omissions**\n${omissions.map((item) => `- ${item.outcomeId}: ${item.reason}`).join("\n")}` : "";
-  return `**Sprint ${goal.id} is ready: ${prUrl}**\nThis PR takes \`${sprintBranch(goal.id)}\` into main. To merge the sprint once its CI is green, a person reacts :${APPROVE_EMOJI}: on this post (or the owner presses M in Chick's detail).${partial}`;
-}
-function revertMessage(goal: PlanningGoal, prUrl: string): string {
-  return `**Rollback of sprint ${goal.id}: ${prUrl}**\nThis PR on main reverts the sprint's merge commit ${goal.integration!.mergedSha!.slice(0, 7)}. To merge the revert once its CI is green, a person reacts :${APPROVE_EMOJI}: on this post (or the owner presses M in Chick's detail).`;
 }
 function nothingToApprove(goal: PlanningGoal): string {
   return `Nothing to approve: goal ${goal.id} is at the ${stageOf(goal)} stage. :${APPROVE_EMOJI}: approves only Chick's proposal post while it awaits review${goal.stage === "clarifying" ? `; react :${PROPOSE_EMOJI}: on the goal post to request one` : ""}.`;
@@ -161,26 +119,6 @@ const reviewing = (goal: PlanningGoal) => goal.stage === "awaiting-review" || go
 const stageOf = (goal: PlanningGoal): CeremonyStage => goal.ceremony?.stage ?? (goal.stage === "approved" ? "implement" : goal.stage === "clarifying" ? "planning" : "proposal");
 const canDraft = (goal: PlanningGoal) => !goal.ceremony?.closure && !goal.proposal && ["planning", "proposal"].includes(stageOf(goal));
 const canClarify = (goal: PlanningGoal, metadata: BridgeRecord) => stageOf(goal) === "planning" || (canDraft(goal) && !!metadata.proposalRequest);
-
-/** Chick's prompts are contracts: the outcome and its acceptance, what Indra does next, the constraints and the schema. */
-function prompt(goal: PlanningGoal, input: string, drafting: boolean, developers: Seat[]): string {
-  const seats = developers.map((seat) => `${seat.id} (${seat.displayName})`).join(", ");
-  const task = drafting
-    ? `Outcome: a proposed outcome-based roadmap for this goal. This is a draft for human review.
-Acceptance: each outcome is small, focused on one concern, and independently verifiable; its description states its acceptance criteria and targeted tests. Keep outcomes roughly equal in size. In each outcome's description, list every file it will touch, including test files. Outcomes assigned to different seats must not touch the same file. Name each dependency by outcome title and owning seat ID, and state the order in which dependent work must land. For any shared-file wiring, name one owning outcome and seat; list its files only under that owner and make the other outcomes depend on it. Assign every outcome to one of these Developer seats by its seat ID: ${seats || "none"}. Give each seat at most one outcome; only when there are more outcomes than seats may a seat take more, spread as evenly as possible.
-Afterwards Indra posts the draft in the goal thread. Nothing starts until a person approves it; then Indra queues each outcome for its Developer seat.
-Return only JSON with keys summary, outcomes (title, description and seatId), risks, openQuestions.`
-    : `Outcome: a reply to the human message and an updated durable brief. Acceptance: decisions hold agreed facts only, and openQuestions names what is still unclear.
-Afterwards Indra posts your reply in the goal thread and keeps the brief for the next message and the draft.
-Return only JSON with keys reply, summary, decisions (agreed facts only), openQuestions.`;
-  return `You are Chick Corea, the Team Lead seat in Indra. This is planning only.
-${task}
-Constraints: do not edit files, run implementation, deploy, or claim approval. Never put credentials in your output.
-Goal: ${goal.goal}
-Projects: ${goal.projectRefs.join(", ")}
-Current brief: ${JSON.stringify(goal.brief)}
-Human message: ${input}`;
-}
 
 /** One process serializes each seat. Poll cursors, handled posts and handled reactions survive restart. */
 export class PlanningBridge {
@@ -353,7 +291,7 @@ export class PlanningBridge {
 
   private async recoverMilestonePosts(goal: PlanningGoal, metadata: BridgeRecord): Promise<void> {
     const integration = goal.integration;
-    if (integration?.prUrl) await this.postIntent(goal, metadata, `integration-pr:${goal.id}`, integrationMessage(goal, integration.prUrl), Date.parse(goal.createdAt), "integration");
+    if (integration?.prUrl) await this.postIntent(goal, metadata, `integration-pr:${goal.id}`, integrationMessage(goal, integration.prUrl, ownerOmissions(goal)), Date.parse(goal.createdAt), "integration");
     if (integration?.revertPrUrl) await this.postIntent(goal, metadata, `revert-pr:${goal.id}`, revertMessage(goal, integration.revertPrUrl), Date.parse(goal.createdAt), "revert");
   }
 
@@ -490,7 +428,7 @@ export class PlanningBridge {
     if (statuses.every((status) => status === "merged")) { await this.openIntegration(goal, metadata); return; }
     const key = `sprint-incomplete:${id}`;
     if (!statuses.every((status) => status === "merged" || status === "failed") || metadata.processedPostIds.includes(key)) return;
-    const { merged, missed } = outcomeLines(goal, teamSeats(state, goal.teamId));
+    const { merged, missed } = outcomeLines(goal, teamSeats(state, goal.teamId), ownerOmissions(goal));
     metadata.pending = { inputPostId: key, since: Date.now(), message: `**Sprint ${id} is not complete**\n${missed.join("\n")}\n\n${merged.length ? `${merged.length} outcome(s) merged into \`${goal.integration.branch}\`. The owner can still open the integration PR for what merged: press I in Chick's detail (\`planning integrate --goal ${id}\`).` : "Nothing merged, so there is no integration PR to open."}` };
     await this.store.saveRuntime(id, metadata);
     await this.deliver(goal, metadata);
@@ -563,12 +501,12 @@ export class PlanningBridge {
     goal = await this.beginRelease(goal, metadata, owner);
     const state = await this.store.read();
     const github = this.project(state, goal);
-    const prUrl = await this.github.openPr(github, goal.integration!.branch, `Sprint ${goal.id}: ${goal.goal}`.slice(0, 200), sprintSummary(goal, teamSeats(state, goal.teamId)));
+    const prUrl = await this.github.openPr(github, goal.integration!.branch, `Sprint ${goal.id}: ${goal.goal}`.slice(0, 200), sprintSummary(goal, teamSeats(state, goal.teamId), ownerOmissions(goal)));
     await this.store.update((doc) => {
       const found = doc.planningGoals!.find((item) => item.id === goal.id)!;
       if (found.integration?.status === "collecting") { found.integration = { ...found.integration, status: "pr-open", prUrl }; found.updatedAt = new Date().toISOString(); }
     }, `Open integration PR for goal ${goal.id}`);
-    metadata.pending = { inputPostId: `integration-pr:${goal.id}`, since: Date.now(), message: integrationMessage(goal, prUrl), mergePost: "integration" };
+    metadata.pending = { inputPostId: `integration-pr:${goal.id}`, since: Date.now(), message: integrationMessage(goal, prUrl, ownerOmissions(goal)), mergePost: "integration" };
     await this.store.saveRuntime(goal.id, metadata);
     await this.deliver(goal, metadata);
     return prUrl;
