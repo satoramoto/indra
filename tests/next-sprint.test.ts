@@ -54,6 +54,7 @@ class Chat implements PlanningChat {
   async reactions() { return []; }
   async since(channel: string, at: number) { return this.posts.filter((post) => post.channel_id === channel && post.create_at >= at); }
   async post(channel: string, message: string, root = "", delivery?: string) {
+    if (Array.from(message).length > 16_383) throw new Error("Mattermost post exceeds the message limit");
     const post: Post = { id: `post-${this.posts.length + 1}`, channel_id: channel, root_id: root, user_id: "chick", message, create_at: Date.now(), props: { indra_delivery_id: delivery } };
     this.posts.push(post); await this.afterPost?.(post); return post;
   }
@@ -148,6 +149,37 @@ describe("next sprint closure adapter", () => {
     expect(current.backlog![0].status).toBe("planned");
     expect(await f.store.readRuntimeFile(nextSprintRuntimeName("goal-previous"))).toMatchObject({ status: "proposed", goalId: next.id });
     expect(JSON.stringify(await f.store.read())).not.toContain("next-sprint-waiting");
+  });
+
+  it("delivers large backlog citations and recovers a lost response without duplicating the approval post", async () => {
+    const value = team();
+    value.sprintCandidates = [candidate("candidate-one", 1, ["ticket-one", "ticket-two"])];
+    for (const item of value.backlog!) {
+      item.description = "Acceptance detail ".repeat(2_000);
+      item.research = [{ url: `https://example.test/${item.id}`, finding: "Recorded finding ".repeat(2_000) + `Final fact for ${item.id}` }];
+    }
+    const f = await fixture(undefined, value); await freeze(f.store, closedGoal());
+    await expect(f.handle()).rejects.toThrow("waiting for Chick");
+    let responseLost = false;
+    f.chat.afterPost = async (post) => {
+      if (post.message.startsWith("**Draft proposal") && !responseLost) { responseLost = true; throw new Error("Accepted, response lost"); }
+    };
+    await expect(f.bridge().poll()).rejects.toThrow("Accepted, response lost");
+    await f.bridge().poll(); await f.bridge().poll();
+    expect(responseLost).toBe(true);
+    expect(proposals(f.chat)).toHaveLength(1);
+    const post = proposals(f.chat)[0];
+    expect(post.message.length).toBeLessThanOrEqual(15_000);
+    for (const citation of ["ticket-one", "ticket-two", "Sprint value candidate-one", "docs/retros/goal-previous.md", "With auto mode off"]) expect(post.message).toContain(citation);
+    expect(post.message).toContain("Basis excerpt");
+    expect(f.message).toHaveBeenCalledTimes(1);
+    expect(f.message.mock.calls[0][0]).toContain("Final fact for ticket-two");
+    const [next] = await f.nextGoals();
+    expect(next.stage).toBe("awaiting-review"); expect(next.assignments).toBeUndefined();
+    expect(next.goal).toContain("Final fact for ticket-two");
+    const metadata = await f.store.runtime(next.id);
+    expect(metadata.proposalPostIds).toEqual([post.id]); expect(metadata.pending).toBeUndefined();
+    expect(await f.store.readRuntimeFile(nextSprintRuntimeName("goal-previous"))).toMatchObject({ status: "proposed", goalId: next.id });
   });
 
   it("uses the latest available frozen retro, skipping missing or corrupt newer publications", async () => {

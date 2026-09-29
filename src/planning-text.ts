@@ -10,6 +10,16 @@ export const APPROVE_EMOJI = "white_check_mark";
 
 export type Seat = { id: string; displayName: string };
 
+// Leave room below Mattermost's 16,383-character limit for the seat's post decoration.
+const PROPOSAL_POST_LIMIT = 15_000;
+function excerpt(text: string, limit: number, notice = "…"): string {
+  if (text.length <= limit) return text;
+  if (limit <= notice.length) return notice.slice(0, Math.max(0, limit));
+  // Count UTF-16 conservatively and avoid cutting a surrogate pair.
+  const end = Math.max(0, limit - notice.length);
+  return text.slice(0, end).replace(/[\uD800-\uDBFF]$/, "") + notice;
+}
+
 /** These messages describe the gate, never infer an authorization from the current setting. */
 export function approvalGateText(kind: "proposal" | "integration" | "retro"): string {
   const human = kind === "proposal"
@@ -26,12 +36,14 @@ export interface NextSprintRetro {
 export interface NextSprintTextInput {
   closedGoalId: string; mission: string; candidate: SprintCandidate; tickets: BacklogTicket[]; github: string; retro?: NextSprintRetro;
 }
-/** A frozen planning basis, retained verbatim in the proposal even if the model omits its citations. */
+/** Keep references ahead of the full planning basis so a post excerpt still cites its sources. */
 export function nextSprintText({ closedGoalId, mission, candidate, tickets, github, retro }: NextSprintTextInput): string {
   const retrospective = retro
-    ? `Latest available frozen retrospective: [${retro.goalId}](https://github.com/${github}/blob/${retro.evidence.mergedSha}/${retro.evidence.path}), archived by ${retro.evidence.prUrl}; verified thread post ${retro.evidence.postId}.\n${retro.ownerProposals.length ? `Recorded owner proposals (suggestions for this plan, not approvals):\n${retro.ownerProposals.map((item) => `- ${item.text} [${item.evidenceId}]`).join("\n")}` : "No owner proposals were extracted; consult the frozen archive for its recorded facts."}`
+    ? `Latest available frozen retrospective: [${retro.goalId}](https://github.com/${github}/blob/${retro.evidence.mergedSha}/${retro.evidence.path}), archived by ${retro.evidence.prUrl}; verified thread post ${retro.evidence.postId}.`
     : "No verified frozen retrospective is available. Retrospective evidence and recommendations are unknown; do not invent them.";
-  return `Next sprint after verified closure of ${closedGoalId}.\nMission: ${mission}\nCandidate ${candidate.id}: ${candidate.title}\n${candidate.summary}\nValue this sprint would deliver: ${candidate.value}\n\nBacklog tickets (indra-state IDs):\n${tickets.map((ticket) => `- **${ticket.id}: ${ticket.title}**\n  ${ticket.description}\n  Value: ${ticket.value}\n  Dependencies: ${ticket.dependsOn?.join(", ") || "none"}${ticket.research?.length ? `\n  Research: ${ticket.research.map((item) => `${item.url} — ${item.finding}`).join("; ")}` : ""}`).join("\n")}\n\n${retrospective}`;
+  const recommendations = !retro ? "" : `\n\n${retro.ownerProposals.length ? `Recorded owner proposals (suggestions for this plan, not approvals):\n${retro.ownerProposals.map((item) => `- ${item.text} [${item.evidenceId}]`).join("\n")}` : "No owner proposals were extracted; consult the frozen archive for its recorded facts."}`;
+  const value = excerpt(candidate.value, 1_000);
+  return `Next sprint after verified closure of ${closedGoalId}.\nCandidate ${candidate.id}\nBacklog tickets (indra-state IDs): ${tickets.map((ticket) => ticket.id).join(", ")}\n${retrospective}\nValue this sprint would deliver: ${value}\n\nMission: ${mission}\nCandidate ${candidate.id}: ${candidate.title}\n${candidate.summary}${value === candidate.value ? "" : `\nFull prospective value: ${candidate.value}`}\n\nBacklog ticket details:\n${tickets.map((ticket) => `- **${ticket.id}: ${ticket.title}**\n  ${ticket.description}\n  Value: ${ticket.value}\n  Dependencies: ${ticket.dependsOn?.join(", ") || "none"}${ticket.research?.length ? `\n  Research: ${ticket.research.map((item) => `${item.url} — ${item.finding}`).join("; ")}` : ""}`).join("\n")}${recommendations}`;
 }
 
 function seatLabel(seats: Map<string, string>, seatId: string): string {
@@ -42,7 +54,17 @@ export function rootMessage(id: string, goalText: string): string {
 }
 export function proposalMessage(goal: PlanningGoal, seats: Map<string, string>): string {
   const draft = goal.proposal!;
-  return `**Draft proposal ${draft.id} — awaiting review**\n${draft.summary}\n${draft.outcomes.map((item) => `- **${item.title}** → ${seatLabel(seats, item.seatId)}: ${item.description}`).join("\n")}${goal.source ? `\n\n**Backlog and retrospective basis**\n${goal.goal}` : ""}\n\nRecorded in indra-state as ${goal.id}. No work has been approved or executed. ${approvalGateText("proposal")}`;
+  const header = `**Draft proposal ${draft.id} — awaiting review**\n`;
+  const body = `${draft.summary}\n${draft.outcomes.map((item) => `- **${item.title}** → ${seatLabel(seats, item.seatId)}: ${item.description}`).join("\n")}`;
+  const footer = `\n\nRecorded in indra-state as ${goal.id}. No work has been approved or executed. ${approvalGateText("proposal")}`;
+  if (!goal.source) return header + body + footer;
+  const heading = "\n\n**Backlog and retrospective basis**\n";
+  const budget = PROPOSAL_POST_LIMIT - header.length - heading.length - footer.length;
+  // Prefer the complete draft, reserving space for source references if the draft itself is oversized.
+  const basisBudget = Math.max(Math.min(4_000, goal.goal.length), budget - body.length);
+  const basis = excerpt(goal.goal, basisBudget, "\n… Basis excerpt; full ticket details and research are recorded with this goal in indra-state.");
+  const plan = excerpt(body, budget - basis.length, "\n… Proposal excerpt; read the full recorded proposal in indra-state before approving.");
+  return header + plan + heading + basis + footer;
 }
 export function approvalMessage(goal: PlanningGoal, seats: Map<string, string>): string {
   const titles = new Map(goal.proposal!.outcomes.map((item) => [item.id, item.title]));
@@ -71,7 +93,10 @@ export function sprintSummary(goal: PlanningGoal, seats: Map<string, string>, om
 }
 export function integrationMessage(goal: PlanningGoal, prUrl: string, omissions: ImplementationEvidence["omissions"]): string {
   const partial = omissions?.length ? `\n\n**Owner-authorized omissions**\n${omissions.map((item) => `- ${item.outcomeId}: ${item.reason}`).join("\n")}` : "";
-  return `**Sprint ${goal.id} is ready: ${prUrl}**\nThis PR takes \`${sprintBranch(goal.id)}\` into main. ${approvalGateText("integration")}${partial}`;
+  const gate = partial
+    ? `This partial integration requires human merge approval even with auto mode on: a person reacts :${APPROVE_EMOJI}: on this post or the owner presses M in Chick's detail, after a fresh review of the current head and green CI are verified.`
+    : approvalGateText("integration");
+  return `**Sprint ${goal.id} is ready: ${prUrl}**\nThis PR takes \`${sprintBranch(goal.id)}\` into main. ${gate}${partial}`;
 }
 export function revertMessage(goal: PlanningGoal, prUrl: string): string {
   return `**Rollback of sprint ${goal.id}: ${prUrl}**\nThis PR on main reverts the sprint's merge commit ${goal.integration!.mergedSha!.slice(0, 7)}. To merge the revert once its CI is green, a person reacts :${APPROVE_EMOJI}: on this post (or the owner presses M in Chick's detail).`;

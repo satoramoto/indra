@@ -3,7 +3,7 @@ import type { ImplementationEvidence } from "../src/ceremony.js";
 import { proposalDigest } from "../src/ceremony.js";
 import type { PlanningGoal } from "../src/planning.js";
 import { APPROVE_EMOJI, PROPOSE_EMOJI } from "../src/planning-bridge.js";
-import { approvalGateText, approvalMessage, integrationMessage, nextSprintText, prompt, proposalMessage, revertMessage, rootMessage, sprintSummary } from "../src/planning-text.js";
+import { approvalGateText, approvalMessage, integrationMessage, nextSprintText, prompt, proposalMessage, revertMessage, rootMessage, sprintSummary, type NextSprintTextInput } from "../src/planning-text.js";
 
 const at = "2026-01-01T00:00:00Z";
 const seats = new Map([["seat-003", "Aaron Magner"], ["seat-004", "Corey Henry"]]);
@@ -188,7 +188,7 @@ This PR takes \`sprint/goal-text\` into main. With auto mode off, a person react
 
   it("renders integration with omissions in their recorded order", () => {
     expect(integrationMessage(goal(), "https://github.com/test/project/pull/9", omissions)).toBe(`**Sprint goal-text is ready: https://github.com/test/project/pull/9**
-This PR takes \`sprint/goal-text\` into main. With auto mode off, a person reacts :white_check_mark: on this post or the owner presses M in Chick's detail. With auto mode on, Indra may merge under the owner's current standing policy only after a fresh review of the current head and green CI are verified; it records the approval as automatic. Turning auto mode off stops at the next approval gate.
+This PR takes \`sprint/goal-text\` into main. This partial integration requires human merge approval even with auto mode on: a person reacts :white_check_mark: on this post or the owner presses M in Chick's detail, after a fresh review of the current head and green CI are verified.
 
 **Owner-authorized omissions**
 - outcome-2: Owner chose a smaller release.
@@ -278,5 +278,53 @@ Human message: `);
     const post = proposalMessage(value, seats);
     for (const citation of ["candidate-next", "ticket-setup", "Acceptance: onboard a seat", "Value this sprint would deliver: Less setup time", "ticket-prior", "https://example.test/research", "No verified frozen retrospective is available"]) expect(post).toContain(citation);
     expect(post).not.toContain("has delivered");
+  });
+
+  it.each([false, true])("bounds long citations while retaining sources and the complete approval gate (retro: %s)", (hasRetro) => {
+    const authors = { createdAt: at, updatedAt: at, createdBySeatId: "seat-lead", updatedBySeatId: "seat-lead" };
+    const tickets: NextSprintTextInput["tickets"] = Array.from({ length: 25 }, (_, index) => ({
+      id: `ticket-${index}`, title: `Ticket ${index}`, description: "Acceptance: " + "🎹界".repeat(10_000), value: "Less setup time", status: "open", ...authors,
+      research: [{ url: `https://example.test/research/${index}`, finding: "Long finding ".repeat(5_000) + "Final research fact" }],
+    }));
+    const retro: NextSprintTextInput["retro"] = hasRetro ? { goalId: "goal-previous", evidence: {
+      kind: "retro-published", path: "docs/retros/goal-previous.md", prUrl: "https://github.com/test/project/pull/3", baseBranch: "main", mergedSha: "a".repeat(40), postId: "retro-post", publishedAt: at, factsOnly: true, suggestions: "owner-proposals-only",
+    }, ownerProposals: [{ text: "Suggestion ".repeat(5_000), evidenceId: "release-rounds" }] } : undefined;
+    const text = nextSprintText({ closedGoalId: "goal-previous", mission: "Owner steers by value", github: "test/project", retro, tickets,
+      candidate: { id: "candidate-next", title: "Improve onboarding", summary: "Make joining simpler", value: "Less setup time", rank: 1, status: "candidate", ticketIds: tickets.map((ticket) => ticket.id), ...authors },
+    });
+    const value = { ...goal(), goal: text, source: { candidateId: "candidate-next", ticketIds: tickets.map((ticket) => ticket.id) } };
+    // The space calculation must include a substantial draft as well as the appended basis.
+    value.proposal!.summary = "Draft detail ".repeat(700);
+    const post = proposalMessage(value, seats);
+    expect(post.length).toBeLessThanOrEqual(15_000);
+    expect(Buffer.from(post, "utf8").toString("utf8")).toBe(post);
+    for (const ticket of tickets) expect(post).toContain(ticket.id);
+    expect(post).toContain("Value this sprint would deliver: Less setup time");
+    expect(post).toContain("candidate-next");
+    expect(post).toContain("Basis excerpt; full ticket details and research are recorded with this goal in indra-state.");
+    expect(post).toContain(value.proposal!.summary);
+    for (const outcome of value.proposal!.outcomes) expect(post).toContain(outcome.description);
+    expect(post).toContain(approvalGateText("proposal"));
+    expect(post.match(/To approve it/g)).toHaveLength(1);
+    expect(text).toContain(tickets.at(-1)!.research![0].finding);
+    expect(prompt(value, "Draft", true, developers)).toContain("Final research fact");
+    if (retro) expect(post).toContain(`https://github.com/test/project/blob/${retro.evidence.mergedSha}/${retro.evidence.path}`);
+    else {
+      expect(post).toContain("No verified frozen retrospective is available");
+      expect(post).not.toContain("docs/retros/");
+    }
+  });
+
+  it.each(["", "x"])("keeps one bounded approval post even when the draft itself is oversized (%j)", (padding) => {
+    const value = { ...goal(), source: { candidateId: "candidate-next", ticketIds: ["ticket-next"] } };
+    value.goal = "Candidate candidate-next, ticket-next. Value: easier setup. No verified frozen retrospective is available.";
+    value.proposal!.outcomes[0].description = padding + "🎹".repeat(20_000);
+    const post = proposalMessage(value, seats);
+    expect(post.length).toBeLessThanOrEqual(15_000);
+    expect(Buffer.from(post, "utf8").toString("utf8")).toBe(post);
+    expect(post).toContain(value.goal);
+    expect(post).toContain("Proposal excerpt; read the full recorded proposal in indra-state before approving.");
+    expect(post).toContain(approvalGateText("proposal"));
+    expect(value.proposal!.outcomes[0].description).toHaveLength(40_000 + padding.length);
   });
 });
