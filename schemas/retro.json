@@ -12,9 +12,9 @@
         "additionalProperties": false,
         "required": ["evidenceId", "kind", "text"],
         "properties": {
-          "evidenceId": { "type": "string", "minLength": 1, "maxLength": 160 },
-          "kind": { "enum": ["went-well", "went-poorly"] },
-          "text": { "type": "string", "minLength": 1, "maxLength": 2000 }
+          "evidenceId": { "type": "string" },
+          "kind": { "type": "string", "enum": ["went-well", "went-poorly"] },
+          "text": { "type": "string" }
         }
       }
     },
@@ -26,9 +26,9 @@
         "additionalProperties": false,
         "required": ["evidenceId", "kind", "text"],
         "properties": {
-          "evidenceId": { "type": "string", "minLength": 1, "maxLength": 160 },
-          "kind": { "const": "owner-proposal" },
-          "text": { "type": "string", "minLength": 1, "maxLength": 2000 }
+          "evidenceId": { "type": "string" },
+          "kind": { "type": "string", "enum": ["owner-proposal"] },
+          "text": { "type": "string" }
         }
       }
     }
