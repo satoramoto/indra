@@ -72,7 +72,7 @@ export async function createPlanningBridge(store: PlanningStore, chat: PlanningC
         } };
       } } };
     }
-    for (const key of ["implementation", "release", "retro"] as const) if (supplied?.[key]) {
+    for (const key of Object.keys(supplied ?? {}) as (keyof CeremonyAdapters)[]) if (supplied?.[key]) {
       if (adapters[key]) throw new Error(`Multiple ceremony adapters provide ${key}.`);
       Object.assign(adapters, { [key]: supplied[key] });
     }

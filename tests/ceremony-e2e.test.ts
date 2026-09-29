@@ -51,6 +51,7 @@ class Agent implements AgentRuntime {
   }
 }
 class Services implements Shell, RetroArchive {
+  branch = "";
   integrationMerged = false; integrationOpen = false; running = false;
   archive?: RetroPr;
   markdown?: string;
@@ -61,10 +62,14 @@ class Services implements Shell, RetroArchive {
   async run(_command: string, args: string[]) {
     let stdout = "";
     if (args[0] === "api") stdout = "a".repeat(40);
+    if (args[0] === "api" && args[1].includes("/git/ref/heads/sprint/")) this.branch = args[1].split("/heads/")[1];
     if (args[0] === "pr" && args[1] === "list") stdout = this.integrationOpen ? integrationUrl : "";
     if (args[0] === "pr" && args[1] === "create") { this.integrationOpen = true; stdout = integrationUrl; }
     if (args[0] === "pr" && args[1] === "merge") this.integrationMerged = true;
-    if (args[0] === "pr" && args[1] === "view") stdout = JSON.stringify({ state: this.integrationMerged ? "MERGED" : "OPEN", mergeCommit: this.integrationMerged ? { oid: releaseSha } : null });
+    if (args[0] === "pr" && args[1] === "view") stdout = JSON.stringify({ state: this.integrationMerged ? "MERGED" : "OPEN", mergeCommit: this.integrationMerged ? { oid: releaseSha } : null,
+      headRefName: this.branch, baseRefName: "main", headRefOid: "a".repeat(40), isCrossRepository: false, isDraft: false, author: { login: "owner" } });
+    if (args[0] === "api" && args[1].includes("/reviews?")) stdout = JSON.stringify([[{ id: 1, user: { login: "satori-miyamoto" }, state: "APPROVED", commit_id: "a".repeat(40) }]]);
+    if (args[0] === "pr" && args[1] === "checks") stdout = JSON.stringify([{ name: "checks", bucket: "pass" }]);
     return { code: 0, stdout, stderr: "" };
   }
   async ensureRetroPr(project: string, goalId: string, markdown: string) {

@@ -4,8 +4,9 @@ import { runChecked, stderrExcerpt, type Shell, type ShellResult } from "./comma
 import { ensureProjectCheckout } from "./project-checkout.js";
 import { withFileLock } from "./state-commit.js";
 import { GITHUB_REPO } from "./local-state.js";
-import { homedir } from "node:os";
 import { redactSecrets } from "./redact.js";
+import { gitCommand, ghCommand, runGit, runGh, type GitOptions } from "./git-gh.js";
+import { currentHeadApproved, inspectReviewedPr, passingChecks, type ReviewedPr } from "./integration-review.js";
 
 /** A sprint GitHub problem whose message is ours and safe to post in the goal thread. */
 export class SprintError extends Error { override name = "SprintError"; }
@@ -14,8 +15,6 @@ export const sprintBranch = (goalId: string) => `sprint/${goalId}`;
 export const revertBranch = (goalId: string) => `revert/${goalId}`;
 const PR_URL = /^https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+$/;
 const SHA = /^[0-9a-f]{40}$/;
-// gh supplies the credential for one command; Git's configuration is never changed.
-const GH_CREDENTIAL = ["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential"];
 
 export type MergeResult = { merged: true; sha: string } | { merged: false; reason: string };
 
@@ -37,7 +36,8 @@ export interface RetroArchive {
   ensureRetroPr(github: string, goalId: string, markdown: string): Promise<string>;
   inspectRetroPr(github: string, goalId: string, markdown: string, prUrl: string): Promise<RetroPr>;
   reviewRetroPr(github: string, goalId: string, markdown: string, prUrl: string, headSha: string, review: (worktree: string) => Promise<RetroReview>): Promise<void>;
-  mergeRetroPr(github: string, goalId: string, markdown: string, prUrl: string, headSha: string): Promise<MergeResult>;
+  /** Await beforeMerge after verification, immediately before writing; skip it when only reconciling an existing merge. */
+  mergeRetroPr(github: string, goalId: string, markdown: string, prUrl: string, headSha: string, beforeMerge?: () => Promise<void>): Promise<MergeResult>;
 }
 
 /**
@@ -48,9 +48,12 @@ export class SprintGitHub implements RetroArchive {
   constructor(private readonly shell: Shell, private readonly runtimeDir: string) {}
 
   /** gh with explicit repositories and URLs, run beside the state checkout so no local repository is involved. */
-  private async run(command: string, args: string[], cwd = dirname(this.runtimeDir)): Promise<ShellResult> { return await this.shell.run(command, args, cwd); }
-  private async must(command: string, args: string[], cwd = dirname(this.runtimeDir)): Promise<ShellResult> {
-    return await runChecked(this.shell, command, args, cwd, (result) => new SprintError(`${command} ${args.slice(0, 2).join(" ")} failed: ${stderrExcerpt(result.stderr)}`));
+  private async run(command: "git" | "gh", args: string[], cwd = dirname(this.runtimeDir), options: GitOptions = {}): Promise<ShellResult> {
+    return command === "git" ? await runGit(this.shell, args, cwd, options) : await runGh(this.shell, args, cwd);
+  }
+  private async must(command: "git" | "gh", args: string[], cwd = dirname(this.runtimeDir), options: GitOptions = {}): Promise<ShellResult> {
+    const call = command === "git" ? gitCommand(args, options) : ghCommand(args);
+    return await runChecked(this.shell, call.command, call.args, cwd, (result) => new SprintError(`${call.command} ${call.args.slice(0, 2).join(" ")} failed: ${stderrExcerpt(result.stderr)}`));
   }
 
   /** Creates `sprint/<goal-id>` on GitHub from main's current head unless it exists; returns the branch's head. */
@@ -80,28 +83,24 @@ export class SprintGitHub implements RetroArchive {
     return created;
   }
 
-  private async view(prUrl: string): Promise<{ state: string; sha?: string }> {
-    const view = await this.must("gh", ["pr", "view", prUrl, "--json", "state,mergeCommit"]);
-    try {
-      const parsed = JSON.parse(view.stdout) as { state?: unknown; mergeCommit?: { oid?: unknown } | null };
-      const sha = typeof parsed.mergeCommit?.oid === "string" && SHA.test(parsed.mergeCommit.oid) ? parsed.mergeCommit.oid : undefined;
-      return { state: typeof parsed.state === "string" ? parsed.state : "UNKNOWN", ...(sha ? { sha } : {}) };
-    } catch { throw new SprintError(`gh pr view returned nothing readable for ${prUrl}.`); }
+  async inspectMergePr(github: string, branch: string, prUrl: string): Promise<ReviewedPr> {
+    return await inspectReviewedPr(this.shell, dirname(this.runtimeDir), github, branch, prUrl);
   }
 
   /**
-   * Squash-merges the PR once its CI is green, by URL. The PR's state is the success signal, not gh's exit code;
+   * Squash-merges the authorized head with fresh review and green CI. State is the success signal, not gh's exit code;
    * a PR that already merged returns its merge commit without merging again.
    */
-  async merge(prUrl: string): Promise<MergeResult> {
-    const before = await this.view(prUrl);
-    if (before.state === "MERGED" && before.sha) return { merged: true, sha: before.sha };
+  async merge(github: string, branch: string, prUrl: string, headSha: string, beforeMerge?: () => Promise<void>): Promise<MergeResult> {
+    const before = await this.inspectMergePr(github, branch, prUrl);
+    if (before.headSha !== headSha) return { merged: false, reason: "The PR head changed; a new approval is required" };
+    if (!before.reviewed || !before.checksPassed) return { merged: false, reason: "The PR needs a fresh current-head review and green CI" };
+    if (before.state === "MERGED" && before.mergedSha) return { merged: true, sha: before.mergedSha };
     if (before.state !== "OPEN") return { merged: false, reason: `${prUrl} is ${before.state.toLowerCase()}` };
-    const checks = await this.run("gh", ["pr", "checks", prUrl]);
-    if (checks.code !== 0) return { merged: false, reason: `CI on ${prUrl} is not green yet` };
-    const merged = await this.run("gh", ["pr", "merge", prUrl, "--squash"]);
-    const after = await this.view(prUrl);
-    if (after.state === "MERGED" && after.sha) return { merged: true, sha: after.sha };
+    await beforeMerge?.();
+    const merged = await this.run("gh", ["pr", "merge", prUrl, "--squash", "--match-head-commit", headSha]);
+    const after = await this.inspectMergePr(github, branch, prUrl);
+    if (after.state === "MERGED" && after.mergedSha && after.headSha === headSha && after.reviewed && after.checksPassed) return { merged: true, sha: after.mergedSha };
     return { merged: false, reason: `gh pr merge failed: ${stderrExcerpt(merged.stderr)}` };
   }
 
@@ -156,12 +155,12 @@ export class SprintGitHub implements RetroArchive {
       if (found) return found;
       const project = await this.retroCheckout(github);
       const branch = retroBranch(goalId); const path = retroPath(goalId);
-      const remote = await this.run("git", [...GH_CREDENTIAL, "ls-remote", "--exit-code", "origin", `refs/heads/${branch}`], project);
+      const remote = await this.run("git", ["ls-remote", "--exit-code", "origin", `refs/heads/${branch}`], project, { githubCredential: true });
       if (remote.code !== 0 && remote.code !== 2) throw new SprintError("Could not inspect the retrospective branch.");
       if (remote.code === 0) {
         const sha = remote.stdout.split(/\s/)[0];
         if (!SHA.test(sha)) throw new SprintError("Invalid retrospective branch head.");
-        await this.must("git", [...GH_CREDENTIAL, "fetch", "origin", sha], project);
+        await this.must("git", ["fetch", "origin", sha], project, { githubCredential: true });
         const base = (await this.must("git", ["merge-base", "origin/main", sha], project)).stdout.trim();
         await this.retroTree(project, base, sha, path, markdown);
       } else {
@@ -181,7 +180,7 @@ export class SprintGitHub implements RetroArchive {
           await this.must("git", ["add", "--", path], worktree);
           await this.must("git", ["commit", "--only", "-m", `Archive retrospective for ${goalId}`, "--", path], worktree);
           await this.retroTree(worktree, "HEAD^", "HEAD", path, markdown);
-          const pushed = await this.run("git", [...GH_CREDENTIAL, "push", "origin", `HEAD:refs/heads/${branch}`], worktree);
+          const pushed = await this.run("git", ["push", "origin", `HEAD:refs/heads/${branch}`], worktree, { githubCredential: true });
           if (pushed.code !== 0) throw new SprintError("Retrospective push was not confirmed; reconcile the branch on retry.");
         } finally {
           const removed = await this.run("git", ["worktree", "remove", "--force", worktree], project);
@@ -216,27 +215,20 @@ export class SprintGitHub implements RetroArchive {
     const files = await this.retroPages<{ filename: string; status: string; previous_filename?: string }>(`${endpoint}/files?per_page=100`);
     if (files.length !== 1 || files[0].filename !== path || !["added", "modified"].includes(files[0].status) || files[0].previous_filename) throw new SprintError("Retrospective PR may change only its goal's document.");
     const project = await this.retroCheckout(github);
-    await this.must("git", [...GH_CREDENTIAL, "fetch", "origin", `refs/pull/${prUrl.split("/").at(-1)}/head`], project);
+    await this.must("git", ["fetch", "origin", `refs/pull/${prUrl.split("/").at(-1)}/head`], project, { githubCredential: true });
     const mode = (await this.must("git", ["ls-tree", pr.headRefOid, "--", path], project)).stdout;
     const content = (await this.must("git", ["show", `${pr.headRefOid}:${path}`], project)).stdout;
     if (!mode.startsWith("100644 blob ") || content !== markdown) throw new SprintError("Retrospective head differs from the frozen document.");
     if (pr.state === "MERGED") {
       if (!SHA.test(pr.mergeCommit?.oid ?? "")) throw new SprintError("Retrospective merge commit is unverified.");
-      await this.must("git", [...GH_CREDENTIAL, "fetch", "origin", pr.mergeCommit!.oid], project);
+      await this.must("git", ["fetch", "origin", pr.mergeCommit!.oid], project, { githubCredential: true });
       await this.must("git", ["merge-base", "--is-ancestor", pr.mergeCommit!.oid, "origin/main"], project);
       await this.retroTree(project, `${pr.mergeCommit!.oid}^`, pr.mergeCommit!.oid, path, markdown);
     }
     const reviews = await this.retroPages<{ id: number; user: { login: string }; state: string; commit_id: string }>(`${endpoint}/reviews?per_page=100`);
-    const latest = new Map<string, typeof reviews[number]>();
-    for (const review of reviews.sort((a, b) => a.id - b.id)) if (["APPROVED", "CHANGES_REQUESTED", "DISMISSED"].includes(review.state)) latest.set(review.user?.login, review);
-    const approved = latest.get("satori-miyamoto");
-    const reviewed = pr.author.login !== "satori-miyamoto" && pr.reviewDecision !== "CHANGES_REQUESTED" && ![...latest.values()].some((review) => review.state === "CHANGES_REQUESTED") && approved?.state === "APPROVED" && approved.commit_id === pr.headRefOid;
+    const reviewed = currentHeadApproved(reviews, pr.headRefOid, pr.author.login, pr.reviewDecision);
     const checks = await this.run("gh", ["pr", "checks", prUrl, "--json", "name,bucket"]);
-    let checksPassed = false;
-    try {
-      const rows = JSON.parse(checks.stdout) as { name: string; bucket: string }[];
-      checksPassed = checks.code === 0 && Array.isArray(rows) && rows.some((row) => row.name === "checks") && rows.every((row) => row.bucket === "pass");
-    } catch { /* Missing/unreadable CI is pending. */ }
+    const checksPassed = passingChecks(checks);
     const after = await read();
     if (JSON.stringify(after) !== JSON.stringify(pr)) throw new SprintError("Retrospective PR changed during verification; retry.");
     return { url: prUrl, state: pr.state, headSha: pr.headRefOid, mergedSha: pr.mergeCommit?.oid, reviewed: reviewed && !pr.isDraft, checksPassed };
@@ -254,7 +246,7 @@ export class SprintGitHub implements RetroArchive {
       if (await reconciled()) return;
       const before = await this.inspectRetroPr(github, goalId, markdown, prUrl);
       if (before.state !== "OPEN" || before.headSha !== headSha) throw new SprintError("Retrospective PR changed before review.");
-      const reviewCommand = async (args: string[]) => await this.run("env", [`GH_CONFIG_DIR=${join(homedir(), ".config/gh-yahaha-bot")}`, "gh", ...args]);
+      const reviewCommand = async (args: string[]) => await runGh(this.shell, args, dirname(this.runtimeDir), "reviewer");
       const account = await reviewCommand(["api", "user", "--jq", ".login"]);
       if (account.code !== 0 || account.stdout.trim() !== "satori-miyamoto") throw new SprintError("Retrospective review requires the satori-miyamoto account.");
       const project = await this.retroCheckout(github);
@@ -286,11 +278,12 @@ export class SprintGitHub implements RetroArchive {
   }
 
   /** The publication adapter persists human authorization before calling this narrowly scoped merge path. */
-  async mergeRetroPr(github: string, goalId: string, markdown: string, prUrl: string, headSha: string): Promise<MergeResult> {
+  async mergeRetroPr(github: string, goalId: string, markdown: string, prUrl: string, headSha: string, beforeMerge?: () => Promise<void>): Promise<MergeResult> {
     const before = await this.inspectRetroPr(github, goalId, markdown, prUrl);
     if (before.headSha !== headSha || !before.reviewed || !before.checksPassed) return { merged: false, reason: "The archive needs a current-head review and passing CI." };
     if (before.state === "MERGED" && before.mergedSha) return { merged: true, sha: before.mergedSha };
     if (before.state !== "OPEN") return { merged: false, reason: "The retrospective PR is closed without a merge." };
+    await beforeMerge?.();
     await this.run("gh", ["pr", "merge", prUrl, "--squash", "--match-head-commit", headSha]);
     const after = await this.inspectRetroPr(github, goalId, markdown, prUrl);
     if (after.state === "MERGED" && after.mergedSha && after.headSha === headSha && after.reviewed && after.checksPassed) return { merged: true, sha: after.mergedSha };
@@ -314,7 +307,7 @@ export class SprintGitHub implements RetroArchive {
     try {
       await this.must("git", ["worktree", "add", "--no-track", "-b", branch, worktree, "origin/main"], project);
       await this.must("git", ["revert", "--no-edit", mergedSha], worktree);
-      await this.must("git", [...GH_CREDENTIAL, "push", "origin", `HEAD:refs/heads/${branch}`], worktree);
+      await this.must("git", ["push", "origin", `HEAD:refs/heads/${branch}`], worktree, { githubCredential: true });
       return await this.openPr(github, branch, title, body);
     } finally {
       await this.run("git", ["worktree", "remove", "--force", worktree], project);
