@@ -9,6 +9,7 @@ import type { StateSyncResult } from "../src/state-commit.js";
 import { TerminalApp } from "../src/terminal-ui-solid.js";
 import { attachTmux, parseOwnedTmuxTarget } from "../src/tmux-attach.js";
 import type { AssignmentRetry, GoalStarter, SeatLive, SeatProcessPort } from "../src/supervisor.js";
+import { prLabel } from "../src/hub-format.js";
 import { CEREMONY_STAGES, type CeremonySnapshot, type CeremonyStage, type SprintBuild, type SprintLoop } from "../src/session-snapshot.js";
 
 const ceremony = (stage: CeremonyStage): CeremonySnapshot => ({ version: 1, stage,
@@ -334,11 +335,11 @@ describe("terminal UI", () => {
     try {
       await wide.renderOnce();
       const frame = wide.captureCharFrame();
-      expect(frame).toMatch(/George Duke {2}· {2}Developer {2}· {2}RUNNING/);
-      expect(frame).toContain("Second · in-review · https://github.com/o/r/pull/2");
+      expect(frame).toMatch(/George Duke +Developer +RUNNING/);
+      expect(frame).toContain("Second · in-review 🐙 #2");
       expect(frame).toContain("Latest: Opened PR 2");
-      expect(frame).toMatch(/Aaron Magner {2}· {2}Developer {2}· {2}NO CREDENTIAL/);
-      expect(frame).toMatch(/Corey Henry {2}· {2}Developer {2}· {2}STOPPED/);
+      expect(frame).toMatch(/Aaron Magner +Developer +NO CREDENTIAL/);
+      expect(frame).toMatch(/Corey Henry +Developer +STOPPED/);
       expect(frame).toContain("Third · queued");
       expect(frame).toContain("No thread activity yet.");
     } finally { wide.renderer.destroy(); }
@@ -1161,7 +1162,7 @@ describe("persisted ceremony and allowed actions", () => {
       const frames = await scrollFrames(setup, "team-scroll");
       expect(visibleIn(frames, "Release waiting: " + reason)).toBe(true);
       expect(visibleIn(frames, "Current stage: release")).toBe(true);
-      expect(visibleIn(frames, session.loop!.integration!.prUrl!)).toBe(true);
+      expect(visibleIn(frames, "Integration PR: 🐙 " + prLabel(session.loop!.integration!.prUrl, true))).toBe(true);
       expect(fixture.model.ceremonyKeys()).not.toContain("M merge release");
     } finally { setup.renderer.destroy(); }
   });
@@ -1218,10 +1219,10 @@ describe("visible sprint loop", () => {
       const current = spans.find((span) => span.text.includes("[implement]"));
       expect(current?.fg.toInts().slice(0, 3)).toEqual([103, 232, 249]);
       expect(spans.find((span) => span.text.includes("planning →"))?.fg.toInts()).not.toEqual(current?.fg.toInts());
-      const frames = await scrollFrames(setup, "sprint-scroll");
+      const frames = await scrollFrames(setup, "team-scroll");
       for (const ticket of ticketLoop.tickets) {
         expect(visibleIn(frames, `${ticket.title} · ${ticket.status}`)).toBe(true);
-        expect(visibleIn(frames, ticket.prUrl!)).toBe(true);
+        expect(visibleIn(frames, "🐙 " + prLabel(ticket.prUrl))).toBe(true);
       }
       for (const action of [processes.ensureAll, processes.stop, processes.restart, processes.retry, goals.start, goals.propose, goals.approve, goals.sprint]) expect(action).not.toHaveBeenCalled();
       expect(model.confirm).toBeUndefined();
@@ -1242,13 +1243,13 @@ describe("visible sprint loop", () => {
     try {
       await setup.renderOnce();
       const frames = await scrollFrames(setup, "team-scroll");
-      for (const text of ["SPRINT · goal-one", "SPRINT · goal-two", "Current stage: implement", "Current stage: release", "implement · build, review and fix", "release · integration and update", "Failed ticket retained · failed", "Seat: George Duke (seat-002)", "Seat: Aaron Magner (seat-003)", second.loop!.integration!.prUrl!, second.loop!.tickets[0].prUrl!]) {
+      for (const text of ["SPRINT · goal-one", "SPRINT · goal-two", "Current stage: implement", "Current stage: release", "Integration PR: 🐙 " + prLabel(second.loop!.integration!.prUrl, true), "Failed ticket retained · failed", "👤 George Duke", "👤 Aaron Magner", "🐙 " + prLabel(second.loop!.tickets[0].prUrl)]) {
         expect(visibleIn(frames, text), text).toBe(true);
       }
       expect(visibleIn(frames, "planning → proposal → [implement] → release → retro")).toBe(true);
       for (const ticket of ticketLoop.tickets) {
         expect(visibleIn(frames, `${ticket.title} · ${ticket.status}`), `${ticket.title} · ${ticket.status}`).toBe(true);
-        expect(visibleIn(frames, ticket.prUrl!), ticket.prUrl).toBe(true);
+        expect(visibleIn(frames, "🐙 " + prLabel(ticket.prUrl)), ticket.prUrl).toBe(true);
       }
     } finally { setup.renderer.destroy(); }
   });
@@ -1289,7 +1290,7 @@ describe("visible sprint loop", () => {
     const setup = await testRender(() => <TerminalApp model={fixture.model} revision={() => fixture.model.revision} onKey={() => {}} />, { width: 120, height: 40 });
     try {
       await setup.renderOnce();
-      const frames = await scrollFrames(setup, "sprint-scroll");
+      const frames = await scrollFrames(setup, "team-scroll");
       expect(visibleIn(frames, message), frames[0]).toBe(true);
       expect(visibleIn(frames, "Current stage: release")).toBe(true);
     } finally { setup.renderer.destroy(); }

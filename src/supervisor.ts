@@ -8,6 +8,8 @@ import { ImplementationRecorder, implementationEligible } from "./implementation
 import { ownsSeatRecord, seatRecordName } from "./developer-maintenance.js";
 import { redactSecrets } from "./redact.js";
 import { childEnv } from "./op-env.js";
+import { readAssignmentFacts, seatHarness, type AssignmentFacts, type SeatHarness } from "./hub-facts.js";
+import { loadSeatEngines } from "./seat-runtime.js";
 
 /** `no channel`: the seat's bot could not join its team's Mattermost team or home channel. */
 export type ProcessState = "running" | "stopped" | "no credential" | "no channel";
@@ -22,7 +24,9 @@ export interface SeatLive {
   problem?: string;
   /** Running an older build than `dist/`; it is restarted at its next safe point. */
   updatePending?: boolean;
-  assignment?: { title: string; status: string; prUrl?: string };
+  assignment?: { title: string; status: string; prUrl?: string; goalId?: string; outcomeId?: string; facts?: AssignmentFacts };
+  /** The seat's harness, model and effort; absent when the local seat-engines file cannot be read. */
+  harness?: SeatHarness;
   /** Newest failed assignment still eligible to be queued for this Developer seat. */
   retry?: AssignmentRetry;
   activity?: { message: string; at: string };
@@ -151,18 +155,24 @@ export class Supervisor implements SeatProcessPort {
     const state = await this.store.read();
     const live: Record<string, SeatLive> = {};
     const stamp = await readBuildStamp(this.appDir);
-    for (const seat of seatsOf(state)) {
+    const seats = seatsOf(state);
+    // Read-only: the same local file the seat runners start from; unreadable means the harness is not shown.
+    const engines = await loadSeatEngines(this.store.runtimeDir, seats.map((seat) => seat.id)).catch(() => undefined);
+    for (const seat of seats) {
       const { process, problem, target, record } = await this.processState(this.host(seat));
       const held = (state.planningGoals ?? []).filter((goal) => goal.stage === "approved").flatMap((goal) => (goal.assignments ?? []).filter((item) => item.seatId === seat.id).map((assignment) => ({ goal, assignment })));
       const current = held.find((item) => ACTIVE.includes(item.assignment.status))
         ?? held.filter((item) => item.assignment.status === "queued" && implementationEligible(item.goal)).sort((a, b) => a.assignment.updatedAt.localeCompare(b.assignment.updatedAt))[0];
       const activity = await this.store.readRuntimeFile<{ message?: unknown; at?: unknown }>(activityRecordName(seat.id)).catch(() => undefined);
       const retry = newestFailedAssignment(state, seat.id);
+      const facts = current ? await readAssignmentFacts(this.store, seat.id, current.goal.id, current.assignment.outcomeId) : undefined;
       live[seat.id] = {
         process,
         ...(problem ? { problem } : {}),
         ...(record && stamp && record.build !== stamp.id ? { updatePending: true } : {}),
-        ...(current ? { assignment: { title: current.goal.proposal?.outcomes.find((item) => item.id === current.assignment.outcomeId)?.title ?? current.assignment.outcomeId, status: current.assignment.status, prUrl: current.assignment.prUrl } } : {}),
+        ...(current ? { assignment: { title: current.goal.proposal?.outcomes.find((item) => item.id === current.assignment.outcomeId)?.title ?? current.assignment.outcomeId, status: current.assignment.status, prUrl: current.assignment.prUrl,
+          goalId: current.goal.id, outcomeId: current.assignment.outcomeId, ...(facts ? { facts } : {}) } } : {}),
+        ...(engines ? { harness: seatHarness(Object.hasOwn(engines, seat.id) ? engines[seat.id] : "codex", seat.roles) } : {}),
         ...(retry ? { retry } : {}),
         ...(typeof activity?.message === "string" && typeof activity.at === "string" ? { activity: { message: activity.message, at: activity.at } } : {}),
         ...(target ? { attach: { kind: "tmux" as const, target } } : {}),

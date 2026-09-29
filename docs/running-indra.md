@@ -21,6 +21,14 @@ In the UI, `a` watches a seat's live process: `Ctrl-]` comes back to Indra, the 
 and `q`, `Esc` or scrolling to the bottom returns to live. Nothing you type reaches the seat's run. `t` shows the seat's
 current Claude or Codex session as a read-only transcript that follows it live. `?` lists every key.
 
+The screens are designed for a window of about 720×720 logical pixels at a 13 px font: 96 columns by 42 rows. At that
+size the team screen (seats plus the sprint card) and a seat's screen (live pane, seat detail, sprint strip) fit
+without scrolling; smaller terminals scroll with `PgUp`/`PgDn`. Colours and icons mean the same everywhere: 🏃 green
+running, ⌛ amber waiting, 🙋 pink needs you, 💥 red failed, ✅ blue done, 💤 grey idle; needs-you and failed blink.
+Each assignment shows its pipeline 🔨 build, 🔍 review, 🩹 fix, 🧪 CI, 🔀 merge, lit as it advances, with a 🟢 🟡 🔴 dot
+for its last recorded CI run. Tokens (🧮) are the recorded input, cached input and output of finished sessions.
+🐙 PR links and the 💬 goal thread and 📝 proposal post links are OSC 8 hyperlinks, and a click opens them with `open`.
+
 A browser preview may attach to the running session (`tmux -L indra-ui attach -t ui`), but it must never start it.
 
 ## Why not under ttyd

@@ -12,6 +12,7 @@ import { mergedWithCeremony } from "./project-checkout.js";
 import { PlanningBridge, type CeremonyAdapters, type PlanningChat } from "./planning-bridge.js";
 import { assertCeremonyReady, type CeremonyWriteReadiness } from "./ceremony-ports.js";
 import type { ReleaseActivationOptions, ReleaseActivationReadPort } from "./release-activation.js";
+import { MATTERMOST_SERVER } from "./hub-format.js";
 import { CHICK_USERNAME, MattermostAccessError, MattermostPlanningChat, readBotToken, readChickToken, type BotTokenOptions } from "./planning-mattermost.js";
 import { opCredential, stageServiceToken } from "./service-account.js";
 import { captureOpEnvironment } from "./op-env.js";
@@ -83,7 +84,7 @@ export async function createPlanningBridge(store: PlanningStore, chat: PlanningC
   return new PlanningBridge(store, chat, runtime, 20, processShell, adapters);
 }
 
-export const SERVER = "https://mattermost.newegypt.io";
+export const SERVER = MATTERMOST_SERVER;
 export type Write = (line: string) => void;
 export type Read = (prompt: string) => Promise<string>;
 
