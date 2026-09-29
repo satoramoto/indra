@@ -67,8 +67,19 @@ async function fixture() {
 }
 
 describe("recoverable retro publication", () => {
+  it("surfaces the protected merge setup blocker while retaining the open retrospective", async () => {
+    const f = await fixture();
+    const reason = "Automatic merge blocked: The target must require approving Code Owner reviews and dismiss stale approvals. See docs/remodel-contract.md for the required server-side Code Owner policy.";
+    vi.mocked(f.archive.mergeRetroPr).mockResolvedValue({ merged: false, reason });
+    expect(await f.restart().poll(f.context)).toEqual({ status: "pending", reason });
+    expect(f.archive.mergeRetroPr).toHaveBeenCalledTimes(1);
+    expect(f.pr.state).toBe("OPEN"); expect(f.state.planningGoals[0]).toEqual(goalAtRetro());
+    expect(f.record().verifiedAt).toBeUndefined();
+    await expect(f.restart().merge(f.context)).rejects.toThrow(reason);
+  });
+
   it("wires production review to a new read-only runtime at the archive head without resuming Chick", async () => {
-    const f = await fixture(); await f.restart().poll(f.context); f.pr.reviewed = false;
+    const f = await fixture(); f.pr.checksPassed = false; await f.restart().poll(f.context); f.pr.reviewed = false;
     try {
       vi.spyOn(SprintGitHub.prototype, "ensureRetroPr").mockImplementation(f.archive.ensureRetroPr);
       vi.spyOn(SprintGitHub.prototype, "inspectRetroPr").mockImplementation(f.archive.inspectRetroPr);
@@ -111,32 +122,26 @@ describe("recoverable retro publication", () => {
     expect(f.record().review?.headSha).toBe(f.pr.headSha);
   });
 
-  it("resumes an authorized merge that stopped before GitHub received it", async () => {
-    const f = await fixture(); await f.restart().poll(f.context);
+  it("retries an interrupted automatic merge only after bot review and CI are still verified", async () => {
+    const f = await fixture();
     vi.mocked(f.archive.mergeRetroPr).mockRejectedValueOnce(new Error("Interrupted before merge"));
-    await expect(f.restart().merge(f.context, f.owner())).rejects.toThrow("Interrupted");
-    const approval = structuredClone(f.record().authorization);
+    expect((await f.restart().poll(f.context)).status).toBe("pending");
+    expect(f.record().authorization).toBeUndefined();
     f.pr.checksPassed = false;
     expect((await f.restart().poll(f.context)).status).toBe("pending");
     expect(f.archive.mergeRetroPr).toHaveBeenCalledTimes(1);
     f.pr.checksPassed = true;
     expect((await f.restart().poll(f.context)).status).toBe("complete");
     expect(f.archive.mergeRetroPr).toHaveBeenCalledTimes(2);
-    expect(f.record().authorization).toEqual(approval);
   });
 
-  it.each(["head", "pr", "post", "closed", "review", "ci"])("does not resume saved authorization when %s no longer matches its gates", async (change) => {
-    const f = await fixture(); await f.restart().poll(f.context);
-    vi.mocked(f.archive.mergeRetroPr).mockRejectedValueOnce(new Error("Interrupted"));
-    await expect(f.restart().merge(f.context, f.owner())).rejects.toThrow("Interrupted");
-    if (change === "head") f.pr.headSha = "f".repeat(40);
-    if (change === "pr") f.pr.url = "https://github.com/test/project/pull/4";
-    if (change === "post") f.record().authorization!.postId = "another-post";
+  it.each(["closed", "review", "ci"])("does not auto-merge when %s proof is missing", async (change) => {
+    const f = await fixture();
     if (change === "closed") f.pr.state = "CLOSED";
     if (change === "review") f.pr.reviewed = false;
     if (change === "ci") f.pr.checksPassed = false;
     expect((await f.restart().poll(f.context)).status).toBe("pending");
-    expect(f.archive.mergeRetroPr).toHaveBeenCalledTimes(1);
+    expect(f.archive.mergeRetroPr).not.toHaveBeenCalled();
   });
 
   it("reuses the frozen draft and accepted thread post when the delivery response is lost", async () => {
@@ -216,49 +221,35 @@ describe("recoverable retro publication", () => {
     expect(f.deliveries.size).toBe(2);
   });
 
-  it.each(["review", "CI", "closed", "unapproved-merge"])("keeps the goal in retro for %s", async (problem) => {
-    const f = await fixture(); await f.restart().poll(f.context);
-    if (problem === "review") f.pr.reviewed = false;
-    if (problem === "CI") f.pr.checksPassed = false;
-    if (problem === "closed") f.pr.state = "CLOSED";
-    if (problem === "unapproved-merge") { f.pr.state = "MERGED"; f.pr.mergedSha = "d".repeat(40); }
-    expect((await f.restart().poll(f.context)).status).toBe("pending");
-    await expect(f.restart().merge(f.context, f.owner())).rejects.toThrow();
+  it("archives with bot review and CI without manufacturing a second human approval", async () => {
+    const f = await fixture();
+    expect((await f.restart().poll(f.context)).status).toBe("complete");
+    expect(f.archive.mergeRetroPr).toHaveBeenCalledTimes(1);
     expect(f.record().authorization).toBeUndefined();
-    expect(f.context.goal.ceremony!.closure).toBeUndefined();
-    expect(f.archive.mergeRetroPr).not.toHaveBeenCalled();
+    expect([...f.deliveries.values()].some((post) => post.message.includes("React ✅"))).toBe(false);
   });
 
-  it.each(["plan", "release", "old-time", "bot"])("refuses %s approval for the separate archival merge", async (kind) => {
-    const f = await fixture(); await f.restart().poll(f.context);
-    const mark = { source: "reaction", userId: "owner", verifiedHuman: true, emoji: "white_check_mark", postId: f.record().gate!.postId, at: new Date().toISOString() };
-    if (kind === "plan") mark.postId = "proposal-post";
-    if (kind === "release") mark.postId = "release-post";
-    if (kind === "old-time") mark.at = at(4);
-    if (kind === "bot") mark.verifiedHuman = false;
-    await expect(f.restart().merge(f.context, mark as HumanApproval)).rejects.toThrow("new human");
+  it("announces a changed head and waits for its fresh review", async () => {
+    const f = await fixture(); f.pr.checksPassed = false;
+    await f.restart().poll(f.context);
+    const originalPost = f.record().gate!.postId;
+    f.pr.headSha = "e".repeat(40); f.pr.reviewed = false; f.pr.checksPassed = true;
+    expect((await f.restart().poll(f.context)).status).toBe("pending");
+    expect(f.record().gate!.postId).not.toBe(originalPost);
     expect(f.archive.mergeRetroPr).not.toHaveBeenCalled();
-  });
-
-  it("requires a new announcement and authorization when the PR head changes", async () => {
-    const f = await fixture(); await f.restart().poll(f.context);
-    const originalPost = f.record().gate!.postId; f.pr.headSha = "e".repeat(40);
-    await expect(f.restart().merge(f.context, f.owner())).rejects.toThrow("changed");
-    await f.restart().poll(f.context); expect(f.record().gate!.postId).not.toBe(originalPost);
-    await expect(f.restart().merge(f.context, { source: "reaction", userId: "human", postId: originalPost, emoji: "white_check_mark", verifiedHuman: true, at: new Date().toISOString() })).rejects.toThrow("new human");
-    await f.restart().merge(f.context, f.owner());
+    f.pr.reviewed = true;
     expect((await f.restart().poll(f.context)).status).toBe("complete");
   });
 
-  it("persists human authorization before merge and recovers a lost merge response", async () => {
-    const f = await fixture(); await f.restart().poll(f.context);
+  it("recovers a lost merge response from verified GitHub state without human authorization", async () => {
+    const f = await fixture();
     vi.mocked(f.archive.mergeRetroPr).mockImplementationOnce(async () => {
-      expect(f.record().authorization?.headSha).toBe(f.pr.headSha);
+      expect(f.record().authorization).toBeUndefined();
       f.pr.state = "MERGED"; f.pr.mergedSha = "d".repeat(40); throw new Error("Response lost");
     });
-    await expect(f.restart().merge(f.context, f.owner())).rejects.toThrow("Response lost");
+    expect((await f.restart().poll(f.context)).status).toBe("pending");
     const result = await f.restart().poll(f.context);
-    expect(result).toMatchObject({ status: "complete", evidence: { path: "docs/retros/goal-one.md", postId: f.record().postIds![0], prUrl: f.pr.url, factsOnly: true, suggestions: "owner-proposals-only" } });
+    expect(result).toMatchObject({ status: "complete", evidence: { path: "docs/retros/goal-one.md", postId: f.record().postIds![0], prUrl: f.pr.url } });
     expect(await f.restart().poll(f.context)).toEqual(result);
     expect(f.archive.mergeRetroPr).toHaveBeenCalledTimes(1);
   });
@@ -290,7 +281,7 @@ describe("recoverable retro publication", () => {
     // Thread verification still binds every post to its frozen part.
     const content = [...f.deliveries.values()].find((item) => !item.mergePost)!; const original = content.message;
     content.message = frozen.parts[0];
-    await expect(f.publication().merge(f.context, f.owner())).rejects.toThrow("unverified");
+    await expect(f.publication().merge(f.context, f.owner())).rejects.toThrow("verification is pending");
     content.message = original;
     await expect(f.publication().merge(f.context, f.owner())).resolves.toContain("merged");
   });

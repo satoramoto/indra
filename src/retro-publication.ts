@@ -183,6 +183,7 @@ export class RetroPublication {
       record.prUrl = await this.archive.ensureRetroPr(record.github, context.goal.id, frozen.markdown);
       await this.save(context, record);
       let pr = await this.archive.inspectRetroPr(record.github, context.goal.id, frozen.markdown, record.prUrl);
+      if (pr.url !== record.prUrl) return pending("The inspected archival PR does not match this publication.");
       if (pr.state === "CLOSED") return pending("The retrospective PR is closed without merging; the owner must resolve it before the goal can close.");
       if (pr.state === "OPEN") {
         const announcedAt = record.gate?.headSha === pr.headSha ? record.gate.announcedAt : new Date().toISOString();
@@ -191,21 +192,22 @@ export class RetroPublication {
           record.gate = { headSha: pr.headSha, postId: "", announcedAt };
           await this.save(context, record);
         }
-        const postId = await context.post(`retro-merge:${pr.headSha}`, `**Retrospective archive: ${context.goal.id}**\n${pr.url}\n\nOnly \`${retroPath(context.goal.id)}\` may change. A fresh review and passing CI are required. React ✅ on this post or use \`planning merge --goal ${context.goal.id}\` (M) to authorize this archive. Earlier plan and release approvals do not apply. Suggested process changes remain proposals for the owner.`, "retro");
+        const postId = await context.post(`retro-merge:${pr.headSha}`, `**Retrospective archive: ${context.goal.id}**\n${pr.url}\n\nOnly \`${retroPath(context.goal.id)}\` may change. A fresh review and passing CI are required. It merges automatically once the current head is approved and CI passes. Suggested process changes remain proposals for the owner.`, "retro");
         record.gate = { headSha: pr.headSha, postId, announcedAt };
         await this.save(context, record);
         if (!pr.reviewed) {
           await this.review(context, record, pr);
           pr = await this.archive.inspectRetroPr(record.github, context.goal.id, frozen.markdown, record.prUrl);
         }
-        if (pr.state === "OPEN" && this.authorized(record, pr) && pr.reviewed && pr.checksPassed) {
+        if (pr.state === "OPEN" && pr.reviewed && pr.checksPassed) {
           await this.verifyPosts(context, record);
-          await this.archive.mergeRetroPr(record.github, context.goal.id, frozen.markdown, pr.url, pr.headSha);
+          const merge = await this.archive.mergeRetroPr(record.github, context.goal.id, frozen.markdown, pr.url, pr.headSha);
           pr = await this.archive.inspectRetroPr(record.github, context.goal.id, frozen.markdown, record.prUrl);
+          if (!merge.merged && pr.state !== "MERGED") return pending(merge.reason);
         }
-        if (pr.state !== "MERGED") return pending(!pr.reviewed ? "The retrospective archive needs a fresh review on its current head." : !pr.checksPassed ? "The retrospective archive is waiting for passing CI." : this.authorized(record, pr) ? "The authorized archival merge is pending; it will be retried." : "The retrospective archive is waiting for a new human checkmark or the owner's M.");
+        if (pr.state !== "MERGED") return pending(!pr.reviewed ? "The retrospective archive needs a fresh review on its current head." : !pr.checksPassed ? "The retrospective archive is waiting for passing CI." : "The archival merge is pending verification.");
       }
-      if (!this.authorized(record, pr) || !pr.reviewed || !pr.checksPassed || !pr.mergedSha) return pending("The archival merge still needs verified human authorization, current-head review and passing CI.");
+      if (!pr.reviewed || !pr.checksPassed || !pr.mergedSha) return pending("The archival merge still needs current-head review and passing CI.");
       await this.verifyPosts(context, record);
       record.verifiedAt ??= new Date().toISOString();
       record.stageTimings = context.goal.ceremony!.history.map((entry, index, history) => {
@@ -221,31 +223,13 @@ export class RetroPublication {
     }
   }
 
-  private authorized(record: RetroPublicationRecord, pr: RetroPr): boolean {
-    const authorization = record.authorization;
-    return !!authorization && authorization.prUrl === pr.url && authorization.headSha === pr.headSha && authorization.postId === record.gate?.postId && record.gate.headSha === pr.headSha;
+  /** Compatibility retry; authorization is the approved goal, never a second human action. */
+  async merge(context: CeremonyContext, _historicalApproval?: HumanApproval): Promise<string> {
+    const result = await this.poll(context);
+    if (result.status === "pending") throw new Error(result.reason);
+    return `Retrospective archive merged: ${result.evidence.prUrl}. Closure follows verified thread delivery and archival merge.`;
   }
 
-  /** Called only by the bridge after a GET-verified human reaction, or the owner's terminal M. */
-  async merge(context: CeremonyContext, approval: HumanApproval): Promise<string> {
-    let record = await this.load(context);
-    // The bridge may consume a reaction immediately after recovering its outbox, before our next poll.
-    if (record.gate && !record.gate.postId) { await this.poll(context); record = await this.load(context); }
-    if (!record.frozen || !record.prUrl || !record.gate?.postId || !record.postIds?.length) throw new Error("Publish the retrospective and its archival PR before approving its merge.");
-    const pr = await this.archive.inspectRetroPr(record.github, context.goal.id, record.frozen.markdown, record.prUrl);
-    if (pr.state === "MERGED" && this.authorized(record, pr) && pr.reviewed && pr.checksPassed) return `Retrospective archive is already merged: ${pr.url}.`;
-    if (pr.state !== "OPEN" || pr.headSha !== record.gate.headSha) throw new Error("The retrospective PR changed or is closed; reconcile it before a new approval.");
-    const release = context.goal.ceremony!.history.find((entry) => entry.stage === "retro")!;
-    if (!Number.isFinite(Date.parse(approval.at)) || Date.parse(approval.at) < Date.parse(record.gate.announcedAt) || Date.parse(approval.at) < Date.parse(release.enteredAt ?? context.goal.createdAt)
-      || (approval.source === "owner-command" ? approval.command !== "planning merge" : approval.emoji !== "white_check_mark" || approval.verifiedHuman !== true || approval.postId !== record.gate.postId)) throw new Error("The archive requires a new human checkmark on its own post or the owner's M.");
-    if (!pr.reviewed || !pr.checksPassed) throw new Error("The retrospective archive needs a fresh current-head review and passing CI before merging.");
-    await this.verifyPosts(context, record);
-    record.authorization = { headSha: pr.headSha, prUrl: pr.url, postId: record.gate.postId, approval };
-    await this.save(context, record);
-    const result = await this.archive.mergeRetroPr(record.github, context.goal.id, record.frozen.markdown, pr.url, pr.headSha);
-    if (!result.merged) throw new Error(result.reason);
-    return `Retrospective archive merged: ${pr.url}. Closure follows verified thread delivery and archival merge.`;
-  }
 }
 
 /** Read only persisted evidence. Missing attempt coverage and unrecorded wall time stay explicitly unknown. */

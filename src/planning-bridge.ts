@@ -57,7 +57,7 @@ export interface CeremonyAdapters {
   retro?: {
     poll(context: CeremonyContext): Promise<CeremonyProgress<PublishedRetroEvidence>>;
     /** Called only from a verified human checkmark on an adapter post or the owner's M command. */
-    merge?(context: CeremonyContext, approval: HumanApproval): Promise<string>;
+    merge?(context: CeremonyContext, approval?: HumanApproval): Promise<string>;
   };
 }
 /** The producer contract is shared by successful results and AgentRunError.facts. */
@@ -261,7 +261,7 @@ export class PlanningBridge {
       if (entry.stage !== "planning" && entry.enteredAt !== null) {
         const detail = entry.stage === "proposal" ? "Chick is preparing the draft for the owner's plan approval."
           : entry.stage === "implement" ? approvalMessage(goal, seats)
-          : entry.stage === "release" ? "Implementation is frozen. The integration PR, human merge approval and running build verification complete this stage."
+          : entry.stage === "release" ? "Implementation is frozen. The integration PR merges after current-head bot approval and green CI; running build verification completes this stage."
           : "The released build is verified running. Chick's retrospective must be published and archived before this goal closes.";
         await this.postIntent(goal, metadata, key, `**Stage: ${entry.stage}**\n${detail}`, entry.enteredAt ? Date.parse(entry.enteredAt) : Date.parse(goal.createdAt));
       }
@@ -308,7 +308,7 @@ export class PlanningBridge {
     let goal = (await this.store.read()).planningGoals!.find((item) => item.id === id)!;
     if (!goal.ceremony || goal.ceremony.closure) return;
     const metadata = await this.metadata(id);
-    // The revert PR merged through the human merge gate before the release was verified running: nothing ran to retro on.
+    // The revert PR merged through the current-head bot/CI gate before the release was verified running: nothing ran to retro on.
     if (goal.ceremony.stage === "release" && goal.integration?.status === "reverted") {
       await this.store.update((state) => {
         const found = state.planningGoals!.find((item) => item.id === id)!;
@@ -325,7 +325,7 @@ export class PlanningBridge {
       const progress = await this.adapters.release?.poll({ ...this.context(goal), mergeApproval: metadata.mergeApproval }) ?? { status: "pending" as const, reason: "Waiting for the running-build verification adapter." };
       Object.assign(metadata, await this.metadata(id));
       if (progress.status === "pending") { metadata.waiting = { stage: "release", reason: progress.reason }; await this.store.saveRuntime(id, metadata); return; }
-      if (!metadata.mergeApproval || progress.evidence.mergePostId !== metadata.mergeApproval.postId || JSON.stringify(progress.evidence.approval) !== JSON.stringify(metadata.mergeApproval.approval)) throw new Error("Running release evidence does not match the recorded human merge approval.");
+      if (!progress.evidence.mergeVerification) throw new Error("Running release requires verified current-head bot approval and green CI.");
       await this.store.update((state) => {
         const found = state.planningGoals!.find((item) => item.id === id)!;
         found.ceremony = advanceCeremony(found, { to: "retro", at: new Date().toISOString(), evidence: progress.evidence });
@@ -366,7 +366,30 @@ export class PlanningBridge {
     for (const goal of goals) await this.store.withGoalLock(goal.id, () => this.pollGoal(goal, own));
   }
 
+  /** Product owns its root proposal; Chick only reads it and verifies a human decision. */
+  private async verifyProductPost(goal: PlanningGoal): Promise<void> {
+    const state = await this.store.read();
+    const team = (state.teams as { id: string; seats: { id: string; roles: string[]; externalIdentities: { mattermost: { userId: string } } }[] }[]).find((item) => item.id === goal.teamId);
+    const product = team?.seats.find((seat) => seat.id === goal.goalProposal?.productSeatId && seat.roles[0] === "Product");
+    const post = (await this.chat.since(goal.mattermost.channelId, Date.parse(goal.createdAt) - 5000)).find((item) => item.id === goal.mattermost.rootPostId);
+    if (!product || !post || post.user_id !== product.externalIdentities.mattermost.userId || post.channel_id !== goal.mattermost.channelId || post.root_id !== "") throw new Error("The Product-authored root proposal has not been verified in the team home.");
+  }
+  private async productApproval(goal: PlanningGoal): Promise<void> {
+    if (goal.stage !== "awaiting-review" || !goal.goalProposal || goal.ceremony?.closure) return;
+    await this.verifyProductPost(goal);
+    const state = await this.store.read();
+    for (const reaction of await this.chat.reactions(goal.mattermost.rootPostId)) {
+      if (reaction.post_id !== goal.mattermost.rootPostId || reaction.emoji_name !== APPROVE_EMOJI || reaction.create_at < Date.parse(goal.createdAt) || !await this.human(state, goal, reaction.user_id)) continue;
+      const at = new Date(Math.max(Date.now(), reaction.create_at)).toISOString();
+      await this.store.approveGoal(goal.id, { kind: "approval", proposalId: goal.goalProposal.proposalId, proposalPostId: goal.mattermost.rootPostId,
+        approval: { source: "reaction", userId: reaction.user_id, postId: reaction.post_id, emoji: "white_check_mark", verifiedHuman: true, at: new Date(reaction.create_at).toISOString() } }, at);
+      return;
+    }
+  }
+
   private async pollGoal(goal: PlanningGoal, own: string): Promise<void> {
+    // New-model event scheduling arrives in the Scheduler lane; historical seats must never claim these goals.
+    if (goal.workflowModel === "goals-v1") { await this.productApproval(goal); return; }
     await this.initialize(goal);
     goal = (await this.store.read()).planningGoals!.find((item) => item.id === goal.id)!;
     const metadata = await this.metadata(goal.id);
@@ -409,6 +432,14 @@ export class PlanningBridge {
     if (current?.stage === "approved" && current.integration?.status === "collecting") {
       try { await this.enqueue(goal.seatId, () => this.sprintProgress(goal.id)); }
       catch { console.error(`Sprint ${goal.id}: integration is pending; it will be retried.`); }
+    }
+    const mergeGoal = (await this.store.read()).planningGoals?.find((item) => item.id === goal.id);
+    if (mergeGoal?.stage === "approved" && (mergeGoal.integration?.status === "pr-open" || (mergeGoal.integration?.status === "merged" && mergeGoal.integration.revertPrUrl))) {
+      const latest = await this.metadata(goal.id);
+      try {
+        const result = await this.mergeGate(goal.id, undefined, latest);
+        if (result.merged) await this.postIntent(mergeGoal, latest, `auto-merge:${goal.id}:${mergeGoal.integration.status}`, result.message);
+      } catch { console.error(`Sprint ${goal.id}: bot review, CI or merge verification is pending.`); }
     }
     await this.ceremonyProgress(goal.id);
   }
@@ -547,18 +578,10 @@ export class PlanningBridge {
    * and by the owner's `planning merge`. It merges only once CI is green, records the result, and posts it.
    * Merging a PR that already merged changes nothing. Returns what happened, and whether it was merged.
    */
-  private async mergeGate(id: string, kind: BridgeMergeKind | undefined, metadata: BridgeRecord, approval: HumanApproval): Promise<{ message: string; merged: boolean; post: boolean; recorded?: boolean }> {
+  private async mergeGate(id: string, kind: BridgeMergeKind | undefined, metadata: BridgeRecord, approval?: HumanApproval): Promise<{ message: string; merged: boolean; post: boolean; recorded?: boolean }> {
     const goal = this.approvedGoal((await this.store.read()).planningGoals?.find((item) => item.id === id), id);
     const integration = goal.integration!;
-    // A sprint merged by a pre-ceremony build and migrated into release has no recorded merge approval; a fresh human
-    // merge approval records it so release can complete. It merges nothing.
-    if ((kind === undefined || kind === "integration") && goal.ceremony?.stage === "release" && !goal.ceremony.closure && integration.status === "merged" && !integration.revertPrUrl && !metadata.mergeApproval) {
-      const mergePost = metadata.mergePosts?.find((item) => item.kind === "integration" && (approval.source !== "reaction" || item.id === approval.postId));
-      if (!mergePost) throw new Error("The merge PR must be posted before human merge approval.");
-      metadata.mergeApproval = { postId: mergePost.id, approval };
-      await this.store.saveRuntime(id, metadata);
-      return { message: `Sprint ${id} was already merged into main as ${integration.mergedSha!.slice(0, 7)}; recorded your merge approval so release can complete.`, merged: false, post: true, recorded: true };
-    }
+    if (!kind && integration.status === "merged" && !integration.revertPrUrl && goal.ceremony?.stage !== "retro") return { message: `Sprint ${id} is already merged into main as ${integration.mergedSha!.slice(0, 7)}.`, merged: false, post: true, recorded: true };
     const target: BridgeMergeKind | undefined = kind ?? (integration.status === "pr-open" ? "integration" : integration.status === "merged" && integration.revertPrUrl ? "revert" : goal.ceremony?.stage === "retro" ? "retro" : undefined);
     if (target === "retro") {
       if (goal.ceremony?.stage !== "retro" || goal.ceremony.closure) throw new Error("Retro merge requires an open goal at retro.");
@@ -571,16 +594,11 @@ export class PlanningBridge {
     if (target === "revert" && integration.status === "reverted") return { message: `Sprint ${id} is already rolled back (${integration.revertPrUrl}).`, merged: false, post: true };
     const prUrl = target === "integration" && integration.status === "pr-open" ? integration.prUrl : target === "revert" && integration.status === "merged" ? integration.revertPrUrl : undefined;
     if (!target || !prUrl) return { message: `Nothing to merge for sprint ${id}: it is ${integration.status}${integration.status === "collecting" ? " and has no integration PR yet" : ""}.`, merged: false, post: false };
-    const mergePost = metadata.mergePosts?.find((item) => item.kind === target && (approval.source !== "reaction" || item.id === approval.postId));
-    if (!mergePost) throw new Error("The merge PR must be posted before human merge approval.");
-    metadata.mergeIntent = { kind: target, approval };
-    if (target === "integration") metadata.mergeApproval = { postId: mergePost.id, approval };
-    await this.store.saveRuntime(id, metadata);
     const result = await this.github.merge(prUrl);
     if (!result.merged) {
       delete metadata.mergeIntent;
       await this.store.saveRuntime(id, metadata);
-      return { message: `Not merged: ${result.reason}. Nothing changed; merge again once CI is green.`, merged: false, post: true };
+      return { message: `Not merged: ${result.reason}. Waiting for verified bot review, CI and merge events.`, merged: false, post: true };
     }
     await this.store.update((state) => {
       const found = state.planningGoals!.find((item) => item.id === id)!;
@@ -602,7 +620,7 @@ export class PlanningBridge {
       const metadata = await this.metadata(id);
       if (metadata.pending) await this.deliver(goal, metadata);
       await this.recoverMilestonePosts(goal, metadata);
-      const result = await this.mergeGate(id, undefined, metadata, { source: "owner-command", command: "planning merge", at: new Date().toISOString() });
+      const result = await this.mergeGate(id, undefined, metadata);
       if (!result.merged && !result.recorded) throw new Error(result.message);
       metadata.pending = { inputPostId: `owner-merge:${id}:${Date.now()}`, since: Date.now(), message: result.message };
       await this.store.saveRuntime(id, metadata);
@@ -642,7 +660,7 @@ export class PlanningBridge {
     const metadata = await this.metadata(goal.id);
     const root = goal.mattermost.rootPostId;
     const found: Reaction[] = [];
-    for (const postId of [root, ...(metadata.proposalPostIds ?? []), ...(metadata.mergePosts ?? []).map((item) => item.id)]) {
+    for (const postId of [root, ...(metadata.proposalPostIds ?? [])]) {
       found.push(...(await this.chat.reactions(postId)).filter((reaction) => reaction.post_id === postId && reaction.user_id !== own && (reaction.emoji_name === APPROVE_EMOJI || (reaction.emoji_name === PROPOSE_EMOJI && postId === root))));
     }
     return found.map((reaction) => ({ reaction, key: reactionKey(reaction) })).filter((item) => !metadata.processedPostIds.includes(item.key)).sort((a, b) => a.reaction.create_at - b.reaction.create_at);
@@ -769,13 +787,8 @@ export class PlanningBridge {
     if (metadata.processedPostIds.includes(key)) return;
     const seats = teamSeats(state, goal.teamId);
     const approving = reaction.emoji_name === APPROVE_EMOJI;
-    const gate = approving ? metadata.mergePosts?.find((item) => item.id === reaction.post_id) : undefined;
     let message: string; let announcesProposal = false;
-    if (!(await this.human(state, goal, reaction.user_id))) message = `Only a person can ${gate ? "merge a sprint" : approving ? "approve a proposal" : "request a proposal"}; reactions from bots and Chick don't count. Nothing changed.`;
-    else if (gate) {
-      try { message = (await this.mergeGate(id, gate.kind, metadata, { source: "reaction", userId: reaction.user_id, postId: reaction.post_id, emoji: "white_check_mark", verifiedHuman: true, at: new Date(reaction.create_at).toISOString() })).message; }
-      catch (error) { console.error(`Sprint ${id} merge could not be confirmed.`); message = `Could not merge the sprint's PR right now; nothing changed. React :${APPROVE_EMOJI}: again (remove and re-add it) to retry.`; }
-    }
+    if (!(await this.human(state, goal, reaction.user_id))) message = `Only a person can ${approving ? "approve a proposal" : "request a proposal"}; reactions from bots and Chick don't count. Nothing changed.`;
     else if (goal.ceremony?.closure) message = `Goal ${id} is closed.`;
     else if (goal.stage === "approved") message = approvalMessage(goal, seats);
     else if (!approving && goal.stage === "awaiting-review") { message = proposalMessage(goal, seats); announcesProposal = true; }
@@ -885,6 +898,13 @@ export class PlanningBridge {
     check((await this.store.read()).planningGoals?.find((item) => item.id === id));
     return await this.store.withGoalLock(id, async () => {
       const goal = check((await this.store.read()).planningGoals?.find((item) => item.id === id));
+      if (goal.workflowModel === "goals-v1") {
+        if (goal.stage === "approved") return { goal, alreadyApproved: true };
+        await this.verifyProductPost(goal);
+        const at = new Date().toISOString();
+        await this.store.approveGoal(id, { kind: "approval", proposalId: goal.goalProposal!.proposalId, proposalPostId: goal.mattermost.rootPostId, approval: { source: "owner-command", command: "planning approve", at } }, at);
+        return { goal: (await this.store.read()).planningGoals!.find((item) => item.id === id)!, alreadyApproved: false };
+      }
       const metadata = await this.metadata(id);
       if (metadata.pending) await this.deliver(goal, metadata);
       await this.ensureProposalAnnouncement(goal, metadata);

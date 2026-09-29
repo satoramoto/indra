@@ -13,8 +13,8 @@ export function assertCeremonyReady(readiness?: CeremonyWriteReadiness): void {
 /**
  * Adapters verify external facts before returning evidence; absence is not success. Persist returned proof with
  * advanceCeremony/closeCeremony in a single PlanningStore.update. Store validation binds proof to the current goal.
- * Approval adapters accept only the owner's terminal command or a GET-verified human checkmark on Chick's matching
- * proposal/merge post, excluding bots, the bridge and Chick. No adapter automatically approves or applies suggestions.
+ * Approval adapters accept only the owner's terminal command or a GET-verified human checkmark on the matching
+ * proposal post, excluding bots, the bridge and every team seat. Release adapters verify current-head bot review and CI; historical human merge evidence is read-only. No adapter automatically approves goals or applies suggestions.
  */
 export interface CeremonyEvidencePorts {
   approval(goal: PlanningGoal): Promise<ApprovalEvidence | undefined>;
