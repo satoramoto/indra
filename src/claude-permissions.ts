@@ -49,13 +49,21 @@ async function readOnlyWritePaths(cwd: string): Promise<string[]> {
  * No inherited tool grants, hooks, MCP servers, settings, slash commands (skills) or auto-memory. Managed policy
  * still applies. Claude keeps the owner's config directory, where its login lives: see the README's engine section.
  */
-export async function claudePermissionArgs(cwd: string, write?: WriteAccess): Promise<string[]> {
+/**
+ * `headedResult` is a headed read-only run's result file (see headed-session.ts). An interactive session never prompts:
+ * plan mode would stop at its plan-approval prompt, so it runs in `dontAsk` (anything not allowed is denied), with Bash
+ * allowed only inside the same read-only, no-network sandbox and the Write tool allowed only for that one file.
+ * Write sessions keep the same flags headed or headless.
+ */
+export async function claudePermissionArgs(cwd: string, write?: WriteAccess, headedResult?: string): Promise<string[]> {
+  const readOnlyHeaded = !write && headedResult !== undefined;
+  const resultRules = readOnlyHeaded ? [`Write(/${resolve(headedResult)})`, `Edit(/${resolve(headedResult)})`] : [];
   const settings = {
     disableAllHooks: true, autoMemoryEnabled: false,
-    permissions: { disableBypassPermissionsMode: "disable", disableAutoMode: "disable" },
+    permissions: { disableBypassPermissionsMode: "disable", disableAutoMode: "disable", ...(readOnlyHeaded ? { allow: resultRules } : {}) },
     sandbox: {
       enabled: true, failIfUnavailable: true, allowUnsandboxedCommands: false,
-      autoAllowBashIfSandboxed: !!write, excludedCommands: [],
+      autoAllowBashIfSandboxed: !!write || readOnlyHeaded, excludedCommands: [],
       filesystem: write ? { allowWrite: write.extraDirs.map((dir) => resolve(dir)) } : { denyWrite: await readOnlyWritePaths(cwd) },
       network: { allowedDomains: write ? ["*"] : [], strictAllowlist: true, allowLocalBinding: false },
     },
@@ -63,8 +71,8 @@ export async function claudePermissionArgs(cwd: string, write?: WriteAccess): Pr
   return [
     "--setting-sources", "", "--settings", JSON.stringify(settings),
     "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--disable-slash-commands", "--no-chrome",
-    "--permission-mode", write ? "acceptEdits" : "plan", "--permission-prompts", "none",
-    "--tools", write ? "Bash,Read,Glob,Grep,Edit,Write,NotebookEdit" : "Bash,Read,Glob,Grep",
-    ...(write ? write.extraDirs.flatMap((dir) => ["--add-dir", resolve(dir)]) : ["--disallowedTools", "Edit,Write,NotebookEdit,Agent,WebFetch,WebSearch"]),
+    "--permission-mode", write ? "acceptEdits" : readOnlyHeaded ? "dontAsk" : "plan", "--permission-prompts", "none",
+    "--tools", write ? "Bash,Read,Glob,Grep,Edit,Write,NotebookEdit" : readOnlyHeaded ? "Bash,Read,Glob,Grep,Write" : "Bash,Read,Glob,Grep",
+    ...(write ? write.extraDirs.flatMap((dir) => ["--add-dir", resolve(dir)]) : ["--disallowedTools", readOnlyHeaded ? "Edit,NotebookEdit,Agent,WebFetch,WebSearch" : "Edit,Write,NotebookEdit,Agent,WebFetch,WebSearch"]),
   ];
 }

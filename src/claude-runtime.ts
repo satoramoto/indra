@@ -1,11 +1,15 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { claudePermissionArgs } from "./claude-permissions.js";
 import { claudeProgress } from "./claude-progress.js";
 import { CLARIFY_TIMEOUT_MS, checkPromptSize, type RecordedAgentResult, type AgentRuntime, type MessageOptions, type WriteAccess } from "./codex-runtime.js";
 import { HARNESS_CONTEXT_TOKEN_LIMIT } from "./harness-home.js";
+import { claimHeaded, firstMessage, HeadedStartError, headedAvailable, prepareTaskFiles, readLog, resultValidator, runHeaded, taskDocument } from "./headed-session.js";
 import { childEnv } from "./op-env.js";
-import { RuntimeEventStream, RuntimeFacts, RuntimeStop, recordedError } from "./runtime-facts.js";
+import { AgentRunError, RuntimeEventStream, RuntimeFacts, RuntimeStop, recordedError } from "./runtime-facts.js";
 
 export { claudePermissionArgs };
 
@@ -33,6 +37,30 @@ export function claudeEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return { ...env, CLAUDE_CODE_RESUME_INTERRUPTED_TURN: "0", CLAUDE_CODE_AUTO_COMPACT_WINDOW: String(HARNESS_CONTEXT_TOKEN_LIMIT) };
 }
 
+/** Authentication belongs to the logged-in CLI, never an injected API key: no credential-looking variable reaches Claude. */
+function claudeChildEnv(): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(childEnv()).filter(([key]) => !/token|password|passwd|secret|api_?key/i.test(key)));
+}
+
+async function readSchema(schemaPath: string): Promise<object> {
+  let schema: unknown;
+  try { schema = JSON.parse(await readFile(schemaPath, "utf8")); }
+  catch { throw new RuntimeStop("Claude output schema could not be read as JSON."); }
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) throw new RuntimeStop("Claude output schema must be a JSON Schema object.");
+  return schema;
+}
+
+/** A headed session's transcript, `<config dir>/projects/<project>/<session-id>.jsonl`, once Claude has written it. */
+export async function claudeTranscript(sessionId: string, env: NodeJS.ProcessEnv = process.env): Promise<string | undefined> {
+  const projects = join(env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), "projects");
+  const dirs = await readdir(projects).catch(() => [] as string[]);
+  for (const dir of dirs) {
+    const file = join(projects, dir, `${sessionId}.jsonl`);
+    if (await stat(file).then((info) => info.isFile(), () => false)) return file;
+  }
+  return undefined;
+}
+
 export function claudeSessionId(handle: string): string {
   const id = handle.slice(CLAUDE_SESSION_PREFIX.length);
   if (!handle.startsWith(CLAUDE_SESSION_PREFIX) || !uuid.test(id)) throw new RuntimeStop("Invalid Claude session handle; expected claude:<UUID>.");
@@ -41,20 +69,64 @@ export function claudeSessionId(handle: string): string {
 
 /** The authenticated Claude CLI, with schema output on every turn and explicit same-engine continuation. */
 export class ClaudeRuntime implements AgentRuntime {
-  /** `roles` are the seat's roles from state; they pick the effort (see claudeModelArgs). */
-  constructor(private readonly cwd: string, private readonly timeoutMs = CLARIFY_TIMEOUT_MS, private readonly write?: WriteAccess, private readonly roles?: readonly string[]) {}
+  /**
+   * `roles` are the seat's roles from state; they pick the effort (see claudeModelArgs). `headed` defaults to
+   * headedAvailable(): a new session in a hosted seat pane runs the interactive CLI there (see headed-session.ts).
+   */
+  constructor(private readonly cwd: string, private readonly timeoutMs = CLARIFY_TIMEOUT_MS, private readonly write?: WriteAccess, private readonly roles?: readonly string[], private readonly headed = headedAvailable()) {}
 
   async message(prompt: string, schemaPath: string, sessionId?: string, options: MessageOptions = {}): Promise<RecordedAgentResult> {
+    const release = this.headed && sessionId === undefined ? claimHeaded() : undefined;
+    if (release) {
+      try { return await this.headedMessage(prompt, schemaPath, options); }
+      catch (error) {
+        if (!(error instanceof AgentRunError && error.cause instanceof HeadedStartError)) throw error;
+        console.log("Claude did not start a headed session; running this task headless.");
+      } finally { release(); }
+    }
+    return await this.headlessMessage(prompt, schemaPath, sessionId, options);
+  }
+
+  /** One fresh interactive session in this process's terminal; the task and result are files (see headed-session.ts). */
+  private async headedMessage(prompt: string, schemaPath: string, options: MessageOptions): Promise<RecordedAgentResult> {
+    const id = randomUUID();
+    const evidence = new RuntimeFacts("claude", undefined);
+    evidence.sessionId = `${CLAUDE_SESSION_PREFIX}${id}`;
+    let started = false;
+    try {
+      const schema = await readSchema(schemaPath);
+      checkPromptSize(prompt);
+      const files = await prepareTaskFiles(this.cwd);
+      await writeFile(files.task, taskDocument(prompt, schema, files), { mode: 0o600 });
+      const args = [...claudeModelArgs(this.roles), "--session-id", id, ...await claudePermissionArgs(this.cwd, this.write, files.result), "--", firstMessage(files)];
+      // Indra disables every project setting source, hook and MCP server, so the workspace trust dialog guards nothing
+      // here; CLAUDE_CODE_SANDBOXED skips it so the session never waits on it.
+      const env = { ...claudeEnv(claudeChildEnv()), CLAUDE_CODE_SANDBOXED: "1" };
+      const transcript = () => claudeTranscript(id);
+      const response = await runHeaded({
+        label: "Claude", cwd: this.cwd, files, validate: resultValidator(schema), launch: { command: "claude", args, env },
+        started: async () => (started = !!await transcript()), timeoutMs: options.timeoutMs ?? this.timeoutMs, signal: options.signal,
+      });
+      await readLog(await transcript(), evidence);
+      const facts = evidence.finish("succeeded");
+      return { sessionId: evidence.sessionId, response, usage: facts.usage, startedAt: facts.startedAt, finishedAt: facts.finishedAt, facts };
+    } catch (error) {
+      if (started) await readLog(await claudeTranscript(id), evidence);
+      else evidence.sessionId = undefined;
+      const recorded = recordedError(error, evidence);
+      if (error instanceof HeadedStartError) recorded.cause = error;
+      throw recorded;
+    }
+  }
+
+  private async headlessMessage(prompt: string, schemaPath: string, sessionId?: string, options: MessageOptions = {}): Promise<RecordedAgentResult> {
     const evidence = new RuntimeFacts("claude", sessionId);
     let result: Record<string, unknown> | undefined;
     const stream = new RuntimeEventStream((event) => { evidence.observe(event); if (event.type === "result") result = event; });
     try {
       if (options.signal?.aborted) throw new RuntimeStop("Claude run cancelled.", "interrupted");
       const resumeId = sessionId === undefined ? undefined : claudeSessionId(sessionId);
-      let schema: unknown;
-      try { schema = JSON.parse(await readFile(schemaPath, "utf8")); }
-      catch { throw new RuntimeStop("Claude output schema could not be read as JSON."); }
-      if (!schema || typeof schema !== "object" || Array.isArray(schema)) throw new RuntimeStop("Claude output schema must be a JSON Schema object.");
+      const schema = await readSchema(schemaPath);
       const args = ["--print", "--output-format", "stream-json", "--verbose", "--include-partial-messages", ...claudeModelArgs(this.roles), "--json-schema", JSON.stringify(schema), ...await claudePermissionArgs(this.cwd, this.write), ...(resumeId ? ["--resume", resumeId] : [])];
       const timeoutMs = options.timeoutMs ?? this.timeoutMs;
       if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new RuntimeStop("Claude timeout must be a positive number of milliseconds.");
@@ -77,9 +149,7 @@ export class ClaudeRuntime implements AgentRuntime {
       if (signal?.aborted) { reject(new RuntimeStop("Claude run cancelled.", "interrupted")); return; }
       let child: ChildProcessWithoutNullStreams;
       try {
-        // Authentication belongs to the logged-in CLI, never an injected API key. Never replay interrupted turns.
-        const env = Object.fromEntries(Object.entries(childEnv()).filter(([key]) => !/token|password|passwd|secret|api_?key/i.test(key)));
-        child = spawn("claude", args, { cwd: this.cwd, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32", env: claudeEnv(env) });
+        child = spawn("claude", args, { cwd: this.cwd, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32", env: claudeEnv(claudeChildEnv()) });
       } catch { reject(new RuntimeStop("Claude could not be started; check the executable and working directory.")); return; }
       let settled = false; let stdoutBytes = 0; let stderrBytes = 0; const progress = claudeProgress({ cwd: this.cwd });
       let failure: RuntimeStop | undefined;
