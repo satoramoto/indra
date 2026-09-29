@@ -3,6 +3,9 @@ import { TmuxHost } from "./tmux-host.js";
 import { LocalReleaseActivationReader, type ReleaseActivation } from "./release-activation.js";
 import { retroRuntimeName, type RetroPublicationRecord } from "./retro-publication.js";
 import { retroPath } from "./sprint.js";
+import { readAssignmentFacts, type AssignmentFacts } from "./hub-facts.js";
+import { parseUsage, sumUsage } from "./hub-format.js";
+import type { TokenUsage } from "./runtime-facts.js";
 
 export type SessionEngine = "codex" | "claude" | "unknown";
 /** Persisted handles: unqualified legacy IDs are Codex; only claude:<id> identifies Claude. */
@@ -32,6 +35,8 @@ export type CeremonyGoal = Omit<PlanningGoal, "ceremony"> & { ceremony?: Ceremon
 export interface SprintTicket {
   id: string; title: string; seatId: string; prUrl?: string;
   status: "queued" | "building" | "in review" | "merged" | "failed" | "not assigned";
+  /** Step, CI and token facts from the seat's runtime records; read only for open goals. */
+  facts?: AssignmentFacts;
 }
 export interface SprintBuild {
   status: ReleaseActivation["status"];
@@ -49,6 +54,8 @@ export interface SprintLoop {
   tickets: SprintTicket[];
   integration?: SprintIntegration;
   build?: SprintBuild;
+  /** The sprint's recorded token use: every assignment's sessions plus the lead's planning runs. Open goals only. */
+  usage?: TokenUsage;
 }
 
 /** Read-only projection: finished and failed assignments remain in the same sprint as active work. */
@@ -111,6 +118,12 @@ export interface SessionSnapshot {
     loop?: SprintLoop;
     /** Only for a goal without a ceremony: why start-up migration has not given it one. */
     migration?: string;
+    createdAt?: string;
+    /** The goal's Mattermost thread and newest proposal post, for links; IDs only, from state and runtime records. */
+    mattermost?: { channelId: string; rootPostId: string; proposalPostId?: string };
+    /** The lead's recorded planning runs for this goal. */
+    usage?: TokenUsage;
+    runs?: number;
   }[];
 }
 export type SprintView = "collecting" | "pr-open" | "merged" | "revert-open" | "reverted";
@@ -150,7 +163,18 @@ export class LocalSessionReader implements SessionReadPort {
           loop.retro = { status: "pending", path: retroPath(goal.id), prUrl: publication.prUrl };
         }
       }
-      const context = { id: goal.id, teamId: goal.teamId, seatId: goal.seatId, goal: goal.goal, stage: goal.stage, updatedAt: goal.updatedAt,
+      // Hub details for open goals only, so finished history costs no reads: two small files per assignment.
+      const reader = this.store.readRuntimeFile?.bind(this.store);
+      if (reader && !loop.closedAt) {
+        for (const ticket of loop.tickets) {
+          if (ticket.status === "not assigned") continue;
+          const facts = await readAssignmentFacts({ readRuntimeFile: reader }, ticket.seatId, goal.id, ticket.id).catch(() => undefined);
+          if (facts) ticket.facts = facts;
+        }
+      }
+      const thread = goal.mattermost && typeof goal.mattermost.rootPostId === "string" ? { channelId: goal.mattermost.channelId, rootPostId: goal.mattermost.rootPostId } : undefined;
+      const context = { id: goal.id, teamId: goal.teamId, seatId: goal.seatId, goal: goal.goal, stage: goal.stage, updatedAt: goal.updatedAt, createdAt: goal.createdAt,
+        ...(thread ? { mattermost: thread } : {}),
         loop, ...(loop.ceremony ? { ceremony: structuredClone(loop.ceremony), retro: structuredClone(loop.retro) } : {}),
         ...(loop.closedAt ? { closedAt: loop.closedAt } : {}), ...(loop.release ? { release: structuredClone(loop.release) } : {}),
         ...(goal.integration ? { sprint: sprintView(goal) } : {}),
@@ -162,7 +186,14 @@ export class LocalSessionReader implements SessionReadPort {
       }
       catch { sessions.push({ ...context, status: "error", engine: "unknown", recentActivity: ["Runtime metadata is unreadable."] }); continue; }
       const engine = sessionEngine(runtime.sessionId);
-      sessions.push({ ...context, status: connection === "error" ? "error" : "idle", engine, sessionId: runtime.sessionId, recentActivity: runtime.runs.slice(-3).map((run) => `${engineLabel(engine)} run finished ${run.finishedAt}`), ...(target ? { attach: { kind: "tmux" as const, target } } : {}) });
+      const planning = sumUsage(runtime.runs.map((run) => parseUsage(run?.usage)));
+      if (!loop.closedAt) {
+        const usage = sumUsage([planning, ...loop.tickets.map((ticket) => ticket.facts?.usage)]);
+        if (usage) loop.usage = usage;
+      }
+      const proposalPostId = Array.isArray(runtime.proposalPostIds) ? runtime.proposalPostIds.filter((id) => typeof id === "string").at(-1) : undefined;
+      sessions.push({ ...context, ...(thread && proposalPostId ? { mattermost: { ...thread, proposalPostId } } : {}),
+        ...(planning ? { usage: planning } : {}), runs: runtime.runs.length, status: connection === "error" ? "error" : "idle", engine, sessionId: runtime.sessionId, recentActivity: runtime.runs.slice(-3).map((run) => `${engineLabel(engine)} run finished ${run.finishedAt}`), ...(target ? { attach: { kind: "tmux" as const, target } } : {}) });
     }
     return { connection, sessions };
   }

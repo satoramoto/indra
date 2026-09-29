@@ -1,7 +1,8 @@
 import type { PlanningChat, Post, Reaction } from "./planning-bridge.js";
 import { envServiceToken, opRead, type OpCredential } from "./op-env.js";
+import { MATTERMOST_SERVER } from "./hub-format.js";
 
-const SERVER = "https://mattermost.newegypt.io";
+const SERVER = MATTERMOST_SERVER;
 /** 1Password reference for a seat's Mattermost bot token, named after the bot's username. */
 export const botTokenRef = (username: string) => `op://Agent Rig/Mattermost bot - ${username}/token`;
 
