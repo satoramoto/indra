@@ -1,6 +1,6 @@
 import { dirname, join } from "node:path";
 import { lstat, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { stderrExcerpt, type Shell, type ShellResult } from "./developer-seat.js";
+import { runChecked, stderrExcerpt, type Shell, type ShellResult } from "./command-shell.js";
 import { ensureProjectCheckout } from "./project-checkout.js";
 import { withFileLock } from "./state-commit.js";
 import { GITHUB_REPO } from "./local-state.js";
@@ -49,10 +49,8 @@ export class SprintGitHub implements RetroArchive {
 
   /** gh with explicit repositories and URLs, run beside the state checkout so no local repository is involved. */
   private async run(command: string, args: string[], cwd = dirname(this.runtimeDir)): Promise<ShellResult> { return await this.shell.run(command, args, cwd); }
-  private async must(command: string, args: string[], cwd?: string): Promise<ShellResult> {
-    const result = await this.run(command, args, cwd);
-    if (result.code !== 0) throw new SprintError(`${command} ${args.slice(0, 2).join(" ")} failed: ${stderrExcerpt(result.stderr)}`);
-    return result;
+  private async must(command: string, args: string[], cwd = dirname(this.runtimeDir)): Promise<ShellResult> {
+    return await runChecked(this.shell, command, args, cwd, (result) => new SprintError(`${command} ${args.slice(0, 2).join(" ")} failed: ${stderrExcerpt(result.stderr)}`));
   }
 
   /** Creates `sprint/<goal-id>` on GitHub from main's current head unless it exists; returns the branch's head. */

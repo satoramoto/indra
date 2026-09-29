@@ -1,21 +1,18 @@
-import { execFile } from "node:child_process";
-import { childEnv } from "./op-env.js";
 import { randomUUID } from "node:crypto";
 import { lstat, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import type { AgentResult, AgentRuntime, WriteAccess } from "./codex-runtime.js";
+import { runChecked, type Shell, type ShellResult } from "./command-shell.js";
 import { maintainDeveloperSeat, ownsSeatRecord, retainSeatRecord, seatRecordName } from "./developer-maintenance.js";
 import { postReviewOnce, requireApprovedReview } from "./developer-review.js";
 import { missingTeamMessage, teamProject, type PlanningAssignment as Assignment, type PlanningGoal, type PlanningOutcome as ApprovedOutcome, type PlanningStore } from "./planning.js";
 import { ensureProjectCheckout, ProjectCheckoutError, projectCheckoutPath } from "./project-checkout.js";
-import { redactSecrets } from "./redact.js";
 import { schemaPathOf } from "./reload.js";
 import { ImplementationRecorder, implementationEligible, type ImplementationEvent } from "./implementation-facts.js";
 import { AgentRunError } from "./runtime-facts.js";
 import { activityRecordName } from "./supervisor.js";
 
-export interface ShellResult { code: number; stdout: string; stderr: string }
-export interface Shell { run(command: string, args: string[], cwd: string): Promise<ShellResult> }
+export { processShell, stderrExcerpt, type Shell, type ShellResult } from "./command-shell.js";
 export interface SeatChat { post(channelId: string, message: string, rootId?: string): Promise<unknown> }
 /** Creates an agent runtime in `cwd`: read-only without `write`, otherwise workspace-write plus the given extra dirs (the shared Git dir). */
 export type RuntimeFactory = (cwd: string, write?: WriteAccess) => AgentRuntime;
@@ -430,9 +427,7 @@ export class DeveloperSeat {
   }
 
   private async sh(command: string, args: string[], cwd: string): Promise<ShellResult> {
-    const result = await this.shell.run(command, args, cwd);
-    if (result.code !== 0) throw new SeatError(`${command} ${args.slice(0, 2).join(" ")} failed (exit ${result.code}).`);
-    return result;
+    return await runChecked(this.shell, command, args, cwd, (result) => new SeatError(`${command} ${args.slice(0, 2).join(" ")} failed (exit ${result.code}).`));
   }
 
   private async setStatus(goalId: string, outcomeId: string, change: Partial<Assignment>): Promise<boolean> {
@@ -546,22 +541,3 @@ Constraints: do not rebase, reset, force-push or abort the merge. ${CREDENTIALS}
 Return only JSON: prUrl (${prUrl}) and summary.
 ${outcomeText(outcome)}`;
 }
-
-/** A short, single-line excerpt of command stderr with anything token-shaped removed. */
-export function stderrExcerpt(stderr: string, max = 120): string {
-  // Redact before truncating so no partial secret survives the cut.
-  const text = redactSecrets(stderr)
-    .replace(/\s+/g, " ")
-    .trim();
-  return (text || "no output").slice(0, max);
-}
-
-/** Runs commands without a shell; output is kept in memory only. */
-export const processShell: Shell = {
-  run: (command, args, cwd) => new Promise((done) => {
-    execFile(command, args, { cwd, encoding: "utf8", maxBuffer: 20_000_000, timeout: 2 * 60 * 60_000, env: childEnv() },(error, stdout, stderr) => {
-      const code = error ? (typeof (error as { code?: unknown }).code === "number" ? (error as { code: number }).code : 1) : 0;
-      done({ code, stdout, stderr });
-    });
-  }),
-};
