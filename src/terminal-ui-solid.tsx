@@ -19,10 +19,11 @@ import { TranscriptView } from "./transcript-view.js";
 import type { TranscriptSource } from "./session-transcript.js";
 import type { LiveUsagePort } from "./live-usage.js";
 import { isFinishedSprint } from "./finished-sprint.js";
-import { CI_DOT, formatTokens, openableUrl, pipelineSteps, prLabel, sumUsage, totalTokens, usageLine } from "./hub-format.js";
+import { formatTokens, openableUrl, pipelineSteps, sumUsage, workTokens } from "./hub-format.js";
+import { GLYPH } from "./hub-style.js";
 import {
-  assignmentLine, createTicker, elapsedText, harnessText, HUB_STATE, isDeveloper, LinkText, occupancy, PipelineLabels, processColor, SeatRow,
-  seatState, SprintCard, SprintStrip, stateColor, theme, threadActivity, type HubState,
+  ActivitySection, assignmentLine, AttentionSection, burnSparkline, CI_COLOR, clip, seatInfo, createTicker, elapsedText, Field, FieldText, HUB_STATE, isDeveloper, KeyLegend, LinkText, occupancy, pad,
+  PipelineLabels, prText, processColor, SeatHeader, SeatRow, Section, seatState, SprintCard, SprintStrip, stateColor, stateCounts, theme, threadActivity, UsageSpans,
 } from "./hub-view.js";
 
 /** The end of a long goal, as many characters as fit in six wrapped lines, so the cursor stays visible. */
@@ -94,18 +95,26 @@ export function TerminalApp(props: TerminalAppProps) {
   const runtime = createMemo(() => {
     props.revision();
     const connection = props.model.sessionResult.connection;
-    return connection === "connected" ? { text: "🟢 RUNTIME CONNECTED", color: theme.running } : connection === "error" ? { text: "🔴 RUNTIME ERROR", color: theme.error } : { text: "🟡 RUNTIME DISCONNECTED", color: theme.idle };
+    return connection === "connected" ? { text: "runtime connected", color: theme.ok } : connection === "error" ? { text: "runtime error", color: theme.bad } : { text: "runtime disconnected", color: theme.wait };
   });
   const stateSummary = createMemo(() => {
     props.revision();
     return props.model.stateError
-      ? "STATE ERROR · " + displayText(props.model.stateError)
+      ? "State error · " + displayText(props.model.stateError)
       : "State loaded " + (displayText(props.model.refreshedAt) || "pending");
   });
   const notice = createMemo(() => { props.revision(); return props.model.notice; });
   const launchWarning = createMemo(() => { props.revision(); return props.model.launchWarning; });
   const sync = createMemo(() => { props.revision(); return props.model.syncLine(); });
   const update = createMemo(() => { props.revision(); return props.model.updateLine(); });
+  /** The status line: state, sync and update in one dim row while all is well; a failing one gets its own red row. */
+  const statusRows = createMemo(() => {
+    const width = Math.max(20, dimensions().width - 2);
+    const first = stateSummary() + "  " + GLYPH.separator + "  " + (displayText(props.model.sessionResult.message) || "Auto-updating");
+    const parts = [sync(), update()].filter((part): part is { text: string; ok: boolean } => !!part);
+    const quiet = [first, ...parts.filter((part) => part.ok).map((part) => part.text)].join("  " + GLYPH.separator + "  ");
+    return [{ text: clip(displayText(quiet, 2000), width), ok: !props.model.stateError }, ...parts.filter((part) => !part.ok).map((part) => ({ text: displayText(part.text, width), ok: false }))];
+  });
 
   const input = createMemo(() => { props.revision(); return props.model.input ? { ...props.model.input } : undefined; });
   const confirm = createMemo(() => { props.revision(); return props.model.confirm ? { ...props.model.confirm } : undefined; });
@@ -131,13 +140,12 @@ export function TerminalApp(props: TerminalAppProps) {
   const truecolor = () => props.truecolor ?? detected();
   const burn = new TokenBurn();
   const overlay = createMemo(() => { props.revision(); return props.model.overlay; });
-  /** Seats per state for the team title: the owner sees at once how many run, wait, need them or failed. */
-  const teamCounts = createMemo(() => {
-    props.revision();
-    const counts = new Map<HubState, number>();
-    for (const item of team()?.seats ?? []) { const state = seatState(props.model, item); counts.set(state, (counts.get(state) ?? 0) + 1); }
-    return (["running", "waiting", "needs", "failed", "idle"] as HubState[]).filter((state) => counts.get(state)).map((state) => HUB_STATE[state].icon + " " + counts.get(state) + " " + HUB_STATE[state].word).join(" · ");
-  });
+  /** Seats per state for the seats title: the owner sees at once how many run, wait, need them or failed. */
+  const teamCounts = createMemo(() => { props.revision(); return stateCounts(props.model, team()?.seats ?? []); });
+  /** Content width inside the page's side padding. */
+  const contentWidth = () => Math.max(20, dimensions().width - 3);
+  /** One column on the right stays free for the scroll bar, so it never covers a row's last character. */
+  const scrollContent = { paddingRight: 1 };
 
   let teamScroll: ScrollBoxRenderable | undefined;
   let detailScroll: ScrollBoxRenderable | undefined;
@@ -167,7 +175,7 @@ export function TerminalApp(props: TerminalAppProps) {
     else props.model.focusAt(region, seatId);
   };
   const focusedRegion = createMemo(() => { props.revision(); return page() === "seat" ? props.model.focus : undefined; });
-  const regionBorder = (region: FocusRegion) => focusedRegion() === region ? theme.accent : theme.border;
+  const regionBorder = (region: FocusRegion) => focusedRegion() === region ? theme.accent : theme.rule;
   const paneMode = createMemo<PaneMode>(() => {
     props.revision();
     const model = props.model;
@@ -188,7 +196,7 @@ export function TerminalApp(props: TerminalAppProps) {
   const seatDetail = () => {
     props.revision();
     const selected = seat();
-    if (!selected) return <text fg={theme.muted}>Select a seat to inspect its runtime.</text>;
+    if (!selected) return <text fg={theme.dim}>Select a seat to inspect its runtime.</text>;
     const state = occupancy(props.model, selected);
     const hub = seatState(props.model, selected);
     const connected = props.model.sessionResult.connection === "connected";
@@ -200,59 +208,72 @@ export function TerminalApp(props: TerminalAppProps) {
     const held = live?.assignment;
     const facts = held?.facts;
     const leadUsage = props.model.withLiveUsage(selected.id, sumUsage(sessions.map((session) => session.usage)), sessions.map((session) => session.sessionId));
-    const liveNote = props.model.liveUsage[selected.id] ? " · includes the run in progress" : "";
+    const running = props.model.liveUsage[selected.id];
+    const usage = isDeveloper(selected) ? props.model.withLiveUsage(selected.id, facts?.usage, facts?.sessionIds ?? []) : leadUsage;
+    const sep = "  " + GLYPH.separator + "  ";
     return (
-      <box flexDirection="column" flexShrink={0} paddingLeft={1} paddingRight={1} backgroundColor={theme.panel}>
-        <text>
-          <span style={{ fg: theme.heading }}>{displayText(selected.displayName)}  @{displayText(selected.handle)}</span>
-          <span style={{ fg: theme.muted }}>{" · Role: " + displayText(selected.roles.join(", ") || "none") + " · "}</span>
-          <span style={{ fg: stateColor(hub, pulse()) }}>{HUB_STATE[hub].icon + " " + HUB_STATE[hub].word.toUpperCase()}</span>
+      <box flexDirection="column" flexShrink={0}>
+        <text flexShrink={0}>
+          <span style={{ fg: stateColor(hub, pulse()) }}>{"  " + HUB_STATE[hub].glyph + " "}</span>
+          <span style={{ fg: theme.text }}>{displayText(selected.displayName) + "  @" + displayText(selected.handle)}</span>
+          <span style={{ fg: theme.dim }}>{sep + displayText(selected.roles.join(", ") || "no role") + sep}</span>
+          <span style={{ fg: stateColor(hub, pulse()) }}>{HUB_STATE[hub].word}</span>
         </text>
         <Show when={live}>
-          <text fg={processColor[live!.process]}>Process: {live!.process}{live!.updatePending ? " · update pending (restarts when idle)" : ""}{isDeveloper(selected) ? " (seat runner)" : " (planning bridge)"}  ·  s restart  ·  x stop</text>
-          <Show when={live!.problem}><text fg={stateColor("failed", pulse())} wrapMode="word">⚠ {displayText(live!.problem, 300)}</text></Show>
+          <FieldText label="process" value={live!.process + (live!.updatePending ? " · update pending (restarts when idle)" : "") + (isDeveloper(selected) ? " (seat runner)" : " (planning bridge)") + sep + "s restart" + sep + "x stop"}
+            glyph={live!.process === "running" ? undefined : GLYPH.state.failed} glyphColor={processColor[live!.process]} />
+          <Show when={live!.problem}><FieldText label="problem" value={displayText(live!.problem, 300)} glyph={GLYPH.warn} glyphColor={stateColor("failed", pulse())} /></Show>
         </Show>
-        <text fg={theme.heading}>🤖 {live?.harness ? `${live.harness.engine === "claude" ? "Claude" : "Codex"} · model ${displayText(live.harness.model, 40)} · effort ${displayText(live.harness.effort, 20)}` : harnessText(undefined)}</text>
-        <Show when={!isDeveloper(selected)}><text fg={theme.accent}>🧮 Planning: {usageLine(leadUsage) + liveNote}</text></Show>
+        <FieldText label="harness" value={live?.harness ? `${live.harness.engine === "claude" ? "Claude" : "Codex"} · model ${displayText(live.harness.model, 40)} · effort ${displayText(live.harness.effort, 20)}` : "unknown"} />
+        <Field label="tokens">
+          <text flexShrink={1} flexGrow={1}>
+            <UsageSpans usage={usage} context={running?.context} compactedAt={running?.compactedAt} now={now} />
+            <span style={{ fg: theme.dim }}>{running ? sep + "includes the run in progress" : ""}</span>
+          </text>
+        </Field>
+        <FieldText label="burn" value={burnSparkline(seatInfo(props.model, selected), selected.id, now(), burn) + "  last hour"} color={theme.dim} />
         <Show when={live && isDeveloper(selected)}>
-          <text fg={theme.regular} wrapMode="word">Assignment: {assignmentLine(live!, 160)}</text>
+          <FieldText label="assignment" value={assignmentLine(live!, 160)} />
           <Show when={held}>
-            <box flexDirection="row" height={1} flexShrink={0}>
-              <text flexShrink={0}>{"   "}</text>
-              <LinkText url={held?.prUrl} label={held?.prUrl ? "🐙 " + (prLabel(held?.prUrl, true) ?? "PR") : "PR not opened"} open={open} />
-              <text flexShrink={0} fg={theme.muted}>{facts?.ci ? " · " + CI_DOT[facts.ci] + " CI " + facts.ci : ""}</text>
-            </box>
-            <text fg={theme.muted}>{"   " + (facts?.sessions ?? 0) + " sessions · ⌛ " + elapsedText(facts ?? {}, now()) + " on this task"}</text>
-            <PipelineLabels steps={pipelineSteps({ status: held!.status, step: facts?.step, fixRounds: facts?.fixRounds })} pulse={pulse} />
-            <text fg={theme.accent}>🧮 {usageLine(props.model.withLiveUsage(selected.id, facts?.usage, facts?.sessionIds ?? [])) + liveNote}</text>
+            <Field label="pr">
+              <LinkText url={held?.prUrl} label={held?.prUrl ? prText(held?.prUrl, true) : "not opened"} open={open} />
+              <text flexShrink={1} flexGrow={1} wrapMode="word">
+                <span style={{ fg: theme.dim }}>{facts?.ci ? sep : ""}</span>
+                <span style={{ fg: facts?.ci ? CI_COLOR[facts.ci] : theme.dim }}>{facts?.ci ? GLYPH.ci + " " : ""}</span>
+                <span style={{ fg: theme.dim }}>{(facts?.ci ? "CI " + facts.ci : "") + sep + (facts?.sessions ?? 0) + " sessions" + sep + elapsedText(facts ?? {}, now()) + " on this task"}</span>
+              </text>
+            </Field>
+            <Field label="steps"><PipelineLabels steps={pipelineSteps({ status: held!.status, step: facts?.step, fixRounds: facts?.fixRounds })} pulse={pulse} /></Field>
           </Show>
-          <Show when={live!.retry}><text fg={stateColor("needs", pulse())}>🙋 T retries {displayText(live!.retry?.goalId, 40)}/{displayText(live!.retry?.outcomeId, 40)}: {displayText(live!.retry?.title, 120)} (confirm first)</text></Show>
-          <text fg={theme.muted}>💬 {threadActivity(live!, 300)}{live!.activity ? "  (" + displayText(live!.activity.at) + ")" : ""}</text>
+          <Show when={live!.retry}>
+            <FieldText label="retry" value={`T retries ${displayText(live!.retry?.goalId, 40)}/${displayText(live!.retry?.outcomeId, 40)}: ${displayText(live!.retry?.title, 120)} (confirm first)`}
+              glyph={GLYPH.state.needs} glyphColor={stateColor("needs", pulse())} />
+          </Show>
+          <FieldText label="latest" value={threadActivity(live!, 300) + (live!.activity ? "  (" + displayText(live!.activity.at) + ")" : "")} />
         </Show>
-        <text fg={state.color}>{state.label}</text>
+        <FieldText label="session" value={state.label} color={state.color} />
         <Show when={!connected}>
-          <text fg={theme.idle}>{displayText(props.model.sessionResult.message) || "Session reader unavailable."}</text>
+          <FieldText label="reader" value={displayText(props.model.sessionResult.message) || "Session reader unavailable."} color={theme.wait} />
         </Show>
         <For each={sessions}>{(session) => (
           <box flexDirection="column" flexShrink={0}>
-            <text fg={theme.accent} wrapMode="word">Planning goal: {displayText(session.goal, 160)}</text>
-            <text fg={theme.regular} wrapMode="word">Planning detail: {displayText(session.stage)}  ·  {connected ? "" : "Last "}{engineLabel(session.engine)} session: {displayText(session.sessionId) || "not started"}  ·  {session.runs ?? 0} runs · 🧮 Σ{formatTokens(totalTokens(session.usage))}  ·  updated {displayText(session.updatedAt) || "not reported"}</text>
+            <FieldText label="goal" value={displayText(session.goal, 160)} />
+            <FieldText label="detail" value={displayText(session.stage) + sep + (connected ? "" : "Last ") + engineLabel(session.engine) + " session: " + (displayText(session.sessionId) || "not started")
+              + sep + (session.runs ?? 0) + " runs" + sep + "work " + formatTokens(workTokens(session.usage)) + sep + "updated " + (displayText(session.updatedAt) || "not reported")} />
             <Show when={session.id === props.model.clarifyingGoal()?.id}>
-              <text fg={stateColor("needs", pulse())}>🙋 P requests Chick's proposal here, or react :memo: on the goal post</text>
+              <FieldText label="proposal" value="P requests Chick's proposal here, or react :memo: on the goal post" glyph={GLYPH.state.needs} glyphColor={stateColor("needs", pulse())} />
             </Show>
             <Show when={session.id === props.model.reviewGoal()?.id}>
-              <text fg={stateColor("needs", pulse())}>🙋 A approves it here, or react :white_check_mark: on its proposal post</text>
+              <FieldText label="approval" value="A approves it here, or react :white_check_mark: on its proposal post" glyph={GLYPH.state.needs} glyphColor={stateColor("needs", pulse())} />
             </Show>
-            <text fg={connected && session.attach ? theme.running : theme.muted}>
-              Live session: {connected && session.attach ? "shown above · i or a click on it drives" : "not available"}
-            </text>
-            <Show when={session.recentActivity.length} fallback={<text fg={theme.muted}>No runtime activity recorded.</text>}>
-              <For each={session.recentActivity.slice(0, 3)}>{(activity) => <text fg={theme.regular}>• {displayText(activity, 160)}</text>}</For>
+            <FieldText label="live" value={connected && session.attach ? "shown above · i or a click on it drives" : "not available"} color={connected && session.attach ? theme.text : theme.dim} />
+            <Show when={session.recentActivity.length} fallback={<FieldText label="activity" value="No runtime activity recorded." color={theme.dim} />}>
+              <For each={session.recentActivity.slice(0, 3)}>{(activity, index) => <FieldText label={index() ? "" : "activity"} value={GLYPH.bullet + " " + displayText(activity, 160)} />}</For>
             </Show>
           </box>
         )}</For>
         <Show when={connected && !sessions.some((session) => !!session.sessionId)}>
-          <text fg={theme.muted}>No active runtime session occupies this seat.</text>
+          <FieldText label="" value="No active runtime session occupies this seat." color={theme.dim} />
         </Show>
       </box>
     );
@@ -268,45 +289,54 @@ export function TerminalApp(props: TerminalAppProps) {
     <box flexGrow={1} flexDirection="column" paddingLeft={1} paddingRight={1} onMouseDown={focus(undefined)}>
       <box flexShrink={0} flexDirection="column">
         <HeaderBar frame={frame} drifting={sprintRunning} truecolor={truecolor()}>
-          <text fg={theme.barText} flexGrow={1}>{" 💠 INDRA  ›  " + (page() === "teams" ? "Teams" : displayText(team()?.displayName, 30)) + (page() === "seat" && seat() ? "  ›  " + displayText(seat()?.displayName, 30) : "")}</text>
-          <text fg={runtime().color} flexShrink={0}>{runtime().text + " "}</text>
+          <text flexGrow={1}>
+            <span style={{ fg: theme.accent }}>{" INDRA"}</span>
+            <span style={{ fg: theme.text }}>{"  " + GLYPH.crumb + "  " + (page() === "teams" ? "Teams" : displayText(team()?.displayName, 30)) + (page() === "seat" && seat() ? "  " + GLYPH.crumb + "  " + displayText(seat()?.displayName, 30) : "")}</span>
+          </text>
+          <text flexShrink={0}>
+            <span style={{ fg: runtime().color }}>{GLYPH.dot + " "}</span>
+            <span style={{ fg: theme.dim }}>{runtime().text + " "}</span>
+          </text>
         </HeaderBar>
-        <text fg={props.model.stateError ? theme.error : theme.muted}>
-          {displayText(stateSummary() + "  ·  " + (displayText(props.model.sessionResult.message) || "Auto-updating"), Math.max(20, dimensions().width - 3))}
-        </text>
-        <Show when={sync()}><text fg={sync()?.ok ? theme.muted : theme.error}>{displayText(sync()?.text, Math.max(20, dimensions().width - 3))}</text></Show>
-        <Show when={update()}><text fg={update()?.ok ? theme.muted : theme.error}>{displayText(update()?.text, Math.max(20, dimensions().width - 3))}</text></Show>
+        <For each={statusRows()}>{(row) => <text fg={row.ok ? theme.dim : theme.bad}>{row.text}</text>}</For>
       </box>
 
       <Show when={page() === "teams"}>
-        <scrollbox flexGrow={1} scrollY>
-          <Show when={props.model.teams.length} fallback={<text fg={theme.idle}>{props.model.stateError ? "No usable team state is available." : "No teams are recorded."}</text>}>
-            <For each={props.model.teams}>{(item) => {
-              const selected = () => { props.revision(); return props.model.teamId === item.id; };
-              const occupied = () => { props.revision(); return props.model.sessionResult.connection === "connected"
-                ? item.seats.filter((member) => props.model.sessionResult.sessions.some((session) => session.teamId === item.id && session.seatId === member.id && session.sessionId)).length.toString()
-                : "unknown"; };
-              return (
-                <box height={2} flexShrink={0} flexDirection="column" paddingLeft={1} backgroundColor={selected() ? theme.selected : theme.panel}>
-                  <text fg={selected() ? theme.accent : theme.regular}>{selected() ? "▶ " : "  "}👥 {displayText(item.displayName)}  ({displayText(item.slug)})</text>
-                  <text fg={theme.muted}>{"     "}{item.seats.length} stable seats  ·  {occupied()} with runtime sessions{item.project ? "  ·  🐙 " + displayText(item.project.github, 60) : ""}</text>
-                </box>
-              );
-            }}</For>
-          </Show>
+        <scrollbox flexGrow={1} scrollY contentOptions={scrollContent}>
+          <Section title="TEAMS">
+            <Show when={props.model.teams.length} fallback={<text fg={theme.wait}>{props.model.stateError ? "No usable team state is available." : "No teams are recorded."}</text>}>
+              <For each={props.model.teams}>{(item) => {
+                const selected = () => { props.revision(); return props.model.teamId === item.id; };
+                const occupied = () => { props.revision(); return props.model.sessionResult.connection === "connected"
+                  ? item.seats.filter((member) => props.model.sessionResult.sessions.some((session) => session.teamId === item.id && session.seatId === member.id && session.sessionId)).length.toString()
+                  : "unknown"; };
+                return (
+                  <text flexShrink={0} bg={selected() ? theme.selected : undefined}>
+                    <span style={{ fg: theme.accent }}>{selected() ? GLYPH.selected + "   " : "    "}</span>
+                    <span style={{ fg: selected() ? theme.accent : theme.text }}>{pad(clip(displayText(item.displayName, 30) + "  (" + displayText(item.slug, 30) + ")", 24), 24) + " "}</span>
+                    <span style={{ fg: theme.dim }}>{item.seats.length + " seats  " + GLYPH.separator + "  " + occupied() + " in a session" + (item.project ? "  " + GLYPH.separator + "  " : "")}</span>
+                    <span style={{ fg: theme.text }}>{item.project ? clip(GLYPH.pr + " " + displayText(item.project.github, 60), 30) : ""}</span>
+                  </text>
+                );
+              }}</For>
+            </Show>
+          </Section>
         </scrollbox>
       </Show>
 
       <Show when={page() === "team" && !!team()}>
-        <scrollbox id="team-scroll" ref={teamScroll} flexGrow={1} scrollY>
-          <box flexDirection="column" flexShrink={0} border borderColor={theme.border} title={" 👥 " + displayText(team()?.displayName ?? "Team", 30) + " · " + (team()?.seats.length ?? 0) + " STABLE SEATS " + (teamCounts() ? "· " + teamCounts() + " " : "")} titleColor={theme.accent}>
-            <Show when={team()?.seats.length} fallback={<text fg={theme.idle}>No seats are recorded for this team.</text>}>
-              <For each={team()?.seats ?? []}>{(item) => <SeatRow model={props.model} seat={item} revision={props.revision} pulse={pulse} now={now} width={() => dimensions().width - 5} open={open} burn={burn} truecolor={truecolor()} />}</For>
+        <scrollbox id="team-scroll" ref={teamScroll} flexGrow={1} scrollY contentOptions={scrollContent}>
+          <AttentionSection model={props.model} seats={team()?.seats ?? []} revision={props.revision} pulse={pulse} width={contentWidth} />
+          <For each={sprints()}>{(sprint) => <SprintCard model={props.model} sprint={sprint} team={team()} session={sessionOf(sprint.id)} pulse={pulse} now={now} width={contentWidth} open={open} truecolor={truecolor()} />}</For>
+          <Section title={"SEATS " + GLYPH.separator + " " + displayText(team()?.displayName ?? "Team", 30) + " " + GLYPH.separator + " " + (team()?.seats.length ?? 0) + (teamCounts() ? "   " + teamCounts() : "")}>
+            <Show when={team()?.seats.length} fallback={<text fg={theme.wait}>No seats are recorded for this team.</text>}>
+              <SeatHeader width={contentWidth} />
+              <For each={team()?.seats ?? []}>{(item) => <SeatRow model={props.model} seat={item} revision={props.revision} pulse={pulse} now={now} width={contentWidth} open={open} burn={burn} truecolor={truecolor()} />}</For>
             </Show>
-          </box>
-          <For each={sprints()}>{(sprint) => <SprintCard model={props.model} sprint={sprint} team={team()} session={sessionOf(sprint.id)} pulse={pulse} now={now} open={open} truecolor={truecolor()} />}</For>
+          </Section>
+          <ActivitySection model={props.model} seats={team()?.seats ?? []} revision={props.revision} now={now} width={contentWidth} />
           <Show when={splash()}>
-            <IdleSplash frame={frame} width={() => dimensions().width - 2} truecolor={truecolor()} background={theme.background} caption="No sprint open" captionColor={theme.muted} />
+            <IdleSplash frame={frame} width={contentWidth} truecolor={truecolor()} background={theme.background} caption="No sprint open" captionColor={theme.dim} />
           </Show>
         </scrollbox>
       </Show>
@@ -319,9 +349,9 @@ export function TerminalApp(props: TerminalAppProps) {
               const state = () => { props.revision(); return seatState(props.model, item); };
               return (
                 <box height={1} flexShrink={0} backgroundColor={selected() ? theme.selected : undefined} onMouseDown={focus("seats", item.id)}>
-                  <text>
-                    <span style={{ fg: stateColor(state(), pulse()) }}>{HUB_STATE[state()].icon + " "}</span>
-                    <span style={{ fg: selected() ? theme.accent : theme.regular }}>{displayText(item.displayName, SEAT_LIST_WIDTH - 6)}</span>
+                  <text wrapMode="none">
+                    <span style={{ fg: stateColor(state(), pulse()) }}>{HUB_STATE[state()].glyph + " "}</span>
+                    <span style={{ fg: selected() ? theme.accent : theme.text }}>{displayText(item.displayName, SEAT_LIST_WIDTH - 6)}</span>
                   </text>
                 </box>
               );
@@ -333,34 +363,39 @@ export function TerminalApp(props: TerminalAppProps) {
                 onFocus={() => (props.onFocus ?? ((region: FocusRegion | undefined) => props.model.focusAt(region)))("session")}
                 onScroll={(lines) => props.onSessionScroll ? props.onSessionScroll(lines) : props.model.scrollSession(lines)} intervalMs={props.mirrorMs} />
             </Show>
-            <scrollbox id="detail-scroll" ref={detailScroll} flexGrow={2} scrollY border borderColor={regionBorder("details")} title=" 🪑 SEAT DETAIL " titleColor={theme.accent} onMouseDown={focus("details")}>
+            <scrollbox id="detail-scroll" ref={detailScroll} flexGrow={2} scrollY border borderColor={regionBorder("details")} title={" SEAT " + displayText(seat()?.displayName, 40) + " "} titleColor={theme.accent} onMouseDown={focus("details")} contentOptions={scrollContent}>
               {seatDetail()}
             </scrollbox>
-            <scrollbox id="sprint-scroll" ref={sprintScroll} flexGrow={1} scrollY border borderColor={regionBorder("sprints")} title=" SPRINTS " titleColor={theme.accent} onMouseDown={focus("sprints")}>
-              <For each={sprints()} fallback={<text fg={theme.muted}>No open sprint.</text>}>{(sprint) => <SprintStrip sprint={sprint} team={team()} session={sessionOf(sprint.id)} pulse={pulse} open={open} />}</For>
+            <scrollbox id="sprint-scroll" ref={sprintScroll} flexGrow={1} scrollY border borderColor={regionBorder("sprints")} title=" SPRINTS " titleColor={theme.accent} onMouseDown={focus("sprints")} contentOptions={scrollContent}>
+              <For each={sprints()} fallback={<text fg={theme.dim}>No open sprint.</text>}>{(sprint) => <SprintStrip sprint={sprint} team={team()} session={sessionOf(sprint.id)} pulse={pulse} open={open} />}</For>
             </scrollbox>
           </box>
         </box>
       </Show>
 
-      <box flexShrink={0} flexDirection="column">
-        <Show when={newGoalHint()}><text fg={theme.idle} wrapMode="word">{displayText(newGoalHint(), 240)}</text></Show>
-        <Show when={launchWarning()}><text fg={stateColor("failed", pulse())} wrapMode="word">⚠ {displayText(launchWarning())}</text></Show>
-        <Show when={notice()}><text fg={theme.idle} wrapMode="word">{displayText(notice())}</text></Show>
+      <box flexShrink={0} flexDirection="column" border={["top"]} borderColor={theme.rule}>
+        <Show when={newGoalHint()}><text fg={theme.dim} wrapMode="word">{displayText(newGoalHint(), 240)}</text></Show>
+        <Show when={launchWarning()}>
+          <text wrapMode="word"><span style={{ fg: stateColor("failed", pulse()) }}>{GLYPH.warn + " "}</span><span style={{ fg: theme.text }}>{displayText(launchWarning())}</span></text>
+        </Show>
+        <Show when={notice()}><text fg={theme.text} wrapMode="word">{displayText(notice())}</text></Show>
         <Show when={input()}>
-          <text fg={theme.muted}>{inputLine()}</text>
-          <text fg={theme.heading} wrapMode="char">
+          <text fg={theme.dim}>{inputLine()}</text>
+          <text fg={theme.accent} wrapMode="char">
             New planning goal: {goalInputTail(input()?.value ?? "", dimensions().width)}▏
           </text>
-          <text fg={theme.muted}>
+          <text fg={theme.dim}>
             {(input()?.value.length ?? 0) >= GOAL_INPUT_LIMIT ? `Limit reached (${GOAL_INPUT_LIMIT} characters); extra characters are ignored.` : `${input()?.value.length ?? 0}/${GOAL_INPUT_LIMIT}`}
           </text>
         </Show>
         <Show when={confirm()}>
-          <text fg={stateColor("needs", pulse())} wrapMode="word">{confirmText(confirm()!, dimensions().width)}{confirm()?.action === "retry" ? " · n/Esc cancel" : " · any other key cancels"}</text>
+          <text wrapMode="word">
+            <span style={{ fg: stateColor("needs", pulse()) }}>{GLYPH.state.needs + " "}</span>
+            <span style={{ fg: theme.text }}>{confirmText(confirm()!, dimensions().width) + (confirm()?.action === "retry" ? " · n/Esc cancel" : " · any other key cancels")}</span>
+          </text>
         </Show>
         <Show when={!props.model.drivingOn() && (page() === "teams" || page() === "team")}>
-          <text fg={theme.muted}>{paused() ? "Auto-update paused · U resumes" : "Auto-update on · U pauses"} · r checks now · R rolls back · q quits, seats keep running</text>
+          <KeyLegend line={(paused() ? "Auto-update paused · U resumes" : "Auto-update on · U pauses") + " · r checks now · R rolls back · q quits, seats keep running"} />
         </Show>
       </box>
       <Show when={overlay() === "help"}><HelpOverlay /></Show>
@@ -376,12 +411,12 @@ export function TerminalApp(props: TerminalAppProps) {
 /** The always-visible bar of the keys that apply right now; it turns the driving colour while the owner drives. */
 export function ShortcutBar(props: { shortcuts: Accessor<Shortcut[]>; driving: Accessor<boolean> }) {
   return (
-    <box id="shortcut-bar" flexShrink={0} flexDirection="row" flexWrap="wrap" paddingLeft={1} paddingRight={1} backgroundColor={props.driving() ? "#7C2D12" : theme.bar}>
+    <box id="shortcut-bar" flexShrink={0} flexDirection="row" flexWrap="wrap" paddingLeft={1} paddingRight={1} backgroundColor={theme.selected}>
       <For each={props.shortcuts()}>{([key, meaning], index) => (
         <text flexShrink={0}>
-          <span style={{ fg: theme.barText }}>{index() ? " · " : ""}</span>
-          <span style={{ fg: props.driving() ? "#FDBA74" : theme.accent }}>{key ? key + " " : ""}</span>
-          <span style={{ fg: theme.barText }}>{meaning}</span>
+          <span style={{ fg: theme.dim }}>{index() ? " " + GLYPH.separator + " " : ""}</span>
+          <span style={{ fg: props.driving() ? theme.wait : theme.accent }}>{key ? key + " " : ""}</span>
+          <span style={{ fg: theme.dim }}>{meaning}</span>
         </text>
       )}</For>
     </box>

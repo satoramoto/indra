@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { ansiToLines, applySgr, color256, lineText } from "../src/ansi-lines.js";
 import { KeyForwarder, MIN_MIRROR_MS, MirrorPoller, sendKeysArgs, tmuxKey, TmuxSeatSession, type DriveResult, type MirrorFrame, type MirrorSeat, type MirrorTimers, type SessionPort, type TmuxKey } from "../src/session-mirror.js";
 import { SessionDriver } from "../src/session-drive.js";
-import { classifyPaneLine, styledLine } from "../src/session-pane.js";
+import { classifyPaneLine, PANE_COLOR, PANE_LINE_COLOR, styledLine } from "../src/session-pane.js";
 import { shortcutContext, shortcutsFor, shortcutText } from "../src/shortcuts.js";
 import { headedMarkerFile } from "../src/headed-session.js";
 import { TmuxHost, type TmuxRunner } from "../src/tmux-host.js";
@@ -49,10 +49,10 @@ describe("mirroring a pane's colours", () => {
 
   it("draws styled spans with their own colours, and colours an unstyled progress line by its mark", () => {
     expect(styledLine([{ text: "x", style: { fg: "#CD3131", bold: true } }, { text: "y", style: {} }])).toEqual([
-      { text: "x", style: { fg: "#CD3131", bold: true } }, { text: "y", style: { fg: "#E5E7EB" } },
+      { text: "x", style: { fg: "#CD3131", bold: true } }, { text: "y", style: { fg: PANE_COLOR.text } },
     ]);
     expect(styledLine([{ text: "12:34 $ ✓ git status", style: {} }])).toEqual([
-      { text: "12:34 ", style: { fg: "#6B7280" } }, { text: "$ ✓ git status", style: { fg: "#FDBA74" } },
+      { text: "12:34 ", style: { fg: PANE_LINE_COLOR.time } }, { text: "$ ✓ git status", style: { fg: PANE_LINE_COLOR.git } },
     ]);
     expect(classifyPaneLine("12:34 ! turn failed").kind).toBe("fail");
     expect(classifyPaneLine("plain").kind).toBe("plain");

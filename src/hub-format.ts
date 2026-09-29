@@ -1,14 +1,14 @@
 import type { TokenUsage } from "./runtime-facts.js";
 
 /**
- * Pure presentation helpers for the terminal UI hub: pipeline icons, token and time formatting, and link building.
+ * Pure presentation helpers for the terminal UI hub: pipeline states, token and time formatting, and link building.
+ * Glyphs and colours live in `hub-style.ts`.
  * Nothing here reads files or the network; the inputs are Indra's recorded facts.
  */
 
 /** An assignment's pipeline, in order. */
 export const PIPELINE = ["build", "review", "fix", "ci", "merge"] as const;
 export type PipelineStage = typeof PIPELINE[number];
-export const PIPELINE_ICON: Record<PipelineStage, string> = { build: "🔨", review: "🔍", fix: "🩹", ci: "🧪", merge: "🔀" };
 /** `skipped` is a fix round that was never needed; `failed` is where a failed assignment stopped. */
 export type StageState = "done" | "active" | "pending" | "skipped" | "failed";
 export interface PipelineStep { stage: PipelineStage; state: StageState }
@@ -40,7 +40,6 @@ export function pipelineSteps(input: { status: string; step?: string; fixRounds?
 
 /** CI as recorded in the implementation ledger: the newest CI event of the newest attempt. */
 export type CiState = "passed" | "pending" | "failed";
-export const CI_DOT: Record<CiState, string> = { passed: "🟢", pending: "🟡", failed: "🔴" };
 
 /** 950 · 12.3k · 1.25M · 3.1B; unknown counters show as an en dash. */
 export function formatTokens(value: number | undefined): string {
@@ -82,10 +81,44 @@ export function totalTokens(usage: TokenUsage | undefined): number | undefined {
   return (input ?? 0) + (usage.outputTokens ?? 0);
 }
 
-/** `in 1.2M · cached 980k · out 45k · Σ 1.25M tok`, the same shape for a seat and a sprint. */
+/**
+ * Input that was not a cache re-read. Codex's input includes cached input, so it is input − cached; Claude's inclusive
+ * input is uncached + cache writes + cache reads, so the same subtraction leaves `input_tokens + cache_creation_input_tokens`.
+ */
+export function freshInputTokens(usage: TokenUsage | undefined): number | undefined {
+  if (!usage) return undefined;
+  if (usage.inputTokens !== undefined) return Math.max(0, usage.inputTokens - (usage.cachedInputTokens ?? 0));
+  return usage.uncachedInputTokens !== undefined ? usage.uncachedInputTokens + (usage.cacheWriteInputTokens ?? 0) : undefined;
+}
+
+/** Fresh work, the headline figure: fresh input plus output (reasoning included). Cache re-reads are left out. */
+export function workTokens(usage: TokenUsage | undefined): number | undefined {
+  const fresh = freshInputTokens(usage);
+  if (fresh === undefined && usage?.outputTokens === undefined) return undefined;
+  return (fresh ?? 0) + (usage?.outputTokens ?? 0);
+}
+
+/** `work 240k · out 38k · cache 9.1M`, the same shape for a seat, a ticket and a sprint. */
 export function usageLine(usage: TokenUsage | undefined): string {
   if (!usage) return "no tokens recorded yet";
-  return `in ${formatTokens(usage.inputTokens)} · cached ${formatTokens(usage.cachedInputTokens)} · out ${formatTokens(usage.outputTokens)} · Σ ${formatTokens(totalTokens(usage))} tok`;
+  return `work ${formatTokens(workTokens(usage))} · out ${formatTokens(usage.outputTokens)} · cache ${formatTokens(usage.cachedInputTokens)}`;
+}
+
+/** The share of the context cap above which the window shows as a warning. */
+export const CONTEXT_WARN_SHARE = 0.8;
+
+/** `ctx 182k/300k`; undefined without a live session's window. */
+export function contextText(context: number | undefined, limit: number): string | undefined {
+  return context === undefined ? undefined : `ctx ${formatTokens(context)}/${formatTokens(limit)}`;
+}
+
+/** How long a compaction stays noted on the hub. */
+export const COMPACTION_NOTE_MS = 5 * 60_000;
+
+/** `compacted 2m ago` while a compaction is recent, else undefined. */
+export function compactionNote(compactedAt: string | undefined, now: number): string | undefined {
+  const since = elapsedSince(compactedAt, now);
+  return since !== undefined && since < COMPACTION_NOTE_MS ? "compacted " + formatElapsed(since) + " ago" : undefined;
 }
 
 /** 45s · 12m · 2h05m · 3d04h. */

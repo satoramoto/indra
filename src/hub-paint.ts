@@ -3,6 +3,8 @@
  * sprint progress bar, braille token sparklines and the 256-colour fallback. Nothing here touches the renderer.
  */
 
+import { PALETTE } from "./hub-style.js";
+
 export type Rgb = readonly [number, number, number];
 
 export function hexRgb(hex: string): Rgb {
@@ -59,8 +61,11 @@ export function supportsTruecolor(capabilities: { rgb?: boolean } | null | undef
   return /^(truecolor|24bit)$/i.test(env.COLORTERM ?? "");
 }
 
-/** Header bar stops: deep indigo into slate teal and back, dark enough that the bar text stays legible. */
-const HEADER_STOPS: Rgb[] = [hexRgb("#1E1B4B"), hexRgb("#312E81"), hexRgb("#1E3A5F"), hexRgb("#134E4A")];
+/**
+ * Header bar stops: the palette's own dark slates (background, selection, rule), close together so the bar reads as
+ * one calm band and its slow drift is barely there. The bar text stays legible on every stop.
+ */
+const HEADER_STOPS: Rgb[] = [hexRgb(PALETTE.selected), hexRgb("#243247"), hexRgb(PALETTE.rule), hexRgb("#243247")];
 
 /**
  * One colour per column of the header bar. `phase` (0–1, wrapping) slides the gradient sideways; the stops loop, so
@@ -77,10 +82,11 @@ export function headerGradient(width: number, phase: number): Rgb[] {
 }
 
 /** The fill colour of each ceremony stage, and of a closed sprint. */
+/** One colour for an open sprint's bar (the accent) and the ok green for a closed one: no colour per stage. */
 export const STAGE_COLOR: Record<"planning" | "proposal" | "implement" | "release" | "retro" | "closed", string> = {
-  planning: "#818CF8", proposal: "#A78BFA", implement: "#67E8F9", release: "#4ADE80", retro: "#60A5FA", closed: "#4ADE80",
+  planning: PALETTE.accent, proposal: PALETTE.accent, implement: PALETTE.accent, release: PALETTE.accent, retro: PALETTE.accent, closed: PALETTE.ok,
 };
-export const TRACK_COLOR = "#334155";
+export const TRACK_COLOR: string = PALETTE.rule;
 
 /**
  * How far a sprint is through its ceremony, 0–1: each of the five stages is a fifth, and implement fills its fifth as

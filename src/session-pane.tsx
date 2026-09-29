@@ -3,23 +3,25 @@ import { createEffect, createSignal, For, Index, Match, on, onCleanup, onMount, 
 import { PROGRESS_MARK, STATUS, type ProgressKind } from "./codex-progress.js";
 import { lineText, type MirrorLine, type MirrorStyle } from "./ansi-lines.js";
 import { MirrorPoller, type MirrorFrame, type MirrorSeat, type SessionPort } from "./session-mirror.js";
+import { GLYPH, PALETTE } from "./hub-style.js";
 
 /** What a headless progress line is, for colouring. `plain` is anything that isn't a Codex progress line. */
 export type PaneLineKind = Exclude<ProgressKind, "error"> | "git" | "fail" | "plain";
 export interface PaneLine { time?: string; kind: PaneLineKind; text: string }
 
+/** The hub's restrained palette: plain text for the run's words, dim for its asides, red only for a failure. */
 export const PANE_LINE_COLOR: Record<PaneLineKind | "time", string> = {
-  time: "#6B7280",
-  purpose: "#67E8F9",
-  thinking: "#7C8799",
-  agent: "#F9FAFB",
-  command: "#93C5FD",
-  tool: "#93C5FD",
-  git: "#FDBA74",
-  files: "#86EFAC",
-  info: "#9CA3AF",
-  fail: "#FCA5A5",
-  plain: "#E5E7EB",
+  time: PALETTE.dim,
+  purpose: PALETTE.accent,
+  thinking: PALETTE.dim,
+  agent: PALETTE.text,
+  command: PALETTE.text,
+  tool: PALETTE.text,
+  git: PALETTE.text,
+  files: PALETTE.text,
+  info: PALETTE.dim,
+  fail: PALETTE.bad,
+  plain: PALETTE.text,
 };
 
 const KIND_BY_MARK = new Map<string, ProgressKind>(Object.entries(PROGRESS_MARK).map(([kind, mark]) => [mark, kind as ProgressKind]));
@@ -39,7 +41,10 @@ export function classifyPaneLine(line: string): PaneLine {
 }
 
 /** The pane's colours: calm while watching, the accent when focused, and a warm colour while the owner drives. */
-export const PANE_COLOR = { background: "#0B1220", text: "#E5E7EB", border: "#42536B", focused: "#67E8F9", driving: "#FDBA74", title: "#67E8F9", muted: "#9CA3AF", warn: "#FDE68A", error: "#FCA5A5" };
+export const PANE_COLOR = {
+  background: PALETTE.background, text: PALETTE.text, border: PALETTE.rule, focused: PALETTE.accent, driving: PALETTE.wait,
+  title: PALETTE.accent, muted: PALETTE.dim, warn: PALETTE.wait, error: PALETTE.bad,
+};
 
 /** A span to draw: its text, and a style with the foreground always set. */
 export interface DrawSpan { text: string; style: MirrorStyle & { fg: string } }
@@ -106,10 +111,10 @@ export function SessionPane(props: SessionPaneProps) {
   const title = () => {
     const mode = props.mode();
     if (mode === "driving") return ` DRIVING ${name()} — Esc Esc or Tab to stop `;
-    if (mode === "connecting") return ` ${name()} · connecting… `;
+    if (mode === "connecting") return ` ${name()} ${GLYPH.separator} connecting… `;
     const kind = headed() ? `headed ${headed() === "claude" ? "Claude" : "Codex"}` : "progress";
-    const scrolled = props.scroll() ? ` · ${props.scroll()} lines back · End live` : "";
-    return ` LIVE · ${name()} · ${kind} · ${mode === "focused" ? "watching" : "click or i to drive"}${scrolled} `;
+    const scrolled = props.scroll() ? ` ${GLYPH.separator} ${props.scroll()} lines back ${GLYPH.separator} End live` : "";
+    return ` LIVE ${GLYPH.separator} ${name()} ${GLYPH.separator} ${kind} ${GLYPH.separator} ${mode === "focused" ? "watching" : "click or i to drive"}${scrolled} `;
   };
   const border = () => props.mode() === "driving" ? PANE_COLOR.driving : props.mode() === "watching" ? PANE_COLOR.border : PANE_COLOR.focused;
   return (

@@ -1,4 +1,4 @@
-import { createMemo, createSignal, For, onCleanup, Show, type Accessor } from "solid-js";
+import { createMemo, createSignal, For, onCleanup, Show, type Accessor, type JSX } from "solid-js";
 import type { StateSeat, StateTeam } from "./state-domain.js";
 import { currentSession, displayText, newestPlanningRecord, sessionSprint, type TerminalSession, type TerminalSprint, type TerminalUiModel } from "./terminal-ui.js";
 import { CEREMONY_STAGES, engineLabel, type SprintBuild, type SprintLoop, type SprintTicket } from "./session-snapshot.js";
@@ -6,54 +6,58 @@ import type { SeatLive } from "./supervisor.js";
 import type { SeatHarness } from "./hub-facts.js";
 import { isFinishedSprint } from "./finished-sprint.js";
 import {
-  CI_DOT, elapsedSince, formatElapsed, formatTokens, mattermostPostUrl, PIPELINE_ICON, pipelineSteps, prLabel, sumUsage, totalTokens, usageLine,
+  compactionNote, CONTEXT_WARN_SHARE, contextText, elapsedSince, formatElapsed, formatTokens, mattermostPostUrl, pipelineSteps, prLabel, sumUsage, workTokens,
   type CiState, type PipelineStep, type StageState,
 } from "./hub-format.js";
+import { faded, GLYPH, PALETTE, PULSE_MS } from "./hub-style.js";
+import { HARNESS_CONTEXT_TOKEN_LIMIT } from "./harness-home.js";
 import type { TokenUsage } from "./runtime-facts.js";
 import { burnBuckets, paintHex, sparkline, sprintProgress, STAGE_COLOR, type TokenBurn } from "./hub-paint.js";
 import { ProgressBar } from "./hub-canvas.js";
+import { totalTokens } from "./hub-format.js";
 
-const SPARK_COLOR = "#7DD3FC";
+/** Burn is a secondary detail: dim, like the other secondary figures. */
+const SPARK_COLOR = PALETTE.dim;
 
 /**
  * The hub's building blocks. Layout target: a 720×720 logical-pixel window (a vertical ultrawide at half height) with a
  * ~13 px terminal font, about 96 columns by 42 rows. Every screen fits that grid without scrolling; the scroll boxes
  * only matter on smaller terminals.
+ *
+ * Every screen is built from the same parts, in the same order: a section rule with its title, then rows that share
+ * one grid. A row's first four columns are a gutter for the selection and a state glyph; labels and names start at
+ * column four.
  */
 export const HUB_GRID = { columns: 96, rows: 42 } as const;
 
-export const theme = {
-  background: "#0F172A", panel: "#1E293B", selected: "#1E3A5F", bar: "#312E81", barText: "#EEF2FF",
-  border: "#475569", heading: "#E9D5FF", accent: "#67E8F9", regular: "#E5E7EB", muted: "#94A3B8", link: "#93C5FD",
-  running: "#4ADE80", idle: "#FDE68A", error: "#F87171",
-};
+/** The palette under the names the screens use. */
+export const theme = PALETTE;
 
-/** The five states the owner scans for, each with one colour and one icon everywhere. */
+/** The states the owner scans for, each with one glyph and one colour everywhere. */
 export type HubState = "running" | "waiting" | "needs" | "failed" | "done" | "idle";
-export const HUB_STATE: Record<HubState, { icon: string; color: string; dim: string; pulse: boolean; word: string }> = {
-  running: { icon: "🏃", color: "#4ADE80", dim: "#4ADE80", pulse: false, word: "running" },
-  waiting: { icon: "⌛", color: "#FBBF24", dim: "#FBBF24", pulse: false, word: "waiting" },
-  needs: { icon: "🙋", color: "#F472B6", dim: "#9D174D", pulse: true, word: "needs you" },
-  failed: { icon: "💥", color: "#F87171", dim: "#7F1D1D", pulse: true, word: "failed" },
-  done: { icon: "✅", color: "#60A5FA", dim: "#60A5FA", pulse: false, word: "done" },
-  idle: { icon: "💤", color: "#94A3B8", dim: "#94A3B8", pulse: false, word: "idle" },
+export const HUB_STATE: Record<HubState, { glyph: string; color: string; pulse: boolean; word: string }> = {
+  running: { glyph: GLYPH.state.running, color: PALETTE.wait, pulse: false, word: "running" },
+  waiting: { glyph: GLYPH.state.waiting, color: PALETTE.wait, pulse: false, word: "waiting" },
+  needs: { glyph: GLYPH.state.needs, color: PALETTE.bad, pulse: true, word: "needs you" },
+  failed: { glyph: GLYPH.state.failed, color: PALETTE.bad, pulse: true, word: "failed" },
+  done: { glyph: GLYPH.state.done, color: PALETTE.ok, pulse: false, word: "done" },
+  idle: { glyph: GLYPH.state.idle, color: PALETTE.dim, pulse: false, word: "idle" },
 };
-/** The colour of a state at this pulse phase; only needs-you and failed blink. */
-export const stateColor = (state: HubState, pulse: boolean) => pulse && HUB_STATE[state].pulse ? HUB_STATE[state].dim : HUB_STATE[state].color;
+/** The colour of a state at this pulse phase; only what needs the owner (needs you, failed) pulses. */
+export const stateColor = (state: HubState, pulse: boolean) => pulse && HUB_STATE[state].pulse ? faded(HUB_STATE[state].color) : HUB_STATE[state].color;
 
-const STEP_BG: Record<StageState, [string, string]> = {
-  done: ["#14532D", "#14532D"], active: ["#A16207", "#422006"], failed: ["#991B1B", "#450A0A"], pending: ["", ""], skipped: ["", ""],
-};
-const STEP_FG: Record<StageState, string> = { done: "#4ADE80", active: "#FBBF24", failed: "#F87171", pending: "#475569", skipped: "#475569" };
-/** Pending stages are a dim dot and a skipped fix is a dash, so the icons light up as the assignment advances. */
-export const stepGlyph = (step: PipelineStep) => step.state === "pending" ? "◦ " : step.state === "skipped" ? "– " : PIPELINE_ICON[step.stage];
+const STEP_COLOR: Record<StageState, string> = { done: PALETTE.ok, active: PALETTE.wait, failed: PALETTE.bad, pending: PALETTE.dim, skipped: PALETTE.dim };
+/** A stage's colour; the one active stage is the only one that pulses. */
+export const stepColor = (state: StageState, pulse: boolean) => pulse && state === "active" ? faded(STEP_COLOR.active) : STEP_COLOR[state];
+export const stepGlyph = (step: PipelineStep) => GLYPH.stage[step.state];
+export const CI_COLOR: Record<CiState, string> = { passed: PALETTE.ok, pending: PALETTE.wait, failed: PALETTE.bad };
 
 /**
- * One timer for every blinking thing: it flips a signal that only style attributes read, so a tick recolours existing
+ * One timer for the pulse: it flips a signal that only style attributes read, so a tick recolours existing
  * renderables and never rebuilds the tree (the lesson of #52: rebuilding creates native renderables faster than they
  * are freed). The clock ticks slower and only feeds elapsed-time text.
  */
-export function createTicker(pulseMs = 700, clockMs = 15_000): { pulse: Accessor<boolean>; now: Accessor<number> } {
+export function createTicker(pulseMs = PULSE_MS, clockMs = 15_000): { pulse: Accessor<boolean>; now: Accessor<number> } {
   const [pulse, setPulse] = createSignal(false);
   const [now, setNow] = createSignal(Date.now());
   const pulseTimer = setInterval(() => setPulse((value) => !value), pulseMs);
@@ -63,18 +67,78 @@ export function createTicker(pulseMs = 700, clockMs = 15_000): { pulse: Accessor
   return { pulse, now };
 }
 
+/** Five one-column glyphs, build to merge: ■ done, ◧ active, □ pending, ─ skipped, ✗ failed. */
 export function Pipeline(props: { steps: PipelineStep[]; pulse: Accessor<boolean> }) {
-  return <For each={props.steps}>{(step) => (
-    <span style={{ fg: STEP_FG[step.state], bg: STEP_BG[step.state][props.pulse() && step.state !== "done" ? 1 : 0] || undefined }}>{stepGlyph(step)}</span>
-  )}</For>;
+  return <For each={props.steps}>{(step) => <span style={{ fg: stepColor(step.state, props.pulse()) }}>{stepGlyph(step)}</span>}</For>;
 }
 
 /** A link: an OSC 8 hyperlink where the terminal supports one, and a click that opens it with the system opener. */
 export function LinkText(props: { url?: string; label: string; fg?: string; open?: (url: string) => void }) {
   return (
-    <text flexShrink={0} fg={props.url ? props.fg ?? theme.link : theme.muted} onMouseUp={() => { if (props.url) props.open?.(props.url); }}>
+    <text flexShrink={0} fg={props.url ? props.fg ?? theme.link : theme.dim} onMouseUp={() => { if (props.url) props.open?.(props.url); }}>
       <Show when={props.url} fallback={props.label}><a href={props.url!}>{props.label}</a></Show>
     </text>
+  );
+}
+
+/** `⎇ #103`, or `⎇ owner/repo#103` with `repo`. */
+export const prText = (url: string | undefined, repo = false) => GLYPH.pr + " " + (prLabel(url, repo) ?? "PR");
+
+const pad = (text: string, width: number) => { const chars = Array.from(text); return chars.length >= width ? chars.slice(0, width).join("") : text + " ".repeat(width - chars.length); };
+const padStart = (text: string, width: number) => { const chars = Array.from(text); return chars.length >= width ? chars.slice(0, width).join("") : " ".repeat(width - chars.length) + text; };
+const clip = (text: string, width: number) => { const chars = Array.from(text); return chars.length <= width ? text : chars.slice(0, Math.max(1, width - 1)).join("") + "…"; };
+const elapsedText = (info: { claimedAt?: string; endedAt?: string }, now: number) => {
+  const end = info.endedAt ? Date.parse(info.endedAt) : now;
+  return info.claimedAt ? formatElapsed(elapsedSince(info.claimedAt, end)) : "–";
+};
+
+/** A major section: one rule with the title in the accent colour. The only border the hub draws. */
+export function Section(props: { title: string; id?: string; children?: JSX.Element }) {
+  return (
+    <box id={props.id} flexDirection="column" flexShrink={0} border={["top"]} borderColor={theme.rule} title={" " + props.title + " "} titleColor={theme.accent}>
+      {props.children}
+    </box>
+  );
+}
+
+const KEY_WORDS = new Set(["Enter", "Esc", "PgUp", "PgDn"]);
+
+/** The footer's key legend: each item's key in the accent, its meaning dim, the text itself unchanged. */
+export function KeyLegend(props: { line: string }) {
+  const parts = () => props.line.split(/( +· +)/).map((part, index) => {
+    if (index % 2) return { key: "", rest: part };
+    const [first = "", ...rest] = part.split(" ");
+    return Array.from(first).length <= 2 || KEY_WORDS.has(first) ? { key: first, rest: rest.length ? " " + rest.join(" ") : "" } : { key: "", rest: part };
+  });
+  return (
+    <text wrapMode="word" flexShrink={0}>
+      <For each={parts()}>{(part) => <><span style={{ fg: theme.accent }}>{part.key}</span><span style={{ fg: theme.dim }}>{part.rest}</span></>}</For>
+    </text>
+  );
+}
+
+/** Label column width; every labelled row on every screen uses it. */
+export const LABEL_WIDTH = 11;
+
+/** A labelled row: the gutter (with an optional state glyph), a dim label, then the value, which may wrap. */
+export function Field(props: { label: string; glyph?: string; glyphColor?: string; children?: JSX.Element }) {
+  return (
+    <box flexDirection="row" flexShrink={0}>
+      <text flexShrink={0} wrapMode="none">
+        <span style={{ fg: props.glyphColor ?? theme.dim }}>{"  " + (props.glyph ?? " ") + " "}</span>
+        <span style={{ fg: theme.dim }}>{pad(props.label, LABEL_WIDTH) + " "}</span>
+      </text>
+      {props.children}
+    </box>
+  );
+}
+
+/** A labelled row whose value is plain text. */
+export function FieldText(props: { label: string; value: string; color?: string; glyph?: string; glyphColor?: string }) {
+  return (
+    <Field label={props.label} glyph={props.glyph} glyphColor={props.glyphColor}>
+      <text fg={props.color ?? theme.text} wrapMode="word" flexGrow={1} flexShrink={1}>{props.value}</text>
+    </Field>
   );
 }
 
@@ -82,27 +146,28 @@ export function occupancy(model: TerminalUiModel, seat: StateSeat): { label: str
   const records = model.sessionsFor(seat.id);
   const session = currentSession(records);
   const newest = newestPlanningRecord(records);
-  if (model.sessionResult.connection !== "connected") return { label: "OCCUPANCY UNKNOWN", color: theme.idle, session: newest };
-  if (newest?.status === "error" && !newest.sessionId) return { label: records.some((record) => !!record.sessionId) ? "RUNTIME ERROR · SAVED SESSION" : "RUNTIME RECORD ERROR", color: theme.error, session: newest };
-  if (!session?.sessionId) return { label: "NO ACTIVE SESSION", color: theme.idle, session };
+  if (model.sessionResult.connection !== "connected") return { label: "occupancy unknown", color: theme.wait, session: newest };
+  if (newest?.status === "error" && !newest.sessionId) return { label: records.some((record) => !!record.sessionId) ? "runtime error · saved session" : "runtime record error", color: theme.bad, session: newest };
+  if (!session?.sessionId) return { label: "no active session", color: theme.dim, session };
   return {
-    label: session.status.toUpperCase() + " SESSION · " + engineLabel(session.engine),
-    color: session.status === "error" ? theme.error : session.status === "running" ? theme.running : theme.idle,
+    label: session.status + " session · " + engineLabel(session.engine),
+    color: session.status === "error" ? theme.bad : theme.text,
     session,
   };
 }
 
+/** A lead seat's newest runtime activity, without a prefix: the section or label says what it is. */
 export function activityLine(model: TerminalUiModel, seat: StateSeat, limit: number): string {
   const session = newestPlanningRecord(model.sessionsFor(seat.id));
   if (!session) return model.sessionResult.connection === "connected" ? "No recent runtime activity." : "Live activity unavailable.";
   const latest = session.recentActivity.at(-1);
-  if (latest) return (model.sessionResult.connection === "connected" ? "Latest: " : "Recorded: ") + displayText(latest, limit);
+  if (latest) return (model.sessionResult.connection === "connected" ? "" : "Recorded: ") + displayText(latest, limit);
   return "Planning goal: " + displayText(session.goal, limit) + " · stage: " + displayText((session.ceremony ?? session.loop?.ceremony)?.stage ?? "not recorded", 30);
 }
 
-export const processColor: Record<SeatLive["process"], string> = { running: theme.running, stopped: theme.idle, "no credential": theme.error, "no channel": theme.error };
+export const processColor: Record<SeatLive["process"], string> = { running: theme.ok, stopped: theme.wait, "no credential": theme.bad, "no channel": theme.bad };
 export const isDeveloper = (seat: StateSeat) => seat.roles.includes("Developer");
-export const processLabel = (live: SeatLive) => live.process.toUpperCase() + (live.updatePending ? " · UPDATE PENDING" : "");
+export const processLabel = (live: SeatLive) => live.process + (live.updatePending ? " · update pending" : "");
 
 export function assignmentLine(live: SeatLive, limit: number): string {
   const held = live.assignment;
@@ -110,25 +175,34 @@ export function assignmentLine(live: SeatLive, limit: number): string {
   return displayText(held.title, limit) + " · " + displayText(held.status, 20);
 }
 
+/** A Developer seat's newest thread post. */
 export function threadActivity(live: SeatLive, limit: number): string {
-  return live.activity ? "Latest: " + displayText(live.activity.message, limit) : "No thread activity yet.";
+  return live.activity ? displayText(live.activity.message, limit) : "No thread activity yet.";
 }
 
-export const harnessText = (harness: SeatHarness | undefined) => harness
-  ? `${harness.engine === "claude" ? "Claude" : "Codex"} ${displayText(harness.model.replace(/^claude-/, ""), 30)}·${displayText(harness.effort, 10)}` : "harness unknown";
+/** The seats table's model column: `gpt-6-sol`, `opus-5-5`. The seat screen names the harness, model and effort in full. */
+export const harnessText = (harness: SeatHarness | undefined) => harness ? displayText(harness.model.replace(/^claude-/, ""), 30) : "–";
 
-/** An open goal the owner has to act on: approve a proposal, merge an integration, revert or retro PR. */
-export function needsOwner(session: TerminalSession): boolean {
+const ROLE_SHORT: Record<string, string> = { "Team Lead": "lead", Developer: "dev", Product: "prod" };
+export const roleShort = (roles: readonly string[]) => roles.length ? roles.map((role) => ROLE_SHORT[role] ?? displayText(role, 10).toLowerCase()).join("+") : "–";
+
+/** What an open goal waits on from the owner: plan approval, or merging an integration, revert or retro PR. */
+export function ownerAction(session: TerminalSession): string | undefined {
   const loop = sessionSprint(session).loop;
-  if (isFinishedSprint(loop)) return false;
+  if (isFinishedSprint(loop)) return undefined;
   const stage = loop.ceremony?.stage;
-  if (stage === "proposal" && session.stage === "awaiting-review") return true;
-  if (loop.integration?.status === "pr-open" && !!loop.integration.prUrl) return true;
-  if (loop.integration?.status === "merged" && !!loop.integration.revertPrUrl) return true;
-  return stage === "retro" && loop.retro?.status === "pending" && !!loop.retro.prUrl;
+  const id = displayText(session.id, 40);
+  if (stage === "proposal" && session.stage === "awaiting-review") return `Proposal for ${id} waits for your plan approval`;
+  if (loop.integration?.status === "pr-open" && !!loop.integration.prUrl) return `Integration PR for ${id} waits for your merge`;
+  if (loop.integration?.status === "merged" && !!loop.integration.revertPrUrl) return `Revert PR for ${id} waits for your merge`;
+  if (stage === "retro" && loop.retro?.status === "pending" && !!loop.retro.prUrl) return `Retro PR for ${id} waits for your merge`;
+  return undefined;
 }
 
-/** One seat's state for colour, icon and blinking. */
+/** An open goal the owner has to act on. */
+export const needsOwner = (session: TerminalSession): boolean => !!ownerAction(session);
+
+/** One seat's state for its glyph and colour. */
 export function seatState(model: TerminalUiModel, seat: StateSeat): HubState {
   const live = model.live[seat.id];
   if (live?.problem || live?.process === "no credential" || live?.process === "no channel") return "failed";
@@ -149,15 +223,21 @@ export function seatState(model: TerminalUiModel, seat: StateSeat): HubState {
   return "idle";
 }
 
-/** Everything a seat row shows, computed once per revision. */
+/** Everything a seat's rows show, computed once per revision. */
 export interface SeatInfo {
-  state: HubState; name: string; role: string; process?: string; harness: string;
+  state: HubState; name: string; role: string; harness: string;
   usage?: TokenUsage; claimedAt?: string; endedAt?: string;
+  /** The live session's context window and its newest compaction, while a headed run is going. */
+  context?: number; compactedAt?: string;
   /** Recorded sessions' tokens by finish time, for the burn sparkline; live rises fill in where there are none. */
   burn: { at: number; tokens: number }[];
-  task?: { title: string; status: string; prUrl?: string; steps: PipelineStep[]; ci?: CiState };
-  second: { text: string; color: string };
-  activity: string;
+  /** The seats table's task column. */
+  task: { text: string; color: string };
+  steps?: PipelineStep[]; prUrl?: string; ci?: CiState;
+  /** Why the seat needs the owner, for the section at the top. */
+  attention?: string;
+  /** The newest activity, for the log at the bottom. */
+  latest: string;
 }
 
 export function seatInfo(model: TerminalUiModel, seat: StateSeat): SeatInfo {
@@ -167,87 +247,177 @@ export function seatInfo(model: TerminalUiModel, seat: StateSeat): SeatInfo {
   const held = developer ? live.assignment : undefined;
   const facts = held?.facts;
   const status = occupancy(model, seat);
+  const records = model.sessionsFor(seat.id);
   // A Developer's cost is its current assignment's; the lead's is its planning runs on open goals.
   // Both add the headed run still going, from its session log.
-  const open = model.sessionsFor(seat.id).filter((session) => !isFinishedSprint(sessionSprint(session).loop));
+  const open = records.filter((session) => !isFinishedSprint(sessionSprint(session).loop));
   const usage = developer ? model.withLiveUsage(seat.id, facts?.usage, facts?.sessionIds ?? [])
     : model.withLiveUsage(seat.id, sumUsage(open.map((session) => session.usage)), open.map((session) => session.sessionId));
-  const second = live?.problem ? { text: "⚠ " + displayText(live.problem, 300), color: theme.error }
-    : developer ? held ? { text: "", color: theme.regular }
-      : { text: (live.retry ? "🙋 " : "💤 ") + assignmentLine(live, 60), color: live.retry ? HUB_STATE.needs.color : theme.muted }
-    : { text: status.label, color: status.color };
+  const processDown = !!live && live.process !== "running";
+  const task = held ? { text: displayText(held.title, 200), color: held.status === "failed" ? theme.bad : theme.text }
+    : processDown ? { text: processLabel(live), color: processColor[live.process] }
+    : developer ? live.retry ? { text: "failed · T retry", color: theme.bad } : { text: "no assignment", color: theme.dim }
+    : { text: status.label, color: status.color === theme.text ? theme.dim : status.color };
+  const attention = state !== "needs" && state !== "failed" ? undefined
+    : live?.problem ? displayText(live.problem, 300)
+    : held?.status === "failed" ? displayText(held.title, 200) + " · failed"
+    : developer && live.retry ? assignmentLine(live, 200)
+    : records.map(ownerAction).find(Boolean) ?? (processDown ? processLabel(live) : status.label);
+  const running = model.liveUsage[seat.id];
   return {
-    state, name: displayText(seat.displayName, 40), role: displayText(seat.roles.join(", ") || "No role", 20),
-    ...(live ? { process: processLabel(live) } : {}),
-    harness: harnessText(live?.harness),
+    state, name: displayText(seat.displayName, 40), role: roleShort(seat.roles), harness: harnessText(live?.harness), task,
     ...(usage ? { usage } : {}),
+    ...(running?.context !== undefined ? { context: running.context } : {}),
+    ...(running?.compactedAt ? { compactedAt: running.compactedAt } : {}),
     ...(facts?.claimedAt ? { claimedAt: facts.claimedAt } : {}),
     ...(facts?.endedAt ? { endedAt: facts.endedAt } : {}),
     burn: (facts?.burn ?? []).map((point) => ({ at: Date.parse(point.at), tokens: point.tokens })),
-    ...(held ? { task: { title: displayText(held.title, 200), status: displayText(held.status, 20), prUrl: held.prUrl, ci: facts?.ci,
-      steps: pipelineSteps({ status: held.status, step: facts?.step, fixRounds: facts?.fixRounds }) } } : {}),
-    second,
-    activity: developer ? threadActivity(live, 200) : activityLine(model, seat, 200),
+    ...(held ? { steps: pipelineSteps({ status: held.status, step: facts?.step, fixRounds: facts?.fixRounds }), prUrl: held.prUrl, ci: facts?.ci } : {}),
+    ...(attention ? { attention } : {}),
+    latest: developer ? threadActivity(live, 200) : activityLine(model, seat, 200),
   };
 }
 
-const pad = (text: string, width: number) => { const chars = Array.from(text); return chars.length >= width ? chars.slice(0, width).join("") : text + " ".repeat(width - chars.length); };
-const clip = (text: string, width: number) => { const chars = Array.from(text); return chars.length <= width ? text : chars.slice(0, Math.max(1, width - 1)).join("") + "…"; };
-const elapsedText = (info: { claimedAt?: string; endedAt?: string }, now: number) => {
-  const end = info.endedAt ? Date.parse(info.endedAt) : now;
-  return info.claimedAt ? formatElapsed(elapsedSince(info.claimedAt, end)) : "–";
-};
+/** The window's colour: neutral, yellow above CONTEXT_WARN_SHARE of the cap. */
+export const contextColor = (context: number | undefined) => context !== undefined && context > CONTEXT_WARN_SHARE * HARNESS_CONTEXT_TOKEN_LIMIT ? theme.wait : theme.text;
 
-/** Two rows per seat: who and how it runs, then what it is doing. */
+/**
+ * Tokens as spans, one shape everywhere: fresh work first in plain text, then output, then cache re-reads dim, then
+ * the live context window against the cap and a recent compaction.
+ */
+export function UsageSpans(props: { usage?: TokenUsage; context?: number; compactedAt?: string; now: Accessor<number> }) {
+  const note = () => compactionNote(props.compactedAt, props.now());
+  return <>
+    <span style={{ fg: theme.text }}>{props.usage ? "work " + formatTokens(workTokens(props.usage)) : "no tokens recorded yet"}</span>
+    <span style={{ fg: theme.text }}>{props.usage ? " " + GLYPH.separator + " out " + formatTokens(props.usage.outputTokens) : ""}</span>
+    <span style={{ fg: theme.dim }}>{props.usage ? " " + GLYPH.separator + " cache " + formatTokens(props.usage.cachedInputTokens) : ""}</span>
+    <span style={{ fg: contextColor(props.context) }}>{props.context !== undefined ? " " + GLYPH.separator + " " + contextText(props.context, HARNESS_CONTEXT_TOKEN_LIMIT) : ""}</span>
+    <span style={{ fg: theme.wait }}>{note() ? " " + GLYPH.separator + " " + note() : ""}</span>
+  </>;
+}
+
+/**
+ * The seats table's columns, left to right: selection, state, seat, role, task, steps, model, work, out, cache, ctx,
+ * time, PR and CI. At 96 columns the role moves to the seat screen; narrower screens drop the model, then the time.
+ * The task takes what is left.
+ */
+export interface SeatColumns { task: number; role: boolean; model: boolean; time: boolean; detail: boolean; burn: boolean }
+export const SEAT_WIDTH = { name: 13, role: 4, steps: 5, model: 11, work: 5, out: 5, cache: 5, ctx: 4, time: 5, burn: 4, pr: 8 } as const;
+export function seatColumns(width: number): SeatColumns {
+  const role = width >= 104;
+  // The burn sparkline needs room the 96-column grid does not have; the seat screen always shows it.
+  const burn = width >= 100;
+  const model = width >= 88;
+  // Below 72 columns only fresh work stays; output, cache and the window move to the seat screen.
+  const detail = width >= 72;
+  const time = width >= 64;
+  const w = SEAT_WIDTH;
+  // Gutter (4), then each column and the space after it; PR and CI share the last one.
+  const fixed = 4 + (w.name + 1) + (role ? w.role + 1 : 0) + 1 + (w.steps + 1) + (model ? w.model + 1 : 0)
+    + (w.work + 1) + (detail ? w.out + 1 + w.cache + 1 + w.ctx + 1 : 0) + (time ? w.time + 1 : 0) + (burn ? w.burn + 1 : 0) + w.pr;
+  return { role, model, time, detail, burn, task: Math.max(8, width - fixed) };
+}
+
+/** The dim header row over the seats table. */
+export function SeatHeader(props: { width: Accessor<number> }) {
+  const cols = () => seatColumns(props.width());
+  const w = SEAT_WIDTH;
+  return (
+    <text fg={theme.dim} flexShrink={0} wrapMode="none">
+      {"    " + pad("SEAT", w.name) + " " + (cols().role ? pad("ROLE", w.role) + " " : "") + pad("TASK", cols().task) + " " + pad("STEPS", w.steps) + " "
+        + (cols().model ? pad("MODEL", w.model) + " " : "") + padStart("WORK", w.work) + " "
+        + (cols().detail ? padStart("OUT", w.out) + " " + padStart("CACHE", w.cache) + " " + padStart("CTX", w.ctx) + " " : "") + (cols().time ? padStart("TIME", w.time) + " " : "") + (cols().burn ? pad("BURN", w.burn) + " " : "") + pad("PR", w.pr - 2) + "CI"}
+    </text>
+  );
+}
+
+/**
+ * The last hour of a seat's token burn in eight 7.5-minute buckets, four braille cells: recorded sessions from before
+ * the hub opened, then the rises it has seen in the seat's running total, the headed run in progress included.
+ */
+export function burnSparkline(info: SeatInfo, key: string, now: number, burn?: TokenBurn): string {
+  burn?.observe(key, totalTokens(info.usage), now);
+  return sparkline(burnBuckets(burn ? burn.series(key, info.burn) : info.burn, now, 8));
+}
+
+/** One aligned row per seat. From 100 columns it also shows the last hour's burn. */
 export function SeatRow(props: { model: TerminalUiModel; seat: StateSeat; revision: Accessor<number>; pulse: Accessor<boolean>; now: Accessor<number>; width: Accessor<number>; open?: (url: string) => void; burn?: TokenBurn; truecolor?: boolean }) {
   const info = createMemo(() => { props.revision(); return seatInfo(props.model, props.seat); });
-  // The last hour of token burn in eight 7.5-minute buckets: recorded sessions from before the hub opened, then the
-  // rises it sees in the seat's running total, the headed run in progress included.
-  const spark = createMemo(() => {
-    const current = info(); const now = props.now();
-    props.burn?.observe(props.seat.id, totalTokens(current.usage), now);
-    return sparkline(burnBuckets(props.burn ? props.burn.series(props.seat.id, current.burn) : current.burn, now, 8));
-  });
+  // Observed on every look, shown when the table has room for it.
+  const spark = createMemo(() => burnSparkline(info(), props.seat.id, props.now(), props.burn));
   const selected = createMemo(() => { props.revision(); return props.model.seatId === props.seat.id; });
-  // The second row's own text comes first; the latest activity gets what is left of the row.
-  const secondWidth = () => Math.max(10, props.width() - 8);
-  // A task row: indent, five pipeline icons, title, status, PR link and CI dot. The sprint card shows the title whole.
-  const taskFixed = () => { const task = info().task!; return 5 + 10 + 1 + 3 + task.status.length + 1 + (task.prUrl ? 8 : 0) + (task.ci ? 3 : 0); };
-  const titleRoom = () => Math.max(12, props.width() - taskFixed() - 1);
-  const activityRoom = () => {
-    const task = info().task;
-    const used = task ? taskFixed() + Math.min(titleRoom(), Array.from(task.title).length) : 5 + Math.min(secondWidth(), Array.from(info().second.text).length) + 1;
-    return Math.max(0, props.width() - used - 5);
-  };
-  // 96 columns hold every column; narrower screens drop the harness, then the elapsed time.
-  const showHarness = () => props.width() >= 90;
-  const showElapsed = () => props.width() >= 66;
+  const cols = () => seatColumns(props.width());
+  const w = SEAT_WIDTH;
+  const pr = () => info().prUrl ? prText(info().prUrl) : "";
   return (
-    <box height={2} flexShrink={0} flexDirection="column" paddingLeft={1} backgroundColor={selected() ? theme.selected : theme.panel}>
-      <text>
-        <span style={{ fg: selected() ? theme.accent : theme.muted }}>{selected() ? "▶ " : "  "}</span>
-        <span style={{ fg: stateColor(info().state, props.pulse()) }}>{HUB_STATE[info().state].icon + " "}</span>
-        <span style={{ fg: selected() ? theme.accent : theme.regular }}>{pad(info().name, 14)}</span>
-        <span style={{ fg: theme.muted }}>{" " + pad(info().role, 9)}</span>
-        <span style={{ fg: stateColor(info().state, props.pulse()) }}>{" " + pad(info().process ?? HUB_STATE[info().state].word.toUpperCase(), 13)}</span>
-        <span style={{ fg: theme.heading }}>{showHarness() ? " 🤖 " + pad(info().harness, 22) : ""}</span>
-        <span style={{ fg: theme.idle }}>{showElapsed() ? " ⌛ " + pad(elapsedText(info(), props.now()), 5) : ""}</span>
-        <span style={{ fg: paintHex(SPARK_COLOR, props.truecolor ?? true) }}>{" " + spark()}</span>
-        <span style={{ fg: theme.accent }}>{" Σ" + formatTokens(totalTokens(info().usage))}</span>
+    <box height={1} flexShrink={0} flexDirection="row" backgroundColor={selected() ? theme.selected : undefined}>
+      <text flexShrink={0} wrapMode="none">
+        <span style={{ fg: theme.accent }}>{selected() ? GLYPH.selected + " " : "  "}</span>
+        <span style={{ fg: stateColor(info().state, props.pulse()) }}>{HUB_STATE[info().state].glyph + " "}</span>
+        <span style={{ fg: selected() ? theme.accent : theme.text }}>{pad(info().name, w.name) + " "}</span>
+        <span style={{ fg: theme.dim }}>{cols().role ? pad(info().role, w.role) + " " : ""}</span>
+        <span style={{ fg: info().task.color }}>{pad(clip(info().task.text, cols().task), cols().task) + " "}</span>
+        <Pipeline steps={info().steps ?? []} pulse={props.pulse} />
+        <span style={{ fg: theme.dim }}>{(info().steps ? "" : " ".repeat(w.steps)) + " " + (cols().model ? pad(clip(info().harness, w.model), w.model) + " " : "")}</span>
+        <span style={{ fg: theme.text }}>{padStart(formatTokens(workTokens(info().usage)), w.work) + " " + (cols().detail ? padStart(formatTokens(info().usage?.outputTokens), w.out) + " " : "")}</span>
+        <span style={{ fg: theme.dim }}>{cols().detail ? padStart(formatTokens(info().usage?.cachedInputTokens), w.cache) + " " : ""}</span>
+        <span style={{ fg: contextColor(info().context) }}>{cols().detail ? padStart(formatTokens(info().context), w.ctx) + " " : ""}</span>
+        <span style={{ fg: theme.dim }}>{cols().time ? padStart(elapsedText(info(), props.now()), w.time) + " " : ""}</span>
+        <span style={{ fg: paintHex(SPARK_COLOR, props.truecolor ?? true) }}>{cols().burn ? pad(spark(), w.burn) + " " : ""}</span>
       </text>
-      <box flexDirection="row" height={1}>
-        <Show when={info().task} fallback={<text fg={info().second.color} flexShrink={0}>{"     " + clip(info().second.text, secondWidth()) + " "}</text>}>
-          <text flexShrink={0}>
-            <span>{"     "}</span>
-            <Pipeline steps={info().task!.steps} pulse={props.pulse} />
-            <span style={{ fg: theme.regular }}>{" " + clip(info().task!.title, titleRoom()) + " · " + info().task!.status + " "}</span>
-          </text>
-          <Show when={info().task!.prUrl}><LinkText url={info().task!.prUrl} label={"🐙 " + (prLabel(info().task!.prUrl) ?? "PR")} open={props.open} /></Show>
-          <Show when={info().task!.ci}><text flexShrink={0}>{" " + CI_DOT[info().task!.ci!]}</text></Show>
-        </Show>
-        <Show when={activityRoom() >= 12}><text fg={theme.muted} flexShrink={1}>{" 💬 " + clip(info().activity, activityRoom())}</text></Show>
-      </box>
+      <Show when={info().prUrl}><LinkText url={info().prUrl} label={pr()} open={props.open} /></Show>
+      <text flexShrink={0} wrapMode="none">
+        <span>{" ".repeat(Math.max(1, w.pr - 1 - Array.from(pr()).length))}</span>
+        <span style={{ fg: info().ci ? CI_COLOR[info().ci!] : theme.dim }}>{info().ci ? GLYPH.ci : ""}</span>
+      </text>
     </box>
+  );
+}
+
+/** Seats per state, for the seats section's title: the legend and the count in one. */
+export function stateCounts(model: TerminalUiModel, seats: readonly StateSeat[]): string {
+  const counts = new Map<HubState, number>();
+  for (const seat of seats) { const state = seatState(model, seat); counts.set(state, (counts.get(state) ?? 0) + 1); }
+  return (["running", "waiting", "needs", "failed", "idle"] as HubState[]).filter((state) => counts.get(state))
+    .map((state) => HUB_STATE[state].glyph + " " + counts.get(state) + " " + HUB_STATE[state].word).join("  ");
+}
+
+/** The top of the team screen: each seat that needs the owner, and why. Just the rule when nothing does. */
+export function AttentionSection(props: { model: TerminalUiModel; seats: readonly StateSeat[]; revision: Accessor<number>; pulse: Accessor<boolean>; width: Accessor<number> }) {
+  const infos = createMemo(() => { props.revision(); return props.seats.map((seat) => seatInfo(props.model, seat)); });
+  const count = () => infos().filter((info) => info.attention).length;
+  return (
+    <Section title={"NEEDS YOU · " + (count() || "nothing")}>
+      <For each={props.seats}>{(_, index) => (
+        <Show when={infos()[index()]?.attention}>
+          <text flexShrink={0} wrapMode="none">
+            <span style={{ fg: stateColor(infos()[index()].state, props.pulse()) }}>{"  " + HUB_STATE[infos()[index()].state].glyph + " "}</span>
+            <span style={{ fg: theme.text }}>{pad(infos()[index()].name, SEAT_WIDTH.name) + " "}</span>
+            <span style={{ fg: theme.text }}>{clip(infos()[index()].attention ?? "", Math.max(10, props.width() - 18))}</span>
+          </text>
+        </Show>
+      )}</For>
+    </Section>
+  );
+}
+
+/** The bottom of the team screen: each seat's newest activity, one row each. */
+export function ActivitySection(props: { model: TerminalUiModel; seats: readonly StateSeat[]; revision: Accessor<number>; now: Accessor<number>; width: Accessor<number> }) {
+  return (
+    <Section title="LATEST">
+      <For each={props.seats}>{(seat) => {
+        const info = createMemo(() => { props.revision(); return seatInfo(props.model, seat); });
+        // A compaction is noted here for a few minutes: the context window just shrank.
+        const note = () => { const text = compactionNote(info().compactedAt, props.now()); return text ? "context " + text + " " + GLYPH.separator + " " : ""; };
+        return (
+          <text flexShrink={0} wrapMode="none">
+            <span style={{ fg: theme.dim }}>{"    " + pad(info().name, SEAT_WIDTH.name) + " "}</span>
+            <span style={{ fg: theme.wait }}>{note()}</span>
+            <span style={{ fg: theme.text }}>{clip(info().latest, Math.max(10, props.width() - 18 - note().length))}</span>
+          </text>
+        );
+      }}</For>
+    </Section>
   );
 }
 
@@ -291,21 +461,19 @@ export function retroDetail(loop: SprintLoop): string {
 function proposalDetail(sprint: TerminalSprint): string {
   const stage = sprint.loop.ceremony?.stage;
   if (!stage) return "Proposal progress: " + (sprint.planningStage ?? "not recorded") + ".";
-  if (stage === "planning") return "Waiting for a proposal request.";
+  if (stage === "planning") return "Clarifying the goal; waiting for a proposal request.";
   if (stage !== "proposal") return "Plan approved.";
   return sprint.planningStage === "awaiting-review" ? "Draft ready; waiting for the owner's plan approval."
     : sprint.planningStage === "drafting" ? "Chick is drafting the proposal." : "Waiting for Chick's draft.";
 }
 
-/** Done stages green, the current one bracketed and blinking, later ones dim. */
-function StageCycle(props: { loop: SprintLoop; pulse: Accessor<boolean> }) {
+/** Done stages in plain text, the current one bracketed in the accent, later ones dim. Static: nothing here pulses. */
+function StageCycle(props: { loop: SprintLoop }) {
   const at = () => { const stage = props.loop.ceremony?.stage; return stage ? CEREMONY_STAGES.indexOf(stage) : -1; };
   return (
-    <text wrapMode="word">
-      <For each={CEREMONY_STAGES}>{(name, index) => <span style={{ fg: index() === at() ? props.pulse() ? theme.heading : theme.accent : index() < at() || props.loop.closedAt ? theme.running : theme.muted }}>
-        {(index() ? " → " : "") + (index() === at() ? `[${name}]` : name)}
-      </span>}</For>
-    </text>
+    <For each={CEREMONY_STAGES}>{(name, index) => <span style={{ fg: index() === at() ? theme.accent : index() < at() || props.loop.closedAt ? theme.text : theme.dim }}>
+      {(index() ? " " + GLYPH.arrow + " " : "") + (index() === at() ? `[${name}]` : name)}
+    </span>}</For>
   );
 }
 
@@ -323,15 +491,35 @@ export function sprintLinks(team: StateTeam | undefined, session: TerminalSessio
 
 function LinkRow(props: { links: SprintLinks; open?: (url: string) => void }) {
   return (
-    <box flexDirection="row" height={1} flexShrink={0} gap={2}>
-      <LinkText url={props.links.thread} label="💬 goal thread" open={props.open} />
-      <LinkText url={props.links.proposal} label="📝 proposal post" open={props.open} />
-    </box>
+    <Field label="links">
+      <LinkText url={props.links.thread} label={GLYPH.link + " goal thread"} open={props.open} />
+      <text flexShrink={0}>{"   "}</text>
+      <LinkText url={props.links.proposal} label={GLYPH.link + " proposal post"} open={props.open} />
+    </Field>
   );
 }
 
-/** The sprint panel on the team screen: the whole ceremony at a glance, one or two rows per part. */
-export function SprintCard(props: { sprint: TerminalSprint; model: TerminalUiModel; team?: StateTeam; session?: TerminalSession; pulse: Accessor<boolean>; now: Accessor<number>; open?: (url: string) => void; truecolor?: boolean }) {
+/** The stages row: where the ceremony is, whether the goal is closed, and how many tickets merged. */
+function StagesField(props: { loop: SprintLoop; tail?: string }) {
+  const closedAt = () => props.loop.ceremony?.closure?.closedAt ?? props.loop.closedAt;
+  return (
+    <Field label="stages" glyph={closedAt() ? GLYPH.state.done : undefined} glyphColor={theme.ok}>
+      <text wrapMode="word" flexGrow={1} flexShrink={1}>
+        <Show when={props.loop.ceremony?.stage} fallback={<span style={{ fg: theme.wait }}>not recorded · awaiting migration before ceremony actions</span>}>
+          <StageCycle loop={props.loop} />
+        </Show>
+        <span style={{ fg: theme.dim }}>{"   " + (closedAt() ? "closed " + displayText(closedAt()) : "open") + (props.tail ? " " + GLYPH.separator + " " + props.tail : "")}</span>
+      </text>
+    </Field>
+  );
+}
+
+/** The ticket table's columns: steps, ticket, status, seat, PR, CI, tokens. */
+const TICKET_WIDTH = { steps: 5, status: 12, seat: 13, pr: 8, work: 5 } as const;
+const ticketTitleWidth = (width: number) => { const w = TICKET_WIDTH; return Math.max(10, width - 4 - (w.steps + 1) - 1 - (w.status + 1) - (w.seat + 1) - (w.pr + 1) - w.work); };
+
+/** The sprint section on the team screen: the whole ceremony, one labelled row per part and one row per ticket. */
+export function SprintCard(props: { sprint: TerminalSprint; model: TerminalUiModel; team?: StateTeam; session?: TerminalSession; pulse: Accessor<boolean>; now: Accessor<number>; width: Accessor<number>; open?: (url: string) => void; truecolor?: boolean }) {
   const loop = () => props.sprint.loop;
   const stage = () => loop().ceremony?.stage;
   const closedAt = () => loop().ceremony?.closure?.closedAt ?? loop().closedAt;
@@ -342,99 +530,130 @@ export function SprintCard(props: { sprint: TerminalSprint; model: TerminalUiMod
   const integrationUrl = () => loop().integration?.prUrl ?? loop().release?.prUrl;
   const progress = () => sprintProgress({ stage: stage(), closed: !!closedAt(), merged: merged(), tickets: loop().tickets.length });
   const fill = () => closedAt() ? STAGE_COLOR.closed : STAGE_COLOR[stage() ?? "planning"];
-  return <box flexDirection="column" flexShrink={0} paddingLeft={1} paddingRight={1} border borderColor={theme.border} backgroundColor={theme.panel}
-    title={" 🏁 SPRINT · " + displayText(props.sprint.id, 40) + " "} titleColor={theme.heading}>
-    <text wrapMode="word">
-      <span style={{ fg: theme.accent }}>Current stage: {stage() ?? "not recorded"}</span>
-      <span style={{ fg: closedAt() ? theme.running : theme.idle }}>{" · Closure: " + (closedAt() ? "closed " + displayText(closedAt()) + " · completed sprint history" : "open")}</span>
-      <span style={{ fg: theme.muted }}>{" · " + merged() + "/" + loop().tickets.length + " merged"}</span>
-    </text>
-    {/* The bar sits beside the stage cycle on a wide screen and wraps below it on a narrow one. */}
-    <box flexDirection="row" flexShrink={0} flexWrap="wrap" columnGap={2}>
-      <box flexGrow={1} flexShrink={0} maxWidth="100%"><StageCycle loop={loop()} pulse={props.pulse} /></box>
-      <box flexDirection="row" flexShrink={0} height={1} gap={1}>
-        <ProgressBar fraction={progress} color={fill} width={24} truecolor={props.truecolor ?? true} background={theme.panel} />
-        <text fg={theme.muted} flexShrink={0}>{String(Math.round(progress() * 100)).padStart(3) + "%"}</text>
-      </box>
-    </box>
-    <Show when={!stage()}><text fg={theme.idle} wrapMode="word">Persisted ceremony unavailable; awaiting migration before ceremony actions.</text></Show>
-    <text fg={theme.regular} wrapMode="word">🎯 {displayText(props.sprint.goal, 180)}</text>
-    <LinkRow links={sprintLinks(props.team, props.session)} open={props.open} />
-    <text fg={theme.accent}>{"🧮 Sprint total: " + usageLine(loop().usage) + " · ⌛ " + formatElapsed(elapsedSince(started(), closedAt() ? Date.parse(closedAt()!) : props.now())) + " since planning"}</text>
-    <Show when={stage() === "planning"}><text fg={theme.regular}>🗣 Clarifying the goal.</text></Show>
-    <text fg={props.sprint.planningStage === "awaiting-review" && stage() === "proposal" ? stateColor("needs", props.pulse()) : theme.regular} wrapMode="word">📝 {proposalDetail(props.sprint)}</text>
-    <Show when={loop().tickets.length} fallback={<text fg={theme.muted}>No tickets assigned yet.</text>}>
-      <For each={loop().tickets}>{(ticket) => {
-        const state = ticketState(ticket);
-        const steps = pipelineSteps({ status: ticket.status, step: ticket.facts?.step, fixRounds: ticket.facts?.fixRounds });
-        return <box flexDirection="column" flexShrink={0}>
-          <text wrapMode="word">
-            <Pipeline steps={steps} pulse={props.pulse} />
-            <span style={{ fg: stateColor(state, props.pulse()) }}>{" " + displayText(ticket.title, 8000) + " · " + ticket.status}</span>
+  const needsPlan = () => props.sprint.planningStage === "awaiting-review" && stage() === "proposal";
+  const needsMerge = () => loop().integration?.status === "pr-open";
+  const needsRetro = () => !closedAt() && !!loop().retro?.prUrl;
+  const title = () => ticketTitleWidth(props.width());
+  /** The ticket table needs 90 columns; below that each ticket takes two rows. */
+  const wide = () => props.width() >= 90;
+  const w = TICKET_WIDTH;
+  return (
+    <Section title={"SPRINT " + displayText(props.sprint.id, 40)}>
+      <StagesField loop={loop()} tail={merged() + "/" + loop().tickets.length + " merged"} />
+      <Field label="progress">
+        <ProgressBar fraction={progress} color={fill} width={24} truecolor={props.truecolor ?? true} background={theme.background} />
+        <text fg={theme.dim} flexShrink={0} wrapMode="none">{String(Math.round(progress() * 100)).padStart(4) + "%"}</text>
+      </Field>
+      <Field label="tokens">
+        <text flexShrink={1} flexGrow={1}>
+          <UsageSpans usage={loop().usage} now={props.now} />
+          <span style={{ fg: theme.dim }}>{" " + GLYPH.separator + " " + formatElapsed(elapsedSince(started(), closedAt() ? Date.parse(closedAt()!) : props.now())) + " since planning"}</span>
+        </text>
+      </Field>
+      <FieldText label="goal" value={displayText(props.sprint.goal, 180)} />
+      <LinkRow links={sprintLinks(props.team, props.session)} open={props.open} />
+      <FieldText label="plan" value={proposalDetail(props.sprint)} glyph={needsPlan() ? GLYPH.state.needs : undefined} glyphColor={stateColor("needs", props.pulse())} />
+      <Show when={loop().tickets.length} fallback={<FieldText label="tickets" value="No tickets assigned yet." color={theme.dim} />}>
+        <Show when={wide()}>
+          <text fg={theme.dim} flexShrink={0} wrapMode="none">
+            {"    " + pad("STEPS", w.steps) + " " + pad("TICKET", title()) + " " + pad("STATUS", w.status) + " " + pad("SEAT", w.seat) + " " + pad("PR", w.pr - 1) + "CI" + padStart("WORK", w.work)}
           </text>
-          <box flexDirection="row" height={1} flexShrink={0}>
-            <text fg={theme.muted} flexShrink={0}>{"           👤 " + seatName(ticket.seatId) + " · "}</text>
-            <LinkText url={ticket.prUrl} label={ticket.prUrl ? "🐙 " + (prLabel(ticket.prUrl) ?? "PR") : "PR not opened"} open={props.open} />
-            <Show when={ticket.facts?.ci}><text flexShrink={0} fg={theme.muted}>{" · " + CI_DOT[ticket.facts!.ci!] + " CI " + ticket.facts!.ci}</text></Show>
-            <Show when={ticket.facts?.usage}><text flexShrink={0} fg={theme.accent}>{" · 🧮 Σ" + formatTokens(totalTokens(ticket.facts!.usage))}</text></Show>
-          </box>
-        </box>;
-      }}</For>
-    </Show>
-    <box flexDirection="row" height={1} flexShrink={0}>
-      <text fg={theme.regular} flexShrink={0}>🚀 Integration PR: </text>
-      <LinkText url={integrationUrl()} label={integrationUrl() ? "🐙 " + (prLabel(integrationUrl(), true) ?? displayText(integrationUrl(), 200)) : "not opened"} open={props.open} />
-      <Show when={loop().integration?.revertPrUrl}>
-        <text fg={theme.idle} flexShrink={0}> · Revert PR: </text>
-        <LinkText url={loop().integration?.revertPrUrl} label={"🐙 " + (prLabel(loop().integration?.revertPrUrl, true) ?? "PR")} open={props.open} />
+        </Show>
+        <For each={loop().tickets}>{(ticket) => {
+          const state = ticketState(ticket);
+          const steps = pipelineSteps({ status: ticket.status, step: ticket.facts?.step, fixRounds: ticket.facts?.fixRounds });
+          const pr = ticket.prUrl ? prText(ticket.prUrl) : "";
+          // Narrower than the table: the whole title with its status, then the seat, PR, CI and work under it.
+          const narrow = () => (
+            <box flexDirection="column" flexShrink={0}>
+              <text wrapMode="word" flexShrink={0}>
+                <span>{"    "}</span>
+                <Pipeline steps={steps} pulse={props.pulse} />
+                <span style={{ fg: theme.text }}>{" " + displayText(ticket.title, 400) + " " + GLYPH.separator + " "}</span>
+                <span style={{ fg: stateColor(state, props.pulse()) }}>{ticket.status}</span>
+              </text>
+              <box flexDirection="row" height={1} flexShrink={0}>
+                <text flexShrink={0} fg={theme.dim}>{"          " + seatName(ticket.seatId) + " " + GLYPH.separator + " "}</text>
+                <LinkText url={ticket.prUrl} label={ticket.prUrl ? pr : "PR not opened"} open={props.open} />
+                <text flexShrink={0} wrapMode="none">
+                  <span style={{ fg: ticket.facts?.ci ? CI_COLOR[ticket.facts.ci] : theme.dim }}>{ticket.facts?.ci ? " " + GLYPH.ci : ""}</span>
+                  <span style={{ fg: theme.dim }}>{" " + GLYPH.separator + " work " + formatTokens(workTokens(ticket.facts?.usage))}</span>
+                </text>
+              </box>
+            </box>
+          );
+          return (
+            <Show when={wide()} fallback={narrow()}>
+            <box flexDirection="row" height={1} flexShrink={0}>
+              <text flexShrink={0} wrapMode="none">
+                <span>{"    "}</span>
+                <Pipeline steps={steps} pulse={props.pulse} />
+                <span style={{ fg: theme.text }}>{" " + pad(clip(displayText(ticket.title, 400), title()), title()) + " "}</span>
+                <span style={{ fg: stateColor(state, props.pulse()) }}>{pad(ticket.status, w.status) + " "}</span>
+                <span style={{ fg: theme.dim }}>{pad(clip(seatName(ticket.seatId), w.seat), w.seat) + " "}</span>
+              </text>
+              <Show when={ticket.prUrl}><LinkText url={ticket.prUrl} label={pr} open={props.open} /></Show>
+              <text flexShrink={0} wrapMode="none">
+                <span>{" ".repeat(Math.max(1, w.pr - 1 - Array.from(pr).length))}</span>
+                <span style={{ fg: ticket.facts?.ci ? CI_COLOR[ticket.facts.ci] : theme.dim }}>{ticket.facts?.ci ? GLYPH.ci : " "}</span>
+                <span style={{ fg: theme.text }}>{" " + padStart(formatTokens(workTokens(ticket.facts?.usage)), w.work)}</span>
+              </text>
+            </box>
+            </Show>
+          );
+        }}</For>
       </Show>
-    </box>
-    <text fg={loop().release ? theme.running : loop().integration?.status === "pr-open" ? stateColor("needs", props.pulse()) : theme.idle} wrapMode="word">   {displayText(releaseDetail(loop()), 2000)}</text>
-    <Show when={loop().build}><text fg={loop().build?.status === "running" ? theme.running : theme.idle} wrapMode="word">   Current build: {displayText(loop().build?.reason || buildStatus[loop().build!.status], 2000)}</text></Show>
-    <text fg={closedAt() ? theme.running : loop().retro?.prUrl ? stateColor("needs", props.pulse()) : theme.idle} wrapMode="word">📜 {retroDetail(loop())}</text>
-    <Show when={retro()?.path || retro()?.prUrl}>
-      <box flexDirection="row" height={1} flexShrink={0}>
-        <Show when={retro()?.path}><text fg={theme.regular} flexShrink={0}>{"   Document: " + displayText(retro()?.path, 200) + " "}</text></Show>
-        <Show when={retro()?.prUrl}><text fg={theme.regular} flexShrink={0}>· Retro PR: </text><LinkText url={retro()?.prUrl} label={"🐙 " + (prLabel(retro()?.prUrl, true) ?? "PR")} open={props.open} /></Show>
-      </box>
-    </Show>
-  </box>;
+      <Field label="integration" glyph={needsMerge() ? GLYPH.state.needs : undefined} glyphColor={stateColor("needs", props.pulse())}>
+        <LinkText url={integrationUrl()} label={integrationUrl() ? GLYPH.pr + " " + (prLabel(integrationUrl(), true) ?? displayText(integrationUrl(), 200)) : "not opened"} open={props.open} />
+        <Show when={loop().integration?.revertPrUrl}>
+          <text fg={theme.dim} flexShrink={0}>{" " + GLYPH.separator + " revert "}</text>
+          <LinkText url={loop().integration?.revertPrUrl} label={prText(loop().integration?.revertPrUrl, true)} open={props.open} />
+        </Show>
+      </Field>
+      <FieldText label="release" value={displayText(releaseDetail(loop()), 2000)} glyph={loop().release ? GLYPH.state.done : needsMerge() ? GLYPH.state.needs : undefined}
+        glyphColor={loop().release ? theme.ok : stateColor("needs", props.pulse())} />
+      <Show when={loop().build}><FieldText label="build" value={displayText(loop().build?.reason || buildStatus[loop().build!.status], 2000)} /></Show>
+      <FieldText label="retro" value={retroDetail(loop())} glyph={closedAt() ? GLYPH.state.done : needsRetro() ? GLYPH.state.needs : undefined}
+        glyphColor={closedAt() ? theme.ok : stateColor("needs", props.pulse())} />
+      <Show when={retro()?.path || retro()?.prUrl}>
+        <Field label="document">
+          <Show when={retro()?.path}><text fg={theme.text} flexShrink={0}>{displayText(retro()?.path, 200) + " "}</text></Show>
+          <Show when={retro()?.prUrl}><text fg={theme.dim} flexShrink={0}>{GLYPH.separator + " retro PR "}</text><LinkText url={retro()?.prUrl} label={prText(retro()?.prUrl, true)} open={props.open} /></Show>
+        </Field>
+      </Show>
+    </Section>
+  );
 }
 
 /** The seat screen's short view of a sprint: where the ceremony is and what it waits for. */
 export function SprintStrip(props: { sprint: TerminalSprint; team?: StateTeam; session?: TerminalSession; pulse: Accessor<boolean>; open?: (url: string) => void }) {
   const loop = () => props.sprint.loop;
-  const stage = () => loop().ceremony?.stage;
-  const closedAt = () => loop().ceremony?.closure?.closedAt ?? loop().closedAt;
-  const detail = () => {
-    const current = stage();
-    if (!current || current === "planning" || current === "proposal") return "📝 " + proposalDetail(props.sprint);
-    if (current === "implement") return "🔨 " + loop().tickets.filter((ticket) => ticket.status === "merged").length + "/" + loop().tickets.length + " tickets merged";
-    if (current === "release") return "🚀 " + releaseDetail(loop());
-    return "📜 " + retroDetail(loop());
+  const detail = (): [string, string] => {
+    const current = loop().ceremony?.stage;
+    if (!current || current === "planning" || current === "proposal") return ["plan", proposalDetail(props.sprint)];
+    if (current === "implement") return ["tickets", loop().tickets.filter((ticket) => ticket.status === "merged").length + "/" + loop().tickets.length + " tickets merged"];
+    if (current === "release") return ["release", releaseDetail(loop())];
+    return ["retro", retroDetail(loop())];
   };
-  return <box flexDirection="column" flexShrink={0} paddingLeft={1} border={["top"]} borderColor={theme.border} title={" 🏁 SPRINT · " + displayText(props.sprint.id, 40) + " "} titleColor={theme.heading}>
-    <text wrapMode="word">
-      <span style={{ fg: theme.accent }}>Current stage: {stage() ?? "not recorded"}</span>
-      <span style={{ fg: closedAt() ? theme.running : theme.idle }}>{" · Closure: " + (closedAt() ? "closed " + displayText(closedAt()) : "open")}</span>
-      <span style={{ fg: theme.accent }}>{" · 🧮 Σ" + formatTokens(totalTokens(loop().usage))}</span>
-    </text>
-    <StageCycle loop={loop()} pulse={props.pulse} />
-    <text fg={theme.regular} wrapMode="word">{displayText(detail(), 300)}</text>
-    <LinkRow links={sprintLinks(props.team, props.session)} open={props.open} />
-  </box>;
+  return (
+    <Section title={"SPRINT " + displayText(props.sprint.id, 40)}>
+      <StagesField loop={loop()} tail={"work " + formatTokens(workTokens(loop().usage))} />
+      <FieldText label={detail()[0]} value={displayText(detail()[1], 300)} />
+      <LinkRow links={sprintLinks(props.team, props.session)} open={props.open} />
+    </Section>
+  );
 }
 
-/** The labelled pipeline on the seat screen: each stage named, lit as it advances. */
+/** The labelled pipeline on the seat screen: each stage's glyph and name, lit as it advances. */
 export function PipelineLabels(props: { steps: PipelineStep[]; pulse: Accessor<boolean> }) {
-  const mark: Record<StageState, string> = { done: " ✓", active: " ●", failed: " ✗", pending: "", skipped: " skipped" };
-  return <text>
+  const mark: Partial<Record<StageState, string>> = { failed: " failed", skipped: " skipped" };
+  return <text flexShrink={1} flexGrow={1} wrapMode="word">
     <For each={props.steps}>{(step, index) => <>
-      <span style={{ fg: theme.muted }}>{index() ? "  →  " : ""}</span>
-      <Pipeline steps={[step]} pulse={props.pulse} />
-      <span style={{ fg: STEP_FG[step.state] === "#475569" ? theme.muted : STEP_FG[step.state] }}>{" " + step.stage + mark[step.state]}</span>
+      <span style={{ fg: theme.dim }}>{index() ? "  " + GLYPH.arrow + "  " : ""}</span>
+      <span style={{ fg: stepColor(step.state, props.pulse()) }}>{stepGlyph(step) + " "}</span>
+      <span style={{ fg: step.state === "pending" || step.state === "skipped" ? theme.dim : theme.text }}>{step.stage + (mark[step.state] ?? "")}</span>
     </>}</For>
   </text>;
 }
 
-export { clip, elapsedText };
+export { clip, elapsedText, pad };

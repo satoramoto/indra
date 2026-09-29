@@ -1,6 +1,7 @@
 import { measureText, RGBA, type ASCIIFontRenderable, type BoxRenderable, type OptimizedBuffer } from "@opentui/core";
 import { createEffect, createSignal, onCleanup, type Accessor, type JSX } from "solid-js";
 import { BAR_GLYPH, halfBlockBar, headerGradient, hexRgb, mix, paint, TRACK_COLOR, type Rgb } from "./hub-paint.js";
+import { PALETTE } from "./hub-style.js";
 
 /**
  * The hub's per-cell drawing. Each piece is one renderable that paints its cells in `renderAfter` with `setCell`, so
@@ -41,7 +42,7 @@ export function HeaderBar(props: { frame: Accessor<number>; drifting: Accessor<b
   repaintOn(() => ref, phase);
   function paintBar(this: BoxRenderable, buffer: OptimizedBuffer) {
     const colors = headerGradient(this.width, phase());
-    const fg = rgba(paint("#EEF2FF", props.truecolor));
+    const fg = rgba(paint(PALETTE.text, props.truecolor));
     for (let x = 0; x < this.width; x++) if (onScreen(buffer, this.x + x, this.y)) buffer.setCell(this.x + x, this.y, " ", fg, rgba(paint(colors[x], props.truecolor)));
   }
   return <box ref={ref} flexDirection="row" height={1} flexShrink={0} renderAfter={paintBar}>{props.children}</box>;
@@ -76,8 +77,8 @@ const SPLASH_SIZE = measureText({ text: "INDRA", font: SPLASH_FONT });
  */
 export function IdleSplash(props: { frame: Accessor<number>; width: Accessor<number>; truecolor: boolean; background: string; caption: string; captionColor: string }) {
   let ref: ASCIIFontRenderable | undefined;
-  const face = "#A5B4FC";
-  const shadow = "#312E81";
+  const face = PALETTE.accent;
+  const shadow = PALETTE.rule;
   repaintOn(() => ref, props.frame);
   function shimmer(this: ASCIIFontRenderable, buffer: OptimizedBuffer) {
     const span = this.width + 24;
