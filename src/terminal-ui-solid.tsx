@@ -4,7 +4,7 @@ import { createMemo, createSignal, For, Show, type Accessor } from "solid-js";
 import type { StateInventory, StateSeat } from "./state-domain.js";
 import { attachTmux } from "./tmux-attach.js";
 import { currentSession, displayText, GOAL_INPUT_LIMIT, newestPlanningRecord, TerminalUiModel, type SessionReadPort, type StateSyncPort, type TerminalSession, type TerminalSprint, type UiApproval, type UiRetry, type UiRollback, type UiView, type UpdatePort } from "./terminal-ui.js";
-import { engineLabel, SPRINT_STAGES, type SprintBuild } from "./session-snapshot.js";
+import { CEREMONY_STAGES, engineLabel, type SprintBuild, type SprintLoop } from "./session-snapshot.js";
 import type { GoalStarter, SeatLive, SeatProcessPort } from "./supervisor.js";
 import type { PaneTailSource } from "./pane-tail.js";
 import { PaneTailPanel, paneTailLines } from "./pane-tail-panel.js";
@@ -59,37 +59,62 @@ function threadActivity(live: SeatLive, limit: number): string {
   return live.activity ? "Latest: " + displayText(live.activity.message, limit) : "No thread activity yet.";
 }
 
-function sprintHint(sprint: NonNullable<TerminalSession["sprint"]>): string {
-  return {
-    collecting: "collecting seat PRs · the integration PR opens when all merge; I opens it for what merged",
-    "pr-open": "integration PR open · M merges it once CI is green, or react :white_check_mark: on its post",
-    merged: "merged into main · V rolls the sprint back",
-    "revert-open": "revert PR open · M merges it once CI is green, or react :white_check_mark: on its post",
-    reverted: "rolled back",
-  }[sprint];
-}
-
 const buildStatus: Record<SprintBuild["status"], string> = {
   running: "Running build contains the integration commit.",
   "reload-pending": "Pending reload: available build contains the integration; running build does not.",
   "update-pending": "Update pending: running and available builds do not contain the integration.",
-  unavailable: "Build evidence unavailable; Updated is not confirmed.",
+  unavailable: "Build evidence unavailable; release is not confirmed.",
   "revert-open": "Revert PR open; awaiting human merge confirmation.",
   reverted: "Reverted on main; running revert build is unverified.",
 };
 
+function releaseDetail(loop: SprintLoop): string {
+  if (loop.release) return `Release confirmed running ${loop.release.runningAt} · application ${loop.release.runningSha.slice(0, 7)} · bridge ${loop.release.buildSha.slice(0, 7)}.`;
+  if (!loop.ceremony) return "Release completion is not recorded.";
+  if (["planning", "proposal", "implement"].includes(loop.ceremony.stage)) return "Waiting for implementation to finish.";
+  if (!loop.integration || loop.integration.status === "collecting") return "Release waiting: integration PR has not opened.";
+  if (loop.integration.status === "pr-open") return "Release waiting: integration PR needs the owner's merge and green CI.";
+  if (loop.build?.status === "running") return "Build is running; waiting for the recorded transition to retro.";
+  return "Release waiting: " + (loop.build?.reason || (loop.build ? buildStatus[loop.build.status] : "running application and bridge evidence is unavailable."));
+}
+
+function retroDetail(loop: SprintLoop): string {
+  const published = loop.ceremony?.closure?.evidence;
+  if (published) return `Published ${published.publishedAt}.`;
+  if (loop.retro?.status === "published") return "Publication recorded; waiting for goal closure.";
+  if (loop.ceremony?.stage !== "retro") return "Waiting for the released build to be confirmed running.";
+  if (loop.retro?.prUrl) return "Retro waiting: PR needs the owner's merge, green CI and publication.";
+  return "Retro waiting: Chick's draft and publication PR have not been recorded.";
+}
+
 function SprintCard(props: { sprint: TerminalSprint; model: TerminalUiModel }) {
   const loop = () => props.sprint.loop;
+  const stage = () => loop().ceremony?.stage;
+  const closedAt = () => loop().ceremony?.closure?.closedAt ?? loop().closedAt;
+  const retro = () => loop().ceremony?.closure?.evidence ?? loop().retro;
+  const proposal = () => {
+    if (!stage()) return "Proposal progress: " + (props.sprint.planningStage ?? "not recorded") + ".";
+    if (stage() === "planning") return "Waiting for a proposal request.";
+    if (stage() !== "proposal") return "Plan approved.";
+    return props.sprint.planningStage === "awaiting-review" ? "Draft ready; waiting for the owner's plan approval."
+      : props.sprint.planningStage === "drafting" ? "Chick is drafting the proposal." : "Waiting for Chick's draft.";
+  };
   return <box flexDirection="column" flexShrink={0} padding={1} border borderColor="#42536B" backgroundColor={theme.panel}>
     <text fg={theme.heading} wrapMode="char">{props.sprint.draft ? "DRAFT SPRINT" : "SPRINT"} · {displayText(props.sprint.id)}</text>
-    <text fg={theme.accent}>Current stage: {loop().stage}</text>
+    <text fg={theme.accent}>Current stage: {stage() ?? "not recorded"}</text>
     <text wrapMode="word">
-      <For each={SPRINT_STAGES}>{(stage, index) => <span style={{ fg: stage === loop().stage ? theme.accent : theme.muted }}>
-        {(index() ? " → " : "") + (stage === loop().stage ? `[${stage}]` : stage)}
-      </span>}</For><span style={{ fg: theme.muted }}> → Goal</span>
+      <For each={CEREMONY_STAGES}>{(name, index) => <span style={{ fg: name === stage() ? theme.accent : theme.muted }}>
+        {(index() ? " → " : "") + (name === stage() ? `[${name}]` : name)}
+      </span>}</For>
     </text>
+    <text fg={closedAt() ? theme.running : theme.idle} wrapMode="word">Closure: {closedAt() ? "closed " + displayText(closedAt()) + " · completed sprint history" : props.sprint.draft ? "not started" : "open"}</text>
+    <Show when={!stage()}><text fg={theme.idle} wrapMode="word">{props.sprint.draft ? "Draft only; no ceremony has started." : "Persisted ceremony unavailable; awaiting migration before ceremony actions."}</text></Show>
     <text fg={theme.regular} wrapMode="word">{displayText(props.sprint.goal, 160)}</text>
-    <text fg={theme.heading}>Build · tickets</text>
+    <text fg={theme.heading}>planning · clarification</text>
+    <text fg={theme.regular}>{stage() === "planning" ? "Clarifying the goal." : loop().ceremony?.history.some((entry) => entry.stage === "planning") ? "Clarification recorded." : "Not recorded."}</text>
+    <text fg={theme.heading}>proposal · draft and owner review</text>
+    <text fg={theme.regular} wrapMode="word">{proposal()}</text>
+    <text fg={theme.heading}>implement · build, review and fix</text>
     <Show when={loop().tickets.length} fallback={<text fg={theme.muted}>No tickets assigned yet.</text>}>
       <For each={loop().tickets}>{(ticket) => <box flexDirection="column" flexShrink={0} paddingLeft={1}>
         <text fg={ticket.status === "failed" ? theme.error : ticket.status === "merged" ? theme.running : theme.regular} wrapMode="word">{displayText(ticket.title, 8000)} · {ticket.status}</text>
@@ -97,10 +122,15 @@ function SprintCard(props: { sprint: TerminalSprint; model: TerminalUiModel }) {
         <text fg={theme.muted} wrapMode="char">PR: {displayText(ticket.prUrl, 2000) || "not opened"}</text>
       </box>}</For>
     </Show>
-    <text fg={theme.heading}>Integrate · integration PR</text>
-    <text fg={theme.regular} wrapMode="char">{displayText(loop().integration?.prUrl, 2000) || "Not opened"}</text>
+    <text fg={theme.heading}>release · integration and update</text>
+    <text fg={theme.regular} wrapMode="char">Integration PR: {displayText(loop().integration?.prUrl ?? loop().release?.prUrl, 2000) || "not opened"}</text>
     <Show when={loop().integration?.revertPrUrl}><text fg={theme.idle} wrapMode="char">Revert PR: {displayText(loop().integration?.revertPrUrl, 2000)}</text></Show>
-    <Show when={loop().build}><text fg={loop().build?.status === "running" ? theme.running : theme.idle} wrapMode="word">{buildStatus[loop().build!.status]}</text></Show>
+    <text fg={loop().release ? theme.running : theme.idle} wrapMode="word">{displayText(releaseDetail(loop()), 2000)}</text>
+    <Show when={loop().build}><text fg={loop().build?.status === "running" ? theme.running : theme.idle} wrapMode="word">Current build: {displayText(loop().build?.reason || buildStatus[loop().build!.status], 2000)}</text></Show>
+    <text fg={theme.heading}>retro · draft and publication</text>
+    <text fg={closedAt() ? theme.running : theme.idle} wrapMode="word">{retroDetail(loop())}</text>
+    <Show when={retro()?.path}><text fg={theme.regular} wrapMode="char">Document: {displayText(retro()?.path, 2000)}</text></Show>
+    <Show when={retro()?.prUrl}><text fg={theme.regular} wrapMode="char">Retro PR: {displayText(retro()?.prUrl, 2000)}</text></Show>
   </box>;
 }
 
@@ -117,10 +147,11 @@ function confirmText(confirm: UiApproval | UiRollback | UiRetry, width: number):
     propose: ["Request Chick's proposal for ", "y request"],
     approve: ["Approve the proposal for ", "y approve"],
     integrate: ["Open the integration PR into main, for what merged, for sprint ", "y open"],
-    merge: [confirm.revert ? "Merge the revert PR on main for sprint " : "Merge the integration PR into main for sprint ", "y merge"],
+    merge: [confirm.mergeKind === "revert" ? "Merge the revert PR on main for sprint " : confirm.mergeKind === "retro" ? "Merge the retro publication PR into main for sprint " : "Merge the release integration PR into main for sprint ", "y merge"],
     revert: ["Roll back sprint ", "y open a revert PR"],
   }[confirm.action];
-  return question + displayText(confirm.goalId, 40) + " (" + displayText(confirm.goal, Math.max(10, width - 80)) + ")? " + yes;
+  return question + displayText(confirm.goalId, 40) + " (" + displayText(confirm.goal, Math.max(10, width - 80)) + ")? " + yes
+    + (confirm.prUrl ? "\nPR: " + displayText(confirm.prUrl, 2000) : "");
 }
 
 export interface TerminalAppProps {
@@ -157,6 +188,13 @@ export function TerminalApp(props: TerminalAppProps) {
   const paused = createMemo(() => { props.revision(); return props.model.paused; });
   const sprints = createMemo(() => { props.revision(); return props.model.sprintsForTeam(); });
   const hasPlanningLoops = createMemo(() => sprints().some((sprint) => !sprint.draft));
+  const newGoalBlocked = createMemo(() => { props.revision(); return props.model.newGoalBlocked(); });
+  const newGoalHint = createMemo(() => {
+    props.revision();
+    const open = props.model.openGoals();
+    return newGoalBlocked() && open.length ? "New goal blocked: " + open.map((goal) => goal.id).join(", ") + " still open." : newGoalBlocked();
+  });
+  const ceremonyKeys = createMemo(() => { props.revision(); return props.model.ceremonyKeys(); });
 
   let teamScroll: ScrollBoxRenderable | undefined;
   let sprintScroll: ScrollBoxRenderable | undefined;
@@ -204,16 +242,13 @@ export function TerminalApp(props: TerminalAppProps) {
         <For each={sessions}>{(session) => (
           <box flexDirection="column" gap={0}>
             <text fg={theme.accent}>Planning goal: {displayText(session.goal, 160)}</text>
-            <text fg={theme.regular}>Stage: {displayText(session.stage)}  ·  {props.model.sessionResult.connection === "connected" ? "" : "Last "}{engineLabel(session.engine)} session: {displayText(session.sessionId) || "not started"}</text>
+            <text fg={theme.regular}>Planning detail: {displayText(session.stage)}  ·  {props.model.sessionResult.connection === "connected" ? "" : "Last "}{engineLabel(session.engine)} session: {displayText(session.sessionId) || "not started"}</text>
             <text fg={theme.muted}>Updated: {displayText(session.updatedAt) || "not reported"}</text>
-            <Show when={session.stage === "clarifying"}>
-              <text fg={theme.idle}>Clarifying · {session.id === props.model.clarifyingGoal()?.id ? "P requests Chick's proposal here" : "P requests the newer goal's proposal first"}, or react :memo: on the goal post</text>
+            <Show when={session.id === props.model.clarifyingGoal()?.id}>
+              <text fg={theme.idle}>P requests Chick's proposal here, or react :memo: on the goal post</text>
             </Show>
-            <Show when={session.stage === "awaiting-review"}>
-              <text fg={theme.idle}>Proposal awaiting review · {session.id === props.model.reviewGoal()?.id ? "A approves it here" : "A approves the newer goal first"}, or react :white_check_mark: on its proposal post</text>
-            </Show>
-            <Show when={session.sprint}>
-              <text fg={theme.idle}>Sprint sprint/{displayText(session.id)}: {sprintHint(session.sprint!)}</text>
+            <Show when={session.id === props.model.reviewGoal()?.id}>
+              <text fg={theme.idle}>A approves it here, or react :white_check_mark: on its proposal post</text>
             </Show>
             <text fg={props.model.sessionResult.connection === "connected" && session.attach ? theme.running : theme.muted}>
               Bridge view: {props.model.sessionResult.connection === "connected" && session.attach ? displayText(session.attach.target) : "no verified tmux target"}
@@ -222,12 +257,12 @@ export function TerminalApp(props: TerminalAppProps) {
             <Show when={session.recentActivity.length} fallback={<text fg={theme.muted}>No runtime activity recorded.</text>}>
               <For each={session.recentActivity.slice(0, 5)}>{(activity) => <text fg={theme.regular}>• {displayText(activity, 160)}</text>}</For>
             </Show>
-            <Show when={session.loop}><SprintCard model={props.model} sprint={{ id: session.id, goal: session.goal, loop: session.loop! }} /></Show>
           </box>
         )}</For>
         <Show when={props.model.sessionResult.connection === "connected" && !sessions.some((session) => !!session.sessionId)}>
           <text fg={theme.muted}>No active runtime session occupies this seat.</text>
         </Show>
+        <Show when={page() === "seat"}><For each={sprints()}>{(sprint) => <SprintCard model={props.model} sprint={sprint} />}</For></Show>
       </box>
     );
   };
@@ -308,7 +343,8 @@ export function TerminalApp(props: TerminalAppProps) {
 
       <box flexShrink={0} flexDirection="column">
         <Show when={hasPlanningLoops() && page() !== "teams"}><text fg={theme.muted}>PgUp/PgDn scroll sprint history</text></Show>
-        <Show when={notice()}><text fg={theme.idle}>{displayText(notice())}</text></Show>
+        <Show when={newGoalHint()}><text fg={theme.idle} wrapMode="word">{displayText(newGoalHint(), 240)}</text></Show>
+        <Show when={notice()}><text fg={theme.idle} wrapMode="word">{displayText(notice())}</text></Show>
         <Show when={input()}>
           <text fg={theme.heading} wrapMode="char">
             New planning goal: {goalInputTail(input()?.value ?? "", dimensions().width)}▏
@@ -318,10 +354,12 @@ export function TerminalApp(props: TerminalAppProps) {
           </text>
         </Show>
         <Show when={confirm()}>
-          <text fg={theme.heading}>{confirmText(confirm()!, dimensions().width)}{confirm()?.action === "retry" ? " · n/Esc cancel" : " · any other key cancels"}</text>
+          <text fg={theme.heading} wrapMode="word">{confirmText(confirm()!, dimensions().width)}{confirm()?.action === "retry" ? " · n/Esc cancel" : " · any other key cancels"}</text>
         </Show>
-        <text fg={theme.accent}>
-          {input() ? "Enter start  ·  Esc cancel  ·  " + displayText(team()?.project?.github, 80) + " · home channel" : page() === "teams" ? "↑↓ choose team  ·  Enter open  ·  n new goal  ·  q quit" : page() === "team" ? "↑↓ seat · Enter details · T retry · n new goal · s restart · x stop · b teams · q quit" : "a attach · T retry · P propose · A approve · I/M/V sprint · s restart · x stop · n new goal · b team · q quit"}
+        <text fg={theme.accent} wrapMode="word">
+          {input() ? (newGoalBlocked() ? "Start blocked · Esc cancel" : "Enter start · Esc cancel") + " · " + displayText(team()?.project?.github, 80) + " · home channel"
+            : [page() === "teams" ? "↑↓ choose team · Enter open" : page() === "team" ? "↑↓ seat · Enter details · T retry · s restart · x stop · b teams" : "a attach · T retry · s restart · x stop · b team",
+              ...ceremonyKeys(), ...(newGoalBlocked() ? [] : ["n new goal"]), "q quit"].join(" · ")}
         </text>
         <text fg={theme.muted}>{paused() ? "Auto-update paused  ·  U resumes" : "Auto-update  ·  U pauses"}  ·  r checks now  ·  R rolls back  ·  q leaves seat processes running</text>
       </box>
