@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { SEAT_ROLES } from "./state-domain.js";
-import type { DraftSprint, ProposedAllocation, ProposedWork, StateRepository, StateSnapshot, StateTeam } from "./state-domain.js";
+import type { StateRepository, StateSnapshot, StateTeam } from "./state-domain.js";
 import { validatePlanningDocument, type PlanningDocument } from "./planning.js";
 
 export class StateDataError extends Error {
@@ -119,45 +119,6 @@ function teamProject(value: unknown, path: string): { github: string } {
   return { github };
 }
 
-function sprint(value: unknown, index: number): DraftSprint {
-  const path = `sprints[${index}]`;
-  const data = record(value, path);
-  fields(data, path, ["id", "teamId", "status", "phase", "goal", "proposedWork", "proposedAllocations"]);
-  if (data.status !== "draft") throw new StateDataError(`${path}.status must be 'draft'.`);
-  const proposedWork: ProposedWork[] = array(data.proposedWork, `${path}.proposedWork`).map((value, index) => {
-    const workPath = `${path}.proposedWork[${index}]`;
-    const work = record(value, workPath);
-    fields(work, workPath, ["id", "title", "description"]);
-    return {
-      id: id(work.id, `${workPath}.id`),
-      title: string(work.title, `${workPath}.title`),
-      description: string(work.description, `${workPath}.description`),
-    };
-  });
-  unique(proposedWork.map((work) => work.id), `${path}.proposedWork`);
-  const proposedAllocations: ProposedAllocation[] = array(data.proposedAllocations, `${path}.proposedAllocations`).map((value, index) => {
-    const allocationPath = `${path}.proposedAllocations[${index}]`;
-    const allocation = record(value, allocationPath);
-    fields(allocation, allocationPath, ["seatId", "workIds"]);
-    const workIds = array(allocation.workIds, `${allocationPath}.workIds`).map((item, index) => id(item, `${allocationPath}.workIds[${index}]`));
-    unique(workIds, `${allocationPath}.workIds`, "work ID");
-    return {
-      seatId: id(allocation.seatId, `${allocationPath}.seatId`),
-      workIds,
-    };
-  });
-  unique(proposedAllocations.map((allocation) => allocation.seatId), `${path}.proposedAllocations`, "seat allocation");
-  return {
-    id: id(data.id, `${path}.id`),
-    teamId: id(data.teamId, `${path}.teamId`),
-    status: "draft",
-    phase: string(data.phase, `${path}.phase`),
-    goal: string(data.goal, `${path}.goal`),
-    proposedWork,
-    proposedAllocations,
-  };
-}
-
 /** Validates the version 1 record shape and references before exposing neutral records. */
 export function parseState(raw: unknown): StateSnapshot {
   const data = record(raw, "state.json");
@@ -169,31 +130,13 @@ export function parseState(raw: unknown): StateSnapshot {
     throw new StateDataError(`Unsupported schemaVersion '${String(data.schemaVersion)}'; expected 1.`);
   }
   const teams = array(data.teams, "teams").map(team);
-  const sprints = array(data.sprints, "sprints").map(sprint);
+  // Retired draft sprints: ignored, and emptied at start-up (`PlanningStore.retireLegacySprints`); older builds require the key.
+  if (data.sprints !== undefined) array(data.sprints, "sprints");
   unique(teams.map((item) => item.id), "teams");
   unique(teams.map((item) => item.slug), "team slugs", "slug");
-  unique(sprints.map((item) => item.id), "sprints");
-  const teamsById = new Map(teams.map((item) => [item.id, item]));
-  for (let index = 0; index < sprints.length; index++) {
-    const item = sprints[index];
-    const owner = teamsById.get(item.teamId);
-    if (!owner) throw new StateDataError(`sprints[${index}].teamId '${item.teamId}' does not match a team.`);
-    const seatIds = new Set(owner.seats.map((seat) => seat.id));
-    const workIds = new Set(item.proposedWork.map((work) => work.id));
-    for (let allocationIndex = 0; allocationIndex < item.proposedAllocations.length; allocationIndex++) {
-      const allocation = item.proposedAllocations[allocationIndex];
-      const path = `sprints[${index}].proposedAllocations[${allocationIndex}]`;
-      if (!seatIds.has(allocation.seatId)) {
-        throw new StateDataError(`${path}.seatId '${allocation.seatId}' is not in team '${owner.id}'.`);
-      }
-      for (const workId of allocation.workIds) {
-        if (!workIds.has(workId)) throw new StateDataError(`${path}.workIds contains unknown work ID '${workId}'.`);
-      }
-    }
-  }
   try { validatePlanningDocument(data as unknown as PlanningDocument); }
   catch (error) { throw new StateDataError(error instanceof Error ? error.message : "Invalid planning goals."); }
-  return { teams, sprints };
+  return { teams };
 }
 
 export class LocalStateRepository implements StateRepository {

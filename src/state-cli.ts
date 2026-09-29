@@ -12,21 +12,6 @@ export function printState(snapshot: StateSnapshot, refreshed: string, write: Wr
     for (const seat of team.seats) {
       write(`  ${seat.displayName} (@${seat.handle}) | Role: ${seat.roles.join(", ") || "none"}`);
     }
-    const sprints = snapshot.sprints.filter((sprint) => sprint.teamId === team.id);
-    if (sprints.length === 0) write("  No sprint is recorded.");
-    for (const sprint of sprints) {
-      write(`  Sprint ${sprint.id} | status: DRAFT | phase: ${sprint.phase}`);
-      write(`  Goal: ${sprint.goal}`);
-      write("  Proposed work (DRAFT; not approved or running):");
-      if (sprint.proposedWork.length === 0) write("    None yet.");
-      for (const work of sprint.proposedWork) write(`    ${work.id}: ${work.title} — ${work.description}`);
-      write("  Proposed seat allocations (DRAFT; not approved or running):");
-      if (sprint.proposedAllocations.length === 0) write("    None yet.");
-      for (const allocation of sprint.proposedAllocations) {
-        const seat = team.seats.find((item) => item.id === allocation.seatId);
-        write(`    ${seat?.displayName ?? allocation.seatId}: ${allocation.workIds.join(", ") || "no work"}`);
-      }
-    }
   }
 }
 

@@ -1,6 +1,6 @@
 # Indra
 
-Indra reads stable team seats and draft sprint records from an `indra-state` Git checkout. The planning commands connect Chick's durable seat to an authenticated coding-agent CLI session and a dedicated Mattermost thread.
+Indra reads stable team seats and planning goals from an `indra-state` Git checkout. The planning commands connect Chick's durable seat to an authenticated coding-agent CLI session and a dedicated Mattermost thread.
 
 ## Direction
 

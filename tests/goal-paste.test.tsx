@@ -13,11 +13,6 @@ const state: StateSnapshot = {
     id: "team-001", slug: "yahaha", displayName: "Yahaha", mattermostTeamId: "external-team", homeChannelId: "o9rogqxy7br1zkrcami681sray", project: { github: "satoramoto/indra" },
     seats: names.map((displayName, index) => ({ id: "seat-00" + (index + 1), displayName, handle: displayName.toLowerCase().replace(" ", ""), mattermostUserId: "user-" + (index + 1), roles: [index === 0 ? "Team Lead" : "Developer"] })),
   }],
-  sprints: [{
-    id: "sprint-001", teamId: "team-001", status: "draft", phase: "planning", goal: "Define and validate the first one-seat work cycle",
-    proposedWork: [{ id: "work-001", title: "Draft the workflow", description: "Describe the handoff." }, { id: "work-002", title: "Review the workflow", description: "Record decisions." }],
-    proposedAllocations: [{ seatId: "seat-001", workIds: ["work-001", "work-002"] }],
-  }],
 };
 const goals: GoalStarter = { start: async () => "", approve: async () => { throw new Error("not used"); }, propose: async () => { throw new Error("not used"); } };
 

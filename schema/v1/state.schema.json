@@ -4,7 +4,7 @@
   "title": "Indra state v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["$schema", "schemaVersion", "teams", "sprints"],
+  "required": ["$schema", "schemaVersion", "teams"],
   "properties": {
     "$schema": { "const": "./schema/v1/state.schema.json" },
     "schemaVersion": { "const": 1 },
@@ -13,8 +13,9 @@
       "items": { "$ref": "#/$defs/team" }
     },
     "sprints": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/sprint" }
+      "description": "Retired draft sprints from before planning goals. Ignored by Indra, which empties it at start-up; kept as [] because older builds require it.",
+      "deprecated": true,
+      "type": "array"
     },
     "planningGoals": {
       "type": "array",
@@ -102,49 +103,6 @@
           "properties": {
             "mattermost": { "$ref": "#/$defs/mattermostSeat" }
           }
-        }
-      }
-    },
-    "sprint": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["id", "teamId", "status", "phase", "goal", "proposedWork", "proposedAllocations"],
-      "properties": {
-        "id": { "$ref": "#/$defs/id" },
-        "teamId": { "$ref": "#/$defs/id" },
-        "status": { "const": "draft" },
-        "phase": { "$ref": "#/$defs/nonEmptyText" },
-        "goal": { "$ref": "#/$defs/nonEmptyText" },
-        "proposedWork": {
-          "type": "array",
-          "items": { "$ref": "#/$defs/proposedWork" }
-        },
-        "proposedAllocations": {
-          "type": "array",
-          "items": { "$ref": "#/$defs/proposedAllocation" }
-        }
-      }
-    },
-    "proposedWork": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["id", "title", "description"],
-      "properties": {
-        "id": { "$ref": "#/$defs/id" },
-        "title": { "$ref": "#/$defs/nonEmptyText" },
-        "description": { "$ref": "#/$defs/nonEmptyText" }
-      }
-    },
-    "proposedAllocation": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["seatId", "workIds"],
-      "properties": {
-        "seatId": { "$ref": "#/$defs/id" },
-        "workIds": {
-          "type": "array",
-          "uniqueItems": true,
-          "items": { "$ref": "#/$defs/id" }
         }
       }
     },

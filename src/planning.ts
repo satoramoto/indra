@@ -81,7 +81,9 @@ export interface RuntimeRecord { sessionId?: string; lastSeenAt: number; process
   mergePosts?: { id: string; kind: MergeKind }[];
   pending?: { inputPostId: string; message: string; since: number; proposal?: boolean; mergePost?: MergeKind }; /** The owner's `planning propose`, waiting for the bridge's next poll. */ proposalRequest?: { requestedAt: number }; runs: { startedAt: string; finishedAt: string; usage?: unknown }[];
   /** Why the last proposal draft failed, redacted and capped; local only, never posted. */ lastDraftError?: { at: string; message: string } }
-export interface PlanningDocument { $schema: string; schemaVersion: number; teams: unknown[]; sprints: unknown[]; planningGoals?: PlanningGoal[] }
+export interface PlanningDocument { $schema: string; schemaVersion: number; teams: unknown[];
+  /** Retired draft sprints from before planning goals; `retireLegacySprints` empties them, keeping `[]` for older builds. */ sprints?: unknown[];
+  planningGoals?: PlanningGoal[] }
 
 export function validatePlanningGoal(goal: PlanningGoal): void {
   const fields = (value: unknown, allowed: string[]) => {
@@ -262,6 +264,21 @@ export class PlanningStore {
       if (result) results.push({ goalId: id, ...(result.status === "ready" ? { status: "migrated", summary: legacyMigrationSummary(result.ceremony) } : { status: "conflict", reason: result.reason }) });
     }
     return results;
+  }
+  /**
+   * Empties the retired top-level `sprints` array (draft sprints from before planning goals) in one state commit
+   * through the normal write path. The key stays, as `[]`, because builds before this one require it and rollback
+   * must still read the state. Returns whether it removed anything; running it again changes nothing.
+   */
+  async retireLegacySprints(): Promise<boolean> {
+    if (!(await this.read()).sprints?.length) return false;
+    let removed = false;
+    await this.update((state) => {
+      if (!state.sprints?.length) return;
+      state.sprints = [];
+      removed = true;
+    }, "Retire legacy draft sprints");
+    return removed;
   }
   /** Start-up migration's merge-commit checks, keyed by goal, for the write guard of that one migration. */
   private readonly releaseFacts = new Map<string, boolean | undefined>();

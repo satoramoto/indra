@@ -21,7 +21,6 @@ const snapshot: StateSnapshot = {
     id: "team-001", slug: "yahaha", displayName: "Yahaha", mattermostTeamId: "external-team",
     seats: names.map((displayName, index) => ({ id: "seat-00" + (index + 1), displayName, handle: displayName.toLowerCase().replace(" ", ""), mattermostUserId: "user-" + (index + 1), roles: [index === 0 ? "Team Lead" : "Developer"] })),
   }],
-  sprints: [{ id: "sprint-001", teamId: "team-001", status: "draft", phase: "planning", goal: "Review the first cycle", proposedWork: [], proposedAllocations: [] }],
 };
 
 const homed: StateSnapshot = { ...snapshot, teams: [{ ...snapshot.teams[0], homeChannelId: "o9rogqxy7br1zkrcami681sray", project: { github: "satoramoto/indra" } }] };
@@ -210,7 +209,6 @@ describe("terminal UI", () => {
       const initial = setup.captureCharFrame();
       for (const name of names) expect(initial).toContain(name);
       expect(initial).toContain("NO ACTIVE SESSION");
-      expect(initial).toContain("DRAFT SPRINT");
       fixture.sessions({ connection: "connected", sessions: [{
         id: "goal-1", teamId: "team-001", seatId: "seat-001", status: "running", engine: "codex",
         sessionId: "codex-123", goal: "Plan the next cycle", stage: "clarifying", recentActivity: ["Old note", "Read the brief"],
@@ -1237,7 +1235,7 @@ describe("visible sprint loop", () => {
       integration: { branch: "sprint/goal-two", baseSha: "b".repeat(40), status: "pr-open", prUrl: "https://github.com/example/indra/pull/100" },
     });
     const fixture = harness();
-    fixture.state({ ...homed, sprints: [] });
+    fixture.state(homed);
     fixture.sessions({ connection: "disconnected", sessions: [first, second] });
     await fixture.model.refresh();
     const setup = await testRender(() => <TerminalApp model={fixture.model} revision={() => fixture.model.revision} onKey={() => {}} />, { width, height: 24 });
@@ -1285,7 +1283,7 @@ describe("visible sprint loop", () => {
     ["revert-open", "Revert PR open; awaiting human merge confirmation."],
     ["reverted", "Reverted on main; running revert build is unverified."],
   ])("renders %s build evidence explicitly", async (status, message) => {
-    const fixture = harness(); fixture.state({ ...homed, sprints: [] });
+    const fixture = harness(); fixture.state(homed);
     fixture.sessions({ connection: "connected", sessions: [projectedSession("goal-built", { stage: "release", ceremony: ceremony("release"), tickets: [], build: { status } })] });
     await fixture.model.refresh();
     const setup = await testRender(() => <TerminalApp model={fixture.model} revision={() => fixture.model.revision} onKey={() => {}} />, { width: 120, height: 40 });
@@ -1294,19 +1292,6 @@ describe("visible sprint loop", () => {
       const frames = await scrollFrames(setup, "sprint-scroll");
       expect(visibleIn(frames, message), frames[0]).toBe(true);
       expect(visibleIn(frames, "Current stage: release")).toBe(true);
-    } finally { setup.renderer.destroy(); }
-  });
-
-  it("keeps draft sprints separate without inventing ceremony progress or queued work", async () => {
-    const fixture = harness(); await fixture.model.refresh();
-    expect(fixture.model.sprintsForTeam()[0].loop).toMatchObject({ stage: "Goal", tickets: [] });
-    const setup = await testRender(() => <TerminalApp model={fixture.model} revision={() => fixture.model.revision} onKey={() => {}} />, { width: 80, height: 24 });
-    try {
-      await setup.renderOnce();
-      const frames = await scrollFrames(setup, "team-scroll");
-      expect(visibleIn(frames, "Current stage: not recorded")).toBe(true);
-      expect(visibleIn(frames, "Draft only; no ceremony has started.")).toBe(true);
-      expect(visibleIn(frames, "planning → proposal → implement → release → retro")).toBe(true);
     } finally { setup.renderer.destroy(); }
   });
 
