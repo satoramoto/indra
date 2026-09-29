@@ -1,3 +1,6 @@
+import { SprintGitHub } from "./sprint.js";
+import { DeveloperGoal } from "./developer-goal.js";
+import type { WorkflowEvent, GoalReport } from "./goal-contract.js";
 import { randomUUID } from "node:crypto";
 import { lstat, realpath } from "node:fs/promises";
 import { join } from "node:path";
@@ -80,6 +83,11 @@ export class DeveloperSeat {
     private readonly runtimeFor: RuntimeFactory,
     private readonly log: (line: string) => void = () => {},
   ) {}
+
+  /** Finite goals-v1 entry point. No assignment means no model, Git, chat or legacy work. */
+  async turn(event: WorkflowEvent): Promise<{ events: WorkflowEvent[]; report: GoalReport | null }> {
+    return new DeveloperGoal(this.store, this.seat.id, this.shell, this.runtimeFor, this.log).turn(event);
+  }
 
   /** Resumes the seat's in-flight assignment, or claims the oldest queued one. Returns "idle" when there was nothing to do. */
   async tick(): Promise<"idle" | "worked"> {
@@ -372,6 +380,8 @@ export class DeveloperSeat {
         if (pr.headRefName !== branch || pr.baseRefName !== base) throw new SeatError("PR head or base does not match this sprint assignment; not merging.");
         if (await requireApprovedReview(this.shell, prUrl!, project) !== checkedHead) throw new SeatError("PR head changed after CI; not merging.");
         if (pr.isDraft === true) await this.sh("gh", ["pr", "ready", prUrl!], project);
+        const blocker = await new SprintGitHub(this.shell, this.store.runtimeDir).serverMergeBlocker(prUrl!, checkedHead);
+        if (blocker) throw new SeatError(blocker);
         await this.event(record, { kind: "merge", result: "started", headSha: checkedHead });
         let landed: boolean;
         try {

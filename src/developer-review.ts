@@ -82,6 +82,7 @@ export async function postReviewOnce(options: DeveloperReviewOptions): Promise<s
     saved = { ...saved, posted: true };
     await store.saveRuntime(name, saved);
   }
+  await options.onReview?.(saved);
   return [...saved.findings];
 }
 

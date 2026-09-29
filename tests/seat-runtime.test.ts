@@ -61,3 +61,31 @@ describe("seat engine configuration and routing", () => {
     expect(create).not.toHaveBeenCalled();
   });
 });
+
+import { renderGoalBrief, runGoalAgent, type GoalAgentSession } from "../src/seat-runtime.js";
+import type { GoalBrief } from "../src/goal-contract.js";
+const goalBrief: GoalBrief = { version: 1, goalId: "goal-one", teamId: "team-one", seatId: "seat-003", header: { repo: "test/project", baseBranch: "sprint/goal-one", baseSha: "a".repeat(40), branch: "codex/goal-one/code", prTarget: "sprint/goal-one" }, outcomes: [{ number: 1, title: "Fix", description: "Preserve behavior", reason: "Mission", currentCode: ["src/a.ts"] }], ownedFiles: ["src/a.ts"], exclusions: [{ files: ["src/b.ts"], owner: "lane docs", reason: "Exclusive" }], swarm: "Single-file workers", retros: [{ goalId: "goal-old", path: "docs/retros/goal-old.md", summary: "Earlier lesson" }], redirects: [{ postId: "post", userId: "owner", at: "2026-09-01T00:00:00Z", message: "Preserve public API" }], reportFormat: "PR/head, exact commands/exits, Decisions, Follow-ups and needed-but-unowned" };
+it("gives both engines the identical standard brief and fresh read-only worker context", async () => {
+  const prompts: string[] = [];
+  for (const engine of ["codex", "claude"] as const) {
+    const create = vi.fn<EngineFactory>(() => ({ message: async (prompt, _schema, session) => {
+      prompts.push(prompt); expect(session).toBeUndefined(); return { sessionId: `${engine}-new`, response: { content: "source" }, startedAt: "start", finishedAt: "finish" };
+    } }));
+    const sessions: GoalAgentSession[] = []; const persist = vi.fn(async () => {}); const directory = await config();
+    const runtime = (cwd: string) => new SeatRuntime(engine, cwd, undefined, undefined, create);
+    const invocation = { key: "worker:a", role: "worker" as const, brief: goalBrief, cwd: directory, schema: { type: "object", additionalProperties: false, required: ["content"], properties: { content: { type: "string" } } }, instruction: "Own exactly src/a.ts. Return its bytes; no checks, commits or other workers." };
+    await runGoalAgent(runtime, invocation, directory, sessions, persist);
+    await runGoalAgent(runtime, invocation, directory, sessions, persist);
+    expect(create).toHaveBeenCalledTimes(1); expect(create.mock.calls[0][3]).toBeUndefined(); expect(sessions[0].status).toBe("complete");
+    expect(persist).toHaveBeenCalledTimes(2);
+  }
+  expect(prompts[0]).toBe(prompts[1]);
+  const text = renderGoalBrief(goalBrief);
+  for (const expected of ["Base: sprint/goal-one at", "1. Fix", "Why: Mission", "Current code: src/a.ts", "owned by lane docs", "Single-file workers", "Earlier lesson", "Preserve public API", "exact commands/exits"]) expect(text).toContain(expected);
+});
+it("does not automatically replay an interrupted agent intent", async () => {
+  const directory = await config(); const create = vi.fn();
+  const sessions: GoalAgentSession[] = [{ key: "lead", role: "lead", status: "started", startedAt: "2026-09-01T00:00:00Z" }];
+  await expect(runGoalAgent(create, { key: "lead", role: "lead", brief: goalBrief, cwd: directory, schema: "schema", instruction: "Recover" }, directory, sessions, async () => {})).rejects.toThrow("explicit retry");
+  expect(create).not.toHaveBeenCalled();
+});
