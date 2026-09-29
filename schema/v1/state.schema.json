@@ -1,0 +1,246 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/satoramoto/indra-state/blob/main/schema/v1/state.schema.json",
+  "title": "Indra state v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["$schema", "schemaVersion", "teams", "sprints"],
+  "properties": {
+    "$schema": { "const": "./schema/v1/state.schema.json" },
+    "schemaVersion": { "const": 1 },
+    "teams": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/team" }
+    },
+    "sprints": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/sprint" }
+    },
+    "planningGoals": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/planningGoal" }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]+$"
+    },
+    "nonEmptyText": {
+      "type": "string",
+      "minLength": 1
+    },
+    "mattermostTeam": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["teamId"],
+      "properties": {
+        "teamId": { "$ref": "#/$defs/nonEmptyText" },
+        "homeChannelId": { "$ref": "#/$defs/nonEmptyText" }
+      }
+    },
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["github"],
+      "properties": {
+        "github": {
+          "type": "string",
+          "pattern": "^(?!\\.\\.?/)[A-Za-z0-9_.-]+/(?!\\.\\.?$)[A-Za-z0-9_.-]+$"
+        }
+      }
+    },
+    "mattermostSeat": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["userId", "username"],
+      "properties": {
+        "userId": { "$ref": "#/$defs/nonEmptyText" },
+        "username": { "$ref": "#/$defs/nonEmptyText" }
+      }
+    },
+    "team": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "slug", "displayName", "externalIdentities", "seats"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "slug": { "$ref": "#/$defs/id" },
+        "displayName": { "$ref": "#/$defs/nonEmptyText" },
+        "project": { "$ref": "#/$defs/project" },
+        "externalIdentities": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mattermost"],
+          "properties": {
+            "mattermost": { "$ref": "#/$defs/mattermostTeam" }
+          }
+        },
+        "seats": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/seat" }
+        }
+      }
+    },
+    "seat": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "displayName", "roles", "externalIdentities"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "displayName": { "$ref": "#/$defs/nonEmptyText" },
+        "roles": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": { "enum": ["Team Lead", "Developer"] }
+        },
+        "externalIdentities": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mattermost"],
+          "properties": {
+            "mattermost": { "$ref": "#/$defs/mattermostSeat" }
+          }
+        }
+      }
+    },
+    "sprint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "teamId", "status", "phase", "goal", "proposedWork", "proposedAllocations"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "teamId": { "$ref": "#/$defs/id" },
+        "status": { "const": "draft" },
+        "phase": { "$ref": "#/$defs/nonEmptyText" },
+        "goal": { "$ref": "#/$defs/nonEmptyText" },
+        "proposedWork": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/proposedWork" }
+        },
+        "proposedAllocations": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/proposedAllocation" }
+        }
+      }
+    },
+    "proposedWork": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "title", "description"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "title": { "$ref": "#/$defs/nonEmptyText" },
+        "description": { "$ref": "#/$defs/nonEmptyText" }
+      }
+    },
+    "proposedAllocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["seatId", "workIds"],
+      "properties": {
+        "seatId": { "$ref": "#/$defs/id" },
+        "workIds": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        }
+      }
+    },
+    "planningGoal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "teamId", "seatId", "participantSeatIds", "goal", "projectRefs", "stage", "createdAt", "updatedAt", "mattermost", "brief"],
+      "allOf": [{
+        "if": { "properties": { "stage": { "enum": ["awaiting-review", "approved"] } }, "required": ["stage"] },
+        "then": { "required": ["proposal"] },
+        "else": { "not": { "required": ["proposal"] } }
+      }, {
+        "if": { "properties": { "stage": { "const": "approved" } }, "required": ["stage"] },
+        "else": { "not": { "anyOf": [{ "required": ["assignments"] }, { "required": ["integration"] }] } }
+      }],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "teamId": { "$ref": "#/$defs/id" },
+        "seatId": { "$ref": "#/$defs/id" },
+        "participantSeatIds": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+        "goal": { "$ref": "#/$defs/nonEmptyText" },
+        "projectRefs": { "type": "array", "items": { "$ref": "#/$defs/nonEmptyText" } },
+        "stage": { "enum": ["clarifying", "drafting", "awaiting-review", "approved"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "mattermost": {
+          "type": "object", "additionalProperties": false, "required": ["channelId", "rootPostId"],
+          "properties": {
+            "channelId": { "$ref": "#/$defs/nonEmptyText" },
+            "rootPostId": { "$ref": "#/$defs/nonEmptyText" }
+          }
+        },
+        "brief": {
+          "type": "object", "additionalProperties": false, "required": ["summary", "decisions", "openQuestions"],
+          "properties": {
+            "summary": { "$ref": "#/$defs/nonEmptyText" },
+            "decisions": { "type": "array", "items": { "$ref": "#/$defs/nonEmptyText" } },
+            "openQuestions": { "type": "array", "items": { "$ref": "#/$defs/nonEmptyText" } }
+          }
+        },
+        "proposal": { "$ref": "#/$defs/planningProposal" },
+        "assignments": { "type": "array", "items": { "$ref": "#/$defs/planningAssignment" } },
+        "integration": { "$ref": "#/$defs/sprintIntegration" }
+      }
+    },
+    "sprintIntegration": {
+      "type": "object", "additionalProperties": false,
+      "required": ["branch", "baseSha", "status"],
+      "allOf": [
+        { "if": { "properties": { "status": { "enum": ["pr-open", "merged", "reverted"] } } }, "then": { "required": ["prUrl"] } },
+        { "if": { "properties": { "status": { "enum": ["merged", "reverted"] } } }, "then": { "required": ["mergedSha"] } },
+        { "if": { "properties": { "status": { "const": "reverted" } } }, "then": { "required": ["revertPrUrl"] } }
+      ],
+      "properties": {
+        "branch": { "type": "string", "pattern": "^sprint/[a-z][a-z0-9-]+$" },
+        "baseSha": { "$ref": "#/$defs/gitSha" },
+        "status": { "enum": ["collecting", "pr-open", "merged", "reverted"] },
+        "prUrl": { "$ref": "#/$defs/nonEmptyText" },
+        "mergedSha": { "$ref": "#/$defs/gitSha" },
+        "revertPrUrl": { "$ref": "#/$defs/nonEmptyText" }
+      }
+    },
+    "gitSha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "planningAssignment": {
+      "type": "object", "additionalProperties": false,
+      "required": ["outcomeId", "seatId", "status", "updatedAt"],
+      "properties": {
+        "outcomeId": { "$ref": "#/$defs/id" },
+        "seatId": { "$ref": "#/$defs/id" },
+        "status": { "enum": ["queued", "running", "in-review", "merged", "failed"] },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "prUrl": { "$ref": "#/$defs/nonEmptyText" },
+        "note": { "$ref": "#/$defs/nonEmptyText" }
+      }
+    },
+    "planningProposal": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "createdAt", "summary", "outcomes", "risks", "openQuestions"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "summary": { "$ref": "#/$defs/nonEmptyText" },
+        "outcomes": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/planningOutcome" } },
+        "risks": { "type": "array", "items": { "$ref": "#/$defs/nonEmptyText" } },
+        "openQuestions": { "type": "array", "items": { "$ref": "#/$defs/nonEmptyText" } }
+      }
+    },
+    "planningOutcome": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "title", "description", "seatId"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "title": { "$ref": "#/$defs/nonEmptyText" },
+        "description": { "$ref": "#/$defs/nonEmptyText" },
+        "seatId": { "$ref": "#/$defs/id" }
+      }
+    }
+  }
+}

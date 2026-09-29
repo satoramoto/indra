@@ -2,18 +2,25 @@
  * 1Password CLI variables (`OP_SERVICE_ACCOUNT_TOKEN`, `OP_SESSION_*` and the rest of `OP_*`) belong to `op` alone.
  * The CLI moves them out of `process.env` at start-up, so no child process inherits them by accident; only the
  * `op` invocations get them back, through `opEnv`. Agents, tmux, git, gh and npm run with `childEnv`.
+ *
+ * `INDRA_STATE_GITHUB_TOKEN` is captured the same way, but belongs to the state repository's `git fetch` and
+ * `git push` alone (see `stateRepoToken` and `src/state-commit.ts`); `op` does not get it either.
  */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 const OP_VARIABLE = /^OP_/;
+/** The token the owner may supply for fetching from and pushing to the state repository. */
+export const STATE_TOKEN_VARIABLE = "INDRA_STATE_GITHUB_TOKEN";
+/** Every variable no child process inherits by default. */
+const CAPTURED_VARIABLE = new RegExp(`^(?:OP_|${STATE_TOKEN_VARIABLE}$)`);
 let captured: Record<string, string> = {};
 
-/** Moves every `OP_*` variable out of `env` into this module's memory. Safe to call more than once. */
+/** Moves every `OP_*` variable and `INDRA_STATE_GITHUB_TOKEN` out of `env` into this module's memory. Safe to call more than once. */
 export function captureOpEnvironment(env: NodeJS.ProcessEnv = process.env): void {
   for (const [name, value] of Object.entries(env)) {
-    if (!OP_VARIABLE.test(name)) continue;
+    if (!CAPTURED_VARIABLE.test(name)) continue;
     if (value !== undefined) captured[name] = value;
     delete env[name];
   }
@@ -27,14 +34,20 @@ export function envServiceToken(): string | undefined {
   return captured.OP_SERVICE_ACCOUNT_TOKEN?.trim() || undefined;
 }
 
-/** A copy of `env` without any `OP_*` variable, for every child process that is not `op`. */
+/** The GitHub token the owner supplied as `INDRA_STATE_GITHUB_TOKEN` when starting Indra, if any; only state-repository git uses it. */
+export function stateRepoToken(): string | undefined {
+  return captured[STATE_TOKEN_VARIABLE]?.trim() || undefined;
+}
+
+/** A copy of `env` without any `OP_*` variable or the state repository token, for every child process that is not `op`. */
 export function childEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  return Object.fromEntries(Object.entries(env).filter(([name]) => !OP_VARIABLE.test(name)));
+  return Object.fromEntries(Object.entries(env).filter(([name]) => !CAPTURED_VARIABLE.test(name)));
 }
 
 /** The environment of an `op` invocation: the captured `OP_*` variables, with `serviceToken` taking precedence. */
 export function opEnv(serviceToken?: string): NodeJS.ProcessEnv {
-  return { ...childEnv(), ...captured, ...(serviceToken ? { OP_SERVICE_ACCOUNT_TOKEN: serviceToken } : {}) };
+  const opVariables = Object.fromEntries(Object.entries(captured).filter(([name]) => OP_VARIABLE.test(name)));
+  return { ...childEnv(), ...opVariables, ...(serviceToken ? { OP_SERVICE_ACCOUNT_TOKEN: serviceToken } : {}) };
 }
 
 /** Which service account an `op` invocation uses; without `serviceToken`, the owner's `OP_SERVICE_ACCOUNT_TOKEN` or the desktop. */
@@ -76,7 +89,7 @@ export async function opRead(ref: string, credential: OpCredential = {}, timeout
   }
 }
 
-/** Names of `OP_*` variables set in `tmux show-environment -g` output, so a hosted pane can unset them. */
+/** Names of captured variables (`OP_*`, the state repository token) set in `tmux show-environment -g` output, so a hosted pane can unset them. */
 export function opVariablesIn(showEnvironment: string): string[] {
-  return showEnvironment.split("\n").map((line) => /^(OP_\w*)=/.exec(line)?.[1]).filter((name): name is string => !!name);
+  return showEnvironment.split("\n").map((line) => /^(\w+)=/.exec(line)?.[1]).filter((name): name is string => !!name && CAPTURED_VARIABLE.test(name));
 }
