@@ -53,7 +53,7 @@ describe("Mattermost vs state comparison", () => {
   });
 
   it("prints the report and exits non-zero only when something differs", async () => {
-    const snapshot: StateSnapshot = { teams: [team], sprints: [] };
+    const snapshot: StateSnapshot = { teams: [team] };
     const state = new StateInventory({ read: async () => snapshot });
     const lines: string[] = [];
     expect(await runConsistencyCheck(state, { listTeamMembers: async () => matching }, (line) => lines.push(line))).toBe(0);

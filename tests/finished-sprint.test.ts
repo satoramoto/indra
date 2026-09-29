@@ -38,7 +38,7 @@ describe("isFinishedSprint", () => {
 
 describe("team sprint list", () => {
   it("drops finished sprints from the team list but keeps them resolvable for the seat", async () => {
-    const snapshot = { teams: [{ id: "t", slug: "t", displayName: "T", mattermostTeamId: "m", seats: [{ id: "s", displayName: "S", handle: "s", mattermostUserId: "u", roles: ["Developer"] }] }], sprints: [] };
+    const snapshot = { teams: [{ id: "t", slug: "t", displayName: "T", mattermostTeamId: "m", seats: [{ id: "s", displayName: "S", handle: "s", mattermostUserId: "u", roles: ["Developer"] }] }] };
     const session = (id: string, g: PlanningGoal, sprint?: "merged" | "collecting") => ({ id, teamId: "t", seatId: "s", status: "idle" as const, engine: "codex" as const,
       goal: id, stage: "approved", recentActivity: [], loop: projectSprint(g), ...(sprint ? { sprint } : {}) });
     const closed = goal(["merged"], { status: "merged", prUrl: "https://github.com/o/r/pull/1", mergedSha: "a".repeat(40) });

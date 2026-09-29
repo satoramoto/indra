@@ -283,4 +283,51 @@ describe("a dirty state checkout", () => {
     await expect(persistence.migrateLegacyGoals(migratedAt, preCeremony)).rejects.toThrow("not committed");
     expect(commits(persistence)).toHaveLength(2);
   });
+  it("refuses to retire the legacy draft sprints over uncommitted edits", async () => {
+    const persistence = await store(withDraftSprint());
+    const edited = `${JSON.stringify(withDraftSprint(), null, 2)}\n`;
+    await writeFile(join(persistence.checkout, "state.json"), edited);
+    await expect(persistence.retireLegacySprints()).rejects.toThrow("not committed");
+    expect(await readFile(join(persistence.checkout, "state.json"), "utf8")).toBe(edited);
+    expect(commits(persistence)).toHaveLength(2);
+  });
+});
+
+/** The real state as it still is: its one draft sprint from the original proof of concept, before planning goals. */
+function withDraftSprint(): PlanningDocument {
+  return { ...structuredClone(real), sprints: [{
+    id: "sprint-001", teamId: "team-001", status: "draft", phase: "planning", goal: "Define and validate the first one-seat work cycle",
+    proposedWork: [{ id: "work-001", title: "Define the cycle", description: "Describe one seat's work cycle from goal to merged PR." }],
+    proposedAllocations: [{ seatId: "seat-002", workIds: ["work-001"] }],
+  }] };
+}
+
+describe("retiring the legacy draft sprints", () => {
+  it("removes the top-level sprints in one commit, leaving a state the v1 schema accepts, and is idempotent", async () => {
+    const legacyState = withDraftSprint();
+    expect(validSchema(legacyState), JSON.stringify(validSchema.errors)).toBe(true);
+    const persistence = await store(legacyState);
+    expect(await persistence.retireLegacySprints()).toBe(true);
+    const state = await persistence.read();
+    expect(state).not.toHaveProperty("sprints");
+    expect(state).toEqual((({ sprints: _sprints, ...rest }) => rest)(legacyState));
+    expect(validSchema(state), JSON.stringify(validSchema.errors)).toBe(true);
+    expect(commits(persistence)).toEqual(["Retire legacy draft sprints", "Add schema", "Initial state"]);
+    expect(git(persistence.checkout, "show", "--name-only", "--format=", "HEAD").trim()).toBe("state.json");
+
+    const before = await readFile(join(persistence.checkout, "state.json"), "utf8");
+    expect(await persistence.retireLegacySprints()).toBe(false);
+    expect(await readFile(join(persistence.checkout, "state.json"), "utf8")).toBe(before);
+    expect(commits(persistence)).toHaveLength(3);
+  });
+  it("runs alongside the legacy goal migration, ending with the whole real state valid against the v1 schema", async () => {
+    const persistence = await store(withDraftSprint());
+    await persistence.migrateLegacyGoals(migratedAt, preCeremony);
+    expect(await persistence.retireLegacySprints()).toBe(true);
+    const state = await persistence.read();
+    expect(state).not.toHaveProperty("sprints");
+    expect(state.planningGoals!.every((goal) => goal.ceremony)).toBe(true);
+    expect(validSchema(state), JSON.stringify(validSchema.errors)).toBe(true);
+    expect(commits(persistence)[0]).toBe("Retire legacy draft sprints");
+  });
 });

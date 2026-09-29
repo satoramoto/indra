@@ -214,7 +214,6 @@ describe("pane tail", () => {
         { id: "seat-001", displayName: "Chick Corea", handle: "chickcorea", mattermostUserId: "u1", roles: ["Team Lead"] },
         { id: "seat-002", displayName: "George Duke", handle: "georgeduke", mattermostUserId: "u2", roles: ["Developer"] },
       ] }],
-      sprints: [],
     };
     const calls: string[] = [];
     const source: PaneTailSource = { capture: async (seat) => { calls.push(seat.id); return seat.id === "seat-001" ? { status: "ok", lines: ["Chick is planning", "second line"] } : { status: "no-session" }; } };

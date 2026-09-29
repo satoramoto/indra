@@ -109,15 +109,15 @@ function SprintCard(props: { sprint: TerminalSprint; model: TerminalUiModel }) {
       : props.sprint.planningStage === "drafting" ? "Chick is drafting the proposal." : "Waiting for Chick's draft.";
   };
   return <box flexDirection="column" flexShrink={0} padding={1} border borderColor="#42536B" backgroundColor={theme.panel}>
-    <text fg={theme.heading} wrapMode="char">{props.sprint.draft ? "DRAFT SPRINT" : "SPRINT"} · {displayText(props.sprint.id)}</text>
+    <text fg={theme.heading} wrapMode="char">SPRINT ·{displayText(props.sprint.id)}</text>
     <text fg={theme.accent}>Current stage: {stage() ?? "not recorded"}</text>
     <text wrapMode="word">
       <For each={CEREMONY_STAGES}>{(name, index) => <span style={{ fg: name === stage() ? theme.accent : theme.muted }}>
         {(index() ? " → " : "") + (name === stage() ? `[${name}]` : name)}
       </span>}</For>
     </text>
-    <text fg={closedAt() ? theme.running : theme.idle} wrapMode="word">Closure: {closedAt() ? "closed " + displayText(closedAt()) + " · completed sprint history" : props.sprint.draft ? "not started" : "open"}</text>
-    <Show when={!stage()}><text fg={theme.idle} wrapMode="word">{props.sprint.draft ? "Draft only; no ceremony has started." : "Persisted ceremony unavailable; awaiting migration before ceremony actions."}</text></Show>
+    <text fg={closedAt() ? theme.running : theme.idle} wrapMode="word">Closure: {closedAt() ? "closed " + displayText(closedAt()) + " · completed sprint history" : "open"}</text>
+    <Show when={!stage()}><text fg={theme.idle} wrapMode="word">Persisted ceremony unavailable; awaiting migration before ceremony actions.</text></Show>
     <text fg={theme.regular} wrapMode="word">{displayText(props.sprint.goal, 160)}</text>
     <text fg={theme.heading}>planning · clarification</text>
     <text fg={theme.regular}>{stage() === "planning" ? "Clarifying the goal." : loop().ceremony?.history.some((entry) => entry.stage === "planning") ? "Clarification recorded." : "Not recorded."}</text>
@@ -197,7 +197,7 @@ export function TerminalApp(props: TerminalAppProps) {
   const confirm = createMemo(() => { props.revision(); return props.model.confirm ? { ...props.model.confirm } : undefined; });
   const paused = createMemo(() => { props.revision(); return props.model.paused; });
   const sprints = createMemo(() => { props.revision(); return props.model.sprintsForTeam(); });
-  const hasPlanningLoops = createMemo(() => sprints().some((sprint) => !sprint.draft));
+  const hasPlanningLoops = createMemo(() => sprints().length > 0);
   const newGoalBlocked = createMemo(() => { props.revision(); return props.model.newGoalBlocked(); });
   const newGoalHint = createMemo(() => {
     props.revision();

@@ -32,7 +32,7 @@ export interface UiView { page: UiPage; teamId?: string; seatId?: string }
 /** Structural read port. A stable seat is never treated as a running agent without a runtime session. */
 export type TerminalSession = SessionSnapshot["sessions"][number];
 
-export interface TerminalSprint { id: string; goal: string; loop: SprintLoop; planningStage?: string; draft?: boolean }
+export interface TerminalSprint { id: string; goal: string; loop: SprintLoop; planningStage?: string }
 
 /** Use the persisted ceremony even when an older reader also supplies a legacy loop stage. */
 export function sessionSprint(session: TerminalSession): TerminalSprint {
@@ -555,15 +555,8 @@ export class TerminalUiModel {
   /** Team history includes every planning sprint, independent of which seat currently holds work. */
   sprintsForTeam(): TerminalSprint[] {
     const sessions = this.sessionResult.sessions.filter((session) => session.teamId === this.teamId);
-    return [
-      // Finished sprints leave the list; they stay out of the drafts below too, since `sessions` still holds them.
-      ...sessions.map(sessionSprint).filter((sprint) => !isFinishedSprint(sprint.loop)),
-      ...(this.snapshot?.sprints ?? []).filter((sprint) => sprint.teamId === this.teamId && !sessions.some((session) => session.id === sprint.id)).map((sprint): TerminalSprint => ({
-        id: sprint.id, goal: sprint.goal, draft: true, loop: { stage: "Goal", tickets: sprint.proposedWork.map((work) => ({
-          id: work.id, title: work.title, seatId: sprint.proposedAllocations.find((item) => item.workIds.includes(work.id))?.seatId ?? "unassigned", status: "not assigned",
-        })) },
-      })),
-    ];
+    // Finished sprints leave the list.
+    return sessions.map(sessionSprint).filter((sprint) => !isFinishedSprint(sprint.loop));
   }
 
   selectedSession(): TerminalSession | undefined { return currentSession(this.seat ? this.sessionsFor(this.seat.id) : []); }

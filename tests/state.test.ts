@@ -20,12 +20,6 @@ const fixture = () => ({
       { id: "seat-002", displayName: "Corey Henry", roles: ["Developer"], externalIdentities: { mattermost: { userId: "external-user-2", username: "coreyhenry" } } },
     ],
   }],
-  sprints: [{
-    id: "sprint-001", teamId: "team-001", status: "draft", phase: "planning",
-    goal: "Agree on a first cycle.",
-    proposedWork: [{ id: "work-001", title: "Describe the cycle", description: "Draft a reviewable proposal." }],
-    proposedAllocations: [{ seatId: "seat-002", workIds: ["work-001"] }],
-  }],
 });
 
 const dirs: string[] = [];
@@ -82,7 +76,7 @@ describe("local state checkout", () => {
     expect(() => parseState(value)).toThrow("team's project");
   });
 
-  it("reads the seed shape into neutral records and clearly labels draft work", async () => {
+  it("reads the seed shape into neutral records", async () => {
     const inventory = new StateInventory(new LocalStateRepository(await checkout(fixture())));
     const snapshot = await inventory.current();
     expect(snapshot.teams[0].seats.map((seat) => seat.id)).toEqual(["seat-001", "seat-002"]);
@@ -91,13 +85,17 @@ describe("local state checkout", () => {
     const output: string[] = [];
     printState(snapshot, "now", (line) => output.push(line));
     expect(output.join("\n")).toContain("Yahaha (yahaha) | 2 seats");
-    expect(output.join("\n")).toContain("Sprint sprint-001 | status: DRAFT | phase: planning");
-    expect(output.join("\n")).toContain("Proposed seat allocations (DRAFT; not approved or running)");
-    expect(output.join("\n")).toContain("Corey Henry: work-001");
     expect(output.join("\n")).not.toContain("external-team");
   });
 
-  it("rereads edits to Corey's roles and sprint phase on refresh", async () => {
+  it("still reads a document with the retired draft sprints, and needs no sprints at all", () => {
+    const draft = { id: "sprint-001", teamId: "team-001", status: "draft", phase: "planning", goal: "Agree on a first cycle.", proposedWork: [], proposedAllocations: [] };
+    expect(parseState({ ...fixture(), sprints: [draft] })).toEqual(parseState(fixture()));
+    expect(parseState(fixture())).not.toHaveProperty("sprints");
+    expect(() => parseState({ ...fixture(), sprints: {} })).toThrow("sprints must be an array");
+  });
+
+  it("rereads edits to Corey's roles on refresh", async () => {
     const dir = await checkout(fixture());
     const inventory = new StateInventory(new LocalStateRepository(dir));
     const output: string[] = [];
@@ -107,7 +105,6 @@ describe("local state checkout", () => {
         const edited = JSON.parse(await readFile(join(dir, "state.json"), "utf8")) as ReturnType<typeof fixture>;
         edited.teams[0].seats[0].roles = ["Developer"];
         edited.teams[0].seats[1].roles = ["Team Lead"];
-        edited.sprints[0].phase = "review";
         await writeFile(join(dir, "state.json"), JSON.stringify(edited));
         return "r";
       }
@@ -116,8 +113,6 @@ describe("local state checkout", () => {
     const text = output.join("\n");
     expect(text).toContain("Corey Henry (@coreyhenry) | Role: Developer\n");
     expect(text).toContain("Corey Henry (@coreyhenry) | Role: Team Lead");
-    expect(text).toContain("phase: planning");
-    expect(text).toContain("phase: review");
   });
 
   it("reports malformed JSON, unsupported version, shape, and bad references", async () => {
@@ -130,18 +125,6 @@ describe("local state checkout", () => {
     const missing = fixture();
     missing.teams[0].seats[1].roles = ["Developer", "Developer"];
     expect(() => parseState(missing)).toThrow("teams[0].seats[1].roles contains duplicate role 'Developer'");
-    const badTeam = fixture();
-    badTeam.sprints[0].teamId = "missing";
-    expect(() => parseState(badTeam)).toThrow("sprints[0].teamId 'missing' does not match a team");
-    const badSeat = fixture();
-    badSeat.sprints[0].proposedAllocations[0].seatId = "absent";
-    expect(() => parseState(badSeat)).toThrow("seatId 'absent' is not in team");
-    const badWork = fixture();
-    badWork.sprints[0].proposedAllocations[0].workIds = ["missing"];
-    expect(() => parseState(badWork)).toThrow("unknown work ID 'missing'");
-    const badStatus = fixture();
-    badStatus.sprints[0].status = "approved";
-    expect(() => parseState(badStatus)).toThrow("status must be 'draft'");
     const unknown = fixture() as ReturnType<typeof fixture> & { secrets?: string };
     unknown.secrets = "no";
     expect(() => parseState(unknown)).toThrow("state.json.secrets is not part of state schema v1");
