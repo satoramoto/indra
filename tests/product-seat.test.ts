@@ -11,7 +11,7 @@ import { PlanningStore } from "../src/planning.js";
 import { createLeadGrooming, createProductRunner, groomingRuntimeFor, loadProductSeat, ProductSeat } from "../src/product-seat.js";
 import * as researchModule from "../src/product-research.js";
 import { SeatRuntime } from "../src/seat-runtime.js";
-import { isActiveSeat, type SeatRole, type SeatStatus, type TeamRecord } from "../src/state-domain.js";
+import { INITIAL_TEAM_MISSION, isActiveSeat, type SeatRole, type SeatStatus, type TeamRecord } from "../src/state-domain.js";
 import { stateCheckout } from "./state-checkout.js";
 
 const dirs: string[] = [];
@@ -146,6 +146,20 @@ describe("Product role dispatch and isolation", () => {
     await createLeadGrooming(f.store, identified, factory)({ teamId });
     await vi.waitFor(() => expect(identified).toHaveBeenCalled());
     expect(factory).not.toHaveBeenCalled(); expect(poll).not.toHaveBeenCalled();
+  });
+
+  it("bootstraps only the prescribed initial mission for the authenticated Lead before starting grooming", async () => {
+    const f = await fixture("Product", "active", null);
+    const factory = vi.fn(async () => () => ({ message: vi.fn<AgentRuntime["message"]>() }));
+    vi.spyOn(BacklogGroomer.prototype, "poll").mockImplementation(() => {});
+    await createLeadGrooming(f.store, async () => "chick", factory)({ teamId });
+    await vi.waitFor(() => expect(factory).toHaveBeenCalled());
+    expect((await new BacklogStore(f.store).read(teamId)).mission).toBe(INITIAL_TEAM_MISSION);
+    await f.store.updateOwnerSettings(teamId, { mission: "The owner's edited direction." });
+    const again = vi.fn(async () => () => ({ message: vi.fn<AgentRuntime["message"]>() }));
+    await createLeadGrooming(f.store, async () => "chick", again)({ teamId });
+    await vi.waitFor(() => expect(again).toHaveBeenCalled());
+    expect((await new BacklogStore(f.store).read(teamId)).mission).toBe("The owner's edited direction.");
   });
 
   it("registers Lead grooming through the CLI's actual optional module composition", async () => {

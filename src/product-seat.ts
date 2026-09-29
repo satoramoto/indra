@@ -1,6 +1,7 @@
 import type { AgentRuntime } from "./codex-runtime.js";
 import type { BridgeAdapterServices, ProductRunnerServices } from "./control-adapters.js";
 import { BacklogGroomer, type GroomerOptions } from "./backlog-groomer.js";
+import { BacklogStore } from "./backlog.js";
 import type { SeatIdentity } from "./developer-seat.js";
 import { seatHarnessDir } from "./harness-home.js";
 import { requireTeamHome, PlanningStore } from "./planning.js";
@@ -80,10 +81,11 @@ export function createLeadGrooming(store: PlanningStore, ownUserId: () => Promis
     if (job.starting) return;
     job.starting = (async () => {
       const team = ((await store.read()).teams as TeamRecord[]).find((item) => item.id === teamId);
-      if (!team?.mission?.trim()) return;
       const own = await ownUserId();
       const lead = team?.seats.find((seat) => seat.roles[0] === "Team Lead" && isActiveSeat(seat) && seat.externalIdentities.mattermost.userId === own);
       if (!lead) return;
+      // This fixed, owner-approved bootstrap is outside the agent response path. Owner edits always win.
+      if (team!.mission === undefined) await new BacklogStore(store).initializeMission(teamId);
       // Rebuild if the owner replaced the serving lead; an old runner will fail its active-seat check.
       const identity = `${teamId}/${lead.id}`;
       const seatJob = jobs.get(identity) ?? {};
