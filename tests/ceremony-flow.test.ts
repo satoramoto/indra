@@ -51,16 +51,28 @@ class GitHub implements Shell {
   open = false;
   branch = "";
   reviewDecision = "";
+  botApproved = false;
   reviews = [{ author: { login: "reviewer" }, state: "APPROVED", submittedAt: "2026-01-01T00:00:00Z" }];
   beforeProof?: () => Promise<void>;
   async run(command: string, args: string[]) {
     const line = `${command} ${args.join(" ")}`; this.calls.push(line);
     let stdout = "";
     if (args[0] === "api") { stdout = mainSha; this.branch = args[1].split("heads/")[1] ?? this.branch; }
+    if (args[0] === "api" && args.includes("--method") && !args.includes("--paginate")) {
+      const endpoint = args[1]; const owners = "* @satori-miyamoto\n";
+      if (/\/pulls\/\d+$/.test(endpoint)) stdout = JSON.stringify({ state: "open", draft: false, auto_merge: null, head: { sha: mainSha }, base: { ref: "main", sha: mainSha, repo: { full_name: "test/project" } } });
+      if (endpoint.endsWith("/protection")) stdout = JSON.stringify({ enforce_admins: { enabled: true }, required_status_checks: { contexts: ["checks"] }, required_pull_request_reviews: { required_approving_review_count: 1, require_code_owner_reviews: true, dismiss_stale_reviews: true } });
+      if (endpoint.endsWith("/permission")) stdout = JSON.stringify({ permission: "write", user: { login: "satori-miyamoto", permissions: { push: true } } });
+      if (endpoint.includes("/git/trees/")) stdout = JSON.stringify({ truncated: false, tree: [{ path: ".github/CODEOWNERS", type: "blob", mode: "100644", sha: mainSha }] });
+      if (endpoint.includes("/git/blobs/")) stdout = JSON.stringify({ sha: mainSha, encoding: "base64", content: Buffer.from(owners).toString("base64"), size: Buffer.byteLength(owners) });
+      if (endpoint.includes("/codeowners/errors?")) stdout = JSON.stringify({ errors: [] });
+    }
     if (args[0] === "pr" && args[1] === "list") stdout = this.open && !this.merged ? "https://github.com/test/project/pull/1" : "";
     if (args[0] === "pr" && args[1] === "create") { this.open = true; stdout = "https://github.com/test/project/pull/1"; }
-    if (args[0] === "pr" && args[1] === "merge") this.merged = true;
-    if (args[0] === "pr" && args[1] === "view") stdout = JSON.stringify({ state: this.merged ? "MERGED" : "OPEN", mergeCommit: this.merged ? { oid: mergeSha } : null });
+    if (args[0] === "pr" && args[1] === "merge" && !args.includes("--disable-auto")) this.merged = true;
+    if (args[1]?.includes("/reviews?")) stdout = JSON.stringify([this.botApproved ? [{ id: 1, user: { login: "satori-miyamoto" }, state: "APPROVED", commit_id: mainSha }] : []]);
+    if (args[1] === "checks" && args.includes("name,bucket")) stdout = JSON.stringify([{ name: "checks", bucket: "pass" }]);
+    if (args[0] === "pr" && args[1] === "view") stdout = JSON.stringify({ state: this.merged ? "MERGED" : "OPEN", mergeCommit: this.merged ? { oid: mergeSha } : null, headRefOid: mainSha, isDraft: false, author: { login: "owner" }, reviewDecision: "" });
     if (args.some((arg) => arg.startsWith("state,baseRefName,mergeCommit,reviewDecision"))) { await this.beforeProof?.(); stdout = JSON.stringify({ state: "MERGED", baseRefName: this.branch, mergeCommit: { oid: mainSha }, reviewDecision: this.reviewDecision, ...(args.some((arg) => arg.split(",").includes("reviews")) ? { reviews: this.reviews } : {}) }); }
     return { code: 0, stdout, stderr: "" };
   }
@@ -238,11 +250,12 @@ describe("ordered gates and evidence", () => {
     expect((await store.read()).planningGoals![0].assignments).toHaveLength(1);
   });
 
-  it("keeps merge approval in release until a running-build adapter verifies it", async () => {
-    const { store, bridge, restart, goal, chat } = await implemented();
+  it("keeps a bot-approved merge in release until the running build is verified", async () => {
+    const { store, bridge, restart, goal, chat, github } = await implemented();
+    github.botApproved = true;
     expect((await store.read()).planningGoals![0].ceremony?.stage).toBe("release");
     await expect(bridge.merge(goal.id)).resolves.toContain("merged into main");
-    expect((await approvalOf(store, goal.id))?.approval).toMatchObject({ source: "owner-command" });
+    expect(await approvalOf(store, goal.id)).toBeUndefined();
     await restart().poll();
     const saved = (await store.read()).planningGoals![0];
     expect(saved.integration?.status).toBe("merged");
@@ -287,15 +300,16 @@ describe("ordered gates and evidence", () => {
     const release = vi.fn(async (context: Parameters<NonNullable<CeremonyAdapters["release"]>["poll"]>[0]) => {
       if (!running) return { status: "pending" as const, reason: "Waiting for reload" };
       return { status: "complete" as const, evidence: { kind: "release-running" as const, prUrl: context.goal.integration!.prUrl!, mergedSha: mergeSha,
-        mergePostId: context.mergeApproval!.postId, approval: context.mergeApproval!.approval, checksPassed: true as const, buildSha: mergeSha, runningSha: mergeSha, runningAt: new Date().toISOString() } };
+        mergeVerification: { headSha: mainSha, reviewCommitSha: mainSha, reviewer: "satori-miyamoto" as const, checksPassed: true as const }, checksPassed: true as const, buildSha: mergeSha, runningSha: mergeSha, runningAt: new Date().toISOString() } };
     });
     const retro = vi.fn(async (context: Parameters<NonNullable<CeremonyAdapters["retro"]>["poll"]>[0]) => {
       const postId = await context.post("retro-document", "Recorded sprint retrospective");
-      if (!archived) return { status: "pending" as const, reason: "Archival PR awaits review and human approval" };
+      if (!archived) return { status: "pending" as const, reason: "Archival PR awaits review and CI" };
       return { status: "complete" as const, evidence: { kind: "retro-published" as const, path: `docs/retros/${context.goal.id}.md`, prUrl: "https://github.com/test/project/pull/12", baseBranch: "main" as const,
         mergedSha: "c".repeat(40), postId, publishedAt: new Date().toISOString(), factsOnly: true as const, suggestions: "owner-proposals-only" as const } };
     });
-    const { store, bridge, restart, goal, chat } = await implemented({ release: { poll: release }, retro: { poll: retro } });
+    const { store, bridge, restart, goal, chat, github } = await implemented({ release: { poll: release }, retro: { poll: retro } });
+    github.botApproved = true;
     expect(release).not.toHaveBeenCalled();
     await bridge.merge(goal.id);
     await bridge.poll();
@@ -322,41 +336,23 @@ describe("ordered gates and evidence", () => {
     expect((await store.read()).planningGoals).toHaveLength(2);
   });
 
-  it("records a fresh human merge approval for a sprint merged before the ceremony, then completes release", async () => {
-    const release = vi.fn(async (context: Parameters<NonNullable<CeremonyAdapters["release"]>["poll"]>[0]) => {
-      if (!context.mergeApproval) return { status: "pending" as const, reason: "Waiting for the recorded human integration merge approval." };
-      return { status: "complete" as const, evidence: { kind: "release-running" as const, prUrl: context.goal.integration!.prUrl!, mergedSha: mergeSha,
-        mergePostId: context.mergeApproval.postId, approval: context.mergeApproval.approval, checksPassed: true as const, buildSha: mergeSha, runningSha: mergeSha, runningAt: new Date().toISOString() } };
-    });
-    const { store, github, bridge, restart, goal, chat } = await implemented({ release: { poll: release } });
-    // Reproduce the migrated shape: merged by a pre-ceremony build, at release, with no recorded approval.
-    await store.update((state) => { const found = state.planningGoals![0]; found.integration = { ...found.integration!, status: "merged", mergedSha: mergeSha }; }, "Pre-ceremony build merges the sprint");
+  it("completes an already-merged historical release using bot and running-build evidence without inventing approval", async () => {
+    const release = vi.fn(async (context: Parameters<NonNullable<CeremonyAdapters["release"]>["poll"]>[0]) => ({ status: "complete" as const, evidence: {
+      kind: "release-running" as const, prUrl: context.goal.integration!.prUrl!, mergedSha: mergeSha,
+      mergeVerification: { headSha: mainSha, reviewCommitSha: mainSha, reviewer: "satori-miyamoto" as const, checksPassed: true as const },
+      checksPassed: true as const, buildSha: mergeSha, runningSha: mergeSha, runningAt: new Date().toISOString(),
+    } }));
+    const { store, bridge, goal } = await implemented({ release: { poll: release } });
+    await store.update((state) => { state.planningGoals![0].integration = { ...state.planningGoals![0].integration!, status: "merged", mergedSha: mergeSha }; }, "Record historical merge");
     await bridge.poll();
-    const migrated = await store.runtime(goal.id);
-    expect(await approvalOf(store, goal.id)).toBeUndefined();
-    expect((await store.read()).planningGoals![0].ceremony?.stage).toBe("release");
-    const merges = () => github.calls.filter((call) => call.includes("pr merge")).length;
-    const integrationPost = migrated.mergePosts!.find((item) => item.kind === "integration")!;
-    chat.react(integrationPost.id, "white_check_mark", "bot");
-    await restart().poll();
-    expect((await approvalOf(store, goal.id))).toBeUndefined();
-    expect((await store.read()).planningGoals![0].ceremony?.stage).toBe("release");
-    const message = await restart().merge(goal.id);
-    expect(message).toContain("recorded your merge approval");
-    expect(merges()).toBe(0);
-    expect((await approvalOf(store, goal.id))).toMatchObject({ postId: integrationPost.id, approval: { source: "owner-command", command: "planning merge" } });
-    expect(chat.posts.filter((post) => post.message.includes("recorded your merge approval"))).toHaveLength(1);
-    const recorded = (await approvalOf(store, goal.id));
-    await expect(restart().merge(goal.id)).rejects.toThrow("Nothing to merge");
-    expect((await approvalOf(store, goal.id))).toEqual(recorded);
-    await restart().poll();
     expect((await store.read()).planningGoals![0].ceremony?.stage).toBe("retro");
-    expect(merges()).toBe(0);
-    expect(chat.posts.filter((post) => post.message.includes("recorded your merge approval"))).toHaveLength(1);
+    expect(await approvalOf(store, goal.id)).toBeUndefined();
+    expect(release).toHaveBeenCalledOnce();
   });
 
   it("closes a sprint whose integration is reverted during release, before the new build runs", async () => {
-    const { store, bridge, restart, goal, chat } = await implemented();
+    const { store, bridge, restart, goal, chat, github } = await implemented();
+    github.botApproved = true;
     await bridge.merge(goal.id);
     await bridge.poll();
     expect((await store.read()).planningGoals![0].ceremony?.stage).toBe("release");
@@ -475,14 +471,15 @@ describe("failure boundaries", () => {
     expect(record?.stageEvents?.map((event) => event.stage)).toEqual(["planning", "proposal"]);
   });
 
-  it("rejects running-build evidence that changes the recorded human approval", async () => {
-    const { store, bridge, goal } = await implemented({ release: { poll: async (context) => ({ status: "complete", evidence: {
+  it("rejects new running-build evidence that offers human approval instead of current-head proof", async () => {
+    const { store, bridge, github, goal } = await implemented({ release: { poll: async (context) => ({ status: "complete", evidence: {
       kind: "release-running", prUrl: context.goal.integration!.prUrl!, mergedSha: mergeSha,
       mergePostId: "unrelated-post", approval: { source: "owner-command", command: "planning merge", at: new Date().toISOString() },
       checksPassed: true, buildSha: mergeSha, runningSha: mergeSha, runningAt: new Date().toISOString(),
     } }) } });
+    github.botApproved = true;
     await bridge.merge(goal.id);
-    await expect(bridge.poll()).rejects.toThrow("recorded human merge approval");
+    await expect(bridge.poll()).rejects.toThrow("verified current-head bot approval and green CI");
     expect((await store.read()).planningGoals![0].ceremony?.stage).toBe("release");
   });
 

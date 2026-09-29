@@ -325,14 +325,14 @@ function phaseFacts(input: RetroInput, stages: RetroEvidenceSnapshot["stages"], 
   const work = implementationPhase(input, reviews, rounds, missing);
   const release = goal.ceremony!.history.find((entry) => entry.stage === "retro")!.evidence;
   // No recorder captures integration PR conflict or merge rounds yet; the phase table shows them as unknown.
-  const running = Date.parse(time(release.runningAt)) - Date.parse(time(release.approval.at));
+  const running = release.approval ? Date.parse(time(release.runningAt)) - Date.parse(time(release.approval.at)) : null;
   return [
     { phase: "planning", facts: [fact("planning-turns", "Clarification turns", turns), fact("planning-failures", "Failed clarification turns", failed(CLARIFY_FAILURE, turns))] },
     { phase: "proposal", facts: [fact("proposal-drafts", "Draft attempts", drafts), fact("proposal-draft-failures", "Failed draft attempts", failed(DRAFT_FAILURE, drafts)),
       fact("proposal-approval-wait", "Draft waiting for plan approval", wait !== null && wait >= 0 ? wait : null, "ms")] },
     work,
     { phase: "release", facts: [fact("release-integration-conflicts", "Integration PR conflict rounds", null), fact("release-merge-rounds", "Integration PR merge rounds", null),
-      fact("release-approval-to-running", "From merge approval to the new build running (includes CI wait, merge and build)", running >= 0 ? running : null, "ms")] },
+      fact("release-approval-to-running", "From merge approval to the new build running (includes CI wait, merge and build)", running !== null && running >= 0 ? running : null, "ms")] },
     { phase: "retro", facts: [fact("retro-drafts", "Draft attempts, including this one", retro.failed + 1), fact("retro-failed-drafts", "Failed or aborted draft attempts", retro.failed),
       fact("retro-first-error", "First failed attempt's error kind", retro.firstErrorKind, "text"), fact("retro-last-error", "Last failed attempt's error kind", retro.lastErrorKind, "text")] },
   ];

@@ -1,5 +1,5 @@
-/** The only permanent seat roles. A team has exactly one Team Lead; every other seat is a Developer. */
-export const SEAT_ROLES = ["Team Lead", "Developer"] as const;
+/** New-model teams have one Team Lead, one Product and at least one Developer. */
+export const SEAT_ROLES = ["Team Lead", "Product", "Developer"] as const;
 
 /** Business records used by the terminal, independent of their storage or source. */
 export interface StateSeat {
@@ -12,6 +12,8 @@ export interface StateSeat {
 }
 
 export interface StateTeam {
+  /** Absent on historical two-role v1 records. */
+  workflowModel?: "goals-v1";
   id: string;
   slug: string;
   displayName: string;

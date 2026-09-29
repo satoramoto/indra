@@ -371,6 +371,16 @@ const lateGeneration = (): RetroGeneration => ({ ...generation(), startedAt: at(
 const phaseValue = (snapshot: RetroEvidenceSnapshot, phase: string, id: string) => snapshot.phases.find((item) => item.phase === phase)!.facts.find((item) => item.evidenceId === id)!.value;
 
 describe("per-phase process reflection", () => {
+  it("does not invent historical human-approval timing for automatic releases", () => {
+    const data = realistic();
+    const release = data.goal.ceremony!.history.find((entry) => entry.stage === "retro")!.evidence;
+    delete release.approval; delete release.mergePostId;
+    release.mergeVerification = { headSha: "a".repeat(40), reviewCommitSha: "a".repeat(40), reviewer: "satori-miyamoto", checksPassed: true };
+    const snapshot = buildRetroSnapshot(data);
+    expect(phaseValue(snapshot, "release", "release-approval-to-running")).toBeNull();
+    expect(snapshot.choices.phaseReflections.some((item) => item.evidenceId === "release-approval-to-running")).toBe(false);
+  });
+
   it("computes each phase's facts from a realistic recorded fixture", () => {
     const snapshot = buildRetroSnapshot(realistic());
     expect(snapshot.phases.map((phase) => phase.phase)).toEqual(["planning", "proposal", "implement", "release", "retro"]);

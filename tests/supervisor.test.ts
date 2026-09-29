@@ -341,7 +341,7 @@ function failedGoal(id = "goal-retry", updatedAt = "2026-01-02T00:00:00Z"): Plan
 
 async function retryFixture(goals = [failedGoal()]) {
   for (const goal of goals) {
-    if (!goal.integration || goal.assignments?.some((item) => item.seatId === "seat-001")) continue;
+    if (!goal.integration) continue;
     goal.ceremony = { version: 1, stage: "implement", history: [
       { stage: "planning", enteredAt: goal.createdAt }, { stage: "proposal", enteredAt: goal.proposal!.createdAt },
       { stage: "implement", enteredAt: goal.proposal!.createdAt, evidence: { kind: "approval", proposalId: goal.proposal!.id, proposalPostId: "proposal-post", approval: { source: "owner-command", command: "planning approve", at: goal.proposal!.createdAt } } },
@@ -386,18 +386,30 @@ describe("failed assignment retries", () => {
     Object.assign(closed.integration!, { status: "pr-open", prUrl: "https://github.com/o/r/pull/2" });
     const other = failedGoal("goal-other", "2026-01-05T00:00:00Z");
     other.proposal!.outcomes[0].seatId = other.assignments![0].seatId = "seat-003";
-    const lead = failedGoal("goal-lead", "2026-01-05T00:00:00Z");
-    lead.assignments![0].seatId = "seat-001";
     const active = (["queued", "running", "in-review", "merged"] as const).map((status) => {
       const goal = failedGoal(`goal-${status}`, "2026-01-06T00:00:00Z");
       goal.assignments![0].status = status;
       return goal;
     });
-    const { supervisor } = await retryFixture([old, newest, closed, other, lead, legacy, ...active]);
+    const { supervisor } = await retryFixture([old, newest, closed, other, legacy, ...active]);
     const live = await supervisor.read();
     expect(live["seat-002"].retry).toEqual({ seatId: "seat-002", goalId: "goal-retry", goal: "Fix the terminal", outcomeId: "outcome-2", title: "Newer failure", updatedAt: "2026-01-03T00:00:00Z" });
     expect(live["seat-003"].retry?.goalId).toBe("goal-other");
     expect(live["seat-001"].retry).toBeUndefined();
+  });
+
+  it("rejects an ineligible assignment in a read snapshot without persisting invalid state", async () => {
+    const { store, supervisor, target } = await retryFixture();
+    const snapshot = await store.read();
+    snapshot.planningGoals![0].proposal!.outcomes[0].seatId = "seat-001";
+    snapshot.planningGoals![0].assignments![0].seatId = "seat-001";
+    // Persisted state rejects this combination; exercise the Supervisor's defensive read boundary only.
+    const read = vi.spyOn(PlanningStore.prototype, "read").mockResolvedValue(snapshot);
+    try {
+      expect((await supervisor.read())["seat-001"].retry).toBeUndefined();
+      await expect(supervisor.retry({ ...target, seatId: "seat-001" })).rejects.toThrow("not a Developer");
+    } finally { read.mockRestore(); }
+    expect((await store.read()).planningGoals![0].assignments![0]).toMatchObject({ seatId: "seat-002", status: "failed" });
   });
 
   it.each(["planning", "proposal", "release", "retro", "legacy"])("does not offer or accept retries outside implement: %s", async (stage) => {

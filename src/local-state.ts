@@ -60,7 +60,8 @@ function unique(ids: string[], path: string, label = "ID"): void {
 function team(value: unknown, index: number): StateTeam {
   const path = `teams[${index}]`;
   const data = record(value, path);
-  fields(data, path, ["id", "slug", "displayName", "project", "externalIdentities", "seats"]);
+  fields(data, path, ["id", "slug", "displayName", "project", "externalIdentities", "seats", "workflowModel"]);
+  if (data.workflowModel !== undefined && data.workflowModel !== "goals-v1") throw new StateDataError(`${path}.workflowModel is unsupported.`);
   const project = data.project === undefined ? undefined : teamProject(data.project, `${path}.project`);
   const identities = record(data.externalIdentities, `${path}.externalIdentities`);
   fields(identities, `${path}.externalIdentities`, ["mattermost"]);
@@ -97,7 +98,12 @@ function team(value: unknown, index: number): StateTeam {
   if (leads !== 1) {
     throw new StateDataError(`${path}.seats must contain exactly one 'Team Lead' seat; found ${leads}.`);
   }
+  const products = seats.filter((seat) => seat.roles[0] === "Product").length;
+  if (data.workflowModel === "goals-v1") {
+    if (products !== 1 || !seats.some((seat) => seat.roles[0] === "Developer")) throw new StateDataError(`${path}.seats requires exactly one Product and at least one Developer for goals-v1.`);
+  } else if (products) throw new StateDataError(`${path}.workflowModel must be goals-v1 before a Product seat is enabled.`);
   return {
+    ...(data.workflowModel === "goals-v1" ? { workflowModel: "goals-v1" as const } : {}),
     id: id(data.id, `${path}.id`),
     slug: id(data.slug, `${path}.slug`),
     displayName: string(data.displayName, `${path}.displayName`),

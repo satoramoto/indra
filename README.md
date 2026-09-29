@@ -4,24 +4,7 @@ Indra reads stable team seats and planning goals from an `indra-state` Git check
 
 ## Direction
 
-Indra is a startup simulator: a control plane where stable team seats in Mattermost are filled by coding-agent sessions. This section describes the proof of concept we are building toward. The rest of this README describes what runs today.
-
-**Roles.** There are exactly two permanent roles. The Team Lead is Chick Corea (`seat-001`). Every other seat is a Developer. There are no extra-role claims and no formal soft roles. A sprint proposal can describe soft responsibilities in prose.
-
-**Seats and tasks.** A seat limits concurrency by task ownership: each seat owns one logical workstream at a time. Inside that task it can start any number of subagents with the developer, reviewer and quick-fix profiles.
-
-**Rules inside a task.** Build, then review by a fresh agent, fix, merge. The reviewer is never the same agent reviewing its own work in the same context.
-
-**People and state.** The only human step is approving plans. Agents merge their own PRs once CI is green and the fresh reviewer has approved. Indra writes planning records to `indra-state`. Indra reads live Mattermost (the existing `--mattermost` mode) to confirm it matches `indra-state`; that read stays read-only.
-
-**POC milestone.** The full team loop runs on the Indra repository itself: a goal is set, Chick plans, a human approves, a Developer seat does the work in a worktree, opens a PR, starts a fresh reviewer, fixes, merges, then goes idle. Codex is the default; each seat can select Claude Code for new sessions. Existing sessions stay on their originating engine.
-
-**Planned PR order.**
-
-1. CI.
-2. The two roles, plus the check that live Mattermost matches `indra-state`.
-3. Plan approval, with assignment of approved work to seats.
-4. Developer seats running the task loop.
+[docs/mission.md](docs/mission.md) defines Indra’s mission, three roles, goal ownership and the continuous build/release/retro loop. It takes precedence over descriptions of the historical workflow below.
 
 ## Run
 

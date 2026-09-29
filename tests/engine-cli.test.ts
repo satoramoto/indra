@@ -6,6 +6,7 @@ import type { AgentRuntime, MessageOptions, WriteAccess } from "../src/codex-run
 import type { CeremonyAdapters, PlanningChat } from "../src/planning-bridge.js";
 import { processShell, type RuntimeFactory } from "../src/developer-seat.js";
 import { createPlanningBridge, createPlanningStore, main } from "../src/cli.js";
+import { SprintGitHub } from "../src/sprint.js";
 import { PlanningStore } from "../src/planning.js";
 import { loadSeatPersonas, type SeatPersona } from "../src/seat-persona.js";
 
@@ -201,12 +202,12 @@ describe("every CLI runtime/chat construction path", () => {
   });
 
 
-  it("connects the release reader only after merge approval and green CI, retaining verified descendant evidence", async () => {
+  it("connects the release reader only after exact-head bot approval and green CI, retaining verified descendant evidence", async () => {
     const store = new PlanningStore(checkout);
     const runtime = new (fakeRuntime("codex"))("/project");
     const mergedSha = "a".repeat(40); const runningSha = "b".repeat(40);
     const read = vi.fn(async () => ({ status: "running" as const, reason: "Ready", evidence: { mergedSha, buildSha: runningSha, runningSha, runningAt: new Date().toISOString() } }));
-    const shell = vi.spyOn(processShell, "run").mockResolvedValue({ code: 1, stdout: "", stderr: "" });
+    const proof = vi.spyOn(SprintGitHub.prototype, "mergeVerification").mockResolvedValue(undefined);
     await createPlanningBridge(store, {} as PlanningChat, runtime, { release: { LocalReleaseActivationReader: class { read = read; } } });
     const adapter = fakes.adapters[0].release!;
     const context: Parameters<typeof adapter.poll>[0] = { store, runtime, post: async () => "post", recordRun: async () => {}, recordSession: async () => {}, goal: {
@@ -215,12 +216,10 @@ describe("every CLI runtime/chat construction path", () => {
       integration: { branch: "sprint/goal-one", baseSha: mergedSha, status: "merged", prUrl: "https://github.com/test/project/pull/1", mergedSha },
     } };
     expect(await adapter.poll(context)).toMatchObject({ status: "pending" });
-    expect(shell).not.toHaveBeenCalled();
-    context.mergeApproval = { postId: "merge-post", approval: { source: "owner-command", command: "planning merge", at: new Date().toISOString() } };
-    expect(await adapter.poll(context)).toMatchObject({ status: "pending" });
+    expect(proof).toHaveBeenCalled();
     expect(read).not.toHaveBeenCalled();
-    shell.mockResolvedValue({ code: 0, stdout: "", stderr: "" });
-    expect(await adapter.poll(context)).toMatchObject({ status: "complete", evidence: { mergedSha, buildSha: runningSha, runningSha, mergePostId: "merge-post", ancestry: { ancestorSha: mergedSha, descendantSha: runningSha, verified: true } } });
+    proof.mockResolvedValue({ headSha: mergedSha, reviewCommitSha: mergedSha, reviewer: "satori-miyamoto", checksPassed: true });
+    expect(await adapter.poll(context)).toMatchObject({ status: "complete", evidence: { mergedSha, buildSha: runningSha, runningSha, mergeVerification: { reviewer: "satori-miyamoto", headSha: mergedSha }, ancestry: { ancestorSha: mergedSha, descendantSha: runningSha, verified: true } } });
     expect(read).toHaveBeenCalledWith(context.goal.integration);
   });
 

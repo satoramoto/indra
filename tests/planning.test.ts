@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { mkdir } from "node:fs/promises";
+import { copyFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { homeChannelId, PlanningStore, teamProject, validateOutcomeSeats, validatePlanningGoal } from "../src/planning.js";
+import { homeChannelId, PlanningStore, teamProject, validateOutcomeSeats, validatePlanningGoal, type PlanningGoal } from "../src/planning.js";
 import { git, stateCheckout } from "./state-checkout.js";
 import { PlanningBridge as Bridge, type PlanningChat, type Post, type Reaction } from "../src/planning-bridge.js";
 import type { Shell, ShellResult } from "../src/developer-seat.js";
@@ -9,6 +9,8 @@ import { MattermostPlanningChat } from "../src/planning-mattermost.js";
 import { parseOptions } from "../src/cli.js";
 import type { AgentRuntime, AgentResult } from "../src/codex-runtime.js";
 import { CLARIFY_TIMEOUT_MS, DRAFT_TIMEOUT_MS } from "../src/codex-runtime.js";
+
+import { advanceCeremony } from "../src/ceremony.js";
 
 const MEMO = "memo";
 const CHECK = "white_check_mark";
@@ -44,6 +46,7 @@ class FakeGh implements Shell {
   branches = new Set<string>();
   prs = new Map<string, { url: string; state: string; sha?: string }>();
   checksCode = 0;
+  reviewed = false;
   failBranch = false;
   private next = 100;
   async run(command: string, args: string[], _cwd: string): Promise<ShellResult> {
@@ -56,10 +59,21 @@ class FakeGh implements Shell {
     if (line === "gh api repos/satoramoto/indra/git/ref/heads/main --jq .object.sha") return this.failBranch ? { code: 1, stdout: "", stderr: "HTTP 502" } : ok(`${MAIN_SHA}\n`);
     if (line.startsWith("gh api repos/satoramoto/indra/git/ref/heads/")) { const branch = args[1].split("/heads/")[1]; return this.branches.has(branch) ? ok(`${MAIN_SHA}\n`) : { code: 1, stdout: "", stderr: "HTTP 404" }; }
     if (line.startsWith("gh api -X POST repos/satoramoto/indra/git/refs")) { this.branches.add(flag("-f").replace("ref=refs/heads/", "")); return ok(); }
+    if (args[0] === "api" && args.includes("--method") && !args.includes("--paginate")) {
+      const endpoint = args[1]; const owners = "* @satori-miyamoto\n";
+      if (/\/pulls\/\d+$/.test(endpoint)) return ok(JSON.stringify({ state: "open", draft: false, auto_merge: null, head: { sha: MAIN_SHA }, base: { ref: "main", sha: MAIN_SHA, repo: { full_name: "satoramoto/indra" } } }));
+      if (endpoint.endsWith("/protection")) return ok(JSON.stringify({ enforce_admins: { enabled: true }, required_status_checks: { contexts: ["checks"] }, required_pull_request_reviews: { required_approving_review_count: 1, require_code_owner_reviews: true, dismiss_stale_reviews: true } }));
+      if (endpoint.endsWith("/permission")) return ok(JSON.stringify({ permission: "write", user: { login: "satori-miyamoto", permissions: { push: true } } }));
+      if (endpoint.includes("/git/trees/")) return ok(JSON.stringify({ truncated: false, tree: [{ path: ".github/CODEOWNERS", type: "blob", mode: "100644", sha: MAIN_SHA }] }));
+      if (endpoint.includes("/git/blobs/")) return ok(JSON.stringify({ sha: MAIN_SHA, encoding: "base64", content: Buffer.from(owners).toString("base64"), size: Buffer.byteLength(owners) }));
+      if (endpoint.includes("/codeowners/errors?")) return ok(JSON.stringify({ errors: [] }));
+    }
     if (line.startsWith("gh pr list")) { const pr = this.prs.get(flag("--head")); return ok(pr?.state === "OPEN" ? `${pr.url}\n` : "\n"); }
     if (line.startsWith("gh pr create")) { const url = `https://github.com/satoramoto/indra/pull/${++this.next}`; this.prs.set(flag("--head"), { url, state: "OPEN" }); return ok(`${url}\n`); }
-    if (line.startsWith("gh pr view")) { const pr = byUrl(); return ok(JSON.stringify({ state: pr?.state ?? "UNKNOWN", mergeCommit: pr?.sha ? { oid: pr.sha } : null })); }
-    if (line.startsWith("gh pr checks")) return { code: this.checksCode, stdout: "", stderr: "" };
+    if (line.startsWith("gh pr view")) { const pr = byUrl(); return ok(JSON.stringify({ state: pr?.state ?? "UNKNOWN", mergeCommit: pr?.sha ? { oid: pr.sha } : null, headRefOid: MAIN_SHA, isDraft: false, author: { login: "owner" }, reviewDecision: "" })); }
+    if (line.includes("/reviews?")) return ok(JSON.stringify([this.reviewed ? [{ id: 1, user: { login: "satori-miyamoto" }, state: "APPROVED", commit_id: MAIN_SHA }] : []]));
+    if (line.startsWith("gh pr checks")) return { code: this.checksCode, stdout: JSON.stringify([{ name: "checks", bucket: this.checksCode ? "fail" : "pass" }]), stderr: "" };
+    if (args.includes("--disable-auto")) return ok();
     if (line.startsWith("gh pr merge")) { const pr = byUrl()!; pr.state = "MERGED"; pr.sha = MERGE_SHA; return ok(); }
     return ok();
   }
@@ -645,51 +659,27 @@ describe("sprint integration", () => {
     expect((await failing.store.read()).planningGoals![0].integration).toBeUndefined();
   });
 
-  it("opens one integration PR only once every assignment merged, and only a person's check mark merges it once CI is green", async () => {
+  it("opens one integration PR and merges on exact-head bot approval plus green CI without another reaction", async () => {
     const { store, chat, bridge, goal } = await approvedSprint();
     await setStatuses(store, { "outcome-1": "merged", "outcome-2": "in-review" });
     await bridge.poll();
     expect(gh.calls.some((line) => line.startsWith("gh pr create"))).toBe(false);
-    await expect(bridge.rollback(goal.id)).rejects.toThrow("only a sprint merged into main");
     await setStatuses(store, { "outcome-2": "merged" });
     await bridge.poll();
-    await bridge.poll();
-    const creates = gh.calls.filter((line) => line.startsWith("gh pr create"));
-    expect(creates).toHaveLength(1);
-    expect(creates[0]).toContain(`--base main --head sprint/${goal.id}`);
-    expect(creates[0]).toContain("**Goal:** Explore project");
-    expect(creates[0]).toContain("**Learn project** → Aaron (seat-003): https://github.com/satoramoto/indra/pull/1");
-    expect(creates[0]).not.toContain("Failed or skipped");
-    const integration = await sprintOf(store);
-    expect(integration).toMatchObject({ status: "pr-open", prUrl: "https://github.com/satoramoto/indra/pull/101" });
-    const post = chat.posts.at(-1)!;
-    expect(post.message).toContain(integration!.prUrl!);
-    expect(post.message).toContain(`reacts :${CHECK}: on this post`);
-    expect((await store.runtime(goal.id)).mergePosts).toEqual([{ id: post.id, kind: "integration" }]);
-    // A bot's check mark never merges.
-    chat.react(post.id, CHECK, "george");
-    await bridge.poll();
-    expect(chat.posts.at(-1)?.message).toContain("Only a person can merge a sprint");
-    // A person's check mark while CI is red changes nothing.
-    gh.checksCode = 1;
-    chat.react(post.id, CHECK);
-    await bridge.poll();
-    expect(chat.posts.at(-1)?.message).toContain("not green");
+    expect((await sprintOf(store))?.status).toBe("pr-open");
     expect(gh.calls.some((line) => line.startsWith("gh pr merge"))).toBe(false);
+    gh.reviewed = true; gh.checksCode = 1;
+    await bridge.poll();
     expect((await sprintOf(store))?.status).toBe("pr-open");
     gh.checksCode = 0;
-    chat.react(post.id, CHECK, "sam");
     await bridge.poll();
     expect(await sprintOf(store)).toMatchObject({ status: "merged", mergedSha: MERGE_SHA });
-    expect(chat.posts.at(-1)?.message).toContain("merged into main");
-    expect(gh.calls.filter((line) => line.startsWith("gh pr merge"))).toEqual([`gh pr merge ${integration!.prUrl} --squash`]);
-    // Idempotent: another check mark and the M path merge nothing again.
-    chat.react(post.id, CHECK, "alex");
+    expect(gh.calls.filter((line) => line.startsWith("gh pr create"))).toHaveLength(1);
+    expect(gh.calls.filter((line) => line.startsWith("gh pr merge"))).toEqual([`gh pr merge https://github.com/satoramoto/indra/pull/101 --squash --match-head-commit ${MAIN_SHA}`]);
+    expect((await store.runtime(goal.id)) as object).not.toHaveProperty("mergeApproval");
     await bridge.poll();
-    expect(chat.posts.at(-1)?.message).toContain("already merged");
-    await expect(bridge.merge(goal.id)).rejects.toThrow("Nothing to merge");
     expect(gh.calls.filter((line) => line.startsWith("gh pr merge"))).toHaveLength(1);
-    expect(git(store.checkout, "log", "--format=%s").split("\n").filter((line) => line.includes("sprint") || line.includes("integration"))).toEqual([`Merge sprint ${goal.id} into main`, `Open integration PR for goal ${goal.id}`]);
+    expect(chat.posts.some((post) => post.message.includes("merged into main"))).toBe(true);
   });
 
   it("posts once when outcomes failed, and the owner's integrate opens the PR for what merged", async () => {
@@ -710,6 +700,7 @@ describe("sprint integration", () => {
     expect(create).toContain("Learn project** → Aaron (seat-003): https://github.com/satoramoto/indra/pull/1");
     expect(await bridge.integrate(goal.id)).toContain("is pr-open");
     expect(gh.calls.filter((line) => line.startsWith("gh pr create"))).toHaveLength(1);
+    gh.reviewed = true;
     expect(await bridge.merge(goal.id)).toContain(`Sprint ${goal.id} merged into main`);
     expect((await sprintOf(store))?.status).toBe("merged");
   });
@@ -720,11 +711,13 @@ describe("sprint integration", () => {
     await expect(bridge.integrate(goal.id)).rejects.toThrow("Nothing merged");
   });
 
-  it("rolls a merged sprint back with one revert PR on main, merged through the same check mark gate", async () => {
+  it("rolls a merged sprint back with one revert PR on main, merged through the same bot and CI gate", async () => {
     const { store, chat, bridge, goal } = await approvedSprint();
     await setStatuses(store, { "outcome-1": "merged", "outcome-2": "merged" });
     await bridge.poll();
+    gh.reviewed = true;
     await bridge.merge(goal.id);
+    gh.reviewed = false;
     const result = await bridge.rollback(goal.id);
     expect(result).toContain("https://github.com/satoramoto/indra/pull/102");
     const worktree = join(store.runtimeDir, "worktrees", `revert-${goal.id}`);
@@ -740,7 +733,7 @@ describe("sprint integration", () => {
     chat.react(post.id, CHECK, "george");
     await bridge.poll();
     expect((await sprintOf(store))?.status).toBe("merged");
-    chat.react(post.id, CHECK);
+    gh.reviewed = true;
     await bridge.poll();
     expect((await sprintOf(store))?.status).toBe("reverted");
     expect(chat.posts.at(-1)?.message).toContain(`Sprint ${goal.id} rolled back`);
@@ -751,4 +744,95 @@ describe("sprint integration", () => {
     for (const action of ["integrate", "merge", "rollback"]) expect(parseOptions(["planning", action, "--goal", "goal-1", "--state", "/tmp/s"])).toMatchObject({ mode: "planning", action, goal: "goal-1" });
     expect(() => parseOptions(["planning", "rollback"])).toThrow("Usage:");
   });
+});
+
+
+describe("whole-goal queue contract", () => {
+  const at = "2026-09-01T00:00:00Z";
+  async function remodelStore() {
+    const base = await fixture();
+    await base.update((state) => {
+      const team = state.teams[0] as { workflowModel?: string; seats: object[] };
+      team.workflowModel = "goals-v1";
+      team.seats.push({ id: "seat-002", displayName: "George Duke", roles: ["Product"], externalIdentities: { mattermost: { userId: "george", username: "georgeduke" } } });
+    }, "Enable fixture three-role model");
+    await mkdir(join(base.checkout, "schema/v1"), { recursive: true });
+    await copyFile(new URL("../schema/v1/state.schema.json", import.meta.url), join(base.checkout, "schema/v1/state.schema.json"));
+    return new PlanningStore(base.checkout, undefined, { version: 1, consumers: { planning: 1, developer: 1, release: 1, retro: 1, tui: 1 } });
+  }
+  async function propose(store: PlanningStore, id: string, ownedFiles = ["src/**"], otherTeam = false) {
+    const teamId = otherTeam ? "team-other" : "team-001";
+    const goal: PlanningGoal = { workflowModel: "goals-v1", id, teamId, seatId: otherTeam ? "seat-other-lead" : "seat-001", participantSeatIds: [], goal: "Implement goal", projectRefs: [otherTeam ? "Satoramoto/Indra" : "satoramoto/indra"], stage: "clarifying", createdAt: at, updatedAt: at, mattermost: { channelId: "channel", rootPostId: `root-${id}` }, brief: { summary: "Goal", decisions: [], openQuestions: [] }, ownedFiles };
+    await store.createGoal(goal);
+    await store.update((state) => {
+      const next = state.planningGoals!.find((item) => item.id === id)!;
+      next.stage = "awaiting-review";
+      next.goalProposal = { version: 1, goalId: id, proposalId: `proposal-${id}`, productSeatId: otherTeam ? "seat-other-product" : "seat-002", rank: 1, mission: "docs/mission.md", summary: "Implement goal", outcomes: [{ number: 1, title: "Outcome", description: "Deliver it", reason: "Mission progress", currentCode: ["src/planning.ts"] }], ownedFiles, risks: [], rationale: "Useful", basedOnRetros: [] };
+      next.ceremony = advanceCeremony(next, { to: "proposal", at });
+    }, "Propose fixture goal");
+  }
+  const proof = (id: string) => ({ kind: "approval" as const, proposalId: `proposal-${id}`, proposalPostId: `root-${id}`, approval: { source: "owner-command" as const, command: "planning approve" as const, at } });
+  const sprint = (id: string) => ({ branch: `sprint/${id}`, baseSha: MAIN_SHA, status: "collecting" as const });
+  it("keeps multiple approved goals unassigned and dispatches only disjoint scopes to idle Developers", async () => {
+    const store = await remodelStore();
+    for (const [id, scope] of [["goal-first", "src/**"], ["goal-overlap", "src/future.ts"], ["goal-tests", "tests/**"]]) { await propose(store, id, [scope]); await store.approveGoal(id, proof(id), at); }
+    expect((await store.read()).planningGoals!.every((goal) => !goal.goalAssignment && !goal.assignments && !goal.integration)).toBe(true);
+    expect(await store.teamConflicts()).toEqual([]);
+    await store.assignGoal("goal-first", "seat-003", sprint("goal-first"), at);
+    await expect(store.assignGoal("goal-overlap", "seat-004", sprint("goal-overlap"), at)).rejects.toThrow("overlap");
+    await expect(store.assignGoal("goal-tests", "seat-003", sprint("goal-tests"), at)).rejects.toThrow("one goal");
+    await store.assignGoal("goal-tests", "seat-004", sprint("goal-tests"), at);
+    expect((await store.read()).planningGoals!.filter((goal) => goal.goalAssignment)).toHaveLength(2);
+  });
+  it("blocks unclosed legacy work whose file scope is unknown", async () => {
+    const store = await remodelStore();
+    await store.createGoal({ id: "goal-legacy", teamId: "team-001", seatId: "seat-001", participantSeatIds: [], goal: "Historical work", projectRefs: ["satoramoto/indra"], stage: "clarifying", createdAt: at, updatedAt: at, mattermost: { channelId: "channel", rootPostId: "legacy-root" }, brief: { summary: "Historical work", decisions: [], openQuestions: [] } });
+    await propose(store, "goal-new"); await store.approveGoal("goal-new", proof("goal-new"), at);
+    await expect(store.assignGoal("goal-new", "seat-003", sprint("goal-new"), at)).rejects.toThrow("Unclosed legacy");
+    await expect(store.update((state) => { Object.assign(state.planningGoals![1], { goalAssignment: { seatId: "seat-003", status: "assigned", updatedAt: at }, integration: sprint("goal-new") }); }, "Bypass assignment guard")).rejects.toThrow("unknown scope");
+  });
+  it("reserves overlapping future files across teams on the same repository, ignoring repository letter case", async () => {
+    const store = await remodelStore();
+    await store.update((state) => {
+      state.teams.push({ id: "team-other", slug: "other", displayName: "Other", workflowModel: "goals-v1", project: { github: "Satoramoto/Indra" }, externalIdentities: { mattermost: { teamId: "other-external", homeChannelId: "channel" } }, seats: [
+        { id: "seat-other-lead", displayName: "Lead", roles: ["Team Lead"], externalIdentities: { mattermost: { userId: "other-lead", username: "otherlead" } } },
+        { id: "seat-other-product", displayName: "Product", roles: ["Product"], externalIdentities: { mattermost: { userId: "other-product", username: "otherproduct" } } },
+        { id: "seat-other-dev", displayName: "Developer", roles: ["Developer"], externalIdentities: { mattermost: { userId: "other-dev", username: "otherdev" } } },
+      ] });
+    }, "Add another fixture team on the same project");
+    await propose(store, "goal-local"); await store.approveGoal("goal-local", proof("goal-local"), at);
+    await propose(store, "goal-other", ["src/future.ts"], true); await store.approveGoal("goal-other", proof("goal-other"), at);
+    await store.assignGoal("goal-local", "seat-003", sprint("goal-local"), at);
+    await expect(store.assignGoal("goal-other", "seat-other-dev", sprint("goal-other"), at)).rejects.toThrow("overlap");
+  });
+  it("rejects bot approval, incorrect Product/Developer identities and edits to approved scope", async () => {
+    const store = await remodelStore(); await propose(store, "goal-proof");
+    await expect(store.approveGoal("goal-proof", { ...proof("goal-proof"), approval: { source: "reaction", userId: "george", postId: "root-goal-proof", emoji: "white_check_mark", verifiedHuman: true, at } }, at)).rejects.toThrow("cannot supply human");
+    await expect(store.update((state) => { state.planningGoals![0].goalProposal!.productSeatId = "seat-003"; }, "Wrong provenance")).rejects.toThrow("immutable");
+    await store.approveGoal("goal-proof", proof("goal-proof"), at);
+    await expect(store.update((state) => { state.planningGoals![0].ownedFiles = ["**"]; }, "Expand scope")).rejects.toThrow("immutable");
+    await expect(store.update((state) => { state.planningGoals![0].goalProposal!.rank = 2; }, "Rewrite proposal")).rejects.toThrow("immutable");
+    await expect(store.assignGoal("goal-proof", "seat-002", sprint("goal-proof"), at)).rejects.toThrow("Developer");
+  });
+  it.each(["reaction", "owner"])("approves a real Product-authored root through %s without publishing the whole queue", async (route) => {
+    const store = await remodelStore(); const chat = new FakeChat(); const bridge = new PlanningBridge(store, chat, new FakeRuntime());
+    const proposal = { version: 1 as const, goalId: "goal-product", proposalId: "proposal-product", productSeatId: "seat-002", rank: 1, mission: "docs/mission.md", summary: "Product goal", outcomes: [{ number: 1, title: "Outcome", description: "Deliver it", reason: "Mission", currentCode: ["src/planning.ts"] }], ownedFiles: ["src/**"], risks: [], rationale: "Useful", basedOnRetros: [] };
+    const post = { id: "product-root", userId: "george", channelId: "channel", rootId: "", createdAt: at };
+    const vetting = { proposalId: proposal.proposalId, leadSeatId: "seat-001", ownedFiles: proposal.ownedFiles, notes: [], at };
+    await expect(store.publishProductProposal("team-001", proposal, { ...post, userId: "chick" }, vetting)).rejects.toThrow("Product-authored");
+    await expect(store.publishProductProposal("team-001", proposal, post, { ...vetting, ownedFiles: ["**"] })).rejects.toThrow("vetting");
+    const goal = await store.publishProductProposal("team-001", proposal, post, vetting);
+    expect(goal.mattermost.rootPostId).toBe(post.id);
+    await expect(store.publishProductProposal("team-001", { ...proposal, goalId: "goal-other" }, { ...post, id: "other-root" }, vetting)).rejects.toThrow("Only one published");
+    await expect(bridge.approve(goal.id)).rejects.toThrow("not been verified");
+    chat.posts.push({ id: post.id, user_id: post.userId, channel_id: post.channelId, root_id: "", message: proposal.summary, create_at: Date.parse(at) });
+    chat.react(post.id, CHECK, "george"); await bridge.poll();
+    expect((await store.read()).planningGoals![0].stage).toBe("awaiting-review");
+    if (route === "owner") await bridge.approve(goal.id);
+    else { chat.react(post.id, CHECK, "ryan"); await bridge.poll(); }
+    expect((await store.read()).planningGoals![0]).toMatchObject({ stage: "approved", ceremony: { stage: "implement" } });
+    expect((await store.read()).planningGoals![0].goalAssignment).toBeUndefined();
+    expect(chat.posts).toHaveLength(1);
+  });
+
 });
