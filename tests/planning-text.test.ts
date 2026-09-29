@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { ImplementationEvidence } from "../src/ceremony.js";
+import { proposalDigest } from "../src/ceremony.js";
 import type { PlanningGoal } from "../src/planning.js";
 import { APPROVE_EMOJI, PROPOSE_EMOJI } from "../src/planning-bridge.js";
-import { approvalMessage, integrationMessage, prompt, proposalMessage, revertMessage, rootMessage, sprintSummary } from "../src/planning-text.js";
+import { approvalGateText, approvalMessage, integrationMessage, nextSprintText, prompt, proposalMessage, revertMessage, rootMessage, sprintSummary } from "../src/planning-text.js";
 
 const at = "2026-01-01T00:00:00Z";
 const seats = new Map([["seat-003", "Aaron Magner"], ["seat-004", "Corey Henry"]]);
@@ -36,7 +37,6 @@ function goal(): PlanningGoal {
   };
 }
 
-// Fixed text checked against the original bridge before extracting its renderers.
 describe("planning text", () => {
   it("keeps the bridge's public reaction constants", () => {
     expect(PROPOSE_EMOJI).toBe("memo");
@@ -62,7 +62,7 @@ Keep its newline.
 - **First outcome** → Aaron Magner (seat-003): Touch src/a.ts.
 - **Unknown seat** → seat-999: Keep the seat ID.
 
-Recorded in indra-state as goal-text. No work has been approved or executed. To approve it, a person reacts :white_check_mark: on this post.`);
+Recorded in indra-state as goal-text. No work has been approved or executed. To approve it, a person reacts :white_check_mark: on this post. The owner may also use planning approve. With auto mode off, one of these human approvals is required. With auto mode on, Indra may approve under the owner's current standing policy only after the proposal checks pass; it records the approval as automatic. Turning auto mode off stops at the next approval gate.`);
   });
 
   it("renders approval in assignment order with title fallbacks and the sprint branch", () => {
@@ -183,12 +183,12 @@ Merging this PR lands the whole sprint on main; \`planning rollback --goal goal-
 
   it.each([{ selected: undefined }, { selected: [] }])("renders integration without omissions (%j)", ({ selected }) => {
     expect(integrationMessage(goal(), "https://github.com/test/project/pull/9", selected)).toBe(`**Sprint goal-text is ready: https://github.com/test/project/pull/9**
-This PR takes \`sprint/goal-text\` into main. To merge the sprint once its CI is green, a person reacts :white_check_mark: on this post (or the owner presses M in Chick's detail).`);
+This PR takes \`sprint/goal-text\` into main. With auto mode off, a person reacts :white_check_mark: on this post or the owner presses M in Chick's detail. With auto mode on, Indra may merge under the owner's current standing policy only after a fresh review of the current head and green CI are verified; it records the approval as automatic. Turning auto mode off stops at the next approval gate.`);
   });
 
   it("renders integration with omissions in their recorded order", () => {
     expect(integrationMessage(goal(), "https://github.com/test/project/pull/9", omissions)).toBe(`**Sprint goal-text is ready: https://github.com/test/project/pull/9**
-This PR takes \`sprint/goal-text\` into main. To merge the sprint once its CI is green, a person reacts :white_check_mark: on this post (or the owner presses M in Chick's detail).
+This PR takes \`sprint/goal-text\` into main. With auto mode off, a person reacts :white_check_mark: on this post or the owner presses M in Chick's detail. With auto mode on, Indra may merge under the owner's current standing policy only after a fresh review of the current head and green CI are verified; it records the approval as automatic. Turning auto mode off stops at the next approval gate.
 
 **Owner-authorized omissions**
 - outcome-2: Owner chose a smaller release.
@@ -218,9 +218,9 @@ Keep the newline.
 
   it("renders the draft prompt with Developer seats in the supplied order", () => {
     expect(prompt(goal(), "Draft now.", true, developers)).toBe(`You are Chick Corea, the Team Lead seat in Indra. This is planning only.
-Outcome: a proposed outcome-based roadmap for this goal. This is a draft for human review.
+Outcome: a proposed outcome-based roadmap for this goal. This is a draft for human review, awaiting the plan approval gate.
 Acceptance: each outcome is small, focused on one concern, and independently verifiable; its description states its acceptance criteria and targeted tests. Keep outcomes roughly equal in size. In each outcome's description, list every file it will touch, including test files. Outcomes assigned to different seats must not touch the same file. Name each dependency by outcome title and owning seat ID, and state the order in which dependent work must land. For any shared-file wiring, name one owning outcome and seat; list its files only under that owner and make the other outcomes depend on it. Assign every outcome to one of these Developer seats by its seat ID: seat-004 (Corey Henry), seat-003 (Aaron Magner). Give each seat at most one outcome; only when there are more outcomes than seats may a seat take more, spread as evenly as possible.
-Afterwards Indra posts the draft in the goal thread. Nothing starts until a person approves it; then Indra queues each outcome for its Developer seat.
+Afterwards Indra posts the draft in the goal thread. With auto mode off: Nothing starts until a person approves it through a verified human reaction or the owner's planning approve command; then Indra queues each outcome for its Developer seat. With auto mode on, Indra may approve under the owner's current standing policy after all proposal checks pass, recording automatic provenance. You never grant approval. Cite the selected backlog tickets, the value this sprint would deliver and the latest available frozen retrospective when supplied; unavailable evidence stays unknown.
 Return only JSON with keys summary, outcomes (title, description and seatId), risks, openQuestions.
 Constraints: do not edit files, run implementation, deploy, or claim approval. Never put credentials in your output.
 Goal: Keep output stable.
@@ -233,14 +233,50 @@ Human message: Draft now.`);
   it("renders the draft prompt's empty seat and project fallbacks", () => {
     const value = { ...goal(), goal: "Goal", projectRefs: [], brief: { summary: "Brief", decisions: [], openQuestions: [] } };
     expect(prompt(value, "", true, [])).toBe(`You are Chick Corea, the Team Lead seat in Indra. This is planning only.
-Outcome: a proposed outcome-based roadmap for this goal. This is a draft for human review.
+Outcome: a proposed outcome-based roadmap for this goal. This is a draft for human review, awaiting the plan approval gate.
 Acceptance: each outcome is small, focused on one concern, and independently verifiable; its description states its acceptance criteria and targeted tests. Keep outcomes roughly equal in size. In each outcome's description, list every file it will touch, including test files. Outcomes assigned to different seats must not touch the same file. Name each dependency by outcome title and owning seat ID, and state the order in which dependent work must land. For any shared-file wiring, name one owning outcome and seat; list its files only under that owner and make the other outcomes depend on it. Assign every outcome to one of these Developer seats by its seat ID: none. Give each seat at most one outcome; only when there are more outcomes than seats may a seat take more, spread as evenly as possible.
-Afterwards Indra posts the draft in the goal thread. Nothing starts until a person approves it; then Indra queues each outcome for its Developer seat.
+Afterwards Indra posts the draft in the goal thread. With auto mode off: Nothing starts until a person approves it through a verified human reaction or the owner's planning approve command; then Indra queues each outcome for its Developer seat. With auto mode on, Indra may approve under the owner's current standing policy after all proposal checks pass, recording automatic provenance. You never grant approval. Cite the selected backlog tickets, the value this sprint would deliver and the latest available frozen retrospective when supplied; unavailable evidence stays unknown.
 Return only JSON with keys summary, outcomes (title, description and seatId), risks, openQuestions.
 Constraints: do not edit files, run implementation, deploy, or claim approval. Never put credentials in your output.
 Goal: Goal
 Projects:\u0020
 Current brief: {"summary":"Brief","decisions":[],"openQuestions":[]}
 Human message: `);
+  });
+
+  it("reports recorded automatic approval rather than claiming a human approved", () => {
+    const value = goal();
+    value.ceremony = { version: 1, stage: "implement", history: [
+      { stage: "planning", enteredAt: at }, { stage: "proposal", enteredAt: at },
+      { stage: "implement", enteredAt: at, evidence: { kind: "automatic-approval", proposalId: value.proposal!.id, proposalPostId: "proposal-post", approval: {
+        source: "automatic", policyRevision: 4, at, target: { kind: "proposal", goalId: value.id, proposalId: value.proposal!.id, proposalDigest: proposalDigest(value.proposal!) },
+      } } },
+    ] };
+    expect(approvalMessage(value, seats)).toContain("Approved automatically under the owner's standing policy revision 4.");
+    expect(approvalMessage(value, seats)).not.toContain("Approved by a verified human");
+    value.ceremony.history[2] = { stage: "implement", enteredAt: at, evidence: { kind: "approval", proposalId: value.proposal!.id, proposalPostId: "proposal-post", approval: { source: "owner-command", command: "planning approve", at } } };
+    expect(approvalMessage(value, seats)).toContain("Approved by the owner's planning approve command.");
+    expect(approvalMessage(value, seats)).not.toContain("Approved automatically");
+  });
+
+  it("describes checked automatic gates while keeping reverts under human approval", () => {
+    expect(approvalGateText("proposal")).toContain("only after the proposal checks pass");
+    expect(approvalGateText("integration")).toContain("fresh review of the current head and green CI");
+    expect(approvalGateText("retro")).toContain("running release and the frozen retrospective archive");
+    for (const kind of ["proposal", "integration", "retro"] as const) expect(approvalGateText(kind)).toContain("Turning auto mode off stops at the next approval gate");
+    expect(revertMessage(goal(), "https://github.com/test/project/pull/10")).toContain("a person reacts");
+    expect(revertMessage(goal(), "https://github.com/test/project/pull/10")).not.toContain("automatic");
+  });
+
+  it("retains ticket acceptance, research and honest prospective value in the published proposal", () => {
+    const authors = { createdAt: at, updatedAt: at, createdBySeatId: "seat-lead", updatedBySeatId: "seat-lead" };
+    const text = nextSprintText({ closedGoalId: "goal-previous", mission: "Owner steers by value", github: "test/project",
+      candidate: { id: "candidate-next", title: "Improve onboarding", summary: "Make joining simpler", value: "Less setup time", rank: 1, status: "candidate", ticketIds: ["ticket-setup"], ...authors },
+      tickets: [{ id: "ticket-setup", title: "Setup", description: "Acceptance: onboard a seat", value: "Visible progress", status: "open", dependsOn: ["ticket-prior"], research: [{ url: "https://example.test/research", finding: "A recorded finding" }], ...authors }],
+    });
+    const value = { ...goal(), goal: text, source: { candidateId: "candidate-next", ticketIds: ["ticket-setup"] } };
+    const post = proposalMessage(value, seats);
+    for (const citation of ["candidate-next", "ticket-setup", "Acceptance: onboard a seat", "Value this sprint would deliver: Less setup time", "ticket-prior", "https://example.test/research", "No verified frozen retrospective is available"]) expect(post).toContain(citation);
+    expect(post).not.toContain("has delivered");
   });
 });
