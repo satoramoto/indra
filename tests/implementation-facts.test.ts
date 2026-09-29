@@ -2,8 +2,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ImplementationRecorder, implementationWallTime, readImplementationFacts, type ImplementationAttempt } from "../src/implementation-facts.js";
-import { PlanningStore } from "../src/planning.js";
+import { ImplementationRecorder, implementationEligible, implementationWallTime, readImplementationFacts, type ImplementationAttempt } from "../src/implementation-facts.js";
+import { PlanningStore, type PlanningGoal } from "../src/planning.js";
 import type { SeatTaskRecord } from "../src/developer-seat.js";
 
 const dirs: string[] = [];
@@ -68,4 +68,12 @@ describe("implementation facts", () => {
     expect(attempt.events[0].retained).toMatchObject({ conflictRounds: 2, reviewFixRounds: 1, findings: ["file.ts:2: Bug"], sessions: [{ usage: { input_tokens: 15 } }] });
     expect(JSON.stringify(attempt)).not.toContain("private provider output");
   });
+});
+
+
+it("keeps whole goals and closed historical goals out of the per-outcome claimant", () => {
+  const legacy = { id: "goal-one", stage: "approved", integration: { branch: "sprint/goal-one", status: "collecting" }, ceremony: { stage: "implement" } } as PlanningGoal;
+  expect(implementationEligible(legacy)).toBe(true);
+  expect(implementationEligible({ ...legacy, workflowModel: "goals-v1" })).toBe(false);
+  expect(implementationEligible({ ...legacy, ceremony: { ...legacy.ceremony!, closure: {} as NonNullable<PlanningGoal["ceremony"]>["closure"] } })).toBe(false);
 });

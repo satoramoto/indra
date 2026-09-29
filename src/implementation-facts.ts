@@ -8,7 +8,7 @@ import type { RuntimeSessionFacts } from "./runtime-facts.js";
 import { withFileLock } from "./state-commit.js";
 
 /** Legacy approval alone is not permission to execute, retry, or target main. */
-export const implementationEligible = (goal: PlanningGoal) => goal.stage === "approved"
+export const implementationEligible = (goal: PlanningGoal) => goal.workflowModel !== "goals-v1" && goal.stage === "approved"
   && goal.ceremony?.stage === "implement" && !goal.ceremony.closure
   && goal.integration?.branch === `sprint/${goal.id}` && goal.integration.status === "collecting";
 

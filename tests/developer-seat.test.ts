@@ -1,3 +1,4 @@
+import { SprintGitHub } from "../src/sprint.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
@@ -166,6 +167,7 @@ class FakeCodex {
 }
 
 async function setup(assignments: Assignment[], integration: object = SPRINT) {
+  vi.spyOn(SprintGitHub.prototype, "serverMergeBlocker").mockResolvedValue(undefined);
   const store = await fixture(assignments, "approved", { github: "satoramoto/indra" }, integration);
   const chat = new FakeChat(); const shell = new FakeShell(); const codex = new FakeCodex();
   shell.baseRef = (integration as { branch?: string } | undefined)?.branch ?? "sprint/goal-abc";
@@ -191,6 +193,14 @@ async function retainRecord(store: PlanningStore, shell: FakeShell, changes: Par
 const reviewing = (): Assignment => ({ outcomeId: "outcome-1", seatId: "seat-002", status: "in-review", updatedAt: "2026-01-01T00:00:00Z", prUrl: PR });
 
 describe("developer seat", () => {
+  it("cannot use the legacy path to bypass the shared server review policy", async () => {
+    const f = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
+    vi.spyOn(SprintGitHub.prototype, "serverMergeBlocker").mockResolvedValue("Automatic merge blocked: required bot protection is absent.");
+    await f.seat.tick();
+    expect((await f.assignment("outcome-1")).status).toBe("failed");
+    expect(f.shell.calls.some((call) => call.startsWith("gh pr merge"))).toBe(false);
+  });
+
   it.each([1, 128])("records a checked-command exit %s as a SeatError without command output", async (code) => {
     const { store, shell, codex, seat, chat, assignment } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
     const run = shell.run.bind(shell);
