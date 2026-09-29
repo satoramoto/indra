@@ -10,7 +10,7 @@ import { PlanningStore } from "../src/planning.js";
 import { loadSeatPersonas, type SeatPersona } from "../src/seat-persona.js";
 
 const fakes = vi.hoisted(() => ({
-  calls: [] as { engine: string; cwd: string; timeout?: number; write?: WriteAccess; home?: string; prompt: string; schema: string; session?: string; options?: MessageOptions }[],
+  calls: [] as { engine: string; cwd: string; timeout?: number; write?: WriteAccess; home?: string; roles?: readonly string[]; prompt: string; schema: string; session?: string; options?: MessageOptions }[],
   posts: [] as { username: string; channel: string; message: string; root?: string; delivery?: string }[],
   actions: [] as string[],
   adapters: [] as CeremonyAdapters[],
@@ -20,9 +20,12 @@ const fakes = vi.hoisted(() => ({
 }));
 function fakeRuntime(engine: string) {
   return class implements AgentRuntime {
-    constructor(private cwd: string, private timeout?: number, private write?: WriteAccess, private home?: string) {}
+    // The fourth argument is Codex's harness home, or Claude's seat roles.
+    constructor(private cwd: string, private timeout?: number, private write?: WriteAccess, private fourth?: string | readonly string[]) {}
     async message(prompt: string, schema: string, session?: string, options?: MessageOptions) {
-      fakes.calls.push({ engine, cwd: this.cwd, timeout: this.timeout, write: this.write, home: this.home, prompt, schema, session, options });
+      const home = engine === "codex" ? this.fourth as string | undefined : undefined;
+      const roles = engine === "claude" ? this.fourth as readonly string[] | undefined : undefined;
+      fakes.calls.push({ engine, cwd: this.cwd, timeout: this.timeout, write: this.write, home, roles, prompt, schema, session, options });
       return { sessionId: session ?? (engine === "claude" ? "claude:12345678-1234-4321-8765-123456789abc" : "codex-new"), response: {}, startedAt: "start", finishedAt: "finish" };
     }
   };
@@ -151,7 +154,8 @@ describe("every CLI runtime/chat construction path", () => {
     for (const call of fakes.calls.slice(1)) expect(call.home).toBe(join(`${checkout}.runtime`, "harness", "seat-dev", "codex"));
     await configure({ "seat-lead": "claude" }); fakes.calls.length = 0;
     await planning("start");
-    expect(fakes.calls[0]).toMatchObject({ engine: "claude", home: undefined });
+    // Claude gets no harness home, but it does get the seat's roles from state, which pick its effort.
+    expect(fakes.calls[0]).toMatchObject({ engine: "claude", home: undefined, roles: ["Team Lead"] });
   });
 
   it("surfaces invalid config before reading a token or constructing a model/chat", async () => {
