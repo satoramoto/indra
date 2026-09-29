@@ -192,7 +192,7 @@ const isGoalAction = (action: string | undefined): action is GoalAction => (GOAL
 /** All model and posting paths use the seat from state, local engine selection and optional Indra profiles. */
 async function seatServices(store: PlanningStore, username: string, seatId?: string) {
   const state = await store.read();
-  const teams = state.teams as { slug: string; seats: { id: string; externalIdentities: { mattermost: { username: string } } }[] }[];
+  const teams = state.teams as { slug: string; seats: { id: string; roles?: string[]; externalIdentities: { mattermost: { username: string } } }[] }[];
   const seats = teams.flatMap((team) => team.seats);
   const candidates = seatId === undefined ? teams.find((team) => team.slug === "yahaha")?.seats ?? [] : seats.filter((item) => item.id === seatId);
   const seat = candidates.find((item) => item.externalIdentities.mattermost.username === username);
@@ -203,7 +203,7 @@ async function seatServices(store: PlanningStore, username: string, seatId?: str
   const engine = Object.hasOwn(engines, seat.id) ? engines[seat.id] : "codex";
   return {
     chat: (token: string) => withPersonaChat(new MattermostPlanningChat(token, username), profile),
-    runtime: (cwd: string, timeoutMs?: number, write?: WriteAccess) => withPersonaRuntime(new SeatRuntime(engine, cwd, timeoutMs, write, undefined, seatHarnessDir(store.runtimeDir, seat.id)), profile),
+    runtime: (cwd: string, timeoutMs?: number, write?: WriteAccess) => withPersonaRuntime(new SeatRuntime(engine, cwd, timeoutMs, write, undefined, seatHarnessDir(store.runtimeDir, seat.id), seat.roles), profile),
   };
 }
 
