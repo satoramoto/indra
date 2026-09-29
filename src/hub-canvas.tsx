@@ -1,4 +1,4 @@
-import { RGBA, type ASCIIFontRenderable, type BoxRenderable, type OptimizedBuffer } from "@opentui/core";
+import { measureText, RGBA, type ASCIIFontRenderable, type BoxRenderable, type OptimizedBuffer } from "@opentui/core";
 import { createEffect, createSignal, onCleanup, type Accessor, type JSX } from "solid-js";
 import { BAR_GLYPH, halfBlockBar, headerGradient, hexRgb, mix, paint, TRACK_COLOR, type Rgb } from "./hub-paint.js";
 
@@ -68,12 +68,13 @@ export function ProgressBar(props: { fraction: Accessor<number>; color: Accessor
 }
 
 export const SPLASH_FONT = "block" as const;
+const SPLASH_SIZE = measureText({ text: "INDRA", font: SPLASH_FONT });
 
 /**
  * The idle splash: a large "INDRA" wordmark whose letters catch a soft highlight that sweeps left to right. The sweep
  * recolours the glyph cells the font already drew; the font renderable itself never changes.
  */
-export function IdleSplash(props: { frame: Accessor<number>; truecolor: boolean; background: string; caption: string; captionColor: string }) {
+export function IdleSplash(props: { frame: Accessor<number>; width: Accessor<number>; truecolor: boolean; background: string; caption: string; captionColor: string }) {
   let ref: ASCIIFontRenderable | undefined;
   const face = "#A5B4FC";
   const shadow = "#312E81";
@@ -94,11 +95,16 @@ export function IdleSplash(props: { frame: Accessor<number>; truecolor: boolean;
       buffer.setCell(screenX, screenY, "█", rgba(paint(mix(hexRgb(face), [255, 255, 255], strength), props.truecolor)), cellBg);
     }
   }
+  // Centred by whole columns: a flex-centred odd width lands on half a cell and Yoga's rounding then narrows the
+  // seats table above by one column.
+  const indent = (width: number) => Math.max(0, Math.floor((props.width() - width) / 2));
   return (
-    <box flexDirection="column" alignItems="center" flexShrink={0} paddingTop={1}>
-      <ascii_font ref={ref} text="INDRA" font={SPLASH_FONT} color={[paint(face, props.truecolor), paint(shadow, props.truecolor)].map(rgba)}
-        backgroundColor={rgba(paint(props.background, props.truecolor))} selectable={false} renderAfter={shimmer} />
-      <text fg={props.captionColor}>{props.caption}</text>
+    <box flexDirection="column" flexShrink={0} paddingTop={1}>
+      <box flexDirection="row" flexShrink={0} paddingLeft={indent(SPLASH_SIZE.width)}>
+        <ascii_font ref={ref} text="INDRA" font={SPLASH_FONT} color={[paint(face, props.truecolor), paint(shadow, props.truecolor)].map(rgba)}
+          backgroundColor={rgba(paint(props.background, props.truecolor))} selectable={false} renderAfter={shimmer} />
+      </box>
+      <box flexDirection="row" flexShrink={0} paddingLeft={indent(Array.from(props.caption).length)}><text fg={props.captionColor}>{props.caption}</text></box>
     </box>
   );
 }

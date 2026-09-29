@@ -262,7 +262,7 @@ export function TerminalApp(props: TerminalAppProps) {
           </box>
           <For each={sprints()}>{(sprint) => <SprintCard model={props.model} sprint={sprint} team={team()} session={sessionOf(sprint.id)} pulse={pulse} now={now} open={open} truecolor={truecolor()} />}</For>
           <Show when={splash()}>
-            <IdleSplash frame={frame} truecolor={truecolor()} background={theme.background} caption="No sprint open" captionColor={theme.muted} />
+            <IdleSplash frame={frame} width={() => dimensions().width - 2} truecolor={truecolor()} background={theme.background} caption="No sprint open" captionColor={theme.muted} />
           </Show>
         </scrollbox>
       </Show>

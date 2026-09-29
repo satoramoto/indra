@@ -434,8 +434,14 @@ describe("per-cell polish", () => {
     model.restore({ page: "team", teamId: "team-001", seatId: "seat-002" });
     const { setup } = await animate(model, true);
     try {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      await setup.renderOnce();
       const frame = setup.captureCharFrame();
       await keep("idle-splash", frame);
+      // The seats table keeps its full width: the splash never pushes a scroll bar in.
+      const lines = frame.split("\n");
+      expect(lines.find((line) => line.startsWith(" └"))?.trimEnd(), frame).toBe(" └" + "─".repeat(HUB_GRID.columns - 4) + "┘");
+      expect(lines.find((line) => line.includes("No sprint open"))?.indexOf("No sprint open")).toBe(1 + Math.floor((HUB_GRID.columns - 2 - 14) / 2));
       expect(frame).toContain("No sprint open");
       expect(frame).toContain("█");
       expect(frame.split("\n").length - 1).toBe(HUB_GRID.rows);
