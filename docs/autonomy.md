@@ -51,6 +51,8 @@ This companion uses strict validation and contains durable owner decisions, not 
 commits only `autonomy.json`, using the same state/Git lock as `PlanningStore`. Scope selection and enable/disable
 commands additionally serialize through an owner-settings lock across processes. Configure it through the owner
 commands, not by editing the file or routing it through an agent writer.
+Revocation timestamps are computed from current state inside the state transaction, after any automatic approvals
+committed while the owner command waited for the lock, so those approvals cannot prevent the switch to off.
 
 Enabling first commits a grant snapshot while off, then enables that exact state revision. If the second commit
 fails, the prepared grant remains inactive. Retrying prepares a new timestamp; only the snapshot whose timestamp

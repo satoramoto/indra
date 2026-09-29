@@ -5,7 +5,8 @@ import { approvalPolicy, evaluateAutoPolicy, evaluateAutomaticGate, readPolicyDo
 import { OwnerSettingsCommands, type OwnerScopeChoice } from "../src/owner-settings.js";
 import { PlanningBridge, assertCurrentAutomaticApproval, type AutomaticGateRequest, type CeremonyAdapters, type PlanningChat, type Post } from "../src/planning-bridge.js";
 import { proposalDigest } from "../src/ceremony.js";
-import { PlanningStore } from "../src/planning.js";
+import { PlanningStore, type PlanningGoal } from "../src/planning.js";
+import { StateGit } from "../src/state-commit.js";
 import type { TeamRecord } from "../src/state-domain.js";
 import type { AgentRuntime, AgentResult } from "../src/codex-runtime.js";
 import type { Shell } from "../src/command-shell.js";
@@ -15,6 +16,7 @@ vi.setConfig({ testTimeout: 30_000 });
 const head = "a".repeat(40); const merged = "b".repeat(40);
 const dirs: string[] = [];
 afterEach(async () => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
   await Promise.all(dirs.splice(0).flatMap((dir) => [rm(dir, { recursive: true, force: true }), rm(`${dir}.runtime`, { recursive: true, force: true })]));
 });
@@ -140,6 +142,52 @@ describe("standing policy evaluation", () => {
     expect(after.automaticApprovals).toEqual(before.automaticApprovals);
     expect(after.ceremony).toEqual(before.ceremony);
     expect(approvalPolicy(await readPolicyDocument(f.store.checkout), (await f.store.read()).teams[0] as TeamRecord, approval.policyRevision)).toEqual(policy);
+  });
+
+  it.each([
+    { change: "disable", delay: 0 }, { change: "disable", delay: 1_000 },
+    { change: "scope", delay: 0 }, { change: "scope", delay: 1_000 },
+    { change: "mission", delay: 0 }, { change: "mission", delay: 1_000 },
+  ] as const)("revokes after an approval committed while $change waits for state.lock (delay: $delay ms)", async ({ change, delay }) => {
+    const f = await fixture(); await f.enable();
+    const request = await f.request(); const document = await readPolicyDocument(f.store.checkout);
+    const enabled = ((await f.store.read()).teams[0] as TeamRecord).standingPolicy!.revisions[0];
+    const requestedAt = Date.parse(enabled.at) + 10_000;
+    vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(requestedAt);
+    let enter!: () => void; let release!: () => void;
+    const entered = new Promise<void>((resolve) => { enter = resolve; });
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    let authorized!: PlanningGoal;
+    const commit = StateGit.prototype.commit;
+    vi.spyOn(StateGit.prototype, "commit").mockImplementation(async function (this: StateGit, message) {
+      if (this.checkout === f.store.checkout && message.startsWith(`Approve goal ${f.goal.id}:`)) {
+        authorized = await f.current();
+        enter(); await released; // Keep the approval transaction's state.lock until the settings write starts.
+      }
+      await commit.call(this, message);
+    });
+    const update = f.store.updateOwnerSettings.bind(f.store);
+    vi.spyOn(f.store, "updateOwnerSettings").mockImplementation(async (teamId, patch, at) => {
+      vi.setSystemTime(requestedAt + delay);
+      const approving = f.bridge.poll();
+      await entered;
+      const revoking = update(teamId, patch, at);
+      release();
+      const results = await Promise.allSettled([approving, revoking]);
+      for (const result of results) if (result.status === "rejected") throw result.reason;
+    });
+    if (change === "disable") await f.commands.disable("team-one");
+    else if (change === "scope") await f.commands.chooseScope("team-one", { kind: "problem", goalId: f.goal.id });
+    else await f.commands.updateOwnerSettings("team-one", { mission: "Make delivery dependable" });
+    const state = await f.store.read(); const team = state.teams[0] as TeamRecord;
+    expect(team.standingPolicy!.revisions).toEqual([enabled, {
+      revision: 2, enabled: false, source: "owner-command", at: new Date(requestedAt + delay + 1).toISOString(),
+    }]);
+    expect(authorized.automaticApprovals).toHaveLength(1);
+    expect(authorized.automaticApprovals![0].at).toBe(new Date(requestedAt + delay).toISOString());
+    expect(state.planningGoals![0]).toEqual(authorized);
+    expect(approvalPolicy(await readPolicyDocument(f.store.checkout), team, 1)).toMatchObject({ policyId: document.policies[0].id, scope: document.policies[0].scope });
+    expect(await evaluateAutomaticGate(f.store, f.goal.id, request)).toBeUndefined();
   });
 
   it.each(["disable", "scope"] as const)("rechecks a %s change after evaluation but before approval", async (change) => {

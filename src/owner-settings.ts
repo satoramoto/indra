@@ -44,10 +44,7 @@ export class OwnerSettingsCommands implements OwnerSettingsPort {
   }
   /** Monotonic even for two owner commands in one millisecond or a clock moving backwards. */
   private timestamp(state: PlanningDocument, document: PolicyDocument, team: TeamRecord, supplied?: string): string {
-    if (supplied !== undefined) {
-      if (!/^\d{4}-\d\d-\d\dT/.test(supplied) || !Number.isFinite(Date.parse(supplied))) throw new Error("Invalid owner settings timestamp.");
-      return supplied;
-    }
+    if (supplied !== undefined) return supplied;
     const times = [team.standingPolicy?.revisions.at(-1)?.at,
       ...document.policies.filter((item) => item.teamId === team.id).flatMap((item) => item.grants.map((grant) => grant.at)),
       ...(state.planningGoals ?? []).filter((goal) => goal.teamId === team.id).flatMap((goal) => (goal.automaticApprovals ?? []).map((approval) => approval.at)),
@@ -94,7 +91,7 @@ export class OwnerSettingsCommands implements OwnerSettingsPort {
       const scope = selectedScope(state, team, requested);
       let policy = document.policies.find((item) => item.teamId === teamId);
       if (policy && same(policy.scope, scope)) return;
-      await this.store.updateOwnerSettings(teamId, { autoMode: false }, this.timestamp(state, document, team));
+      await this.store.updateOwnerSettings(teamId, { autoMode: false });
       if (policy) policy.scope = scope;
       else { policy = { id: `policy-${randomUUID()}`, teamId, scope, grants: [] }; document.policies.push(policy); }
       await this.save(document);
@@ -107,6 +104,7 @@ export class OwnerSettingsCommands implements OwnerSettingsPort {
 
   async updateOwnerSettings(teamId: string, patch: SettingsPatch, at?: string): Promise<void> {
     fields(patch, ["mission", "autoMode"]);
+    if (at !== undefined && (!/^\d{4}-\d\d-\d\dT/.test(at) || !Number.isFinite(Date.parse(at)))) throw new Error("Invalid owner settings timestamp.");
     if (patch.mission !== undefined && (typeof patch.mission !== "string" || !patch.mission.trim())) throw new Error("The owner mission must not be empty.");
     if (patch.autoMode !== undefined && typeof patch.autoMode !== "boolean") throw new Error("Auto mode must be on or off.");
     if (patch.mission !== undefined && patch.autoMode === true) throw new Error("Save the mission and choose its scope before enabling auto mode.");
@@ -114,8 +112,7 @@ export class OwnerSettingsCommands implements OwnerSettingsPort {
     await this.serialized(async () => {
       // Off must remain available even if the companion file is missing, dirty or unreadable.
       if (requested.autoMode === false && requested.mission === undefined) {
-        const state = await this.store.read(); const team = settingsTeam(state, teamId);
-        await this.store.updateOwnerSettings(teamId, { autoMode: false }, this.timestamp(state, { version: 1, policies: [] }, team, at));
+        await this.store.updateOwnerSettings(teamId, { autoMode: false }, at);
         return;
       }
       let { state, document } = await this.snapshot();
@@ -123,7 +120,7 @@ export class OwnerSettingsCommands implements OwnerSettingsPort {
       if (requested.autoMode !== true) {
         // A changed mission invalidates the old scope before any later gate can execute it.
         const missionChanged = requested.mission !== undefined && requested.mission !== team.mission;
-        await this.store.updateOwnerSettings(teamId, { ...requested, ...(missionChanged ? { autoMode: false } : {}) }, this.timestamp(state, document, team, at));
+        await this.store.updateOwnerSettings(teamId, { ...requested, ...(missionChanged ? { autoMode: false } : {}) }, at);
         return;
       }
       const policy = document.policies.find((item) => item.teamId === teamId);
@@ -135,7 +132,7 @@ export class OwnerSettingsCommands implements OwnerSettingsPort {
       if (current && same(current.scope, policy.scope)) return;
       if (setting?.enabled) {
         // An old boolean-only setting is not a scoped grant. Revoke it before replacing it.
-        await this.store.updateOwnerSettings(teamId, { autoMode: false }, this.timestamp(state, document, team));
+        await this.store.updateOwnerSettings(teamId, { autoMode: false });
         ({ state, document } = await this.snapshot()); team = settingsTeam(state, teamId);
       }
       const configured = document.policies.find((item) => item.teamId === teamId)!;
