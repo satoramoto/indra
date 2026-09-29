@@ -3,6 +3,8 @@ import { lstat, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import type { AgentResult, AgentRuntime, WriteAccess } from "./codex-runtime.js";
 import { runChecked, type Shell, type ShellResult } from "./command-shell.js";
+import { gitCommand, ghCommand, runGit, runGh, type GitOptions } from "./git-gh.js";
+import { seatStatus, type TeamRecord } from "./state-domain.js";
 import { maintainDeveloperSeat, ownsSeatRecord, retainSeatRecord, seatRecordName } from "./developer-maintenance.js";
 import { postReviewOnce, requireApprovedReview } from "./developer-review.js";
 import { missingTeamMessage, teamProject, type PlanningAssignment as Assignment, type PlanningGoal, type PlanningOutcome as ApprovedOutcome, type PlanningStore } from "./planning.js";
@@ -45,8 +47,6 @@ export const baseBranch = (goal: PlanningGoal) => {
   if (goal.integration?.branch !== `sprint/${goal.id}`) throw new SeatError("Goal has no matching sprint branch.");
   return goal.integration.branch;
 };
-// gh supplies the credential for one command; Git's configuration is never changed.
-const GH_CREDENTIAL = ["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential"];
 
 /** A failure whose message is ours and safe to record in state and the thread. */
 export class SeatError extends Error { override name = "SeatError"; }
@@ -54,10 +54,11 @@ export class SeatError extends Error { override name = "SeatError"; }
 /** Reads a seat from state and refuses unknown or Team Lead seats. */
 export async function loadDeveloperSeat(store: PlanningStore, seatId: string): Promise<SeatIdentity> {
   const state = await store.read();
-  const teams = state.teams as { seats: { id: string; displayName: string; roles: string[]; externalIdentities: { mattermost: { username: string } } }[] }[];
+  const teams = state.teams as TeamRecord[];
   const seat = teams.flatMap((team) => team.seats).find((item) => item.id === seatId);
   if (!seat) throw new SeatError(`Seat '${seatId}' is not in state.`);
   if (seat.roles[0] !== "Developer") throw new SeatError(`Seat '${seatId}' is a ${seat.roles[0] ?? "roleless seat"}; seat run only runs Developer seats.`);
+  if (!["active", "retiring"].includes(seatStatus(seat))) throw new SeatError(`Seat '${seatId}' is ${seatStatus(seat)}; it cannot run.`);
   return { id: seat.id, displayName: seat.displayName, username: seat.externalIdentities.mattermost.username, roles: seat.roles };
 }
 
@@ -74,6 +75,9 @@ export class DeveloperSeat {
 
   /** Resumes the seat's in-flight assignment, or claims the oldest queued one. Returns "idle" when there was nothing to do. */
   async tick(): Promise<"idle" | "worked"> {
+    const state = await this.store.read();
+    const seat = (state.teams as TeamRecord[]).flatMap((team) => team.seats).find((item) => item.id === this.seat.id);
+    if (!seat || !["active", "retiring"].includes(seatStatus(seat))) return "idle";
     if (await maintainDeveloperSeat(this.store, this.seat.id, this.shell, this.log)) return "worked";
     const goals = ((await this.store.read()).planningGoals ?? []).filter(implementationEligible);
     const mine = goals.flatMap((goal) => (goal.assignments ?? []).filter((item) => item.seatId === this.seat.id).map((assignment) => ({ goal, assignment })));
@@ -86,6 +90,8 @@ export class DeveloperSeat {
       const state = await this.store.read();
       const goal = state.planningGoals?.find((item) => item.id === next.goal.id);
       if (!goal || !implementationEligible(goal)) return;
+      const owner = (state.teams as TeamRecord[]).flatMap((team) => team.seats).find((item) => item.id === this.seat.id);
+      if (!owner || !["active", "retiring"].includes(seatStatus(owner))) return;
       const assignment = this.find(state.planningGoals, goal.id, next.assignment.outcomeId);
       if (assignment.status !== "queued") return;
       if ((state.planningGoals ?? []).some((item) => item.assignments?.some((item) => item.seatId === this.seat.id && ACTIVE.has(item.status)))) return;
@@ -103,6 +109,8 @@ export class DeveloperSeat {
       await this.store.update((current) => {
         const currentGoal = current.planningGoals?.find((item) => item.id === goal.id);
         if (!currentGoal || !implementationEligible(currentGoal)) throw new SeatError("Goal no longer accepts implementation claims.");
+        const owner = (current.teams as TeamRecord[]).flatMap((team) => team.seats).find((item) => item.id === this.seat.id);
+        if (!owner || !["active", "retiring"].includes(seatStatus(owner))) throw new SeatError("Seat no longer accepts implementation work.");
         const all = (current.planningGoals ?? []).flatMap((item) => item.assignments ?? []);
         if (all.some((item) => item.seatId === this.seat.id && ACTIVE.has(item.status))) throw new SeatError("Seat already owns an assignment.");
         const target = this.find(current.planningGoals, goal.id, assignment.outcomeId);
@@ -187,7 +195,7 @@ export class DeveloperSeat {
   }
 
   private async recoverMerge(record: SeatTaskRecord): Promise<void> {
-    const pending = await this.shell.run("git", ["rev-parse", "--quiet", "--verify", "MERGE_HEAD"], record.worktree);
+    const pending = await runGit(this.shell, ["rev-parse", "--quiet", "--verify", "MERGE_HEAD"], record.worktree);
     if (pending.code === 1) return;
     if (pending.code !== 0) throw new SeatError("Could not inspect unfinished merge.");
     // This is recovery, not another conflict-resolution round. A failed abort stops all subsequent work.
@@ -243,7 +251,7 @@ export class DeveloperSeat {
             const checkedHead = await requireApprovedReview(this.shell, record.prUrl!, record.worktree);
             await this.event(record, { kind: "ci", result: "started", headSha: checkedHead });
             let checks: ShellResult;
-            try { checks = await this.shell.run("gh", ["pr", "checks", record.prUrl!, "--watch"], record.worktree); }
+            try { checks = await runGh(this.shell, ["pr", "checks", record.prUrl!, "--watch"], record.worktree); }
             catch {
               await this.event(record, { kind: "ci", result: "failed", headSha: checkedHead });
               throw new SeatError("CI observation failed.");
@@ -266,11 +274,11 @@ export class DeveloperSeat {
         await this.say(goal, `Merged ${record.prUrl} for **${outcome.title}**. Going idle.`);
         // Cleanup is best-effort: none of it can fail a merged assignment.
         const github = await this.github(goal);
-        const deleted = await this.shell.run("gh", ["api", "-X", "DELETE", `repos/${github}/git/refs/heads/${record.branch}`], project);
+        const deleted = await runGh(this.shell, ["api", "-X", "DELETE", `repos/${github}/git/refs/heads/${record.branch}`], project);
         if (deleted.code !== 0) this.log(`Could not delete remote branch ${record.branch}.`);
-        const removed = await this.shell.run("git", ["worktree", "remove", "--force", record.worktree], project);
+        const removed = await runGit(this.shell, ["worktree", "remove", "--force", record.worktree], project);
         if (removed.code !== 0) this.log(`Could not remove worktree ${record.worktree}.`);
-        const branchGone = await this.shell.run("git", ["branch", "-D", record.branch], project);
+        const branchGone = await runGit(this.shell, ["branch", "-D", record.branch], project);
         if (branchGone.code !== 0) this.log(`Could not delete local branch ${record.branch}.`);
       }
     } catch (error) {
@@ -283,7 +291,7 @@ export class DeveloperSeat {
 
   private async branchExists(branch: string, project: string): Promise<boolean> {
     for (const ref of [`refs/heads/${branch}`, `refs/remotes/origin/${branch}`]) {
-      const found = await this.shell.run("git", ["show-ref", "--verify", "--quiet", ref], project);
+      const found = await runGit(this.shell, ["show-ref", "--verify", "--quiet", ref], project);
       if (found.code === 0) return true;
       if (found.code !== 1) throw new SeatError("Could not inspect retained assignment branches.");
     }
@@ -366,8 +374,8 @@ export class DeveloperSeat {
         await this.event(record, { kind: "merge", result: "started", headSha: checkedHead });
         let landed: boolean;
         try {
-          await this.shell.run("gh", ["pr", "merge", prUrl!, "--squash", "--match-head-commit", checkedHead], project);
-          const state = await this.shell.run("gh", ["pr", "view", prUrl!, "--json", "state", "--jq", ".state"], project);
+          await runGh(this.shell, ["pr", "merge", prUrl!, "--squash", "--match-head-commit", checkedHead], project);
+          const state = await runGh(this.shell, ["pr", "view", prUrl!, "--json", "state", "--jq", ".state"], project);
           landed = state.code === 0 && state.stdout.trim() === "MERGED";
         } catch {
           await this.event(record, { kind: "merge", result: "failed", headSha: checkedHead });
@@ -402,7 +410,7 @@ export class DeveloperSeat {
     const base = baseBranch(goal);
     for (;;) {
       await ensureProjectCheckout(this.shell, this.store.runtimeDir, await this.github(goal), base);
-      const merged = await this.shell.run("git", ["merge", "--no-edit", `origin/${base}`], record.worktree);
+      const merged = await runGit(this.shell, ["merge", "--no-edit", `origin/${base}`], record.worktree);
       if (merged.code === 0) break;
       const rounds = record.conflictRounds ?? 0;
       await this.event(record, { kind: "conflict", result: "failed", round: rounds, message: "Sprint base merge failed." });
@@ -416,18 +424,19 @@ export class DeveloperSeat {
       await this.say(goal, `${record.prUrl} conflicts with ${base}; resolving (round ${record.conflictRounds} of ${MAX_CONFLICT_ROUNDS}).`);
       await this.codex("fix", record, { extraDirs: [record.gitDir!] }, conflictPrompt(outcome, record.prUrl!, record.branch, base), developerSchema);
       // Resolved means the merge is committed: the base is now an ancestor of HEAD.
-      const resolved = await this.shell.run("git", ["merge-base", "--is-ancestor", `origin/${base}`, "HEAD"], record.worktree);
+      const resolved = await runGit(this.shell, ["merge-base", "--is-ancestor", `origin/${base}`, "HEAD"], record.worktree);
       await this.event(record, { kind: "conflict", result: resolved.code === 0 ? "passed" : "failed", round: record.conflictRounds });
       if (resolved.code === 0) break;
       await this.sh("git", ["merge", "--abort"], record.worktree);
       if (record.conflictRounds >= MAX_CONFLICT_ROUNDS) throw new SeatError(conflictNote(base));
     }
-    await this.sh("git", [...GH_CREDENTIAL, "push", "origin", `HEAD:refs/heads/${record.branch}`], record.worktree);
+    await this.sh("git", ["push", "origin", `HEAD:refs/heads/${record.branch}`], record.worktree, { githubCredential: true });
     return true;
   }
 
-  private async sh(command: string, args: string[], cwd: string): Promise<ShellResult> {
-    return await runChecked(this.shell, command, args, cwd, (result) => new SeatError(`${command} ${args.slice(0, 2).join(" ")} failed (exit ${result.code}).`));
+  private async sh(command: "git" | "gh", args: string[], cwd: string, options: GitOptions = {}): Promise<ShellResult> {
+    const call = command === "git" ? gitCommand(args, options) : ghCommand(args);
+    return await runChecked(this.shell, call.command, call.args, cwd, (result) => new SeatError(`${call.command} ${call.args.slice(0, 2).join(" ")} failed (exit ${result.code}).`));
   }
 
   private async setStatus(goalId: string, outcomeId: string, change: Partial<Assignment>): Promise<boolean> {

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { copyFile, mkdir, mkdtemp, writeFile, readFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PlanningStore, type PlanningGoal } from "../src/planning.js";
@@ -10,6 +10,9 @@ import { ImplementationRecorder } from "../src/implementation-facts.js";
 import { main } from "../src/cli.js";
 import { runTerminalUi } from "../src/terminal-ui-solid.js";
 import { git, stateCheckout } from "./state-checkout.js";
+import { SeatLifecycle } from "../src/seat-lifecycle.js";
+import type { TeamRecord } from "../src/state-domain.js";
+import type { SeatLifecyclePorts } from "../src/autonomy-ports.js";
 
 const rollout = vi.hoisted(() => ({ ready: true }));
 vi.mock("../src/release-activation.js", async (original) => ({
@@ -70,6 +73,75 @@ async function fixture(goals: PlanningGoal[] = []) {
 }
 
 describe("seat process supervisor", () => {
+  it("automatically starts a verified pending seat once and leaves pending or retired seats unhosted", async () => {
+    const { dir, tmux, supervisor } = await fixture();
+    const store = new PlanningStore(dir, undefined, READY);
+    const identity = vi.fn<SeatLifecyclePorts["credentialIdentity"]>(async () => undefined);
+    const lifecycle = new SeatLifecycle(store, { credentialIdentity: identity, branchHasNoPr: async () => false, workSettled: async () => true,
+      startSeat: async (_team, seat) => supervisor.start(seat.id), retireSeat: async (_team, seat) => supervisor.stop(seat.id) });
+    await lifecycle.add({ teamId: "team-001", displayName: "Product", username: "newproduct", role: "Product" });
+    const pending = ((await store.read()).teams as TeamRecord[])[0].seats.at(-1)!;
+    await supervisor.ensureAll();
+    await lifecycle.reconcile();
+    expect(tmux.launches()).toHaveLength(3);
+    await expect(supervisor.restart(pending.id)).rejects.toThrow("Only active or retiring");
+    identity.mockResolvedValue({ userId: "new-bot", username: "newproduct", isBot: true });
+    await lifecycle.reconcile();
+    await lifecycle.reconcile();
+    expect(tmux.launches()).toHaveLength(4);
+    expect((await supervisor.read())[pending.id].process).toBe("running");
+    await supervisor.stop(pending.id);
+    await lifecycle.reconcile();
+    expect((await supervisor.read())[pending.id].process).toBe("stopped");
+    expect(tmux.launches()).toHaveLength(4);
+    await supervisor.start(pending.id);
+    tmux.calls = [];
+    const active = ((await store.read()).teams as TeamRecord[])[0].seats.at(-1)!;
+    await lifecycle.remove({ teamId: "team-001", seatId: active.id, expected: active });
+    await withFileLock(turnLockFile(dir, { kind: "seat", seatId: active.id }), async () => {
+      await lifecycle.reconcile();
+      expect(tmux.kills()).toHaveLength(0);
+    });
+    await lifecycle.reconcile();
+    expect(tmux.kills()).toHaveLength(1);
+    await supervisor.ensureAll();
+    await supervisor.start(active.id);
+    await expect(supervisor.restart(active.id)).rejects.toThrow("Only active or retiring");
+    expect(tmux.launches()).toHaveLength(0);
+  });
+
+  it.each(["replaced", "missing record"])("retirement never stops a session with %s ownership and never starts its retired seat", async (kind) => {
+    const { dir, tmux, supervisor } = await fixture();
+    const store = new PlanningStore(dir, undefined, READY);
+    await supervisor.ensureAll();
+    const host = new TmuxHost(dir, tmux, dir, 1000, { kind: "seat", seatId: "seat-002" });
+    if (kind === "replaced") tmux.sessions.set(host.session, { pane: "%99", identity: "999:999" });
+    else await rm(host.recordFile);
+    const lifecycle = new SeatLifecycle(store, { credentialIdentity: async () => undefined, branchHasNoPr: async () => false, workSettled: async () => true,
+      startSeat: async (_team, seat) => supervisor.start(seat.id), retireSeat: async (_team, seat) => supervisor.stop(seat.id) });
+    const expected = ((await store.read()).teams as TeamRecord[])[0].seats[1];
+    await lifecycle.remove({ teamId: "team-001", seatId: expected.id, expected });
+    await lifecycle.reconcile();
+    await supervisor.ensureAll();
+    expect(tmux.kills()).toHaveLength(0);
+    expect(tmux.sessions.has(host.session)).toBe(true);
+    expect(tmux.launches()).toHaveLength(3);
+    expect(((await store.read()).teams as TeamRecord[])[0].seats[1].status).toBe("retired");
+  });
+
+  it("rechecks status after waiting for another process control operation", async () => {
+    const { dir, tmux, supervisor } = await fixture();
+    const store = new PlanningStore(dir, undefined, READY);
+    let starting: Promise<void>;
+    await withFileLock(join(store.runtimeDir, "process-seat-002.lock"), async () => {
+      starting = supervisor.start("seat-002");
+      await store.update((state) => { (state.teams as TeamRecord[])[0].seats[1].status = "retiring"; }, "Request removal");
+      await store.update((state) => { (state.teams as TeamRecord[])[0].seats[1].status = "retired"; }, "Finish removal");
+    });
+    await starting!;
+    expect(tmux.launches()).toHaveLength(0);
+  });
+
   it("hosts the bridge and one runner per Developer seat, then reuses them instead of duplicating", async () => {
     const { dir, tmux, supervisor } = await fixture();
     expect(await supervisor.ensureAll()).toEqual([]);
@@ -277,6 +349,15 @@ async function retryFixture(goals = [failedGoal()]) {
 }
 
 describe("failed assignment retries", () => {
+  it("keeps a retiring Developer's existing failed assignment available for an explicit retry", async () => {
+    const { store, supervisor, target } = await retryFixture();
+    await store.update((state) => { (state.teams as TeamRecord[])[0].seats[1].status = "retiring"; }, "Request removal");
+    expect((await supervisor.read())["seat-002"].retry).toEqual(target);
+    await supervisor.retry(target);
+    expect((await store.read()).planningGoals![0].assignments![0]).toMatchObject({ seatId: "seat-002", status: "queued" });
+    expect(((await store.read()).teams as TeamRecord[])[0].seats[1].status).toBe("retiring");
+  });
+
   it.each([true, false])("passes rollout readiness through the production UI supervisor (ready: %s)", async (ready) => {
     const { dir, store, target } = await retryFixture();
     const before = git(dir, "rev-list", "--count", "HEAD");
