@@ -1,4 +1,4 @@
-import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { execFile, execFileSync, spawn, type ChildProcess, type ExecFileOptions } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -9,6 +9,8 @@ import { LocalReleaseActivationReader } from "../src/release-activation.js";
 import { IN_USE, switchDist, writeUpdateSettings, type RunningBuildReceipt } from "../src/self-update.js";
 import { childEnv } from "../src/op-env.js";
 import type { HostRecord } from "../src/tmux-host.js";
+
+vi.mock("node:child_process", { spy: true });
 
 describe("release activation", () => {
   let root: string; let appDir: string; let state: string; let runtimeDir: string;
@@ -79,8 +81,29 @@ describe("release activation", () => {
     await select(before);
   });
   afterEach(async () => {
+    vi.mocked(execFile).mockReset();
     await rm(runtimeDir, { recursive: true, force: true });
     await rm(state, { recursive: true, force: true });
+  });
+
+  it("keeps replacement objects from forging release ancestry with the same bounded execution options", async () => {
+    git("replace", "--graft", unrelated, merged);
+    try {
+      expect(git("merge-base", "--is-ancestor", merged, unrelated)).toBe("");
+      await select(unrelated); await start(unrelated); await ready();
+      const result = await reader.read(integration());
+      expect(result.status).toBe("update-pending");
+      expect(result.evidence).toBeUndefined();
+      const calls = vi.mocked(execFile).mock.calls.filter(([command, args]) => command === "git" && (args as string[]).includes("merge-base"));
+      expect(calls).toHaveLength(3);
+      for (const call of calls) {
+        expect(call[1]).toEqual(["merge-base", "--is-ancestor", merged, unrelated]);
+        const options = call[2] as ExecFileOptions;
+        expect(options).toMatchObject({ cwd: appDir, timeout: 2000, maxBuffer: 4096, env: { GIT_NO_REPLACE_OBJECTS: "1" } });
+        expect(options.env?.INDRA_STATE_GITHUB_TOKEN).toBeUndefined();
+        expect(Object.keys(options.env!).some((key) => key.startsWith("OP_"))).toBe(false);
+      }
+    } finally { git("replace", "-d", unrelated); }
   });
 
   it("separates human merge, successful build, dist switch, startup and both processes becoming ready", async () => {

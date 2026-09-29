@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { execFileSync, spawn } from "node:child_process";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { execFile, execFileSync, spawn, type ExecFileOptions } from "node:child_process";
 import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +8,9 @@ import { readBuildStamp } from "../src/build-stamp.js";
 import { recordRunningBuild as recordLoadedBuild } from "../src/running-build.js";
 import { IN_USE, processStart, pruneBuilds, readUpdateStatus, recordRunningBuild, SelfUpdater, switchDist } from "../src/self-update.js";
 import { git } from "./state-checkout.js";
+
+vi.mock("node:child_process", { spy: true });
+afterEach(() => { vi.mocked(execFile).mockReset(); vi.unstubAllEnvs(); });
 
 const head = (dir: string, ref = "HEAD") => git(dir, "rev-parse", ref).trim();
 
@@ -68,6 +71,25 @@ fi
 }
 
 describe("self-update", () => {
+  it.each([undefined, 45_000])("preserves git and npm execution options with timeout %s", async (timeout) => {
+    const { app, runtime, npm, npmCalls, merge } = await fixture();
+    await merge("package-lock.json", '{"lockfileVersion":3,"changed":true}\n');
+    vi.stubEnv("OP_TEST", "fixture-only");
+    vi.stubEnv("INDRA_STATE_GITHUB_TOKEN", "fixture-only");
+    vi.mocked(execFile).mockClear();
+    expect((await new SelfUpdater(app, npm, timeout, runtime).check()).outcome).toBe("built");
+    expect(await npmCalls()).toEqual(["ci", "run build"]);
+    const calls = vi.mocked(execFile).mock.calls.filter(([command]) => command === "git" || command === npm);
+    expect(calls.some(([command]) => command === "git")).toBe(true);
+    expect(calls.filter(([command]) => command === npm)).toHaveLength(2);
+    for (const call of calls) {
+      const options = call[2] as ExecFileOptions;
+      expect(options).toMatchObject({ cwd: app, encoding: "utf8", timeout: timeout ?? 900_000, maxBuffer: 16 * 1024 * 1024, env: { GIT_TERMINAL_PROMPT: "0" } });
+      expect(options.env?.OP_TEST).toBeUndefined();
+      expect(options.env?.INDRA_STATE_GITHUB_TOKEN).toBeUndefined();
+    }
+  });
+
   it("captures the loaded application at startup, confirms readiness on a paused check, and never changes that evidence when dist switches", async () => {
     const { app, runtime, updater, merge } = await fixture();
     const args = process.argv;

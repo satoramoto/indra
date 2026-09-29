@@ -3,7 +3,8 @@ import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { processShell, runChecked, type Shell } from "../src/command-shell.js";
+import { execCommand, processShell, runChecked, type Shell } from "../src/command-shell.js";
+import { childEnv } from "../src/op-env.js";
 
 vi.mock("node:child_process", { spy: true });
 
@@ -46,6 +47,38 @@ describe("processShell", () => {
       return {} as childProcess.ChildProcess;
     });
     await expect(processShell.run("command", ["arg"], "/workspace")).resolves.toEqual({ code: 1, stdout: "partial stdout\n", stderr: "partial stderr\n" });
+  });
+});
+
+describe("execCommand", () => {
+  it("keeps explicit execution limits and environment, output whitespace and the original exit error", async () => {
+    const cwd = await mkdtemp(join(await realpath(tmpdir()), "indra-command-exec-")); roots.push(cwd);
+    const env = childEnv(process.env, { overrides: { INDRA_COMMAND_TEST: "custom" } });
+    const command = { command: process.execPath, args: ["-e", 'process.stdout.write(" " + process.env.INDRA_COMMAND_TEST + "\\n"); process.stderr.write(" diagnostic\\n"); process.exitCode = 7;'] };
+    const result = await execCommand(command, { cwd, env, timeout: 5000, maxBuffer: 4096 });
+    expect(result).toMatchObject({ error: { code: 7 }, stdout: " custom\n", stderr: " diagnostic\n" });
+    expect(vi.mocked(childProcess.execFile)).toHaveBeenCalledExactlyOnceWith(command.command, command.args, { cwd, env, timeout: 5000, maxBuffer: 4096, encoding: "utf8" }, expect.any(Function));
+  });
+
+  it.each([
+    { code: "ENOENT" },
+    { code: null, killed: true, signal: "SIGTERM" },
+    { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" },
+  ])("retains raw failure details instead of normalizing them to exit 1: %j", async (details) => {
+    vi.stubEnv("OP_COMMAND_TEST", "fixture-only");
+    vi.stubEnv("INDRA_STATE_GITHUB_TOKEN", "fixture-only");
+    const error = Object.assign(new Error("process failure"), details);
+    vi.mocked(childProcess.execFile).mockImplementation((...args: unknown[]) => {
+      (args[3] as Function)(error, "partial output", "diagnostic");
+      return {} as childProcess.ChildProcess;
+    });
+    const result = await execCommand({ command: "git", args: ["status"] }, { timeout: 2000, env: undefined });
+    expect(result.error).toBe(error);
+    expect(result.stdout).toBe("partial output");
+    expect(result.stderr).toBe("diagnostic");
+    const options = vi.mocked(childProcess.execFile).mock.calls[0][2] as childProcess.ExecFileOptions;
+    expect(options.env?.OP_COMMAND_TEST).toBeUndefined();
+    expect(options.env?.INDRA_STATE_GITHUB_TOKEN).toBeUndefined();
   });
 });
 

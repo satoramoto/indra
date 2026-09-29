@@ -1,8 +1,8 @@
-import { execFile } from "node:child_process";
 import { readFile, readdir, readlink, realpath } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { readBuildStamp } from "./build-stamp.js";
 import { childEnv } from "./op-env.js";
+import { gitIsAncestor } from "./git-gh.js";
 import type { SprintIntegration } from "./planning.js";
 import { appRootOf } from "./reload.js";
 import { IN_USE, processStart, type RunningBuildReceipt } from "./running-build.js";
@@ -57,9 +57,9 @@ export class LocalReleaseActivationReader implements ReleaseActivationReadPort {
   private async contains(integrationSha: string, buildSha: string | undefined): Promise<boolean | undefined> {
     if (!fullSha(integrationSha) || !fullSha(buildSha)) return undefined;
     // Even exact SHAs require available commit objects; no cached positive survives lost history.
-    return new Promise((done) => execFile("git", ["merge-base", "--is-ancestor", integrationSha, buildSha], {
+    return gitIsAncestor(integrationSha, buildSha, {
       cwd: this.appDir, timeout: 2000, maxBuffer: 4096, env: { ...childEnv(), GIT_NO_REPLACE_OBJECTS: "1" },
-    }, (error) => done(!error ? true : error.code === 1 ? false : undefined)));
+    });
   }
 
   private async receipts(appDir: string): Promise<RunningBuildReceipt[]> {

@@ -3,7 +3,8 @@ import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { GITHUB_REPO } from "./local-state.js";
 import { withFileLock } from "./state-commit.js";
-import type { Shell } from "./developer-seat.js";
+import type { Shell } from "./command-shell.js";
+import { runGh, runGit } from "./git-gh.js";
 
 /** A project checkout problem whose message is ours and safe to record in state and the goal thread. */
 export class ProjectCheckoutError extends Error { override name = "ProjectCheckoutError"; }
@@ -31,7 +32,7 @@ export async function ensureProjectCheckout(shell: Shell, runtimeDir: string, gi
       if (await exists(dir)) throw new ProjectCheckoutError(`${dir} exists but is not a Git checkout; remove it so Indra can clone ${github} again.`);
       await mkdir(dirname(dir), { recursive: true, mode: 0o700 });
       const temp = `${dir}.${randomUUID()}.clone`;
-      const cloned = await shell.run("gh", ["repo", "clone", github, temp], dirname(dir));
+      const cloned = await runGh(shell, ["repo", "clone", github, temp], dirname(dir));
       if (cloned.code !== 0) {
         await rm(temp, { recursive: true, force: true });
         throw new ProjectCheckoutError(`gh repo clone ${github} failed (exit ${cloned.code}).`);
@@ -39,7 +40,7 @@ export async function ensureProjectCheckout(shell: Shell, runtimeDir: string, gi
       await rename(temp, dir);
     }
     // gh supplies the credential for this one command; Git's configuration is never changed.
-    const fetched = await shell.run("git", ["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential", "fetch", "origin", ...branches], dir);
+    const fetched = await runGit(shell, ["fetch", "origin", ...branches], dir, { githubCredential: true });
     if (fetched.code !== 0) throw new ProjectCheckoutError(`git fetch origin ${branches.join(" ")} failed in the ${github} checkout (exit ${fetched.code}).`);
     return dir;
   }, 30 * 60_000); // Another seat may be cloning a large project.
@@ -54,9 +55,9 @@ export const CEREMONY_SOURCE = "src/ceremony.ts";
  */
 export async function commitHasCeremony(shell: Shell, dir: string, sha: string): Promise<boolean | undefined> {
   if (!/^[0-9a-f]{40}$/.test(sha)) return undefined;
-  const commit = await shell.run("git", ["cat-file", "-e", `${sha}^{commit}`], dir);
+  const commit = await runGit(shell, ["cat-file", "-e", `${sha}^{commit}`], dir);
   if (commit.code !== 0) return undefined;
-  return (await shell.run("git", ["cat-file", "-e", `${sha}:${CEREMONY_SOURCE}`], dir)).code === 0;
+  return (await runGit(shell, ["cat-file", "-e", `${sha}:${CEREMONY_SOURCE}`], dir)).code === 0;
 }
 
 /**

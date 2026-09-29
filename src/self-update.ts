@@ -1,5 +1,5 @@
-import { execFile } from "node:child_process";
-import { childEnv } from "./op-env.js";
+import { execCommand, type Command } from "./command-shell.js";
+import { gitCommand, gitEnv } from "./git-gh.js";
 import { randomUUID } from "node:crypto";
 import { access, lstat, mkdir, readdir, readFile, readlink, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
@@ -79,17 +79,14 @@ export class SelfUpdater {
 
   constructor(readonly appDir: string, private readonly npm = "npm", private readonly timeoutMs = 15 * 60_000, private readonly runtimeDir = defaultRuntimeDir(appDir)) {}
 
-  private exec(command: string, args: string[]): Promise<string> {
-    return new Promise((resolve, reject) => {
-      execFile(command, args, { cwd: this.appDir, encoding: "utf8", env: { ...childEnv(), GIT_TERMINAL_PROMPT: "0" }, timeout: this.timeoutMs, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
-        if (!error) { resolve(stdout.trim()); return; }
-        const lines = `${stderr}\n${stdout}`.split("\n").map((line) => line.trim()).filter(Boolean);
-        reject(new Error(`${command} ${args[0]} failed: ${lines.find((line) => /error/i.test(line)) ?? lines.at(-1) ?? error.message}`));
-      });
-    });
+  private async exec(command: Command): Promise<string> {
+    const { error, stdout, stderr } = await execCommand(command, { cwd: this.appDir, env: gitEnv(), timeout: this.timeoutMs, maxBuffer: 16 * 1024 * 1024 });
+    if (!error) return stdout.trim();
+    const lines = `${stderr}\n${stdout}`.split("\n").map((line) => line.trim()).filter(Boolean);
+    throw new Error(`${command.command} ${command.args[0]} failed: ${lines.find((line) => /error/i.test(line)) ?? lines.at(-1) ?? error.message}`);
   }
 
-  private git(...args: string[]): Promise<string> { return this.exec("git", args); }
+  private git(...args: string[]): Promise<string> { return this.exec(gitCommand(args)); }
 
   async check(): Promise<UpdateResult> {
     // Called by the initialized application, including when auto-update is paused.
@@ -130,13 +127,13 @@ export class SelfUpdater {
       const lockChanged = !built?.sha || await this.git("diff", "--name-only", built.sha, head, "--", "package-lock.json").then((names) => names !== "", () => true);
       if (lockChanged) {
         // Not remembered as failed: the install is tried again on the next check.
-        try { await this.exec(this.npm, ["ci"]); }
+        try { await this.exec({ command: this.npm, args: ["ci"] }); }
         catch (error) { return { ...result("blocked", `dependency install failed: ${reason(error)}`), installFailed: true }; }
       }
       const name = `${head.slice(0, 12)}-${Date.now()}`;
       const out = join(this.appDir, BUILDS, name);
       try {
-        await this.exec(this.npm, ["run", "build", "--", "--outDir", out, "--emptyOutDir"]);
+        await this.exec({ command: this.npm, args: ["run", "build", "--", "--outDir", out, "--emptyOutDir"] });
         await access(join(out, "cli.js"));
         await access(join(out, "build-stamp.json"));
       } catch (error) {

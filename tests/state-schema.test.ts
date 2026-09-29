@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFile, execFileSync, spawnSync, type ExecFileOptions } from "node:child_process";
 import { createServer, type Server } from "node:http";
 import { chmod, mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -8,6 +8,8 @@ import { captureOpEnvironment, childEnv, opEnv, opVariablesIn, releaseOpEnvironm
 import { STATE_CREDENTIAL_CONFIG, StateGit } from "../src/state-commit.js";
 import { STATE_SCHEMA_PATH, syncStateSchema } from "../src/state-schema.js";
 import { git, stateCheckout } from "./state-checkout.js";
+
+vi.mock("node:child_process", { spy: true });
 
 const state = {
   $schema: "./schema/v1/state.schema.json", schemaVersion: 1, sprints: [], planningGoals: [],
@@ -36,7 +38,7 @@ async function appHistory(): Promise<{ appDir: string; older: string; running: s
   return { appDir, older: commit("older"), running: commit("running"), newer: commit("newer") };
 }
 
-afterEach(() => { releaseOpEnvironment(); delete process.env.INDRA_STATE_GITHUB_TOKEN; });
+afterEach(() => { vi.mocked(execFile).mockReset(); releaseOpEnvironment(); delete process.env.INDRA_STATE_GITHUB_TOKEN; });
 
 describe("state schema sync", () => {
   it("installs this build's schema verbatim, commits only that file, pushes it, and does nothing when it matches", async () => {
@@ -61,6 +63,14 @@ describe("state schema sync", () => {
     expect(subjects(checkout).at(-1)).toBe(`Update state schema from Indra ${newer}`);
     expect(git(checkout, "show", "--name-only", "--format=", "HEAD").trim()).toBe(STATE_SCHEMA_PATH);
     expect(git(checkout, "show", `HEAD:${STATE_SCHEMA_PATH}`)).toBe(next);
+    const ancestry = vi.mocked(execFile).mock.calls.find((call) => (call[1] as string[]).includes("merge-base"));
+    expect(ancestry?.slice(0, 2)).toEqual(["git", ["-C", appDir, "merge-base", "--is-ancestor", running, newer]]);
+    const options = ancestry![2] as ExecFileOptions;
+    expect(options).toMatchObject({ timeout: 10_000, env: { GIT_TERMINAL_PROMPT: "0" } });
+    expect(options.cwd).toBeUndefined();
+    expect(options.maxBuffer).toBeUndefined();
+    expect(options.env?.INDRA_STATE_GITHUB_TOKEN).toBeUndefined();
+    expect(Object.keys(options.env!).some((key) => key.startsWith("OP_"))).toBe(false);
   });
 
   it("never downgrades a schema written by a build this one does not include", async () => {
