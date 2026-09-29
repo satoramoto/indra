@@ -207,16 +207,35 @@ describe("finite production Developer goal orchestration", () => {
     await f.runner().turn(event("retry")); expect(f.calls.filter((call) => call.role === "fix")).toHaveLength(2);
   });
   it("settles every started worker before a failed turn releases its journal and goal lock", async () => {
-    const f = await fixture(); let release!: () => void; let started!: () => void;
+    const f = await fixture(); let release!: () => void; let started!: () => void; let persisted!: () => void; let drained!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; }); const siblingStarted = new Promise<void>((resolve) => { started = resolve; });
-    f.setWorkers(["src/a.ts", "src/b.ts"], async (file) => { if (file === "src/a.ts") throw new Error("Failed worker"); started(); await gate; });
-    const saves = vi.spyOn(f.store, "saveRuntime"); let settled = false;
-    const turn = f.runner().turn(event()).finally(() => { settled = true; });
-    await siblingStarted; await new Promise<void>((resolve) => setImmediate(resolve));
-    try { expect(settled).toBe(false); } finally { release(); await turn; }
+    const failedWorkerPersisted = new Promise<void>((resolve) => { persisted = resolve; });
+    const siblingPersisted = new Promise<void>((resolve) => { drained = resolve; });
+    // A fails only after both worker-start writes have settled, so its failure is the only pending writer.
+    f.setWorkers(["src/a.ts", "src/b.ts"], async (file) => { if (file === "src/a.ts") { await siblingStarted; throw new Error("Failed worker"); } started(); await gate; });
+    const save = f.store.saveRuntime.bind(f.store); let failedJournalSaved = false; let siblingJournalSaved = false; let failedPersistComplete = false; let writesAfterFailure = 0;
+    const saves = vi.spyOn(f.store, "saveRuntime").mockImplementation(async (name, value) => {
+      if (failedPersistComplete) writesAfterFailure++;
+      const failedWorker = name === developerGoalJournalName(goalId) && (value as { lanes: Record<string, LaneJournal> }).lanes.code?.sessions.some((session) => session.key === "worker:0:src/a.ts" && session.status === "failed");
+      const completedSibling = name === developerGoalJournalName(goalId) && (value as { lanes: Record<string, LaneJournal> }).lanes.code?.sessions.some((session) => session.key === "worker:0:src/b.ts" && session.status === "complete");
+      await save(name, value);
+      if (completedSibling) siblingJournalSaved = true;
+      if (siblingJournalSaved && name === goalRuntimeFilename(goalId)) drained();
+      if (failedWorker) failedJournalSaved = true;
+      if (failedJournalSaved && name === goalRuntimeFilename(goalId) && !failedPersistComplete) { failedPersistComplete = true; persisted(); }
+    });
+    let settled = false; const turn = f.runner().turn(event()).finally(() => { settled = true; });
+    await failedWorkerPersisted;
+    // The completed failure-persist promise now unwinds without further I/O; drain its rejection continuations.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    try {
+      expect(settled).toBe(false);
+      expect(writesAfterFailure).toBe(0); // A failed turn must not start finalizing while B still owns its context.
+      expect((await f.current())!.failure).toBeNull();
+    } finally { release(); await Promise.all([turn, siblingPersisted]); }
     expect((await f.current())!.failure).not.toBeNull();
     const journal = await f.store.readRuntimeFile<{ lanes: Record<string, LaneJournal> }>(developerGoalJournalName(goalId));
-    expect(journal!.lanes.code.sessions.filter((session) => session.role === "worker").map((session) => session.status)).toEqual(["failed", "complete"]);
+    expect(Object.fromEntries(journal!.lanes.code.sessions.filter((session) => session.role === "worker").map((session) => [session.key, session.status]))).toEqual({ "worker:0:src/a.ts": "failed", "worker:0:src/b.ts": "complete" });
     const writes = saves.mock.calls.length; await new Promise<void>((resolve) => setImmediate(resolve)); expect(saves).toHaveBeenCalledTimes(writes);
   });
   it("uses exact observed CI failure logs for a fix instead of believing an event's passing claim", async () => {
