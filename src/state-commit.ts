@@ -1,8 +1,11 @@
-import { execFile, spawn } from "node:child_process";
-import { childEnv, STATE_TOKEN_VARIABLE, stateRepoToken } from "./op-env.js";
+import { spawn } from "node:child_process";
+import { execCommand } from "./command-shell.js";
+import { stateGitCommand } from "./git-gh.js";
 import { link, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import { randomUUID } from "node:crypto";
+
+export { STATE_CREDENTIAL_CONFIG } from "./git-gh.js";
 
 /** How a sync of the state checkout ended; only "synced" means it is level with its upstream. */
 export type StateSyncOutcome = "synced" | "skipped" | "dirty" | "offline" | "conflict" | "push-failed" | "error";
@@ -21,35 +24,6 @@ export class StateCommitError extends Error {
     super(message, options);
     this.name = "StateCommitError";
   }
-}
-
-const gitEnv = () => ({ ...childEnv(), GIT_TERMINAL_PROMPT: "0" });
-
-/**
- * Replaces the machine's credential helpers, for this one git process, with one that answers from the process's
- * own environment. The token itself never appears in arguments, remotes or git config; only the variable name does.
- * The helper ignores `store` and `erase`, so the token is never saved anywhere. It answers only a request for
- * `https://github.com/satoramoto/indra-state(.git)` (`useHttpPath` makes git always send the path); for any other
- * protocol, host or repository, for example after a changed origin or a redirect, it says nothing.
- */
-const TOKEN_HELPER = "!f() { test \"$1\" = get || { cat >/dev/null; exit 0; }; p=; h=; u=; "
-  + "while IFS= read -r line; do case \"$line\" in protocol=*) p=\"${line#protocol=}\";; host=*) h=\"${line#host=}\";; path=*) u=\"${line#path=}\";; esac; done; "
-  + "test \"$p\" = https && test \"$h\" = github.com || exit 0; "
-  + "case \"$u\" in satoramoto/indra-state|satoramoto/indra-state.git) ;; *) exit 0;; esac; "
-  + `echo username=x-access-token; echo "password=$${STATE_TOKEN_VARIABLE}"; }; f`;
-
-/** The `-c` options that make one git process authenticate with the state token, and only to the state repository. */
-export const STATE_CREDENTIAL_CONFIG = ["-c", "credential.helper=", "-c", `credential.helper=${TOKEN_HELPER}`, "-c", "credential.useHttpPath=true"];
-
-/**
- * The git arguments and environment for one command in the state checkout. Fetches and pushes authenticate with
- * the owner's `INDRA_STATE_GITHUB_TOKEN` when it was supplied; every other command, and every command without
- * the token, runs as before with the ambient credentials.
- */
-function gitInvocation(checkout: string, args: string[]): { args: string[]; env: NodeJS.ProcessEnv; token?: string } {
-  const token = stateRepoToken();
-  if (!token || (args[0] !== "fetch" && args[0] !== "push")) return { args: ["-C", checkout, ...args], env: gitEnv() };
-  return { args: ["-C", checkout, ...STATE_CREDENTIAL_CONFIG, ...args], env: { ...gitEnv(), [STATE_TOKEN_VARIABLE]: token }, token };
 }
 
 /** `text` with every occurrence of `token` removed, for messages that might echo what git saw. */
@@ -97,15 +71,12 @@ export async function withFileLock<T>(file: string, work: () => Promise<T>, time
 export class StateGit {
   constructor(readonly checkout: string, readonly path = "state.json") {}
 
-  private run(args: string[]): Promise<string> {
-    const invocation = gitInvocation(this.checkout, args);
-    return new Promise((resolve, reject) => {
-      execFile("git", invocation.args, { encoding: "utf8", env: invocation.env, timeout: 60_000 }, (error, stdout, stderr) => {
-        // The cause is left out when a token was in play: its message repeats the command and git's output.
-        if (error) reject(new StateCommitError(withoutToken(`git ${args[0]} failed in ${this.checkout}: ${(stderr || error.message).trim()}`, invocation.token), invocation.token ? undefined : { cause: error }));
-        else resolve(stdout);
-      });
-    });
+  private async run(args: string[]): Promise<string> {
+    const invocation = stateGitCommand(this.checkout, args);
+    const { error, stdout, stderr } = await execCommand(invocation, { env: invocation.env, timeout: 60_000 });
+    // The cause is left out when a token was in play: its message repeats the command and git's output.
+    if (error) throw new StateCommitError(withoutToken(`git ${args[0]} failed in ${this.checkout}: ${(stderr || error.message).trim()}`, invocation.token), invocation.token ? undefined : { cause: error });
+    return stdout;
   }
 
   /** True when the file differs from HEAD in the index or the working tree, or is untracked. */
@@ -192,8 +163,8 @@ export class StateGit {
   /** Best effort: runs detached, never awaited, and its failure is ignored. */
   pushInBackground(): void {
     try {
-      const invocation = gitInvocation(this.checkout, ["push", "--quiet"]);
-      const child = spawn("git", invocation.args, { detached: true, stdio: "ignore", env: invocation.env });
+      const invocation = stateGitCommand(this.checkout, ["push", "--quiet"]);
+      const child = spawn(invocation.command, invocation.args, { detached: true, stdio: "ignore", env: invocation.env });
       child.on("error", () => undefined);
       child.unref();
     } catch { /* Pushing never fails a write. */ }

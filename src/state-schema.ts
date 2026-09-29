@@ -4,13 +4,12 @@
  * that file (its subject records the build's full commit), and pushes it through the same sync as state.json.
  * It never replaces a schema written by a build it does not include, so a rollback does not downgrade it.
  */
-import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readStampIn } from "./build-stamp.js";
-import { childEnv } from "./op-env.js";
+import { gitEnv, gitIsAncestor } from "./git-gh.js";
 import { appRootOf } from "./reload.js";
 import { StateGit, withFileLock, type StateSyncResult } from "./state-commit.js";
 import bundledSchema from "../schema/v1/state.schema.json?raw";
@@ -43,16 +42,6 @@ const missing = (error: unknown) => (error as NodeJS.ErrnoException).code === "E
 /** The subject of Indra's schema commits, followed by the full commit of the build that wrote them. */
 const COMMIT_SUBJECT = "Update state schema from Indra";
 
-/** Whether `ancestor` is an ancestor of (or equal to) `commit` in the Indra checkout `appDir`; undefined when git cannot tell. */
-function isAncestor(appDir: string, ancestor: string, commit: string): Promise<boolean | undefined> {
-  return new Promise((resolve) => {
-    execFile("git", ["-C", appDir, "merge-base", "--is-ancestor", ancestor, commit], { timeout: 10_000, env: { ...childEnv(), GIT_TERMINAL_PROMPT: "0" } }, (error) => {
-      if (!error) resolve(true);
-      else resolve((error as { code?: unknown }).code === 1 ? false : undefined);
-    });
-  });
-}
-
 /**
  * Makes the state checkout's schema match this build's. Does nothing when they already match. Refuses, without
  * writing anything, when the checkout has uncommitted changes to tracked files or the schema, or an unfinished
@@ -77,7 +66,7 @@ export async function syncStateSchema(checkout: string, options: SchemaSyncOptio
       // whose ancestry cannot be established here) is left alone.
       const recorded = new RegExp(`^${COMMIT_SUBJECT} ([0-9a-f]{40})$`).exec(await git.lastSubject())?.[1];
       if (recorded) {
-        const includes = sha ? await isAncestor(appDir, recorded, sha) : undefined;
+        const includes = sha ? await gitIsAncestor(recorded, sha, { checkout: appDir, timeout: 10_000, env: gitEnv() }) : undefined;
         if (includes === false) return { outcome: "skipped", message: `The state checkout's schema was written by Indra ${recorded.slice(0, 7)}, which this build (${sha.slice(0, 7)}) does not include; Indra left it alone.` };
         if (includes === undefined) return { outcome: "skipped", message: `Could not tell whether this build includes Indra ${recorded.slice(0, 7)}, which wrote the state checkout's schema; Indra left it alone.` };
       }

@@ -1,12 +1,13 @@
 import { createHash } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Shell } from "./developer-seat.js";
+import type { Shell } from "./command-shell.js";
+import { REVIEW_ACCOUNT, runGh, runGit } from "./git-gh.js";
 import type { PlanningStore } from "./planning.js";
 import { redactSecrets } from "./redact.js";
 
-export const REVIEW_ACCOUNT = "satori-miyamoto";
+export { REVIEW_ACCOUNT } from "./git-gh.js";
 export interface LineFinding { path: string; line: number; side: "RIGHT"; body: string }
 /** Kept separately from the mutable assignment step, including after worktree cleanup. */
 export interface SavedReview {
@@ -34,10 +35,9 @@ const endpoint = (prUrl: string) => {
   if (!match) throw new Error("Review requires a GitHub pull request URL.");
   return `repos/${match[1]}/${match[2]}/pulls/${match[3]}/reviews`;
 };
-const asReviewer = (shell: Shell, args: string[], cwd: string) => shell.run("env", [`GH_CONFIG_DIR=${join(homedir(), ".config", "gh-yahaha-bot")}`, "gh", ...args], cwd);
 
 export async function reviewHead(shell: Shell, prUrl: string, cwd: string): Promise<string> {
-  const head = await shell.run("gh", ["pr", "view", prUrl, "--json", "headRefOid", "--jq", ".headRefOid"], cwd);
+  const head = await runGh(shell, ["pr", "view", prUrl, "--json", "headRefOid", "--jq", ".headRefOid"], cwd);
   if (head.code !== 0 || !/^[0-9a-f]{40}$/.test(head.stdout.trim())) throw new Error("Could not read the PR head for review.");
   return head.stdout.trim();
 }
@@ -52,7 +52,7 @@ export async function postReviewOnce(options: DeveloperReviewOptions): Promise<s
   const marker = `<!-- indra-review:${id} -->`;
   let saved = await store.readRuntimeFile<SavedReview>(name);
   if (!saved) {
-    const local = await shell.run("git", ["rev-parse", "HEAD"], worktree);
+    const local = await runGit(shell, ["rev-parse", "HEAD"], worktree);
     if (local.code !== 0 || local.stdout.trim() !== headSha) throw new Error("The review worktree does not match the PR head.");
     const response = await review() as { findings?: unknown; summary?: unknown } | undefined;
     if (!Array.isArray(response?.findings) || response.findings.some((item) => typeof item !== "string")) throw new Error("Reviewer session returned invalid findings.");
@@ -63,7 +63,7 @@ export async function postReviewOnce(options: DeveloperReviewOptions): Promise<s
   }
   await options.onReview?.(saved);
   if (!saved.posted) {
-    const account = await asReviewer(shell, ["api", "user", "--jq", ".login"], worktree);
+    const account = await runGh(shell, ["api", "user", "--jq", ".login"], worktree, "reviewer");
     if (account.code !== 0 || account.stdout.trim() !== REVIEW_ACCOUNT) throw new Error("The designated review account is unavailable.");
     const reviews = await readReviews(shell, url, worktree);
     const verdict = saved.verdict;
@@ -75,7 +75,7 @@ export async function postReviewOnce(options: DeveloperReviewOptions): Promise<s
       try {
         const file = join(dir, "review.json");
         await writeFile(file, JSON.stringify({ commit_id: headSha, event: saved.verdict, body: saved.body, comments: saved.comments }), { mode: 0o600 });
-        const posted = await asReviewer(shell, ["api", url, "--method", "POST", "--input", file], worktree);
+        const posted = await runGh(shell, ["api", url, "--method", "POST", "--input", file], worktree, "reviewer");
         if (posted.code !== 0) throw new Error("Could not post the PR review and line findings.");
       } finally { await rm(dir, { recursive: true, force: true }); }
     }
@@ -87,7 +87,7 @@ export async function postReviewOnce(options: DeveloperReviewOptions): Promise<s
 
 type GitHubReview = { body?: string; state?: string; commit_id?: string; user?: { login?: string } };
 async function readReviews(shell: Shell, url: string, cwd: string): Promise<GitHubReview[]> {
-  const result = await asReviewer(shell, ["api", `${url}?per_page=100`, "--method", "GET", "--paginate", "--slurp"], cwd);
+  const result = await runGh(shell, ["api", `${url}?per_page=100`, "--method", "GET", "--paginate", "--slurp"], cwd, "reviewer");
   if (result.code !== 0) throw new Error("Could not reconcile PR reviews.");
   let pages: unknown;
   try { pages = JSON.parse(result.stdout); } catch { throw new Error("GitHub returned invalid PR reviews."); }

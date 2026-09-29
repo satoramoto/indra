@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { mkdir, mkdtemp, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -65,5 +65,16 @@ describe("project checkout", () => {
   it("only accepts owner/repo, so a project can never point outside the runtime directory", () => {
     expect(projectCheckoutPath("/state.runtime", "satoramoto/indra")).toBe("/state.runtime/projects/satoramoto/indra");
     for (const github of ["../indra", "satoramoto/..", "/etc/passwd", "a/b/c"]) expect(() => projectCheckoutPath("/state.runtime", github)).toThrow(ProjectCheckoutError);
+  });
+
+  it("retains a successful clone after a failed sprint fetch and recovers on the next use", async () => {
+    const { runtimeDir, bare, head } = await remote();
+    const run = vi.fn(localGh(bare).shell.run);
+    await expect(ensureProjectCheckout({ run }, runtimeDir, "satoramoto/indra", "sprint/missing")).rejects.toThrow("git fetch origin main sprint/missing failed in the satoramoto/indra checkout (exit 128).");
+    const dir = projectCheckoutPath(runtimeDir, "satoramoto/indra");
+    expect(run).toHaveBeenLastCalledWith("git", ["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential", "fetch", "origin", "main", "sprint/missing"], dir);
+    expect(await ensureProjectCheckout({ run }, runtimeDir, "satoramoto/indra")).toBe(dir);
+    expect(git(dir, "rev-parse", "origin/main").trim()).toBe(head);
+    expect(run.mock.calls.filter(([command]) => command === "gh")).toHaveLength(1);
   });
 });
