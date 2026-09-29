@@ -1,10 +1,11 @@
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { childEnv } from "./op-env.js";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { access, lstat, mkdir, readdir, readFile, readlink, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { readBuildStamp, readStampIn, type BuildStamp } from "./build-stamp.js";
+import { appRootOf } from "./reload.js";
 
 /**
  * How one check of the Indra checkout ended. "built" means a new build is in `dist/`; "blocked" means Indra
@@ -23,16 +24,34 @@ export interface UpdateSettings {
 }
 
 const SETTINGS = "self-update.json";
+const UPDATE_STATUS = "self-update-status.json";
 
-export async function readUpdateSettings(runtimeDir: string): Promise<UpdateSettings> {
+/** Runtime-only, deliberately excludes subprocess output and error messages. */
+export interface UpdateStatus {
+  appDir: string; outcome: UpdateOutcome | "checking"; at: string; installFailed?: boolean;
+}
+
+export async function readUpdateStatus(runtimeDir: string): Promise<UpdateStatus | undefined> {
+  try {
+    const value = JSON.parse(await readFile(join(runtimeDir, UPDATE_STATUS), "utf8")) as UpdateStatus;
+    if (!value || typeof value.appDir !== "string" || !["checking", "up-to-date", "built", "blocked", "failed", "paused"].includes(value.outcome) || !Number.isFinite(Date.parse(value.at)) || (value.installFailed !== undefined && typeof value.installFailed !== "boolean")) throw new Error("Invalid update status.");
+    return value;
+  } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+}
+
+export async function readUpdateSettings(runtimeDir: string, strict = false): Promise<UpdateSettings> {
   try {
     const value = JSON.parse(await readFile(join(runtimeDir, SETTINGS), "utf8")) as Partial<UpdateSettings>;
     const rollback = value.rollback;
+    if (strict && (typeof value.paused !== "boolean" || (rollback !== undefined && (!rollback || typeof rollback.build !== "string" || typeof rollback.sha !== "string" || typeof rollback.fromSha !== "string")))) throw new Error("Invalid update settings.");
     return {
       paused: value.paused === true,
       ...(rollback && typeof rollback.build === "string" && typeof rollback.sha === "string" && typeof rollback.fromSha === "string" ? { rollback: { build: rollback.build, sha: rollback.sha, fromSha: rollback.fromSha } } : {}),
     };
-  } catch { return { paused: false }; }
+  } catch (error) {
+    if (strict && (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    return { paused: false };
+  }
 }
 
 export async function writeUpdateSettings(runtimeDir: string, settings: UpdateSettings): Promise<void> {
@@ -72,6 +91,22 @@ export class SelfUpdater {
   private git(...args: string[]): Promise<string> { return this.exec("git", args); }
 
   async check(): Promise<UpdateResult> {
+    // Called by the initialized application, including when auto-update is paused.
+    confirmApplicationReady(this.runtimeDir);
+    await this.saveStatus({ outcome: "checking", at: new Date().toISOString() });
+    const result = await this.checkCheckout();
+    await this.saveStatus(result);
+    return result;
+  }
+
+  private async saveStatus(result: Pick<UpdateResult, "at" | "installFailed"> & { outcome: UpdateStatus["outcome"] }): Promise<void> {
+    await mkdir(this.runtimeDir, { recursive: true, mode: 0o700 });
+    const temporary = join(this.runtimeDir, `.${UPDATE_STATUS}-${randomUUID()}`);
+    await writeFile(temporary, JSON.stringify({ appDir: await realpath(this.appDir), outcome: result.outcome, at: result.at, ...(result.installFailed ? { installFailed: true } : {}) } satisfies UpdateStatus), { mode: 0o600 });
+    await rename(temporary, join(this.runtimeDir, UPDATE_STATUS));
+  }
+
+  private async checkCheckout(): Promise<UpdateResult> {
     const at = new Date().toISOString();
     const result = (outcome: UpdateOutcome, message: string): UpdateResult => ({ outcome, message, at });
     if (await this.paused()) return this.pausedCheck(at);
@@ -186,18 +221,74 @@ export function defaultRuntimeDir(appDir: string, stateEnv = process.env.INDRA_S
   return `${resolve(stateEnv || resolve(appDir, "..", "indra-state"))}.runtime`;
 }
 
-const IN_USE = "builds-in-use";
+export const IN_USE = "builds-in-use";
+
+/** Captured by the loaded CLI, never reconstructed from checkout HEAD or the current dist link. */
+export interface RunningBuildReceipt {
+  pid: number; build: string; appDir: string; stamp: BuildStamp;
+  role: "application" | "bridge"; processStart: string; startedAt: string;
+  readyAt?: string; readyNonce?: string;
+}
+const applications = new Map<string, RunningBuildReceipt>();
+
+function liveStart(output: string): string | undefined {
+  const fields = /^(.*?)\s+(\S+)$/.exec(output.trim());
+  return fields?.[1] && !/^[ZX]/.test(fields[2]) ? fields[1] : undefined;
+}
+
+/** PID alone is insufficient: a leftover receipt must not identify a later process that reused it. */
+export async function processStart(pid: number): Promise<string | undefined> {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  return new Promise((done) => {
+    try {
+      execFile("ps", ["-p", String(pid), "-o", "lstart=", "-o", "stat="], { encoding: "utf8", timeout: 2000, maxBuffer: 4096, env: { ...childEnv(), LC_ALL: "C" } }, (error, stdout) => done(error ? undefined : liveStart(stdout)));
+    } catch { done(undefined); }
+  });
+}
+
+function currentProcessStart(): string | undefined {
+  try { return liveStart(execFileSync("ps", ["-p", String(process.pid), "-o", "lstart=", "-o", "stat="], { encoding: "utf8", timeout: 2000, stdio: ["ignore", "pipe", "ignore"], env: { ...childEnv(), LC_ALL: "C" } })); }
+  catch { return undefined; }
+}
+
+function confirmApplicationReady(runtimeDir: string): void {
+  const receipt = applications.get(resolve(runtimeDir));
+  if (!receipt || receipt.readyAt) return;
+  const file = join(runtimeDir, IN_USE, `${process.pid}.json`);
+  const temporary = `${file}.${randomUUID()}.tmp`;
+  try {
+    const ready = { ...receipt, readyAt: new Date().toISOString() };
+    writeFileSync(temporary, JSON.stringify(ready), { mode: 0o600 });
+    renameSync(temporary, file);
+    applications.set(resolve(runtimeDir), ready);
+  } catch { try { rmSync(temporary, { force: true }); } catch { /* readiness stays unavailable */ } }
+}
 
 /**
  * Records in `<runtimeDir>/builds-in-use/<pid>.json` the real build directory this process runs from, so pruning
  * keeps it while the process lives. The record is removed on a clean exit; one left by a dead pid is ignored.
  */
-export function recordRunningBuild(runtimeDir: string, moduleUrl: string): void {
+export function recordRunningBuild(runtimeDir: string, moduleUrl: string, birth: () => string | undefined = currentProcessStart): void {
   try {
     const build = realpathSync(new URL(".", moduleUrl));
     const file = join(runtimeDir, IN_USE, `${process.pid}.json`);
     mkdirSync(join(runtimeDir, IN_USE), { recursive: true, mode: 0o700 });
-    writeFileSync(file, JSON.stringify({ pid: process.pid, build }), { mode: 0o600 });
+    let receipt: RunningBuildReceipt | undefined;
+    try {
+      const args = process.argv.slice(2);
+      const role = args[0] === "planning" && args[1] === "serve" ? "bridge"
+        : args.every((arg, index) => arg === "--ui" || arg === "--state" || args[index - 1] === "--state") ? "application" : undefined;
+      const stamp = JSON.parse(readFileSync(join(build, "build-stamp.json"), "utf8")) as BuildStamp;
+      const start = birth();
+      const nonceIndex = args.indexOf("--ready-nonce");
+      if (role && start && stamp?.id && /^[0-9a-f]{40}$/.test(stamp.sha)) {
+        receipt = { pid: process.pid, build, appDir: realpathSync(appRootOf(moduleUrl)), stamp, role, processStart: start, startedAt: new Date().toISOString(), ...(role === "bridge" && nonceIndex >= 0 ? { readyNonce: args[nonceIndex + 1] } : {}) };
+      }
+    } catch { /* a pruning record alone never proves release activation */ }
+    const temporary = `${file}.${randomUUID()}.tmp`;
+    writeFileSync(temporary, JSON.stringify(receipt ?? { pid: process.pid, build }), { mode: 0o600 });
+    renameSync(temporary, file);
+    if (receipt?.role === "application") applications.set(resolve(runtimeDir), receipt);
     process.once("exit", () => { try { rmSync(file, { force: true }); } catch { /* best effort */ } });
   } catch { /* best effort: pruning still keeps current, previous and recent builds */ }
 }
