@@ -1,5 +1,6 @@
 import { Ajv2020 } from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
+import { createHash } from "node:crypto";
 import type { PlanningGoal } from "./planning.js";
 
 /** Closure is deliberately not a sixth stage. The legacy goal.stage is only a compatibility projection. */
@@ -8,9 +9,24 @@ export type CeremonyStage = typeof CEREMONY_STAGES[number];
 export type HumanApproval =
   | { source: "owner-command"; command: "planning approve" | "planning merge"; at: string }
   | { source: "reaction"; userId: string; postId: string; emoji: "white_check_mark"; verifiedHuman: true; at: string };
-export interface ApprovalEvidence {
-  kind: "approval"; proposalId: string; proposalPostId: string; approval: HumanApproval;
+/** Durable authorization under an immutable owner policy revision, for one exact decision only. */
+export interface AutomaticApproval {
+  source: "automatic"; policyRevision: number; at: string;
+  target:
+    | { kind: "proposal"; goalId: string; proposalId: string; proposalDigest: string }
+    | { kind: "integration" | "retro"; goalId: string; prUrl: string; headSha: string;
+        checksPassed: true; reviewApproved: true; reviewer: "satori-miyamoto"; reviewedHeadSha: string };
 }
+export type ApprovalProvenance = HumanApproval | AutomaticApproval;
+/** Hash the proposal's complete content in stable field order, independent of JSON key insertion order. */
+export function proposalDigest(proposal: NonNullable<PlanningGoal["proposal"]>): string {
+  const canonical = (value: unknown): unknown => Array.isArray(value) ? value.map(canonical)
+    : value && typeof value === "object" ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => [key, canonical(item)])) : value;
+  return createHash("sha256").update(JSON.stringify(canonical(proposal))).digest("hex");
+}
+export type ApprovalEvidence =
+  | { kind: "approval"; proposalId: string; proposalPostId: string; approval: HumanApproval }
+  | { kind: "automatic-approval"; proposalId: string; proposalPostId: string; approval: AutomaticApproval };
 export interface ImplementationEvidence {
   kind: "implementation";
   outcomes: { outcomeId: string; seatId: string; prUrl: string; baseBranch: string; mergedSha: string; checksPassed: true; reviewApproved: true }[];
@@ -18,7 +34,9 @@ export interface ImplementationEvidence {
   partialApproval?: { source: "owner-command"; command: "planning integrate"; at: string };
 }
 export interface RunningReleaseEvidence {
-  kind: "release-running"; prUrl: string; mergedSha: string; mergePostId: string; approval: HumanApproval;
+  kind: "release-running"; prUrl: string; mergedSha: string; mergePostId: string; approval: ApprovalProvenance;
+  /** Required with automatic authorization, identifying the reviewed PR head before merge. */
+  headSha?: string;
   checksPassed: true; buildSha: string; runningSha: string; runningAt: string;
   /** Required for a descendant build; the adapter verifies this exact commit pair in the team's project. */
   ancestry?: { ancestorSha: string; descendantSha: string; verified: true };
@@ -26,6 +44,8 @@ export interface RunningReleaseEvidence {
 export interface PublishedRetroEvidence {
   kind: "retro-published"; path: string; prUrl: string; baseBranch: "main"; mergedSha: string; postId: string;
   publishedAt: string; factsOnly: true; suggestions: "owner-proposals-only";
+  /** Optional for legacy publications; new automatic publication must carry its merge authorization. */
+  authorization?: { headSha: string; mergePostId: string; approval: ApprovalProvenance };
 }
 /**
  * Migration-only proof, taken from what a pre-ceremony goal recorded in state: it reached `approved` (only the human
@@ -72,7 +92,7 @@ const text = ref("ceremonyText");
 const time = ref("ceremonyTime");
 const sha = ref("ceremonySha");
 const id = ref("ceremonyId");
-const approval = ref("ceremonyHumanApproval");
+const approval = ref("ceremonyApprovalProvenance");
 const entryTime = { anyOf: [time, { type: "null" }] };
 const closedBy = (kinds: string[]) => ({ required: ["closure"], properties: { closure: { properties: { evidence: { properties: { kind: { enum: kinds } } } } } } });
 
@@ -87,7 +107,18 @@ export const CEREMONY_SCHEMA_DEFS = {
     object({ source: { const: "owner-command" }, command: { enum: ["planning approve", "planning merge"] }, at: time }),
     object({ source: { const: "reaction" }, userId: text, postId: text, emoji: { const: "white_check_mark" }, verifiedHuman: { const: true }, at: time }),
   ] },
-  ceremonyApproval: object({ kind: { const: "approval" }, proposalId: id, proposalPostId: text, approval }),
+  ceremonyAutomaticApproval: object({ source: { const: "automatic" }, policyRevision: { type: "integer", minimum: 1 }, at: time,
+    target: { oneOf: [
+      object({ kind: { const: "proposal" }, goalId: id, proposalId: id, proposalDigest: { type: "string", pattern: "^[0-9a-f]{64}$" } }),
+      object({ kind: { enum: ["integration", "retro"] }, goalId: id, prUrl: ref("ceremonyPr"), headSha: sha,
+        checksPassed: { const: true }, reviewApproved: { const: true }, reviewer: { const: "satori-miyamoto" }, reviewedHeadSha: sha }),
+    ] },
+  }),
+  ceremonyApprovalProvenance: { oneOf: [ref("ceremonyHumanApproval"), ref("ceremonyAutomaticApproval")] },
+  ceremonyApproval: { oneOf: [
+    object({ kind: { const: "approval" }, proposalId: id, proposalPostId: text, approval: ref("ceremonyHumanApproval") }),
+    object({ kind: { const: "automatic-approval" }, proposalId: id, proposalPostId: text, approval: ref("ceremonyAutomaticApproval") }),
+  ] },
   ceremonyImplementation: { ...object({ kind: { const: "implementation" }, outcomes: {
     type: "array", minItems: 1, items: object({ outcomeId: id, seatId: id, prUrl: ref("ceremonyPr"), baseBranch: text, mergedSha: sha, checksPassed: { const: true }, reviewApproved: { const: true } }),
   }, omissions: { type: "array", minItems: 1, items: object({ outcomeId: id, seatId: id, reason: text }) },
@@ -96,13 +127,17 @@ export const CEREMONY_SCHEMA_DEFS = {
     { if: { required: ["omissions"] }, then: { required: ["partialApproval"] } },
     { if: { required: ["partialApproval"] }, then: { required: ["omissions"] } },
   ] },
-  ceremonyRelease: object({ kind: { const: "release-running" }, prUrl: ref("ceremonyPr"), mergedSha: sha, mergePostId: text,
-    approval, checksPassed: { const: true }, buildSha: sha, runningSha: sha, runningAt: time,
+  ceremonyRelease: { ...object({ kind: { const: "release-running" }, prUrl: ref("ceremonyPr"), mergedSha: sha, mergePostId: text,
+    approval, headSha: sha, checksPassed: { const: true }, buildSha: sha, runningSha: sha, runningAt: time,
     ancestry: object({ ancestorSha: sha, descendantSha: sha, verified: { const: true } }),
   }, ["kind", "prUrl", "mergedSha", "mergePostId", "approval", "checksPassed", "buildSha", "runningSha", "runningAt"]),
+    allOf: [{ if: { properties: { approval: { properties: { source: { const: "automatic" } } } } }, then: { required: ["headSha"] } }],
+  },
   ceremonyRetro: object({ kind: { const: "retro-published" }, path: { type: "string", pattern: "^docs/retros/[a-z][a-z0-9-]+\\.md$" },
     prUrl: ref("ceremonyPr"), baseBranch: { const: "main" }, mergedSha: sha, postId: text, publishedAt: time,
-    factsOnly: { const: true }, suggestions: { const: "owner-proposals-only" } }),
+    factsOnly: { const: true }, suggestions: { const: "owner-proposals-only" },
+    authorization: object({ headSha: sha, mergePostId: text, approval }),
+  }, ["kind", "path", "prUrl", "baseBranch", "mergedSha", "postId", "publishedAt", "factsOnly", "suggestions"]),
   ceremonyLegacyApproval: object({ kind: { const: "legacy-approval" }, proposalId: id }),
   ceremonyLegacyImplementation: object({ kind: { const: "legacy-implementation" },
     outcomes: { type: "array", minItems: 1, items: object({ outcomeId: id, seatId: id, prUrl: ref("ceremonyPr") }) },
@@ -139,6 +174,7 @@ export const CEREMONY_SCHEMA_DEFS = {
 const ajv = new Ajv2020({ strict: false });
 addFormats.default(ajv);
 const shape = ajv.compile({ $defs: CEREMONY_SCHEMA_DEFS, $ref: "#/$defs/ceremony" });
+const automaticShape = ajv.compile({ $defs: CEREMONY_SCHEMA_DEFS, $ref: "#/$defs/ceremonyAutomaticApproval" });
 export class CeremonyError extends Error {
   constructor(message: string) { super(message); this.name = "CeremonyError"; }
 }
@@ -152,12 +188,36 @@ function validateHuman(value: HumanApproval, command: "planning approve" | "plan
   if (value.source === "owner-command") requireThat(value.command === command, `Approval requires the owner's ${command} command.`);
   else requireThat(value.postId === postId && postId !== goal.mattermost.rootPostId, "Approval must be a human checkmark on the corresponding proposal or merge post.");
 }
+export function validateAutomaticApproval(goal: PlanningGoal, value: AutomaticApproval): void {
+  requireThat(automaticShape(value), "Invalid automatic approval evidence.");
+  const target = value.target;
+  requireThat(target.goalId === goal.id, "Automatic approval must identify this goal.");
+  notBefore(value.at, goal.createdAt);
+  if (target.kind === "proposal") {
+    requireThat(goal.proposal && target.proposalId === goal.proposal.id && target.proposalDigest === proposalDigest(goal.proposal), "Automatic approval must identify the exact approved proposal.");
+    notBefore(value.at, goal.proposal.createdAt);
+  } else {
+    requireThat(target.reviewedHeadSha === target.headSha, "Automatic approval requires a fresh review on the exact PR head.");
+    if (target.kind === "integration") requireThat(target.prUrl === goal.integration?.prUrl, "Automatic integration approval must identify this goal's integration PR.");
+    const stage = goal.ceremony?.history.find((entry) => entry.stage === (target.kind === "integration" ? "release" : "retro"));
+    requireThat(stage, "Automatic merge approval requires the preceding ceremony checks.");
+    notBefore(value.at, stage.enteredAt);
+    if (stage.stage === "retro") notBefore(value.at, stage.evidence.runningAt);
+  }
+}
+function validateProvenance(goal: PlanningGoal, value: ApprovalProvenance, kind: "proposal" | "integration" | "retro", postId: string, prUrl?: string, headSha?: string): void {
+  if (value.source !== "automatic") return validateHuman(value, kind === "proposal" ? "planning approve" : "planning merge", postId, goal);
+  validateAutomaticApproval(goal, value);
+  requireThat(goal.automaticApprovals?.some((record) => same(record, value)), "Automatic evidence must have a durable approval record.");
+  const target = value.target;
+  requireThat(target.kind === kind && (target.kind === "proposal" || (target.prUrl === prUrl && target.headSha === headSha)), "Automatic evidence must match the approved proposal or PR head and gate.");
+}
 function validateApproval(goal: PlanningGoal, evidence: ApprovalEvidence): void {
   requireThat(goal.proposal?.id === evidence.proposalId, "Approval evidence must reference this goal's proposal.");
-  validateHuman(evidence.approval, "planning approve", evidence.proposalPostId, goal);
+  validateProvenance(goal, evidence.approval, "proposal", evidence.proposalPostId);
   notBefore(evidence.approval.at, goal.proposal.createdAt);
   const outcomes = goal.proposal.outcomes;
-  requireThat(goal.assignments?.length === outcomes.length && outcomes.every((outcome) => goal.assignments?.some((assignment) => assignment.outcomeId === outcome.id && assignment.seatId === outcome.seatId)), "Approval requires one assignment per proposed outcome, on its proposed seat.");
+  requireThat(goal.assignments?.length === outcomes.length && outcomes.every((outcome) => goal.assignments?.some((assignment) => assignment.outcomeId === outcome.id && (assignment.reassignments?.[0]?.fromSeatId ?? assignment.seatId) === outcome.seatId)), "Approval requires one assignment per proposed outcome, on its proposed seat.");
   requireThat(goal.integration?.branch === `sprint/${goal.id}`, "Approval requires this goal's sprint branch.");
 }
 function validateImplementation(goal: PlanningGoal, evidence: ImplementationEvidence): void {
@@ -167,12 +227,12 @@ function validateImplementation(goal: PlanningGoal, evidence: ImplementationEvid
   for (const item of evidence.outcomes) {
     const outcome = outcomes.find((outcome) => outcome.id === item.outcomeId);
     const assignment = goal.assignments?.find((assignment) => assignment.outcomeId === item.outcomeId);
-    requireThat(outcome?.seatId === item.seatId && assignment?.seatId === item.seatId && assignment.status === "merged" && assignment.prUrl === item.prUrl && item.baseBranch === `sprint/${goal.id}`, "Implementation requires every assigned PR merged into this goal's sprint branch.");
+    requireThat(outcome && assignment?.seatId === item.seatId && assignment.status === "merged" && assignment.prUrl === item.prUrl && item.baseBranch === `sprint/${goal.id}`, "Implementation requires every assigned PR merged into this goal's sprint branch.");
   }
   for (const item of evidence.omissions ?? []) {
     const outcome = outcomes.find((outcome) => outcome.id === item.outcomeId);
     const assignment = goal.assignments?.find((assignment) => assignment.outcomeId === item.outcomeId);
-    requireThat(outcome?.seatId === item.seatId && assignment?.seatId === item.seatId && assignment.status === "failed", "Only terminal, unmerged outcomes may be explicitly omitted by the owner.");
+    requireThat(outcome && assignment?.seatId === item.seatId && assignment.status === "failed", "Only terminal, unmerged outcomes may be explicitly omitted by the owner.");
   }
 }
 function assignmentsMatchOutcomes(goal: PlanningGoal): boolean {
@@ -209,7 +269,8 @@ function validateRelease(goal: PlanningGoal, evidence: RunningReleaseEvidence): 
   requireThat(evidence.buildSha === evidence.runningSha, "Release is complete only when the verified build is running.");
   if (evidence.ancestry) requireThat(evidence.ancestry.verified === true && evidence.ancestry.ancestorSha === evidence.mergedSha && evidence.ancestry.descendantSha === evidence.buildSha, "Release ancestry must verify the merged commit in this build.");
   requireThat(evidence.buildSha === evidence.mergedSha || evidence.ancestry, "A descendant release build requires verified ancestry from the merged commit.");
-  validateHuman(evidence.approval, "planning merge", evidence.mergePostId, goal);
+  validateProvenance(goal, evidence.approval, "integration", evidence.mergePostId, evidence.prUrl, evidence.headSha);
+  if (evidence.approval.source === "automatic") requireThat(evidence.headSha === goal.integration.headSha, "Automatic release must match the integration's approved PR head.");
   notBefore(evidence.runningAt, evidence.approval.at);
 }
 
@@ -226,7 +287,7 @@ export function validateCeremony(goal: PlanningGoal, ceremony: CeremonyRecord = 
     if (entry.stage === "implement" && entry.evidence.kind === "legacy-approval") {
       requireThat(entry.enteredAt === null && ceremony.migratedAt, "Legacy approval evidence is recorded only by migration.");
       validateLegacyApproval(goal, entry.evidence);
-    } else if (entry.stage === "implement" && entry.evidence.kind === "approval") {
+    } else if (entry.stage === "implement" && entry.evidence.kind !== "legacy-approval") {
       validateApproval(goal, entry.evidence);
       notBefore(entry.evidence.approval.at, prior);
       if (entry.enteredAt) notBefore(entry.enteredAt, entry.evidence.approval.at);
@@ -258,6 +319,13 @@ export function validateCeremony(goal: PlanningGoal, ceremony: CeremonyRecord = 
     notBefore(closure.evidence.publishedAt, previous);
     const release = ceremony.history.find((entry) => entry.stage === "retro");
     if (release?.stage === "retro") notBefore(closure.evidence.publishedAt, release.evidence.runningAt);
+    const authorization = closure.evidence.authorization;
+    if (authorization) {
+      validateProvenance(goal, authorization.approval, "retro", authorization.mergePostId, closure.evidence.prUrl, authorization.headSha);
+      if (release?.stage === "retro") notBefore(authorization.approval.at, release.evidence.runningAt);
+      notBefore(closure.evidence.publishedAt, authorization.approval.at);
+    }
+    if (goal.automaticApprovals?.some((record) => record.target.kind === "retro" && record.target.prUrl === closure.evidence.prUrl)) requireThat(authorization, "An automatically approved retro must preserve its authorization.");
     notBefore(closure.closedAt, closure.evidence.publishedAt);
   } else if (closure?.evidence.kind === "release-reverted") {
     requireThat(ceremony.stage === "release", "A reverted release closes from release, before any running release.");
@@ -333,7 +401,7 @@ export function validateCeremonyMutation(before: PlanningGoal, after: PlanningGo
   const old = before.ceremony; const next = after.ceremony;
   requireThat(next, "A ceremony cannot be removed.");
   requireThat(next.migratedAt === old.migratedAt, "Migration provenance is immutable.");
-  if (CEREMONY_STAGES.indexOf(old.stage) >= 2) requireThat(same(before.proposal, after.proposal), "An approved proposal is immutable.");
+  if (CEREMONY_STAGES.indexOf(old.stage) >= 2) requireThat(same(before.proposal, after.proposal) && same(before.source, after.source), "An approved proposal is immutable.");
   if (CEREMONY_STAGES.indexOf(old.stage) >= 3) requireThat(same(before.assignments, after.assignments), "Implementation assignments are frozen once release starts.");
   requireThat(next.history.length >= old.history.length && next.history.length <= old.history.length + 1 && old.history.every((entry, i) => same(entry, next.history[i])), "Ceremony history is append-only, one stage at a time.");
   // Legacy evidence exists only in a whole-ceremony migration; a live transition must bring native proof.

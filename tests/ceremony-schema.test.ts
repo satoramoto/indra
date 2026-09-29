@@ -4,6 +4,7 @@ import addFormats from "ajv-formats";
 import { describe, expect, it } from "vitest";
 import { CEREMONY_SCHEMA_DEFS, startCeremony } from "../src/ceremony.js";
 import { parseState } from "../src/local-state.js";
+import { TEAM_SCHEMA_DEFS } from "../src/state-domain.js";
 
 const schema = JSON.parse(await readFile(new URL("../schema/v1/state.schema.json", import.meta.url), "utf8"));
 const ajv = new Ajv2020({ strict: false }); addFormats.default(ajv);
@@ -23,8 +24,39 @@ function valid(value: unknown): void {
 describe("additive ceremony v1 schema contract", () => {
   it("ships the exact shared definitions for the companion indra-state schema", () => {
     for (const [name, definition] of Object.entries(CEREMONY_SCHEMA_DEFS)) expect(schema.$defs[name]).toEqual(definition);
+    for (const [name, definition] of Object.entries(TEAM_SCHEMA_DEFS)) expect(schema.$defs[name]).toEqual(definition);
     expect(schema.$defs.planningGoal.properties.ceremony).toEqual({ $ref: "#/$defs/ceremony" });
     expect(schema.properties.schemaVersion).toEqual({ const: 1 });
+  });
+  it("accepts Product and pending identities, and requires identities for active or retiring seats", () => {
+    const value = fixture();
+    const pending = { id: "seat-product", displayName: "Product", roles: ["Product"], status: "pending", externalIdentities: { mattermost: { username: "product" } } };
+    Object.assign(value.teams[0], { seats: [...value.teams[0].seats, pending], mission: "Owner mission", standingPolicy: { revisions: [{ revision: 1, source: "owner-command", enabled: false, at: time }] } });
+    valid(value);
+    for (const status of ["active", "retiring", "unknown"]) {
+      pending.status = status;
+      expect(validate(value)).toBe(false);
+      expect(() => parseState(value)).toThrow();
+    }
+    pending.status = "pending";
+    Object.assign(pending, { sessionId: "runtime-only" });
+    expect(validate(value)).toBe(false);
+  });
+  it("requires complete automatic targets with a policy revision and reviewed PR head", () => {
+    const validate = ajv.compile({ $defs: schema.$defs, $ref: "#/$defs/ceremonyAutomaticApproval" });
+    const proposal = { source: "automatic", policyRevision: 1, at: time, target: { kind: "proposal", goalId: "goal-one", proposalId: "proposal-one", proposalDigest: "a".repeat(64) } };
+    const merge = { ...proposal, target: { kind: "integration", goalId: "goal-one", prUrl: "https://github.com/owner/project/pull/1", headSha: "a".repeat(40), reviewedHeadSha: "a".repeat(40), checksPassed: true, reviewApproved: true, reviewer: "satori-miyamoto" } };
+    expect(validate(proposal)).toBe(true); expect(validate(merge)).toBe(true);
+    for (const record of [proposal, merge]) for (const key of ["policyRevision", "target", "at"]) {
+      const invalid = structuredClone(record); Reflect.deleteProperty(invalid, key); expect(validate(invalid)).toBe(false);
+    }
+    for (const key of ["prUrl", "headSha", "reviewedHeadSha", "checksPassed", "reviewApproved", "reviewer"]) {
+      const invalid = structuredClone(merge); Reflect.deleteProperty(invalid.target, key); expect(validate(invalid)).toBe(false);
+    }
+    expect(validate({ ...proposal, policyRevision: 0 })).toBe(false);
+    expect(validate({ ...merge, target: { ...merge.target, checksPassed: false } })).toBe(false);
+    expect(validate({ ...merge, target: { ...merge.target, kind: "revert" } })).toBe(false);
+    const invalid = structuredClone(proposal); Reflect.deleteProperty(invalid.target, "proposalDigest"); expect(validate(invalid)).toBe(false);
   });
   it("accepts existing v1 documents and legacy goals as well as the new optional ceremony", () => {
     valid(fixture());

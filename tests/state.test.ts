@@ -5,9 +5,10 @@ import { afterEach, describe, expect, it } from "vitest";
 import { parseOptions } from "../src/cli.js";
 import { LocalStateRepository, parseState, StateDataError } from "../src/local-state.js";
 import { interactiveState, printState } from "../src/state-cli.js";
-import { StateInventory } from "../src/state-domain.js";
+import { autoModeEnabled, StateInventory, type TeamRecord } from "../src/state-domain.js";
 import { advanceCeremony, startCeremony } from "../src/ceremony.js";
-import type { PlanningGoal } from "../src/planning.js";
+import { developerSeats, type PlanningGoal } from "../src/planning.js";
+import { seatCredentialRequirement } from "../src/autonomy-ports.js";
 
 const fixture = () => ({
   $schema: "./schema/v1/state.schema.json",
@@ -169,10 +170,12 @@ describe("local state checkout", () => {
     }
   });
 
-  it("accepts only the Team Lead and Developer roles, one per seat", () => {
+  it("accepts Team Lead, Developer and Product, one role per seat", () => {
     const product = fixture();
     product.teams[0].seats[1].roles = ["Product"];
-    expect(() => parseState(product)).toThrow("teams[0].seats[1].roles[0] 'Product' is not a seat role; expected 'Team Lead' or 'Developer'");
+    expect(parseState(product).teams[0].seats[1].roles).toEqual(["Product"]);
+    product.teams[0].seats[1].roles = ["Owner"];
+    expect(() => parseState(product)).toThrow("is not a seat role");
     const two = fixture();
     two.teams[0].seats[1].roles = ["Developer", "Team Lead"];
     expect(() => parseState(two)).toThrow("teams[0].seats[1].roles must contain exactly one role");
@@ -185,5 +188,45 @@ describe("local state checkout", () => {
     const twoLeads = fixture();
     twoLeads.teams[0].seats[1].roles = ["Team Lead"];
     expect(() => parseState(twoLeads)).toThrow("teams[0].seats must contain exactly one 'Team Lead' seat; found 2");
+  });
+
+  it("keeps legacy seats active and auto mode off, accepting pending bot identities without an account", () => {
+    const value = fixture();
+    const team = value.teams[0] as TeamRecord;
+    team.seats.push({ id: "seat-product", displayName: "Product", roles: ["Product"], status: "pending", externalIdentities: { mattermost: { username: "productbot" } } });
+    team.seats.push({ id: "seat-next", displayName: "Next", roles: ["Developer"], status: "pending", externalIdentities: { mattermost: { username: "nextbot" } } });
+    const parsed = parseState(value).teams[0];
+    expect(autoModeEnabled(parsed)).toBe(false);
+    expect(developerSeats(value, team.id).map((seat) => seat.id)).toEqual(["seat-002"]);
+    expect(parsed.seats[2]).toMatchObject({ status: "pending", handle: "productbot", mattermostUserId: "" });
+    expect(seatCredentialRequirement(team.seats[2])).toEqual({ username: "productbot", item: "Mattermost bot - productbot", field: "token" });
+    team.seats[2].status = "active";
+    expect(() => parseState(value)).toThrow("userId must be a nonempty string");
+    team.seats[2].externalIdentities.mattermost.userId = "new-product-id";
+    expect(() => parseState(value)).not.toThrow();
+    team.seats[3].externalIdentities.mattermost.username = "productbot";
+    expect(() => parseState(value)).toThrow("duplicate Mattermost username");
+  });
+
+  it("validates backlog authors, dependencies, ranks, goal and retrospective references", () => {
+    const value = fixture(); const team = value.teams[0] as TeamRecord;
+    const authors = { createdAt: "2026-09-01T00:00:00Z", updatedAt: "2026-09-01T00:00:00Z", createdBySeatId: "seat-001", updatedBySeatId: "seat-001" };
+    team.mission = "Build a useful simulator";
+    team.backlog = [{ id: "ticket-one", title: "A problem", description: "The owner cannot add seats", value: "Grow the team", status: "open", ...authors, research: [{ url: "https://example.com/research", finding: "Demand for more seats" }] }];
+    team.sprintCandidates = [{ id: "candidate-one", title: "Scale", summary: "Enable more seats", value: "Parallel work", rank: 1, ticketIds: ["ticket-one"], status: "candidate", ...authors }];
+    expect(parseState(value).teams[0]).toMatchObject({ mission: team.mission, backlog: team.backlog, sprintCandidates: team.sprintCandidates });
+    for (const mutate of [
+      (team: TeamRecord) => { team.backlog![0].updatedBySeatId = "seat-elsewhere"; },
+      (team: TeamRecord) => { team.backlog![0].dependsOn = ["ticket-missing"]; },
+      (team: TeamRecord) => { team.backlog![0].dependsOn = ["ticket-one"]; },
+      (team: TeamRecord) => { team.sprintCandidates![0].ticketIds = ["ticket-missing"]; },
+      (team: TeamRecord) => { team.sprintCandidates!.push({ ...team.sprintCandidates![0], id: "candidate-two" }); },
+      (team: TeamRecord) => { team.sprintCandidates![0].goalId = "goal-elsewhere"; },
+      (team: TeamRecord) => { team.sprintCandidates![0].retrospectiveGoalId = "goal-elsewhere"; },
+      (team: TeamRecord) => { Object.assign(team.backlog![0], { sessionId: "runtime-only" }); },
+    ]) {
+      const invalid = structuredClone(value); mutate(invalid.teams[0] as TeamRecord);
+      expect(() => parseState(invalid)).toThrow();
+    }
   });
 });

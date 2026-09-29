@@ -14,7 +14,8 @@ export function assertCeremonyReady(readiness?: CeremonyWriteReadiness): void {
  * Adapters verify external facts before returning evidence; absence is not success. Persist returned proof with
  * advanceCeremony/closeCeremony in a single PlanningStore.update. Store validation binds proof to the current goal.
  * Approval adapters accept only the owner's terminal command or a GET-verified human checkmark on Chick's matching
- * proposal/merge post, excluding bots, the bridge and Chick. No adapter automatically approves or applies suggestions.
+ * proposal/merge post, excluding bots, the bridge and Chick. Automatic adapters must use the owner's standing policy
+ * and the exact-target contracts in autonomy-ports.ts; suggestions remain owner proposals.
  */
 export interface CeremonyEvidencePorts {
   approval(goal: PlanningGoal): Promise<ApprovalEvidence | undefined>;
@@ -35,6 +36,8 @@ export interface CeremonyRuntimeFacts {
   sessions: { seatId: string; sessionId: string; startedAt: string; finishedAt: string | null; usage: unknown | null }[];
   reviews: { outcomeId: string; prUrl: string; findings: string[] }[];
   rounds: { outcomeId: string; fix: number; conflict: number }[];
+  /** Optional on older runtime records; absence means unknown, never zero. */
+  integrationRounds?: { prUrl: string; headSha: string; conflict: number; merge: number }[];
   failures: { at: string; outcomeId?: string; message: string; retries: number }[];
 }
 export interface CeremonyRuntimeRecord {

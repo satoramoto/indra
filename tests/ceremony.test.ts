@@ -4,12 +4,13 @@ import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { advanceCeremony, CEREMONY_STAGES, closeCeremony, migrateLegacyCeremony, openGoalConflicts, startCeremony, validateCeremony, type ApprovalEvidence, type CeremonyStage, type CeremonyTransition, type ImplementationEvidence, type PublishedRetroEvidence, type RunningReleaseEvidence } from "../src/ceremony.js";
+import { advanceCeremony, CEREMONY_STAGES, closeCeremony, migrateLegacyCeremony, openGoalConflicts, proposalDigest, startCeremony, validateCeremony, type ApprovalEvidence, type AutomaticApproval, type CeremonyStage, type CeremonyTransition, type ImplementationEvidence, type PublishedRetroEvidence, type RunningReleaseEvidence } from "../src/ceremony.js";
 import type { CeremonyWriteReadiness } from "../src/ceremony-ports.js";
 import { PlanningStore, type PlanningDocument, type PlanningGoal } from "../src/planning.js";
 import { parseState } from "../src/local-state.js";
 import { childEnv } from "../src/op-env.js";
 import { git, stateCheckout } from "./state-checkout.js";
+import type { TeamRecord } from "../src/state-domain.js";
 
 const at = (second: number) => `2026-09-01T00:00:${String(second).padStart(2, "0")}Z`;
 const sha = (letter: string) => letter.repeat(40);
@@ -65,6 +66,134 @@ async function store(goals: PlanningGoal[] = [], enabled = true): Promise<Planni
   await copyFile(resolve("schema/v1/state.schema.json"), join(checkout, "schema/v1/state.schema.json"));
   return new PlanningStore(checkout, undefined, enabled ? ready : undefined);
 }
+
+describe("durable autonomy and seat history", () => {
+  const automaticPlan = (item: PlanningGoal): AutomaticApproval => ({ source: "automatic", policyRevision: 1, at: at(2), target: { kind: "proposal", goalId: item.id, proposalId: item.proposal!.id, proposalDigest: proposalDigest(item.proposal!) } });
+  const automaticMerge = (kind: "integration" | "retro", at: string): AutomaticApproval => ({ source: "automatic", policyRevision: 1, at, target: { kind, goalId: "goal-one", prUrl: kind === "integration" ? running.prUrl : retro.prUrl, headSha: sha("e"), reviewedHeadSha: sha("e"), checksPassed: true, reviewApproved: true, reviewer: "satori-miyamoto" } });
+  async function approve(persistence: PlanningStore, approval?: AutomaticApproval): Promise<void> {
+    await persistence.update((state) => {
+      const item = state.planningGoals![0]; const proof = approval ?? automaticPlan(item);
+      prepare(item, "implement"); item.automaticApprovals = [proof];
+      item.ceremony = advanceCeremony(item, { to: "implement", at: at(3), evidence: { kind: "automatic-approval", proposalId: item.proposal!.id, proposalPostId: "proposal-post", approval: proof } });
+    }, "Approve under standing policy");
+  }
+  it("binds automatic proposal approval to complete content and the owner's enabled revision", async () => {
+    const item = staged("proposal"); const persistence = await store([item]);
+    await expect(approve(persistence)).rejects.toThrow("policy");
+    await persistence.updateOwnerSettings("team-one", { autoMode: true }, at(1));
+    const approval = automaticPlan(item);
+    const { summary, ...rest } = item.proposal!;
+    const reordered = { summary, ...rest };
+    expect(proposalDigest(reordered)).toBe(proposalDigest(item.proposal!));
+    for (const patch of [
+      { policyRevision: 99 },
+      { target: { ...approval.target, goalId: "goal-other" } },
+      { target: { ...approval.target, proposalDigest: "f".repeat(64) } },
+    ]) await expect(approve(persistence, { ...approval, ...patch } as AutomaticApproval)).rejects.toThrow();
+    await approve(persistence);
+    const approved = (await persistence.read()).planningGoals![0];
+    expect(approved.ceremony!.history[2]).toMatchObject({ evidence: { kind: "automatic-approval", approval } });
+    await persistence.updateOwnerSettings("team-one", { autoMode: false }, at(4));
+    expect((await persistence.read()).planningGoals![0]).toEqual(approved);
+    await expect(persistence.update((state) => { state.planningGoals![0].automaticApprovals = []; }, "Erase automatic history")).rejects.toThrow();
+    await expect(persistence.update((state) => { state.planningGoals![0].automaticApprovals![0].policyRevision = 2; }, "Rewrite automatic history")).rejects.toThrow();
+    await expect(persistence.update((state) => { state.planningGoals![0].proposal!.outcomes[0].description = "Different acceptance"; }, "Change approved proposal")).rejects.toThrow("exact approved proposal");
+    expect((await persistence.read()).planningGoals![0]).toEqual(approved);
+  });
+  it("requires the current reviewed integration head and preserves authorized history across an off toggle and descendant release", async () => {
+    const item = staged("release"); Object.assign(item.integration!, { status: "pr-open", prUrl: running.prUrl, headSha: sha("e") });
+    const persistence = await store([item]);
+    await persistence.updateOwnerSettings("team-one", { autoMode: true }, at(4));
+    const approval = automaticMerge("integration", at(5));
+    for (const patch of [{ reviewedHeadSha: sha("f") }, { headSha: sha("f"), reviewedHeadSha: sha("f") }, { checksPassed: false }, { reviewApproved: false }, { reviewer: "someone-else" }]) {
+      await expect(persistence.update((state) => { state.planningGoals![0].automaticApprovals = [{ ...approval, target: { ...approval.target, ...patch } } as AutomaticApproval]; }, "Approve stale head")).rejects.toThrow();
+    }
+    await persistence.update((state) => { state.planningGoals![0].automaticApprovals = [approval]; }, "Authorize integration head");
+    await persistence.updateOwnerSettings("team-one", { autoMode: false }, at(6));
+    await persistence.update((state) => {
+      const goal = state.planningGoals![0]; prepare(goal, "retro");
+      goal.ceremony = advanceCeremony(goal, { to: "retro", at: at(8), evidence: { ...descendant, headSha: sha("e"), approval, runningAt: at(7) } });
+    }, "Observe authorized descendant release");
+    const released = (await persistence.read()).planningGoals![0];
+    expect(released.ceremony!.stage).toBe("retro");
+    expect(released.automaticApprovals).toEqual([approval]);
+    // Even backdating a new authorization into an enabled revision cannot pass the current-policy write gate.
+    await expect(persistence.update((state) => { state.planningGoals![0].automaticApprovals!.push(automaticMerge("retro", at(5))); }, "Use a stale on policy")).rejects.toThrow();
+    await expect(persistence.update((state) => { state.planningGoals![0].automaticApprovals!.push({ ...automaticMerge("retro", at(9)), policyRevision: 2 }); }, "Approve while off")).rejects.toThrow("policy");
+  });
+  it("records automatic archival approval only after a running release, binding closure to its PR head", async () => {
+    const persistence = await store([staged("retro")]);
+    await persistence.updateOwnerSettings("team-one", { autoMode: true }, at(7));
+    const approval = automaticMerge("retro", at(8));
+    await persistence.update((state) => { state.planningGoals![0].automaticApprovals = [approval]; }, "Authorize archival head");
+    await expect(persistence.update((state) => {
+      const item = state.planningGoals![0]; item.ceremony = closeCeremony(item, at(10), { ...retro, publishedAt: at(9) });
+    }, "Forget automatic archival proof")).rejects.toThrow("authorization");
+    await expect(persistence.update((state) => {
+      const item = state.planningGoals![0]; item.ceremony = closeCeremony(item, at(10), { ...retro, publishedAt: at(9), authorization: { headSha: sha("f"), mergePostId: "archive-post", approval } });
+    }, "Archive a different head")).rejects.toThrow("PR head");
+    await persistence.update((state) => {
+      const item = state.planningGoals![0]; item.ceremony = closeCeremony(item, at(10), { ...retro, publishedAt: at(9), authorization: { headSha: sha("e"), mergePostId: "archive-post", approval } });
+    }, "Close automatic archival merge");
+    expect((await persistence.read()).planningGoals![0].ceremony!.closure?.evidence).toMatchObject({ authorization: { approval } });
+  });
+  it("rejects a cached integration decision when the owner switches off before it is recorded", async () => {
+    const item = staged("release"); Object.assign(item.integration!, { status: "pr-open", prUrl: running.prUrl, headSha: sha("e") });
+    const persistence = await store([item]);
+    await persistence.updateOwnerSettings("team-one", { autoMode: true }, at(4));
+    const cached = automaticMerge("integration", at(5));
+    await persistence.updateOwnerSettings("team-one", { autoMode: false }, at(6));
+    await expect(persistence.update((state) => { state.planningGoals![0].automaticApprovals = [cached]; }, "Record cached authorization")).rejects.toThrow("current enabled owner policy");
+    expect((await persistence.read()).planningGoals![0].automaticApprovals).toBeUndefined();
+  });
+  it("can reauthorize an unmerged head under a new policy revision without erasing the earlier decision", async () => {
+    const item = staged("release"); Object.assign(item.integration!, { status: "pr-open", prUrl: running.prUrl, headSha: sha("e") });
+    const persistence = await store([item]);
+    await persistence.updateOwnerSettings("team-one", { autoMode: true }, at(4));
+    const first = automaticMerge("integration", at(5));
+    await persistence.update((state) => { state.planningGoals![0].automaticApprovals = [first]; }, "Authorize head before pause");
+    await persistence.updateOwnerSettings("team-one", { autoMode: false }, at(6));
+    await persistence.updateOwnerSettings("team-one", { autoMode: true }, at(7));
+    const next = { ...automaticMerge("integration", at(8)), policyRevision: 3 };
+    await persistence.update((state) => { state.planningGoals![0].automaticApprovals!.push(next); }, "Authorize the same head under the new policy");
+    expect((await persistence.read()).planningGoals![0].automaticApprovals).toEqual([first, next]);
+    await expect(persistence.update((state) => { state.planningGoals![0].automaticApprovals!.push({ ...next, at: at(9) }); }, "Duplicate authorization")).rejects.toThrow("once per policy revision");
+  });
+  it("keeps retired identities and approved seats while reassigning unfinished work", async () => {
+    const persistence = await store([staged("implement")]);
+    const original = (await persistence.read()).planningGoals![0].proposal;
+    await persistence.update((state) => {
+      const team = (state.teams as TeamRecord[])[0];
+      team.seats.push({ id: "seat-next", displayName: "Next", roles: ["Developer"], status: "pending", externalIdentities: { mattermost: { username: "next" } } });
+      team.seats[1].status = "retiring";
+    }, "Request seat replacement");
+    await expect(persistence.update((state) => { (state.teams as TeamRecord[])[0].seats[1].status = "retired"; }, "Retire busy seat")).rejects.toThrow("unfinished work");
+    await expect(persistence.update((state) => { (state.teams as TeamRecord[])[0].seats[2].status = "active"; }, "Activate without identity")).rejects.toThrow("userId");
+    await persistence.update((state) => {
+      const seat = (state.teams as TeamRecord[])[0].seats[2]; seat.status = "active"; seat.externalIdentities.mattermost.userId = "next-bot";
+    }, "Activate verified identity");
+    await persistence.update((state) => {
+      const item = state.planningGoals![0].assignments![0];
+      item.seatId = "seat-next"; item.updatedAt = at(4); item.status = "queued";
+      item.reassignments = [{ fromSeatId: "seat-two", toSeatId: "seat-next", at: at(4), reason: "Retiring seat" }];
+      (state.teams as TeamRecord[])[0].seats[1].status = "retired";
+    }, "Reassign work and retire seat");
+    const retired = await persistence.read();
+    expect(retired.planningGoals![0].proposal).toEqual(original);
+    expect((retired.teams as TeamRecord[])[0].seats[1]).toMatchObject({ id: "seat-two", status: "retired", externalIdentities: { mattermost: { userId: "seat-two" } } });
+    for (const mutate of [
+      (state: PlanningDocument) => { (state.teams as TeamRecord[])[0].seats.splice(1, 1); },
+      (state: PlanningDocument) => { (state.teams as TeamRecord[])[0].seats[1].status = "active"; },
+      (state: PlanningDocument) => { (state.teams as TeamRecord[])[0].seats[1].externalIdentities.mattermost.userId = "replacement"; },
+      (state: PlanningDocument) => { state.planningGoals![0].assignments![0].reassignments![0].reason = "Rewrite transfer"; },
+    ]) await expect(persistence.update(mutate, "Rewrite historical seat")).rejects.toThrow();
+    await persistence.update((state) => {
+      const item = state.planningGoals![0]; prepare(item, "release");
+      item.ceremony = advanceCeremony(item, { to: "release", at: at(5), evidence: { ...implementation, outcomes: [{ ...implementation.outcomes[0], seatId: "seat-next" }] } });
+    }, "Integrate reassigned work");
+    expect((await persistence.read()).planningGoals![0].ceremony!.history[3]).toMatchObject({ evidence: { outcomes: [{ seatId: "seat-next" }] } });
+  });
+});
 
 describe("ordered ceremony", () => {
   it("has exactly five stages, and closes only with a published retro after entering retro", () => {

@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { mkdir } from "node:fs/promises";
-import { join } from "node:path";
+import { copyFile, mkdir } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import { homeChannelId, PlanningStore, teamProject, validateOutcomeSeats, validatePlanningGoal } from "../src/planning.js";
 import { git, stateCheckout } from "./state-checkout.js";
 import { PlanningBridge as Bridge, type PlanningChat, type Post, type Reaction } from "../src/planning-bridge.js";
@@ -9,6 +9,7 @@ import { MattermostPlanningChat } from "../src/planning-mattermost.js";
 import { parseOptions } from "../src/cli.js";
 import type { AgentRuntime, AgentResult } from "../src/codex-runtime.js";
 import { CLARIFY_TIMEOUT_MS, DRAFT_TIMEOUT_MS } from "../src/codex-runtime.js";
+import { autoModeEnabled, INITIAL_TEAM_MISSION, type TeamRecord } from "../src/state-domain.js";
 
 const MEMO = "memo";
 const CHECK = "white_check_mark";
@@ -18,6 +19,42 @@ async function fixture(withField = true, home: { homeChannelId?: string; github?
   const state = { $schema: "./schema/v1/state.schema.json", schemaVersion: 1, teams: [{ id: "team-001", slug: "yahaha", displayName: "Yahaha", ...(home.github ? { project: { github: home.github } } : {}), externalIdentities: { mattermost: { teamId: "team", ...(home.homeChannelId ? { homeChannelId: home.homeChannelId } : {}) } }, seats: [{ ...seat("seat-001", "Chick", "Team Lead", "chick"), externalIdentities: { mattermost: { userId: "chick", username: "chickcorea" } } }, seat("seat-003", "Aaron", "Developer", "aaron"), seat("seat-004", "Corey", "Developer", "corey")] }], sprints: [], ...(withField ? { planningGoals: [] } : {}) };
   return new PlanningStore(await stateCheckout("indra-plan-", state));
 }
+
+describe("owner settings contracts", () => {
+  it("defaults off and separates owner settings from all agent mutations", async () => {
+    const store = await fixture();
+    await mkdir(join(store.checkout, "schema/v1"), { recursive: true });
+    await copyFile(resolve("schema/v1/state.schema.json"), join(store.checkout, "schema/v1/state.schema.json"));
+    const team = () => store.read().then((state) => (state.teams as TeamRecord[])[0]);
+    expect(autoModeEnabled(await team())).toBe(false);
+    await store.updateOwnerSettings("team-001", { autoMode: false });
+    expect((await team()).standingPolicy).toBeUndefined();
+    for (const patch of [
+      { mission: "An agent changed the mission" },
+      { standingPolicy: { revisions: [{ revision: 1, enabled: true, source: "owner-command", at: "2026-09-01T00:00:00Z" }] } },
+    ]) await expect(store.update((state) => Object.assign(state.teams[0] as TeamRecord, patch), "Agent settings change")).rejects.toThrow("Only the owner settings port");
+    await store.updateOwnerSettings("team-001", { mission: INITIAL_TEAM_MISSION, autoMode: true }, "2026-09-01T00:00:00Z");
+    expect(autoModeEnabled(await team())).toBe(true);
+    const enabled = (await team()).standingPolicy!.revisions[0];
+    await store.updateOwnerSettings("team-001", { autoMode: false }, "2026-09-01T00:00:01Z");
+    expect((await team()).mission).toBe(INITIAL_TEAM_MISSION);
+    expect(autoModeEnabled(await team())).toBe(false);
+    expect((await team()).standingPolicy!.revisions).toEqual([enabled, { revision: 2, enabled: false, source: "owner-command", at: "2026-09-01T00:00:01Z" }]);
+    await expect(store.update((state) => { delete (state.teams[0] as TeamRecord).standingPolicy; }, "Erase policy")).rejects.toThrow("Only the owner settings port");
+    await expect(store.update((state) => { (state.teams[0] as TeamRecord).standingPolicy!.revisions[0].enabled = false; }, "Rewrite policy")).rejects.toThrow("Only the owner settings port");
+    await expect(store.updateOwnerSettings("team-001", { autoMode: true }, "2026-09-01T00:00:00Z")).rejects.toThrow("chronological");
+    expect(git(store.checkout, "show", "--format=", "--name-only", "HEAD").trim()).toBe("state.json");
+  });
+  it("does not allow an agent to introduce owner settings by adding or replacing a team", async () => {
+    const store = await fixture();
+    await expect(store.update((state) => {
+      const team = structuredClone(state.teams[0]) as TeamRecord;
+      team.id = "team-new"; team.slug = "new-team"; team.mission = "An agent's mission";
+      state.teams.push(team);
+    }, "Add settings through a new team")).rejects.toThrow("Only the owner settings port");
+    await expect(store.update((state) => { state.teams = []; }, "Delete settings through team removal")).rejects.toThrow("historical seat identities");
+  });
+});
 
 class FakeChat implements PlanningChat {
   posts: Post[] = [];
