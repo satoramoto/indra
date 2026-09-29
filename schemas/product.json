@@ -1,0 +1,254 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "summary",
+    "evidence",
+    "edit"
+  ],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "pattern": "\\S"
+    },
+    "evidence": {
+      "type": "array",
+      "maxItems": 12,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "url",
+          "quote",
+          "finding"
+        ],
+        "properties": {
+          "url": {
+            "type": "string",
+            "pattern": "^https://\\S+$"
+          },
+          "quote": {
+            "type": "string",
+            "pattern": "\\S"
+          },
+          "finding": {
+            "type": "string",
+            "pattern": "\\S"
+          }
+        }
+      }
+    },
+    "edit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "expectedRevision",
+        "ticketChanges",
+        "candidateChanges"
+      ],
+      "properties": {
+        "expectedRevision": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "ticketChanges": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "action",
+              "ticket"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "create",
+                  "update"
+                ]
+              },
+              "ticket": {
+                "$ref": "#/$defs/ticket"
+              }
+            }
+          },
+          "maxItems": 6
+        },
+        "candidateChanges": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "action",
+              "candidate"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "create",
+                  "update"
+                ]
+              },
+              "candidate": {
+                "$ref": "#/$defs/candidate"
+              }
+            }
+          },
+          "maxItems": 3
+        }
+      }
+    }
+  },
+  "$defs": {
+    "text": {
+      "type": "string",
+      "pattern": "\\S"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]+$"
+    },
+    "ticket": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "problem",
+        "value",
+        "acceptanceCriteria",
+        "status",
+        "dependsOn",
+        "research"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "title": {
+          "$ref": "#/$defs/text"
+        },
+        "problem": {
+          "$ref": "#/$defs/text"
+        },
+        "value": {
+          "$ref": "#/$defs/text"
+        },
+        "acceptanceCriteria": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/text"
+          }
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "open",
+            "planned",
+            "done",
+            "discarded"
+          ]
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/id"
+          }
+        },
+        "research": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "url",
+              "finding"
+            ],
+            "properties": {
+              "url": {
+                "type": "string",
+                "pattern": "^https?://\\S+$"
+              },
+              "finding": {
+                "$ref": "#/$defs/text"
+              }
+            }
+          }
+        }
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "summary",
+        "value",
+        "rank",
+        "status",
+        "ticketIds",
+        "goalId",
+        "retrospectiveGoalId"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "title": {
+          "$ref": "#/$defs/text"
+        },
+        "summary": {
+          "$ref": "#/$defs/text"
+        },
+        "value": {
+          "$ref": "#/$defs/text"
+        },
+        "rank": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "candidate",
+            "proposed",
+            "completed",
+            "discarded"
+          ]
+        },
+        "ticketIds": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/id"
+          }
+        },
+        "goalId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "retrospectiveGoalId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    }
+  }
+}
