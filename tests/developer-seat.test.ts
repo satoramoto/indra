@@ -1,22 +1,29 @@
-import { describe, expect, it, vi } from "vitest";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { git, stateCheckout } from "./state-checkout.js";
-import { PlanningStore } from "../src/planning.js";
+import { type PlanningGoal, PlanningStore } from "../src/planning.js";
 import { DeveloperSeat, loadDeveloperSeat, processShell, type SeatChat, type SeatTaskRecord, type Shell, type ShellResult } from "../src/developer-seat.js";
 import { sandboxArgs, type AgentResult, type AgentRuntime, type WriteAccess } from "../src/codex-runtime.js";
 import type { PlanningAssignment as Assignment } from "../src/planning.js";
+import { postReviewOnce } from "../src/developer-review.js";
+import { advanceCeremony } from "../src/ceremony.js";
+import { ImplementationRecorder, implementationWallTime } from "../src/implementation-facts.js";
+import { AgentRunError } from "../src/runtime-facts.js";
 import { parseOptions } from "../src/cli.js";
+
+afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
 const PR = "https://github.com/satoramoto/indra/pull/9";
 const BRANCH = "seat-002/goal-abc-outcome-1";
 const RECORD = "seat-seat-002-goal-abc-outcome-1";
 const seat = (id: string, name: string, roles: string[]) => ({ id, displayName: name, roles, externalIdentities: { mattermost: { userId: id, username: name.toLowerCase() } } });
 
+const READY = { version: 1 as const, consumers: { planning: 1 as const, developer: 1 as const, release: 1 as const, retro: 1 as const, tui: 1 as const } };
 const SPRINT = { branch: "sprint/goal-abc", baseSha: "a".repeat(40), status: "collecting" };
-async function fixture(assignments: Assignment[], stage = "approved", project: { github: string } | null = { github: "satoramoto/indra" }, integration?: object) {
+async function fixture(assignments: Assignment[], stage = "approved", project: { github: string } | null = { github: "satoramoto/indra" }, integration: object = SPRINT) {
   const goal = {
-    id: "goal-abc", teamId: "team-001", seatId: "seat-001", participantSeatIds: [], goal: "Build it", projectRefs: ["/proj"], stage,
+    id: "goal-abc", teamId: "team-001", seatId: "seat-001", participantSeatIds: [], goal: "Build it", projectRefs: ["satoramoto/indra"], stage,
     createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z", mattermost: { channelId: "channel", rootPostId: "root" },
     brief: { summary: "Build it", decisions: [], openQuestions: [] },
     proposal: { id: "proposal-1", createdAt: "2026-01-01T00:00:00Z", summary: "Plan", risks: [], openQuestions: [], outcomes: [
@@ -27,8 +34,18 @@ async function fixture(assignments: Assignment[], stage = "approved", project: {
     assignments,
     ...(integration ? { integration } : {}),
   };
-  const state = { $schema: "./schema/v1/state.schema.json", schemaVersion: 1, sprints: [], planningGoals: [goal], teams: [{ id: "team-001", slug: "yahaha", displayName: "Yahaha", ...(project ? { project } : {}), externalIdentities: { mattermost: { teamId: "team" } }, seats: [seat("seat-001", "Chick", ["Team Lead"]), seat("seat-002", "George", ["Developer"]), seat("seat-003", "Herbie", ["Developer"])] }] };
-  return new PlanningStore(await stateCheckout("indra-seat-", state));
+  if (stage === "approved" && project && integration && assignments.length) {
+    goal.proposal.outcomes = assignments.map((assignment) => ({ ...goal.proposal.outcomes.find((item) => item.id === assignment.outcomeId)!, seatId: assignment.seatId }));
+    (goal as PlanningGoal).ceremony = { version: 1, stage: "implement", history: [
+      { stage: "planning", enteredAt: goal.createdAt }, { stage: "proposal", enteredAt: goal.createdAt },
+      { stage: "implement", enteredAt: goal.createdAt, evidence: { kind: "approval", proposalId: "proposal-1", proposalPostId: "proposal-post", approval: { source: "owner-command", command: "planning approve", at: goal.createdAt } } },
+    ] };
+  }
+  const state = { $schema: "./schema/v1/state.schema.json", schemaVersion: 1, sprints: [], planningGoals: [goal], teams: [{ id: "team-001", slug: "yahaha", displayName: "Yahaha", ...(project ? { project } : {}), externalIdentities: { mattermost: { teamId: "team", homeChannelId: "channel" } }, seats: [seat("seat-001", "Chick", ["Team Lead"]), seat("seat-002", "George", ["Developer"]), seat("seat-003", "Herbie", ["Developer"])] }] };
+  const checkout = await stateCheckout("indra-seat-", state);
+  await mkdir(join(checkout, "schema/v1"), { recursive: true });
+  await copyFile("tests/fixtures/ceremony-state.schema.json", join(checkout, "schema/v1/state.schema.json"));
+  return new PlanningStore(checkout, undefined, READY);
 }
 const queued = (outcomeId: string, updatedAt: string, seatId = "seat-002"): Assignment => ({ outcomeId, seatId, status: "queued", updatedAt });
 
@@ -45,19 +62,20 @@ class FakeShell implements Shell {
   /** The PR's head: by default the branch of the worktree most recently added or retained. */
   headRef?: string;
   lastBranch = "";
-  baseRef = "main";
+  baseRef = "sprint/goal-abc";
+  headSha = "a".repeat(40);
   /** Each mergeability check takes the next status; by default the PR is current with main. */
   mainStatus: { mergeable: string; mergeStateStatus: string }[] = [];
-  /** Each `git merge origin/main` takes the next exit code (1 = conflicts); by default it merges cleanly. */
+  /** Each `git merge origin/sprint/goal-abc` takes the next exit code (1 = conflicts); by default it merges cleanly. */
   mainMerges: number[] = [];
-  /** Each "is origin/main merged into HEAD" check takes the next exit code; by default it is. */
+  /** Each "is origin/sprint/goal-abc merged into HEAD" check takes the next exit code; by default it is. */
   resolved: number[] = [];
   refs = new Set<string>();
   worktrees = new Map<string, { branch: string; gitDir: string }>();
   unfinishedMerge = false;
   inspectCode?: number;
   abortCode = 0;
-  comments: { body: string }[] = [];
+  comments: { body: string; user: { login: string }; state: string; commit_id: string }[] = [];
   maintenancePR: unknown = { merged: false };
   async retain(worktree: string, branch: string, gitDir: string) {
     await mkdir(worktree, { recursive: true });
@@ -69,6 +87,11 @@ class FakeShell implements Shell {
   onFirst?: () => Promise<void>;
   async run(command: string, args: string[], cwd: string): Promise<ShellResult> {
     if (this.onFirst) { const hook = this.onFirst; this.onFirst = undefined; await hook(); }
+    if (command === "env") {
+      expect(args[0]).toMatch(/GH_CONFIG_DIR=.*\/\.config\/gh-yahaha-bot$/);
+      expect(args[1]).toBe("gh");
+      command = "gh"; args = args.slice(2);
+    }
     const line = `${command} ${args.join(" ")} @${cwd}`;
     this.calls.push(line);
     // `gh repo clone` makes the checkout Indra then moves into place.
@@ -78,6 +101,7 @@ class FakeShell implements Shell {
       if (this.worktrees.has(args[5]) || this.refs.has(`refs/heads/${args[4]}`)) return { code: 128, stdout: "", stderr: "already exists" };
       await this.retain(args[5], args[4], join(cwd, ".git"));
     }
+    if (command === "git" && args.join(" ") === "rev-parse HEAD") return { code: 0, stdout: this.headSha, stderr: "" };
     if (line.startsWith("git rev-parse") && args.includes("MERGE_HEAD")) return { code: this.inspectCode ?? (this.unfinishedMerge ? 0 : 1), stdout: this.unfinishedMerge ? "a".repeat(40) : "", stderr: "" };
     if (line.startsWith("git rev-parse") && args.includes("--show-toplevel")) return { code: this.worktrees.has(cwd) ? 0 : 128, stdout: cwd, stderr: "" };
     if (line.startsWith("git rev-parse")) return { code: 0, stdout: this.worktrees.get(cwd)?.gitDir ?? join(cwd, ".git"), stderr: "" };
@@ -88,7 +112,12 @@ class FakeShell implements Shell {
     }
     if (line.startsWith("gh api repos/satoramoto/indra/pulls/9 --method GET")) return { code: 0, stdout: JSON.stringify(this.maintenancePR), stderr: "" };
     if (line.startsWith("gh api") && args.includes("--paginate")) return { code: 0, stdout: JSON.stringify([this.comments]), stderr: "" };
-    if (line.startsWith("gh pr comment")) this.comments.push({ body: args.at(-1)! });
+    if (command === "gh" && args.join(" ") === "api user --jq .login") return { code: 0, stdout: "satori-miyamoto", stderr: "" };
+    if (line.startsWith("gh api") && args.includes("POST")) {
+      const body = JSON.parse(await readFile(args.at(-1)!, "utf8"));
+      this.comments.push({ body: body.body, user: { login: "satori-miyamoto" }, commit_id: body.commit_id, state: body.event === "APPROVE" ? "APPROVED" : "CHANGES_REQUESTED" });
+    }
+    if (line.startsWith("gh pr view") && args.includes("headRefOid")) return { code: 0, stdout: this.headSha, stderr: "" };
     if (line.startsWith("gh pr merge") && this.draft) return { code: 1, stdout: "", stderr: "GraphQL: Pull Request is still a draft (mergePullRequest)" };
     if (line.startsWith("gh pr merge")) {
       // Each merge attempt takes the next outcome; by default gh succeeds and the PR merges.
@@ -96,7 +125,7 @@ class FakeShell implements Shell {
       this.merged = outcome.merged;
       return { code: outcome.code, stdout: "", stderr: outcome.stderr };
     }
-    if (line.startsWith("gh pr edit")) this.baseRef = args.at(-1)!;
+    if (line.startsWith("gh pr edit") && this.baseRef !== "release") this.baseRef = args.at(-1)!;
     if (line.startsWith("gh pr view") && args.includes("isDraft,headRefName,baseRefName,state")) return { code: 0, stdout: JSON.stringify({ isDraft: this.draft, headRefName: this.headRef ?? this.lastBranch,baseRefName: this.baseRef, state: this.merged ? "MERGED" : "OPEN" }), stderr: "" };
     if (line.startsWith("gh pr ready")) this.draft = false;
     if (line.startsWith("gh pr view") && args.includes("mergeable,mergeStateStatus")) return { code: 0, stdout: JSON.stringify(this.mainStatus.shift() ?? { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" }), stderr: "" };
@@ -117,23 +146,27 @@ class FakeShell implements Shell {
 }
 class FakeCodex {
   runs: { cwd: string; sandbox: string[]; schema: string; sessionId?: string; prompt: string }[] = [];
-  findings = ["Bug in foo"];
+  findings = ["src/foo.ts:12: Bug in foo"];
+  afterFix?: () => void;
+  keepFindings = false;
   fail = false;
   factory = (cwd: string, write?: WriteAccess): AgentRuntime => ({
     message: async (prompt: string, schema: string, sessionId?: string): Promise<AgentResult> => {
       // Record the sandbox arguments CodexRuntime would pass for this write access.
       this.runs.push({ cwd, sandbox: sandboxArgs(write), schema, sessionId, prompt });
       if (this.fail) throw new Error("codex down");
+      if (prompt.includes("Outcome: every review finding")) { this.afterFix?.(); if (!this.keepFindings) this.findings = []; }
       const response = schema.endsWith("review.json") ? { findings: this.findings, summary: "Reviewed" } : { prUrl: PR, summary: "Done" };
       return { sessionId: `session-${this.runs.length}`, response, startedAt: "t0", finishedAt: "t1" };
     },
   });
 }
 
-async function setup(assignments: Assignment[], integration?: object) {
+async function setup(assignments: Assignment[], integration: object = SPRINT) {
   const store = await fixture(assignments, "approved", { github: "satoramoto/indra" }, integration);
   const chat = new FakeChat(); const shell = new FakeShell(); const codex = new FakeCodex();
-  shell.baseRef = (integration as { branch?: string } | undefined)?.branch ?? "main";
+  shell.baseRef = (integration as { branch?: string } | undefined)?.branch ?? "sprint/goal-abc";
+  codex.afterFix = () => { shell.headSha = "b".repeat(40); };
   const identity = await loadDeveloperSeat(store, "seat-002");
   const make = () => Object.assign(new DeveloperSeat(store, identity, chat, shell, codex.factory), { mergeRetryMs: 0 });
   const assignment = async (id: string) => (await store.read()).planningGoals![0].assignments!.find((item) => item.outcomeId === id)!;
@@ -147,12 +180,143 @@ async function retainRecord(store: PlanningStore, shell: FakeShell, changes: Par
   };
   await shell.retain(record.worktree, record.branch, record.gitDir!);
   await store.saveRuntime(RECORD, record);
+  if (record.step === "ci") await postReviewOnce({ store, recordName: RECORD, prUrl: PR, worktree: record.worktree, shell, review: async () => ({ findings: [], summary: "Existing approval" }) });
+  shell.calls = [];
   return record;
 }
 
 const reviewing = (): Assignment => ({ outcomeId: "outcome-1", seatId: "seat-002", status: "in-review", updatedAt: "2026-01-01T00:00:00Z", prUrl: PR });
 
 describe("developer seat", () => {
+  it("rechecks implement under the goal lock when release wins the claim race", async () => {
+    const { store, shell, codex, seat } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
+    const lock = store.withGoalLock.bind(store);
+    vi.spyOn(store, "withGoalLock").mockImplementationOnce((id, work) => lock(id, async () => {
+      await store.update((state) => {
+        const goal = state.planningGoals![0];
+        Object.assign(goal.assignments![0], { status: "merged", prUrl: PR });
+        goal.ceremony = advanceCeremony(goal, { to: "release", at: new Date().toISOString(), evidence: { kind: "implementation", outcomes: [{ outcomeId: "outcome-1", seatId: "seat-002", prUrl: PR, baseBranch: SPRINT.branch, mergedSha: "a".repeat(40), checksPassed: true, reviewApproved: true }] } });
+      }, "Enter release before claim");
+      return work();
+    }));
+    expect(await seat.tick()).toBe("idle");
+    expect(shell.calls).toEqual([]); expect(codex.runs).toEqual([]);
+    expect((await new ImplementationRecorder(store, "seat-002", "goal-abc", "outcome-1").read()).attempts).toEqual([]);
+  });
+
+  it("commits one claim when two runners select the same queued assignment", async () => {
+    const { store, seat, make, codex } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
+    codex.findings = [];
+    const lock = store.withGoalLock.bind(store);
+    let entrants = 0; let release!: () => void;
+    const both = new Promise<void>((done) => { release = done; });
+    vi.spyOn(store, "withGoalLock").mockImplementation(async (id, work) => {
+      if (++entrants <= 2) { if (entrants === 2) release(); await both; }
+      return lock(id, work);
+    });
+    const results = await Promise.all([seat.tick(), make().tick()]);
+    expect(results.sort()).toEqual(["idle", "worked"]);
+    const facts = await new ImplementationRecorder(store, "seat-002", "goal-abc", "outcome-1").read();
+    expect(facts.attempts).toHaveLength(1);
+    expect(codex.runs.filter((run) => run.prompt.includes("created from origin/"))).toHaveLength(1);
+  });
+
+  it("recovers a committed claim after interruption without a second attempt or lost start time", async () => {
+    const { store, seat, make, codex } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
+    codex.findings = [];
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-09-01T00:00:00Z"));
+    const update = store.update.bind(store);
+    vi.spyOn(store, "update").mockImplementationOnce(async (...args) => { await update(...args); throw new Error("process stopped after claim"); });
+    await expect(seat.tick()).rejects.toThrow("process stopped");
+    const recorder = new ImplementationRecorder(store, "seat-002", "goal-abc", "outcome-1");
+    expect((await recorder.read()).attempts[0].claimedAt).toBeNull();
+    vi.setSystemTime(new Date("2026-09-01T00:00:12Z"));
+    await make().tick();
+    await make().tick();
+    const facts = await recorder.read();
+    expect(facts.attempts).toHaveLength(1);
+    expect(facts.attempts[0].claimedAt).toBe("2026-09-01T00:00:00.000Z");
+    expect(implementationWallTime(facts.attempts)).toEqual({ wallTimeMs: 12000, knownWallTimeMs: 12000, unknownIntervals: 0 });
+  });
+
+  it("recovers a recorded failure when the terminal state commit was interrupted", async () => {
+    const { store, codex, seat, make, assignment } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
+    codex.fail = true;
+    const update = store.update.bind(store);
+    vi.spyOn(store, "update").mockImplementation(async (...args) => {
+      if (String(args[1]).endsWith(" failed")) throw new Error("state unavailable");
+      await update(...args);
+    });
+    await expect(seat.tick()).rejects.toThrow("state unavailable");
+    expect((await assignment("outcome-1")).status).toBe("running");
+    const before = await new ImplementationRecorder(store, "seat-002", "goal-abc", "outcome-1").read();
+    vi.restoreAllMocks(); codex.fail = false;
+    await make().tick();
+    expect(codex.runs).toHaveLength(1);
+    expect((await assignment("outcome-1")).status).toBe("failed");
+    const after = await new ImplementationRecorder(store, "seat-002", "goal-abc", "outcome-1").read();
+    expect(after.attempts).toHaveLength(1);
+    expect(after.attempts[0].terminal).toEqual(before.attempts[0].terminal);
+  });
+
+  it("recovers a spent conflict round persisted before its mutable counter", async () => {
+    const { store, shell, codex, make, assignment } = await setup([reviewing()]);
+    const record = await retainRecord(store, shell, { conflictRounds: 1 });
+    const facts = new ImplementationRecorder(store, "seat-002", "goal-abc", "outcome-1");
+    record.attemptId = await facts.recover(record);
+    await facts.event(record.attemptId, { kind: "conflict", result: "started", round: 2 });
+    await store.saveRuntime(RECORD, record);
+    shell.mainStatus = [{ mergeable: "CONFLICTING", mergeStateStatus: "DIRTY" }]; shell.mainMerges = [1];
+    await make().tick();
+    expect(codex.runs).toEqual([]);
+    expect((await assignment("outcome-1")).status).toBe("failed");
+    expect((await store.readRuntimeFile<SeatTaskRecord>(RECORD))?.conflictRounds).toBe(2);
+  });
+
+  it("records CI failure then explicit retry, excluding time queued between the attempts", async () => {
+    const { store, shell, seat, make, codex } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
+    codex.findings = [];
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const time = (seconds: number) => vi.setSystemTime(new Date(Date.UTC(2026, 8, 1, 0, 0, seconds)));
+    time(0); shell.onFirst = async () => { time(5); }; shell.checksCode = 1;
+    await seat.tick();
+    time(90);
+    await store.update((state) => { Object.assign(state.planningGoals![0].assignments![0], { status: "queued", updatedAt: new Date().toISOString() }); }, "Explicit retry");
+    time(100); shell.onFirst = async () => { time(107); }; shell.checksCode = 0;
+    await make().tick();
+    const facts = await new ImplementationRecorder(store, "seat-002", "goal-abc", "outcome-1").read();
+    expect(facts.attempts.map((item) => [item.cause, item.terminal?.status])).toEqual([["claim", "failed"], ["retry", "merged"]]);
+    expect(facts.attempts[0].events).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "ci", result: "failed" })]));
+    expect(implementationWallTime(facts.attempts)).toEqual({ wallTimeMs: 12000, knownWallTimeMs: 12000, unknownIntervals: 0 });
+  });
+
+  it.each(["checks", "merge"])("records a thrown %s failure before stopping the attempt", async (command) => {
+    const { store, seat, shell, codex, assignment } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]); codex.findings = [];
+    const run = shell.run.bind(shell);
+    vi.spyOn(shell, "run").mockImplementation(async (...args) => {
+      if (args[0] === "gh" && args[1][0] === "pr" && args[1][1] === command) throw new Error("private command diagnostics");
+      return run(...args);
+    });
+    await seat.tick();
+    expect((await assignment("outcome-1")).status).toBe("failed");
+    const facts = await new ImplementationRecorder(store, "seat-002", "goal-abc", "outcome-1").read();
+    expect(facts.attempts[0].events).toEqual(expect.arrayContaining([expect.objectContaining({ kind: command === "checks" ? "ci" : "merge", result: "failed" })]));
+    expect(facts.attempts[0].terminal?.status).toBe("failed");
+    expect(JSON.stringify(facts)).not.toContain("private command diagnostics");
+  });
+
+  it("does not merge while findings remain after fix sessions", async () => {
+    const { seat, shell, codex, assignment, store } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
+    codex.keepFindings = true;
+    await seat.tick();
+    expect((await assignment("outcome-1")).status).toBe("failed");
+    expect(shell.calls.some((call) => call.startsWith("gh pr merge") || call.startsWith("gh pr checks"))).toBe(false);
+    const facts = await new ImplementationRecorder(store, "seat-002", "goal-abc", "outcome-1").read();
+    expect(facts.attempts[0].events.filter((event) => event.kind === "fix" && event.result === "started")).toHaveLength(2);
+    expect(facts.attempts[0].events.filter((event) => event.kind === "review").every((event) => event.verdict === "REQUEST_CHANGES")).toBe(true);
+  });
+
   it("parses seat run and refuses a Team Lead or unknown seat", async () => {
     expect(parseOptions(["seat", "run", "--seat", "seat-002", "--state", "/tmp/s"])).toEqual({ mode: "seat", seatId: "seat-002", checkout: "/tmp/s" });
     expect(() => parseOptions(["seat", "run"])).toThrow("Usage:");
@@ -175,32 +339,22 @@ describe("developer seat", () => {
     // Indra's own clone of the team's project, never a path from the owner or the goal.
     const project = join(store.runtimeDir, "projects", "satoramoto", "indra");
     expect(shell.calls[0]).toMatch(new RegExp(`^gh repo clone satoramoto/indra ${project}\\.[0-9a-f-]+\\.clone @${join(store.runtimeDir, "projects", "satoramoto")}$`));
-    expect(shell.calls.slice(1)).toEqual([
-      `git -c credential.helper= -c credential.helper=!gh auth git-credential fetch origin main @${project}`,
-      `git show-ref --verify --quiet refs/heads/${BRANCH} @${project}`,
-      `git show-ref --verify --quiet refs/remotes/origin/${BRANCH} @${project}`,
-      `git rev-parse --path-format=absolute --git-common-dir @${project}`,
-      `git worktree add --no-track -b seat-002/goal-abc-outcome-1 ${worktree} origin/main @${project}`,
-      `gh api repos/satoramoto/indra/issues/9/comments?per_page=100 --method GET --paginate --slurp @${worktree}`,
-      expect.stringContaining(`gh pr comment ${PR} --body **Indra review:** Reviewed\n\nFindings:\n- Bug in foo\n\n<!-- indra-review:`),
-      `gh pr view ${PR} --json state --jq .state @${project}`,
-      `gh pr view ${PR} --json mergeable,mergeStateStatus @${project}`,
+    expect(shell.calls).toEqual(expect.arrayContaining([
+      `git worktree add --no-track -b ${BRANCH} ${worktree} origin/sprint/goal-abc @${project}`,
+      `gh pr edit ${PR} --base sprint/goal-abc @${worktree}`,
       `gh pr checks ${PR} --watch @${worktree}`,
-      `gh pr view ${PR} --json isDraft,headRefName,baseRefName,state @${project}`,
-      `gh pr merge ${PR} --squash @${project}`,
-      `gh pr view ${PR} --json state --jq .state @${project}`,
-      `gh api -X DELETE repos/satoramoto/indra/git/refs/heads/seat-002/goal-abc-outcome-1 @${project}`,
+      `gh pr merge ${PR} --squash --match-head-commit ${shell.headSha} @${project}`,
       `git worktree remove --force ${worktree} @${project}`,
-      `git branch -D seat-002/goal-abc-outcome-1 @${project}`,
-    ]);
+    ]));
+    expect(shell.comments.map((item) => item.state)).toEqual(["CHANGES_REQUESTED", "APPROVED"]);
     // Three new sessions: none resumes another. Build and fix write with network; the reviewer is read-only.
     const write = ["--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true", "--add-dir", join(project, ".git")];
-    expect(codex.runs.map((run) => [run.schema.split("/").at(-1), run.sessionId, run.sandbox])).toEqual([["developer.json", undefined, write], ["review.json", undefined, ["--sandbox", "read-only"]], ["developer.json", undefined, write]]);
+    expect(codex.runs.map((run) => [run.schema.split("/").at(-1), run.sessionId, run.sandbox])).toEqual([["developer.json", undefined, write], ["review.json", undefined, ["--sandbox", "read-only"]], ["developer.json", undefined, write], ["review.json", undefined, ["--sandbox", "read-only"]]]);
     expect(codex.runs[2].prompt).toContain("Bug in foo");
     // Each prompt is a contract: where to deliver, what Indra does next, the hard constraints and the schema; no method.
     const [build, review, fix] = codex.runs.map((run) => run.prompt);
     expect(build).toContain(`git push -u origin HEAD:refs/heads/${BRANCH}`);
-    expect(build).toContain("gh pr create --base main");
+    expect(build).toContain("gh pr create --base sprint/goal-abc");
     for (const prompt of [build, fix]) {
       expect(prompt).toMatch(/Do not merge/);
       expect(prompt).toMatch(/do not mark it ready or draft/);
@@ -215,9 +369,9 @@ describe("developer seat", () => {
     expect(review).toMatch(/Return only JSON: findings/);
     for (const prompt of [build, review, fix]) expect(prompt).not.toMatch(/feedback loop|test:watch|once each|run the targeted tests/i);
     const record = JSON.parse(await readFile(join(store.runtimeDir, "seat-seat-002-goal-abc-outcome-1.json"), "utf8")) as SeatTaskRecord;
-    expect(record.sessions.map((item) => [item.role, item.sessionId])).toEqual([["developer", "session-1"], ["reviewer", "session-2"], ["fix", "session-3"]]);
+    expect(record.sessions.map((item) => [item.role, item.sessionId])).toEqual([["developer", "session-1"], ["reviewer", "session-2"], ["fix", "session-3"], ["reviewer", "session-4"]]);
     expect(await readFile(join(store.checkout, "state.json"), "utf8")).not.toContain("session-");
-    expect(chat.messages.map((message) => message.split(" ")[0])).toEqual(["Claimed", "Opened", "Review", "Merged"]);
+    expect(chat.messages.map((message) => message.split(" ")[0])).toEqual(["Claimed", "Opened", "Review", "Review", "Merged"]);
     expect(git(store.checkout, "log", "--format=%s").trim().split("\n").reverse()).toEqual([
       "Initial state",
       "Seat seat-002 claims goal-abc/outcome-1: running",
@@ -241,7 +395,7 @@ describe("developer seat", () => {
     const project = join(store.runtimeDir, "projects", "satoramoto", "indra");
     const ready = shell.calls.indexOf(`gh pr ready ${PR} @${project}`);
     expect(ready).toBeGreaterThan(0);
-    expect(shell.calls[ready + 1]).toBe(`gh pr merge ${PR} --squash @${project}`);
+    expect(shell.calls[ready + 1]).toBe(`gh pr merge ${PR} --squash --match-head-commit ${shell.headSha} @${project}`);
     expect(shell.calls.filter((call) => call.startsWith("gh pr ready"))).toEqual([`gh pr ready ${PR} @${project}`]);
     expect((await assignment("outcome-1")).status).toBe("merged");
   });
@@ -256,11 +410,13 @@ describe("developer seat", () => {
   });
 
   it("retries a merge GitHub briefly refused", async () => {
-    const { shell, seat, assignment } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
+    const { shell, seat, assignment, store } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
     shell.merges = [{ code: 1, stderr: "Pull request is not mergeable", merged: false }, { code: 0, stderr: "", merged: true }];
     await seat.tick();
     expect((await assignment("outcome-1")).status).toBe("merged");
     expect(shell.calls.filter((call) => call.startsWith("gh pr merge"))).toHaveLength(2);
+    const facts = await new ImplementationRecorder(store, "seat-002", "goal-abc", "outcome-1").read();
+    expect(facts.attempts[0].events.filter((event) => event.kind === "merge").map((event) => event.result)).toEqual(["started", "failed", "retry", "started", "passed"]);
   });
 
   it("fails a merge that never lands with a secret-free stderr excerpt", async () => {
@@ -269,7 +425,7 @@ describe("developer seat", () => {
     shell.merges = [refused, refused];
     await seat.tick();
     const failed = await assignment("outcome-1");
-    expect(failed).toMatchObject({ status: "failed", note: "ci: gh pr merge failed: GraphQL: Pull request is not mergeable (token [redacted])" });
+    expect(failed).toMatchObject({ status: "failed", note: "ci: gh pr merge failed; PR is not merged." });
     expect(shell.calls.some((call) => call.startsWith("git worktree remove"))).toBe(false);
   });
 
@@ -290,46 +446,46 @@ describe("developer seat", () => {
     const worktree = join(store.runtimeDir, "worktrees", "goal-abc-outcome-1");
     const project = join(store.runtimeDir, "projects", "satoramoto", "indra");
     const ci = shell.calls.indexOf(`gh pr view ${PR} --json mergeable,mergeStateStatus @${project}`);
-    expect(shell.calls.slice(ci, ci + 7)).toEqual([
+    expect(shell.calls).toEqual(expect.arrayContaining([
       `gh pr view ${PR} --json mergeable,mergeStateStatus @${project}`,
-      `git -c credential.helper= -c credential.helper=!gh auth git-credential fetch origin main @${project}`,
-      `git merge --no-edit origin/main @${worktree}`,
+      `git -c credential.helper= -c credential.helper=!gh auth git-credential fetch origin main sprint/goal-abc @${project}`,
+      `git merge --no-edit origin/sprint/goal-abc @${worktree}`,
       ownPush(worktree),
       `gh pr checks ${PR} --watch @${worktree}`,
       `gh pr view ${PR} --json isDraft,headRefName,baseRefName,state @${project}`,
-      `gh pr merge ${PR} --squash @${project}`,
-    ]);
+      `gh pr merge ${PR} --squash --match-head-commit ${shell.headSha} @${project}`,
+    ]));
     onlyOwnPushes(shell.calls, worktree);
     expect(codex.runs).toHaveLength(2);
     expect((await assignment("outcome-1")).status).toBe("merged");
   });
 
-  it("resolves a conflict with main in one write-access Codex session, then pushes, waits for CI and merges", async () => {
+  it("resolves a conflict with sprint/goal-abc in one write-access Codex session, then pushes, waits for CI and merges", async () => {
     const { store, chat, shell, codex, seat, assignment } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
     codex.findings = [];
     shell.mainStatus = [conflicting];
     shell.mainMerges = [1];
     await seat.tick();
     const worktree = join(store.runtimeDir, "worktrees", "goal-abc-outcome-1");
-    const conflictAt = shell.calls.indexOf(`git merge --no-edit origin/main @${worktree}`);
-    expect(shell.calls.slice(conflictAt + 1, conflictAt + 6)).toEqual([
-      `git merge-base --is-ancestor origin/main HEAD @${worktree}`,
+    const conflictAt = shell.calls.indexOf(`git merge --no-edit origin/sprint/goal-abc @${worktree}`);
+    expect(shell.calls).toEqual(expect.arrayContaining([
+      `git merge-base --is-ancestor origin/sprint/goal-abc HEAD @${worktree}`,
       ownPush(worktree),
       `gh pr checks ${PR} --watch @${worktree}`,
       `gh pr view ${PR} --json isDraft,headRefName,baseRefName,state @${join(store.runtimeDir, "projects", "satoramoto", "indra")}`,
-      `gh pr merge ${PR} --squash @${join(store.runtimeDir, "projects", "satoramoto", "indra")}`,
-    ]);
+      `gh pr merge ${PR} --squash --match-head-commit ${shell.headSha} @${join(store.runtimeDir, "projects", "satoramoto", "indra")}`,
+    ]));
     onlyOwnPushes(shell.calls, worktree);
     const write = ["--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true", "--add-dir", join(store.runtimeDir, "projects", "satoramoto", "indra", ".git")];
     expect(codex.runs).toHaveLength(3);
     expect(codex.runs[2]).toMatchObject({ cwd: worktree, sandbox: write, sessionId: undefined });
     expect(codex.runs[2].prompt).toContain("keeping the intent of both sides");
-    expect(codex.runs[2].prompt).toContain("origin/main is an ancestor of HEAD");
+    expect(codex.runs[2].prompt).toContain("origin/sprint/goal-abc is an ancestor of HEAD");
     expect(codex.runs[2].prompt).toMatch(/Do not push or merge/);
     expect(codex.runs[2].prompt).toMatch(/do not rebase, reset, force-push or abort the merge/);
     expect(codex.runs[2].prompt).toMatch(/Return only JSON: prUrl/);
     expect(codex.runs[2].prompt).not.toMatch(/once each|run the same targeted tests/i);
-    expect(chat.messages.some((message) => message.includes("conflicts with main; resolving (round 1 of 2)"))).toBe(true);
+    expect(chat.messages.some((message) => message.includes("conflicts with sprint/goal-abc; resolving (round 1 of 2)"))).toBe(true);
     expect((await assignment("outcome-1")).status).toBe("merged");
     const record = JSON.parse(await readFile(join(store.runtimeDir, "seat-seat-002-goal-abc-outcome-1.json"), "utf8")) as SeatTaskRecord;
     expect(record.conflictRounds).toBe(1);
@@ -373,19 +529,19 @@ describe("developer seat", () => {
     shell.merges = [refused, refused, refused, refused];
     await seat.tick();
     const worktree = join(store.runtimeDir, "worktrees", "goal-abc-outcome-1");
-    expect(await assignment("outcome-1")).toMatchObject({ status: "failed", note: "ci: merge conflict with main could not be resolved" });
-    expect(chat.messages.at(-1)).toContain("merge conflict with main could not be resolved");
+    expect(await assignment("outcome-1")).toMatchObject({ status: "failed", note: "ci: merge conflict with sprint/goal-abc could not be resolved" });
+    expect(chat.messages.at(-1)).toContain("merge conflict with sprint/goal-abc could not be resolved");
     expect(codex.runs.filter((run) => run.prompt.includes("stopped with conflicts"))).toHaveLength(2);
     expect(shell.calls.filter((call) => call.startsWith("gh pr checks"))).toHaveLength(2);
     expect(shell.calls.at(-1)).toBe(`git merge --abort @${worktree}`);
     onlyOwnPushes(shell.calls, worktree);
   });
 
-  it("fails an assignment whose team has no project, naming the state field", async () => {
+  it("leaves an unmigrated goal without a team project idle", async () => {
     const store = await fixture([queued("outcome-1", "2026-01-01T00:00:00Z")], "approved", null);
     const shell = new FakeShell(); const codex = new FakeCodex();
     await new DeveloperSeat(store, await loadDeveloperSeat(store, "seat-002"), new FakeChat(), shell, codex.factory).tick();
-    expect((await store.read()).planningGoals![0].assignments![0]).toMatchObject({ status: "failed", note: "worktree: Team team-001 has no project.github in state.json; record it in indra-state first." });
+    expect((await store.read()).planningGoals![0].assignments![0]).toMatchObject({ status: "queued" });
     expect(shell.calls).toEqual([]);
     expect(codex.runs).toHaveLength(0);
   });
@@ -420,6 +576,17 @@ describe("developer seat", () => {
     expect(await seat.tick()).toBe("idle");
   });
 
+  it("keeps reported usage for a failed agent session without storing its diagnostics", async () => {
+    const { store, codex, make, assignment } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
+    codex.factory = () => ({ message: async () => { throw new AgentRunError("private diagnostics", { invocationId: "failed-run", engine: "codex", startedAt: "2026-01-01T00:00:00Z", finishedAt: "2026-01-01T00:00:05Z", status: "failed", usage: { inputTokens: 42, outputTokens: 7 } }); } });
+    await make().tick();
+    expect((await assignment("outcome-1")).status).toBe("failed");
+    const facts = await new ImplementationRecorder(store, "seat-002", "goal-abc", "outcome-1").read();
+    expect(facts.attempts[0].events).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "session", session: expect.objectContaining({ invocationId: "failed-run", status: "failed", usage: { inputTokens: 42, outputTokens: 7 } }) })]));
+    expect(JSON.stringify(facts)).not.toContain("private diagnostics");
+    expect(await readFile(join(store.checkout, "state.json"), "utf8")).not.toContain("failed-run");
+  });
+
   it("fails on an agent error using runtime-neutral wording without recording its output", async () => {
     const { codex, seat, assignment } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
     codex.fail = true;
@@ -452,7 +619,7 @@ describe("developer seat", () => {
     shell.mainStatus = [conflicting];
     await make().tick();
     const aborted = shell.calls.indexOf(`git merge --abort @${record.worktree}`);
-    const merged = shell.calls.indexOf(`git merge --no-edit origin/${integration?.branch ?? "main"} @${record.worktree}`);
+    const merged = shell.calls.indexOf(`git merge --no-edit origin/${integration?.branch ?? "sprint/goal-abc"} @${record.worktree}`);
     expect(aborted).toBeGreaterThan(shell.calls.indexOf(`git symbolic-ref --quiet HEAD @${record.worktree}`));
     expect(merged).toBeGreaterThan(aborted);
     expect(shell.calls.filter((call) => call.startsWith("git merge --abort"))).toHaveLength(1);
@@ -572,8 +739,13 @@ describe("developer seat", () => {
     expect(retried).toMatchObject({ branch: saved.branch, worktree: saved.worktree, prUrl: PR, conflictRounds: 2 });
     expect(retried.sessions).toHaveLength(4);
     expect(retried.sessions.slice(0, 2)).toEqual(saved.sessions);
+    const history = await new ImplementationRecorder(store, "seat-002", "goal-abc", "outcome-1").read();
+    expect(history.attempts).toHaveLength(2);
+    expect(history.attempts[0].terminal?.status).toBe("failed");
+    expect(history.attempts[0].events.some((event) => event.retained?.conflictRounds === 2)).toBe(true);
+    expect(history.attempts[1].events.filter((event) => event.kind === "conflict" && event.result === "started").map((event) => event.round)).toEqual([1, 2]);
     expect(codex.runs).toHaveLength(4);
-    for (const run of codex.runs.slice(2)) expect(run.prompt).toContain(`Merging origin/${integration?.branch ?? "main"}`);
+    for (const run of codex.runs.slice(2)) expect(run.prompt).toContain(`Merging origin/${integration?.branch ?? "sprint/goal-abc"}`);
     expect(shell.calls.some((call) => call.startsWith("git worktree add"))).toBe(false);
     expect(await assignment("outcome-1")).toMatchObject({ status: "merged", prUrl: PR });
   });
@@ -666,9 +838,9 @@ describe("developer seat", () => {
     expect((await store.readRuntimeFile<SeatTaskRecord>(RECORD))?.step).toBe("review");
     await store.update((state) => { state.planningGoals![0].assignments![0].status = "queued"; }, "Re-queue interrupted review");
     await make().tick();
-    expect(shell.comments).toHaveLength(1);
-    expect(codex.runs.filter((run) => run.schema.endsWith("review.json"))).toHaveLength(1);
-    expect(codex.runs.at(-1)?.prompt).toContain("Bug in foo");
+    expect(shell.comments.map((item) => item.state)).toEqual(["CHANGES_REQUESTED", "APPROVED"]);
+    expect(codex.runs.filter((run) => run.schema.endsWith("review.json"))).toHaveLength(2);
+    expect(codex.runs.find((run) => run.prompt.includes("Outcome: every review finding"))?.prompt).toContain("Bug in foo");
     expect((await assignment("outcome-1")).status).toBe("merged");
   });
 
