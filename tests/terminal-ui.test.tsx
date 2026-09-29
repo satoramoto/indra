@@ -435,6 +435,9 @@ describe("terminal UI", () => {
     live = { "seat-002": { process: "running" } };
     await model.refresh();
     expect(model.updateLine()?.text).toBe("Indra abc1234 · up to date");
+    result = { outcome: "up-to-date", message: "up to date at abc1234", at: "now", branch: "hotfix", sha: "abc1234def" };
+    await model.updateCode();
+    expect(model.updateLine()?.text).toBe("Indra abc1234 · up to date · Live from local hotfix @ abc1234");
 
     result = { outcome: "blocked", message: "the Indra checkout has uncommitted changes", at: "now" };
     await model.updateCode();

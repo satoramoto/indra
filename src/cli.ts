@@ -352,6 +352,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
           rollback: () => updater.rollback(),
           rolledBack: () => updater.rolledBack(),
         },
+        updateMs: 5_000,
         view,
         reload: async (current) => {
           // Best effort: without the saved view the reloaded UI opens on its default page.
