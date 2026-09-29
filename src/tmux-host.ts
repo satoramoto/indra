@@ -55,6 +55,11 @@ export async function signalReady(stateCheckout: string, nonce: string, error?: 
   await writeFile(file, JSON.stringify({ nonce, pid: process.pid, readyAt: new Date().toISOString(), ...(error ? { error } : {}), ...(message ? { message } : {}) }), { flag: "wx", mode: 0o600 });
 }
 
+/** The `terminal-features` entry that tells tmux every outer terminal takes 24-bit colour. */
+export const TRUECOLOR_FEATURE = "*:RGB";
+/** `show-options -s terminal-features` lines look like `terminal-features[3] "*:RGB"`. */
+export const hasTruecolorFeature = (options: string) => options.split("\n").some((line) => /^terminal-features\[\d+\]\s+"?\*:RGB"?\s*$/.test(line.trim()));
+
 export class TmuxHost {
   readonly appDir: string;
   readonly cli: string;
@@ -99,7 +104,7 @@ export class TmuxHost {
 
   async start(): Promise<HostRecord> {
     const existing = await this.verifiedRecord();
-    if (existing) { await this.waitReady(existing); return existing; }
+    if (existing) { await this.enableTruecolor(); await this.waitReady(existing); return existing; }
     try { await access(this.cli); }
     catch { throw new Error(`Built CLI is missing at ${this.cli}; run npm run build first.`); }
     const previous = await this.readRecord();
@@ -127,6 +132,7 @@ export class TmuxHost {
       await this.runner.run(["-L", this.socket, "kill-session", "-t", this.target()]).catch(() => undefined);
       throw new Error("Tmux did not return a stable server and session identity.");
     }
+    await this.enableTruecolor();
     const record: HostRecord = { socket: this.socket, session: this.session, paneId, tmuxIdentity, readyNonce, stateCheckout: resolve(this.stateCheckout), appDir: this.appDir, startedAt: new Date().toISOString(), ...(build ? { build } : {}) };
     await mkdir(dirname(this.recordFile), { recursive: true, mode: 0o700 });
     const temp = `${this.recordFile}.${randomUUID()}.tmp`;
@@ -138,6 +144,17 @@ export class TmuxHost {
     }
     await this.waitReady(record);
     return record;
+  }
+
+  /**
+   * Lets clients attached to Indra's own tmux server show truecolor: `terminal-features` gains `*:RGB` as a server
+   * option on this socket only, once. The global config, the default socket and other servers are never touched, and
+   * a failure only leaves the watch view in 256 colours.
+   */
+  private async enableTruecolor(): Promise<void> {
+    const current = await this.runner.run(["-L", this.socket, "show-options", "-s", "terminal-features"]).catch(() => undefined);
+    if (current === undefined || hasTruecolorFeature(current)) return;
+    await this.runner.run(["-L", this.socket, "set-option", "-s", "-a", "terminal-features", TRUECOLOR_FEATURE]).catch(() => undefined);
   }
 
   /** Stops only this host's own verified session. Returns false when there was nothing verified to stop. */

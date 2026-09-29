@@ -76,7 +76,8 @@ describe("headed Claude", () => {
     expect(command).toBe("claude"); expect(options.stdio).toBe("inherit"); expect(options.cwd).toBe(dir);
     expect(args).not.toContain("--print"); expect(args).not.toContain("--json-schema");
     expect(args.slice(args.indexOf("--model"), args.indexOf("--model") + 4)).toEqual(["--model", "claude-opus-5-5", "--effort", "medium"]);
-    expect(args[args.indexOf("--permission-mode") + 1]).toBe("acceptEdits");
+    expect(args[args.indexOf("--permission-mode") + 1]).toBe("auto");
+    expect(JSON.parse(args[args.indexOf("--settings") + 1]).sandbox).toMatchObject({ enabled: true, failIfUnavailable: true });
     const task = await taskFile();
     expect(args.slice(-2)).toEqual(["--", `Read .indra/${task.split("/").pop()} and do it.`]);
     expect(args.join(" ")).not.toContain("Build the widget");
