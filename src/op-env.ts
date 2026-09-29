@@ -44,10 +44,25 @@ export function childEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEn
   return Object.fromEntries(Object.entries(env).filter(([name]) => !CAPTURED_VARIABLE.test(name)));
 }
 
-/** The environment of an `op` invocation: the captured `OP_*` variables, with `serviceToken` taking precedence. */
+/**
+ * Turns off `op`'s 1Password desktop app integration. Without these, `op` 2.34.0 reads the app's settings file in
+ * `~/Library/Group Containers/2BUA8C4S2C.com.1password/…` at start-up even with a service account token, and macOS
+ * then asks whether the responsible process (e.g. ttyd) may "access data from other apps".
+ * `OP_BIOMETRIC_UNLOCK_ENABLED=false` is the documented switch for app integration; `OP_LOAD_DESKTOP_APP_SETTINGS=false`
+ * is what stops the settings read itself (verified with `op --debug` under a sandbox that denies the container).
+ * A service account never needs the app, so these apply only when one is in use. See docs/running-indra.md.
+ */
+export const NO_APP_INTEGRATION: Readonly<Record<string, string>> = { OP_BIOMETRIC_UNLOCK_ENABLED: "false", OP_LOAD_DESKTOP_APP_SETTINGS: "false" };
+
+/**
+ * The environment of an `op` invocation: the captured `OP_*` variables, with `serviceToken` taking precedence.
+ * With a service account (`serviceToken` or the owner's `OP_SERVICE_ACCOUNT_TOKEN`), desktop app integration is off;
+ * without one, `op` falls back to the desktop app exactly as before.
+ */
 export function opEnv(serviceToken?: string): NodeJS.ProcessEnv {
   const opVariables = Object.fromEntries(Object.entries(captured).filter(([name]) => OP_VARIABLE.test(name)));
-  return { ...childEnv(), ...opVariables, ...(serviceToken ? { OP_SERVICE_ACCOUNT_TOKEN: serviceToken } : {}) };
+  const serviceAccount = !!serviceToken || !!envServiceToken();
+  return { ...childEnv(), ...opVariables, ...(serviceToken ? { OP_SERVICE_ACCOUNT_TOKEN: serviceToken } : {}), ...(serviceAccount ? NO_APP_INTEGRATION : {}) };
 }
 
 /** Which service account an `op` invocation uses; without `serviceToken`, the owner's `OP_SERVICE_ACCOUNT_TOKEN` or the desktop. */

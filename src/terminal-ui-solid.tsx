@@ -189,6 +189,7 @@ export function TerminalApp(props: TerminalAppProps) {
       : "State loaded " + (displayText(props.model.refreshedAt) || "pending");
   });
   const notice = createMemo(() => { props.revision(); return props.model.notice; });
+  const launchWarning = createMemo(() => { props.revision(); return props.model.launchWarning; });
   const sync = createMemo(() => { props.revision(); return props.model.syncLine(); });
   const update = createMemo(() => { props.revision(); return props.model.updateLine(); });
 
@@ -353,6 +354,7 @@ export function TerminalApp(props: TerminalAppProps) {
       <box flexShrink={0} flexDirection="column">
         <Show when={hasPlanningLoops() && page() !== "teams"}><text fg={theme.muted}>PgUp/PgDn scroll sprint history</text></Show>
         <Show when={newGoalHint()}><text fg={theme.idle} wrapMode="word">{displayText(newGoalHint(), 240)}</text></Show>
+        <Show when={launchWarning()}><text fg={theme.error} wrapMode="word">{displayText(launchWarning())}</text></Show>
         <Show when={notice()}><text fg={theme.idle} wrapMode="word">{displayText(notice())}</text></Show>
         <Show when={input()}>
           <text fg={theme.heading} wrapMode="char">
@@ -396,9 +398,12 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
   reload?: (view: UiView) => Promise<number>;
   /** Reads the selected seat's live pane while its detail is visible. */
   paneTail?: PaneTailSource;
+  /** Returns a warning when Indra was launched under ttyd or its seats' tmux server cannot be verified. */
+  launchCheck?: () => Promise<string | undefined>;
 } = {}): Promise<number> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error("The terminal UI needs an interactive TTY. Use --once for redirected output.");
   const model = new TerminalUiModel(state, sessions, options.processes, options.goals, options.sync, options.update);
+  model.launchCheck = options.launchCheck;
   if (options.view) model.restore(options.view);
   await model.refresh();
   const renderer = await createCliRenderer({ exitOnCtrlC: false, targetFps: 30 });

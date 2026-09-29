@@ -115,6 +115,10 @@ export class TerminalUiModel {
   sessionResult: SessionReadResult = { connection: "disconnected", sessions: [], message: "Runtime session reader has not connected." };
   refreshedAt?: string;
   notice?: string;
+  /** How Indra was launched makes macOS blame ttyd or an unverified tmux server for privacy prompts (src/launch-check.ts). */
+  launchWarning?: string;
+  /** Returns the launch warning, if any; set by the UI runner. */
+  launchCheck?: () => Promise<string | undefined>;
   revision = 0;
   /** Live process, assignment and thread activity per seat ID; empty without a process supervisor. */
   live: Record<string, SeatLive> = {};
@@ -176,7 +180,15 @@ export class TerminalUiModel {
   async start(): Promise<void> {
     await this.syncState();
     await this.ensureProcesses();
+    await this.checkLaunch();
     await this.updateCode();
+  }
+
+  /** Sets the launch warning after hosting, when the seats' tmux server exists; other notices never clear it. */
+  async checkLaunch(): Promise<void> {
+    if (!this.launchCheck) return;
+    this.launchWarning = await this.launchCheck().catch(() => undefined);
+    this.bump();
   }
 
   /**
