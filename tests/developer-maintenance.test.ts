@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { maintainDeveloperSeat, retainSeatRecord, seatRecordName } from "../src/developer-maintenance.js";
 import type { SeatTaskRecord, Shell } from "../src/developer-seat.js";
+import { ImplementationRecorder, implementationWallTime } from "../src/implementation-facts.js";
 import { PlanningStore, type PlanningAssignment, type PlanningDocument } from "../src/planning.js";
 import { git, stateCheckout } from "./state-checkout.js";
 
@@ -47,6 +48,38 @@ async function fixture(status: PlanningAssignment["status"] = "failed") {
 }
 
 describe("developer maintenance", () => {
+  it("copies round and review evidence before retiring archives, and keeps attempt intervals after checkout removal", async () => {
+    const { store, record, maintain, archive } = await fixture("merged");
+    const facts = new ImplementationRecorder(store, "seat-002", "goal-abc", "outcome-1");
+    const attempt = await facts.prepareClaim("2026-01-01T00:00:00Z", "2026-01-01T00:00:01Z");
+    await facts.confirmClaim(attempt.id);
+    await facts.event(attempt.id, { kind: "review", verdict: "REQUEST_CHANGES", findings: ["file.ts:2: Bug"], prUrl: PR }, "review-one");
+    await facts.event(attempt.id, { kind: "review", verdict: "APPROVE", findings: [], prUrl: PR }, "review-two");
+    await facts.finish(attempt.id, "merged", "2026-01-01T00:00:11Z");
+    const evidence = { ...record, attemptId: attempt.id, findings: ["file.ts:2: Bug"], conflictRounds: 2, reviewFixRounds: 1 };
+    const archived = await archive(evidence);
+    await store.saveRuntime(NAME, { ...evidence, step: "done" });
+    await maintain();
+    await expect(lstat(archived)).rejects.toMatchObject({ code: "ENOENT" });
+    await rm(join(store.runtimeDir, `${NAME}.json`));
+    const recovered = await new ImplementationRecorder(store, "seat-002", "goal-abc", "outcome-1").read();
+    expect(implementationWallTime(recovered.attempts).wallTimeMs).toBe(10000);
+    expect(recovered.attempts[0].events.filter((event) => event.kind === "review").map((event) => event.verdict)).toEqual(["REQUEST_CHANGES", "APPROVE"]);
+    expect(recovered.attempts[0].events.some((event) => event.retained?.conflictRounds === 2 && event.retained?.reviewFixRounds === 1)).toBe(true);
+  });
+
+  it("never retires evidence when the independent facts ledger cannot be saved", async () => {
+    const { store, record, maintain, archive } = await fixture("merged");
+    const file = await archive();
+    const save = store.saveRuntime.bind(store);
+    vi.spyOn(store, "saveRuntime").mockImplementation(async (name, value) => {
+      if (name.startsWith("implementation-")) throw new Error("storage unavailable");
+      await save(name, value);
+    });
+    await maintain();
+    expect(JSON.parse(await readFile(file, "utf8"))).toEqual(record);
+  });
+
   it("reconciles a verified merged PR without a checkout, commits valid state, clears the note, and is idempotent", async () => {
     const { store, record, run, maintain, assignment, archive } = await fixture();
     const files = await Promise.all([archive(), archive(), archive({ ...record, sessions: [] })]);
