@@ -1,7 +1,9 @@
 import { execFile } from "node:child_process";
 import { createCliRenderer, type ScrollBoxRenderable } from "@opentui/core";
-import { render, useKeyboard, usePaste, useTerminalDimensions } from "@opentui/solid";
-import { createMemo, createSignal, For, Show, type Accessor } from "solid-js";
+import { render, useKeyboard, usePaste, useRenderer, useTerminalDimensions } from "@opentui/solid";
+import { createMemo, createSignal, For, onCleanup, Show, type Accessor } from "solid-js";
+import { createFrameClock, HeaderBar, IdleSplash } from "./hub-canvas.js";
+import { supportsTruecolor, TokenBurn } from "./hub-paint.js";
 import type { StateInventory } from "./state-domain.js";
 import { attachTmux } from "./tmux-attach.js";
 import { displayText, GOAL_INPUT_LIMIT, sessionSprint, TerminalUiModel, type SessionReadPort, type StateSyncPort, type UiApproval, type UiRetry, type UiRollback, type UiView, type UpdatePort } from "./terminal-ui.js";
@@ -20,7 +22,7 @@ import { isFinishedSprint } from "./finished-sprint.js";
 import { formatTokens, openableUrl, pipelineSteps, sumUsage, workTokens } from "./hub-format.js";
 import { GLYPH } from "./hub-style.js";
 import {
-  ActivitySection, assignmentLine, AttentionSection, CI_COLOR, clip, createTicker, elapsedText, Field, FieldText, HUB_STATE, isDeveloper, KeyLegend, LinkText, occupancy, pad,
+  ActivitySection, assignmentLine, AttentionSection, burnSparkline, CI_COLOR, clip, seatInfo, createTicker, elapsedText, Field, FieldText, HUB_STATE, isDeveloper, KeyLegend, LinkText, occupancy, pad,
   PipelineLabels, prText, processColor, SeatHeader, SeatRow, Section, seatState, SprintCard, SprintStrip, stateColor, stateCounts, theme, threadActivity, UsageSpans,
 } from "./hub-view.js";
 
@@ -69,6 +71,10 @@ export interface TerminalAppProps {
   /** The blink phase and the clock; tests pass their own, the app runs one shared ticker. */
   pulse?: Accessor<boolean>;
   now?: Accessor<number>;
+  /** The animation frame for the header drift and the splash shimmer; the app runs its own clock only while they move. */
+  frame?: Accessor<number>;
+  /** Forces truecolor on or off; by default it is detected, and without it colours snap to the 256-colour palette. */
+  truecolor?: boolean;
 }
 
 export function TerminalApp(props: TerminalAppProps) {
@@ -116,6 +122,17 @@ export function TerminalApp(props: TerminalAppProps) {
     return newGoalBlocked() && open.length ? "New goal blocked: " + open.map((goal) => goal.id).join(", ") + " still open." : newGoalBlocked();
   });
   const ceremonyKeys = createMemo(() => { props.revision(); return props.model.ceremonyKeys(); });
+  // Per-cell polish (hub-canvas.tsx): the header drifts while any sprint runs, and the splash shows on an idle team.
+  const sprintRunning = createMemo(() => { props.revision(); return props.model.sessionResult.sessions.some((session) => !isFinishedSprint(sessionSprint(session).loop)); });
+  const splash = createMemo(() => page() === "team" && !!team() && sprints().length === 0);
+  const frame = props.frame ?? createFrameClock(() => sprintRunning() || splash());
+  const renderer = useRenderer();
+  const [detected, setDetected] = createSignal(supportsTruecolor(renderer.capabilities));
+  const onCapabilities = () => setDetected(supportsTruecolor(renderer.capabilities));
+  renderer.on("capabilities", onCapabilities);
+  onCleanup(() => renderer.off("capabilities", onCapabilities));
+  const truecolor = () => props.truecolor ?? detected();
+  const burn = new TokenBurn();
   const overlay = createMemo(() => { props.revision(); return props.model.overlay; });
   /** Seats per state for the seats title: the owner sees at once how many run, wait, need them or failed. */
   const teamCounts = createMemo(() => { props.revision(); return stateCounts(props.model, team()?.seats ?? []); });
@@ -173,6 +190,7 @@ export function TerminalApp(props: TerminalAppProps) {
             <span style={{ fg: theme.dim }}>{running ? sep + "includes the run in progress" : ""}</span>
           </text>
         </Field>
+        <FieldText label="burn" value={burnSparkline(seatInfo(props.model, selected), selected.id, now(), burn) + "  last hour"} color={theme.dim} />
         <Show when={live && isDeveloper(selected)}>
           <FieldText label="assignment" value={assignmentLine(live!, 160)} />
           <Show when={held}>
@@ -227,16 +245,16 @@ export function TerminalApp(props: TerminalAppProps) {
   return (
     <box width="100%" height="100%" flexDirection="column" backgroundColor={theme.background} paddingLeft={1} paddingRight={1}>
       <box flexShrink={0} flexDirection="column">
-        <box flexDirection="row" height={1}>
+        <HeaderBar frame={frame} drifting={sprintRunning} truecolor={truecolor()}>
           <text flexGrow={1}>
-            <span style={{ fg: theme.accent }}>INDRA</span>
+            <span style={{ fg: theme.accent }}>{" INDRA"}</span>
             <span style={{ fg: theme.text }}>{"  " + GLYPH.crumb + "  " + (page() === "teams" ? "Teams" : displayText(team()?.displayName, 30)) + (page() === "seat" && seat() ? "  " + GLYPH.crumb + "  " + displayText(seat()?.displayName, 30) : "")}</span>
           </text>
           <text flexShrink={0}>
             <span style={{ fg: runtime().color }}>{GLYPH.dot + " "}</span>
-            <span style={{ fg: theme.dim }}>{runtime().text}</span>
+            <span style={{ fg: theme.dim }}>{runtime().text + " "}</span>
           </text>
-        </box>
+        </HeaderBar>
         <For each={statusRows()}>{(row) => <text fg={row.ok ? theme.dim : theme.bad}>{row.text}</text>}</For>
       </box>
 
@@ -266,14 +284,17 @@ export function TerminalApp(props: TerminalAppProps) {
       <Show when={page() === "team" && !!team()}>
         <scrollbox id="team-scroll" ref={teamScroll} flexGrow={1} scrollY contentOptions={scrollContent}>
           <AttentionSection model={props.model} seats={team()?.seats ?? []} revision={props.revision} pulse={pulse} width={contentWidth} />
-          <For each={sprints()}>{(sprint) => <SprintCard model={props.model} sprint={sprint} team={team()} session={sessionOf(sprint.id)} pulse={pulse} now={now} width={contentWidth} open={open} />}</For>
+          <For each={sprints()}>{(sprint) => <SprintCard model={props.model} sprint={sprint} team={team()} session={sessionOf(sprint.id)} pulse={pulse} now={now} width={contentWidth} open={open} truecolor={truecolor()} />}</For>
           <Section title={"SEATS " + GLYPH.separator + " " + displayText(team()?.displayName ?? "Team", 30) + " " + GLYPH.separator + " " + (team()?.seats.length ?? 0) + (teamCounts() ? "   " + teamCounts() : "")}>
             <Show when={team()?.seats.length} fallback={<text fg={theme.wait}>No seats are recorded for this team.</text>}>
               <SeatHeader width={contentWidth} />
-              <For each={team()?.seats ?? []}>{(item) => <SeatRow model={props.model} seat={item} revision={props.revision} pulse={pulse} now={now} width={contentWidth} open={open} />}</For>
+              <For each={team()?.seats ?? []}>{(item) => <SeatRow model={props.model} seat={item} revision={props.revision} pulse={pulse} now={now} width={contentWidth} open={open} burn={burn} truecolor={truecolor()} />}</For>
             </Show>
           </Section>
           <ActivitySection model={props.model} seats={team()?.seats ?? []} revision={props.revision} now={now} width={contentWidth} />
+          <Show when={splash()}>
+            <IdleSplash frame={frame} width={contentWidth} truecolor={truecolor()} background={theme.background} caption="No sprint open" captionColor={theme.dim} />
+          </Show>
         </scrollbox>
       </Show>
 

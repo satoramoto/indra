@@ -330,8 +330,9 @@ export class TerminalUiModel {
   /** One line for the screen: the running version and the update state; undefined without an updater. */
   updateLine(): { text: string; ok: boolean } | undefined {
     if (!this.update) return undefined;
-    const version = "Indra " + (this.update.running?.sha.slice(0, 7) || "unknown build");
+    let version = "Indra " + (this.update.running?.sha.slice(0, 7) || "unknown build");
     const last = this.updateResult;
+    if (last?.following) version += " · Following " + last.following;
     const waiting = this.teams.flatMap((team) => team.seats).filter((seat) => this.live[seat.id]?.updatePending).map((seat) => seat.displayName);
     const rolled = this.rolledBack ? " · rolled back to " + shortSha(this.rolledBack.sha) + " from " + shortSha(this.rolledBack.fromSha) : "";
     const restarts = waiting.length ? " · " + waiting.join(", ") + " restart when idle" : "";

@@ -19,6 +19,7 @@ import { normalizeUsage } from "../src/runtime-facts.js";
 import { allGlyphs, faded, GLYPH, PALETTE, PULSE_MS } from "../src/hub-style.js";
 import { HelpOverlay } from "../src/help-overlay.js";
 import { assignmentFacts, seatHarness } from "../src/hub-facts.js";
+import { ansi256Rgb, paint, STAGE_COLOR } from "../src/hub-paint.js";
 import type { ImplementationFacts } from "../src/implementation-facts.js";
 import type { SeatTaskRecord } from "../src/developer-seat.js";
 import type { RuntimeRecord } from "../src/planning.js";
@@ -142,7 +143,8 @@ describe("recorded facts", () => {
       { id: "a2", cause: "retry", claimedAt: "2026-01-01T01:00:00Z", events: [session("2", { inputTokens: 200, cachedInputTokens: 150, outputTokens: 20 }), { id: "c2", at: "y", kind: "ci", result: "started" }] },
     ] };
     const record = { goalId: "g", outcomeId: "o", step: "ci", branch: "b", worktree: "w", reviewFixRounds: 1, sessions: [] } as SeatTaskRecord;
-    expect(assignmentFacts(record, ledger)).toEqual({ step: "ci", fixRounds: 1, ci: "pending", usage: { inputTokens: 300, cachedInputTokens: 150, outputTokens: 30 }, sessions: 2, engine: "claude", claimedAt: "2026-01-01T01:00:00Z" });
+    expect(assignmentFacts(record, ledger)).toEqual({ step: "ci", fixRounds: 1, ci: "pending", usage: { inputTokens: 300, cachedInputTokens: 150, outputTokens: 30 }, sessions: 2, engine: "claude", claimedAt: "2026-01-01T01:00:00Z",
+      burn: [{ at: "2026-01-01T00:10:00Z", tokens: 110 }, { at: "2026-01-01T00:10:00Z", tokens: 220 }] });
     ledger.attempts[1].events.push({ id: "m", at: "z", kind: "merge", result: "passed" });
     ledger.attempts[1].terminal = { status: "merged", at: "2026-01-01T02:00:00Z" };
     expect(assignmentFacts(record, ledger)).toMatchObject({ ci: "passed", endedAt: "2026-01-01T02:00:00Z" });
@@ -198,7 +200,8 @@ const live: Record<string, SeatLive> = {
   "seat-001": { process: "running", harness: seatHarness("claude", ["Team Lead"]), attach: { kind: "tmux", target: "indra:chick" } },
   "seat-002": { process: "running", harness: seatHarness("codex", ["Developer"]), activity: { message: "Opened PR 103; review requested", at: ago(3) },
     assignment: { title: titles[0], status: "in-review", prUrl: "https://github.com/satoramoto/indra/pull/103", goalId: "goal-hub", outcomeId: "o1",
-      facts: { step: "ci", fixRounds: 0, ci: "pending", usage: usage(1.25), sessions: 3, sessionIds: ["s-george"], engine: "codex", claimedAt: ago(47) } } },
+      facts: { step: "ci", fixRounds: 0, ci: "pending", usage: usage(1.25), sessions: 3, sessionIds: ["s-george"], engine: "codex", claimedAt: ago(47),
+        burn: [{ at: ago(90), tokens: 250_000 }, { at: ago(50), tokens: 400_000 }, { at: ago(20), tokens: 850_000 }] } } },
   "seat-003": { process: "running", harness: seatHarness("claude", ["Developer"]), activity: { message: "Building the pipeline row", at: ago(1) },
     assignment: { title: titles[1], status: "running", goalId: "goal-hub", outcomeId: "o2", facts: { step: "build", usage: usage(0.4), sessions: 1, sessionIds: ["s-aaron"], claimedAt: ago(12) } } },
   "seat-004": { process: "no credential", problem: "The 1Password service account token is missing; run npm start again.", harness: seatHarness("codex", ["Developer"]) },
@@ -223,11 +226,11 @@ const hubSession = (stage: CeremonyStage = "implement"): TerminalSession => ({
   },
 });
 
-async function hubModel(session = hubSession()) {
+async function hubModel(session: TerminalSession | null = hubSession()) {
   const processes: SeatProcessPort = { ensureAll: async () => [], read: async () => live, stop: async () => {}, restart: async () => {}, retry: async () => "" };
   // The header's sync and update lines are on, as in the real app: 42 rows must hold them too.
   const stamp = { id: "build-1", sha: "82e2001aa", builtAt: ago(60) };
-  const model = new TerminalUiModel(new StateInventory({ read: async () => snapshot }), { readSessions: async () => ({ connection: "connected", sessions: [session] }) }, processes,
+  const model = new TerminalUiModel(new StateInventory({ read: async () => snapshot }), { readSessions: async () => ({ connection: "connected", sessions: session ? [session] : [] }) }, processes,
     { start: vi.fn(), propose: vi.fn(), approve: vi.fn(), sprint: vi.fn() }, { sync: vi.fn() },
     { running: stamp, canReload: true, check: vi.fn(), current: async () => stamp });
   await model.refresh();
@@ -288,7 +291,7 @@ describe("the hub on the owner's screen", () => {
       // Nothing to scroll: the content is no taller than the screen gives it.
       if (scroll) expect(scroll.scrollHeight, frame).toBeLessThanOrEqual(scroll.height);
       const expected: Record<string, string[]> = {
-        team: [...names, "NEEDS YOU · 2", "The 1Password service account token is missing; run npm start again.", "Keep the hub inside a 96 by 42 terminal · failed · T retry",
+        team: [...names, "NEEDS YOU · 2", "progress " + "▀".repeat(11) + " ".repeat(13) + "  45%", "The 1Password service account token is missing; run npm start again.", "Keep the hub inside a 96 by 42 terminal · failed · T retry",
           "SPRINT goal-hub", "planning → proposal → [implement] → release → retro", "open · 1/4 merged", "work 1.5M · out 250k · cache 5M · 3h20m since planning",
           "⇗ goal thread", "⇗ proposal post", "plan Plan approved.", "integration not opened", "release Waiting for implementation to finish.",
           "⎇ #103 ●", "⎇ #98 ●", "⎇ #99 ●", "in review", "building", "merged", "failed", "George Duke", "Aaron Magner",
@@ -297,6 +300,8 @@ describe("the hub on the owner's screen", () => {
           "300k 50k 1M 250k 47m ⎇ #103 ●", "12m", "LATEST", "Opened PR 103; review requested", "context compacted 1m ago · Building the pipeline row", "↑↓ seat · Enter details"],
         "developer-seat": ["LIVE PANE · George Duke", "SEAT George Duke", "George Duke @georgeduke · Developer · running", "process running (seat runner)",
           "harness Codex · model gpt-6-sol · effort medium", "tokens work 300k · out 50k · cache 1M · ctx 250k/300k · includes the run in progress",
+          // George Duke's last hour: 400k at 50 minutes ago and 850k at 20 (the 90-minute session is outside the window).
+          "burn ⢠⠀⢸⠀ last hour",
           `assignment ${titles[0]} · in-review`, "pr ⎇ satoramoto/indra#103 · ● CI pending · 3 sessions · 47m on this task",
           "steps ■ build → ■ review → ─ fix skipped → ◧ ci → □ merge", "latest Opened PR 103; review requested",
           "SPRINT goal-hub", "planning → proposal → [implement] → release → retro", "tickets 1/4 tickets merged", "a watch · D drive (Ctrl-] back) · t transcript"],
@@ -439,6 +444,125 @@ describe("the hub on the owner's screen", () => {
         await setup.mockMouse.click(node.x + 1, node.y);
         expect(opened.at(-1), label).toBe(url);
       }
+    } finally { setup.renderer.destroy(); }
+  });
+});
+
+describe("per-cell polish", () => {
+  const PALETTE = new Set(Array.from({ length: 240 }, (_, index) => ansi256Rgb(index + 16).join(",")));
+  /** Every cell's colours on screen row `y`, from the captured spans. */
+  const rowColors = (setup: Awaited<ReturnType<typeof testRender>>, y: number) => setup.captureSpans().lines[y].spans
+    .flatMap((span) => Array.from({ length: Array.from(span.text).length }, () => ({ fg: span.fg.toInts().slice(0, 3).join(","), bg: span.bg.toInts().slice(0, 3).join(",") })));
+
+  async function animate(model: TerminalUiModel, truecolor: boolean) {
+    const [frame, setFrame] = createSignal(0);
+    const setup = await testRender(() => <TerminalApp model={model} revision={() => model.revision} onKey={() => {}} pulse={() => false} now={() => NOW} frame={frame} truecolor={truecolor} />, { width: HUB_GRID.columns, height: HUB_GRID.rows });
+    await setup.renderOnce();
+    await setup.renderOnce();
+    return { setup, setFrame };
+  }
+
+  it.each([
+    ["a running sprint", () => hubModel()],
+    ["the idle splash", () => hubModel(null)],
+  ])("draws 60 animation frames over %s without creating a renderable", async (_name, make) => {
+    const model = await make();
+    model.restore({ page: "team", teamId: "team-001", seatId: "seat-002" });
+    const { setup, setFrame } = await animate(model, true);
+    try {
+      const nodes = walk(setup.renderer.root);
+      const reads = vi.spyOn(model, "sessionsFor");
+      const screens = new Set<string>();
+      for (let tick = 1; tick <= 60; tick++) {
+        setFrame(tick);
+        await setup.renderOnce();
+        screens.add(JSON.stringify(setup.captureSpans().lines.map((line) => line.spans.map((span) => [span.text, span.fg.toInts(), span.bg.toInts()]))));
+      }
+      expect(walk(setup.renderer.root)).toEqual(nodes);
+      expect(reads).not.toHaveBeenCalled();
+      // The frames really moved something: the header drift or the splash shimmer.
+      expect(screens.size).toBeGreaterThan(1);
+    } finally { setup.renderer.destroy(); }
+  });
+
+  it("drifts the header gradient only while a sprint is running", async () => {
+    for (const [session, drifts] of [[hubSession(), true], [null, false]] as const) {
+      const model = await hubModel(session);
+      model.restore({ page: "team", teamId: "team-001" });
+      const { setup, setFrame } = await animate(model, true);
+      try {
+        const before = rowColors(setup, 0).map((cell) => cell.bg);
+        // Behind the title the bar is a gradient, not one flat colour.
+        expect(new Set(before).size).toBeGreaterThan(5);
+        setFrame(60);
+        await setup.renderOnce();
+        expect(rowColors(setup, 0).map((cell) => cell.bg).join(" ") !== before.join(" ")).toBe(drifts);
+        // The title still reads on top of it.
+        expect(setup.captureCharFrame().split("\n")[0]).toContain("INDRA  ›  Yahaha");
+      } finally { setup.renderer.destroy(); }
+    }
+  });
+
+  it("fills the progress bar in the current stage's colour and snaps every drawn colour to 256 without truecolor", async () => {
+    for (const truecolor of [true, false]) {
+      const model = await hubModel();
+      model.restore({ page: "team", teamId: "team-001", seatId: "seat-002" });
+      const { setup } = await animate(model, truecolor);
+      try {
+        const lines = setup.captureCharFrame().split("\n");
+        const y = lines.findIndex((line) => line.includes(" progress "));
+        const x = Array.from(lines[y]).indexOf("▀");
+        const cells = rowColors(setup, y);
+        expect(cells[x].bg).toBe(paint(STAGE_COLOR.implement, truecolor).join(","));
+        // The bar spans the row inside the page's one-column side padding.
+        const header = rowColors(setup, 0).slice(1, -1).map((cell) => cell.bg);
+        const drawn = [...header, ...cells.slice(x, x + 24).flatMap((cell) => [cell.fg, cell.bg])];
+        if (truecolor) expect(drawn.some((color) => !PALETTE.has(color))).toBe(true);
+        else expect(drawn.filter((color) => !PALETTE.has(color))).toEqual([]);
+      } finally { setup.renderer.destroy(); }
+    }
+  });
+
+  it("never paints the progress bar outside its scroll box on a short screen", async () => {
+    const model = await hubModel();
+    model.restore({ page: "team", teamId: "team-001", seatId: "seat-002" });
+    const setup = await testRender(() => <TerminalApp model={model} revision={() => model.revision} onKey={() => {}} pulse={() => false} now={() => NOW} frame={() => 0} truecolor />, { width: 96, height: 16 });
+    try {
+      await setup.renderOnce();
+      const scroll = setup.renderer.root.findDescendantById("team-scroll") as ScrollBoxRenderable;
+      for (let top = 0; top < scroll.scrollHeight; top++) {
+        scroll.scrollTo(top);
+        await setup.renderOnce();
+        const lines = setup.captureCharFrame().split("\n");
+        const outside = lines.filter((_, y) => y < scroll.y || y >= scroll.y + scroll.height);
+        expect(outside.filter((line) => line.includes("▀") || line.includes("▄")), "scrolled to " + top).toEqual([]);
+        expect(lines[0]).toContain("INDRA");
+      }
+    } finally { setup.renderer.destroy(); }
+  });
+
+  it("shows the INDRA wordmark on a team with no open sprint, inside 96×42", async () => {
+    const model = await hubModel(null);
+    model.restore({ page: "team", teamId: "team-001", seatId: "seat-002" });
+    const { setup } = await animate(model, true);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      await setup.renderOnce();
+      const frame = setup.captureCharFrame();
+      await keep("idle-splash", frame);
+      // The seats table keeps its full width: the splash never pushes a scroll bar in.
+      const lines = frame.split("\n");
+      const header = lines.find((line) => line.includes(" TASK ")) ?? "";
+      expect(header.trimEnd().endsWith("PR    CI"), frame).toBe(true);
+      // One column of page padding, then the table across the whole content width.
+      expect(header.trimEnd().length).toBe(1 + HUB_GRID.columns - 3);
+      // Centred in the content width: the page's side padding and the column kept free for the scroll bar.
+      expect(lines.find((line) => line.includes("No sprint open"))?.indexOf("No sprint open")).toBe(1 + Math.floor((HUB_GRID.columns - 3 - 14) / 2));
+      expect(frame).toContain("No sprint open");
+      expect(frame).toContain("█");
+      expect(frame.split("\n").length - 1).toBe(HUB_GRID.rows);
+      const scroll = setup.renderer.root.findDescendantById("team-scroll") as ScrollBoxRenderable;
+      expect(scroll.scrollHeight, frame).toBeLessThanOrEqual(scroll.height);
     } finally { setup.renderer.destroy(); }
   });
 });

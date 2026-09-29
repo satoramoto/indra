@@ -12,6 +12,12 @@ import {
 import { faded, GLYPH, PALETTE, PULSE_MS } from "./hub-style.js";
 import { HARNESS_CONTEXT_TOKEN_LIMIT } from "./harness-home.js";
 import type { TokenUsage } from "./runtime-facts.js";
+import { burnBuckets, paintHex, sparkline, sprintProgress, STAGE_COLOR, type TokenBurn } from "./hub-paint.js";
+import { ProgressBar } from "./hub-canvas.js";
+import { totalTokens } from "./hub-format.js";
+
+/** Burn is a secondary detail: dim, like the other secondary figures. */
+const SPARK_COLOR = PALETTE.dim;
 
 /**
  * The hub's building blocks. Layout target: a 720×720 logical-pixel window (a vertical ultrawide at half height) with a
@@ -223,6 +229,8 @@ export interface SeatInfo {
   usage?: TokenUsage; claimedAt?: string; endedAt?: string;
   /** The live session's context window and its newest compaction, while a headed run is going. */
   context?: number; compactedAt?: string;
+  /** Recorded sessions' tokens by finish time, for the burn sparkline; live rises fill in where there are none. */
+  burn: { at: number; tokens: number }[];
   /** The seats table's task column. */
   task: { text: string; color: string };
   steps?: PipelineStep[]; prUrl?: string; ci?: CiState;
@@ -263,6 +271,7 @@ export function seatInfo(model: TerminalUiModel, seat: StateSeat): SeatInfo {
     ...(running?.compactedAt ? { compactedAt: running.compactedAt } : {}),
     ...(facts?.claimedAt ? { claimedAt: facts.claimedAt } : {}),
     ...(facts?.endedAt ? { endedAt: facts.endedAt } : {}),
+    burn: (facts?.burn ?? []).map((point) => ({ at: Date.parse(point.at), tokens: point.tokens })),
     ...(held ? { steps: pipelineSteps({ status: held.status, step: facts?.step, fixRounds: facts?.fixRounds }), prUrl: held.prUrl, ci: facts?.ci } : {}),
     ...(attention ? { attention } : {}),
     latest: developer ? threadActivity(live, 200) : activityLine(model, seat, 200),
@@ -292,10 +301,12 @@ export function UsageSpans(props: { usage?: TokenUsage; context?: number; compac
  * time, PR and CI. At 96 columns the role moves to the seat screen; narrower screens drop the model, then the time.
  * The task takes what is left.
  */
-export interface SeatColumns { task: number; role: boolean; model: boolean; time: boolean; detail: boolean }
-export const SEAT_WIDTH = { name: 13, role: 4, steps: 5, model: 11, work: 5, out: 5, cache: 5, ctx: 4, time: 5, pr: 8 } as const;
+export interface SeatColumns { task: number; role: boolean; model: boolean; time: boolean; detail: boolean; burn: boolean }
+export const SEAT_WIDTH = { name: 13, role: 4, steps: 5, model: 11, work: 5, out: 5, cache: 5, ctx: 4, time: 5, burn: 4, pr: 8 } as const;
 export function seatColumns(width: number): SeatColumns {
   const role = width >= 104;
+  // The burn sparkline needs room the 96-column grid does not have; the seat screen always shows it.
+  const burn = width >= 100;
   const model = width >= 88;
   // Below 72 columns only fresh work stays; output, cache and the window move to the seat screen.
   const detail = width >= 72;
@@ -303,8 +314,8 @@ export function seatColumns(width: number): SeatColumns {
   const w = SEAT_WIDTH;
   // Gutter (4), then each column and the space after it; PR and CI share the last one.
   const fixed = 4 + (w.name + 1) + (role ? w.role + 1 : 0) + 1 + (w.steps + 1) + (model ? w.model + 1 : 0)
-    + (w.work + 1) + (detail ? w.out + 1 + w.cache + 1 + w.ctx + 1 : 0) + (time ? w.time + 1 : 0) + w.pr;
-  return { role, model, time, detail, task: Math.max(8, width - fixed) };
+    + (w.work + 1) + (detail ? w.out + 1 + w.cache + 1 + w.ctx + 1 : 0) + (time ? w.time + 1 : 0) + (burn ? w.burn + 1 : 0) + w.pr;
+  return { role, model, time, detail, burn, task: Math.max(8, width - fixed) };
 }
 
 /** The dim header row over the seats table. */
@@ -315,14 +326,25 @@ export function SeatHeader(props: { width: Accessor<number> }) {
     <text fg={theme.dim} flexShrink={0} wrapMode="none">
       {"    " + pad("SEAT", w.name) + " " + (cols().role ? pad("ROLE", w.role) + " " : "") + pad("TASK", cols().task) + " " + pad("STEPS", w.steps) + " "
         + (cols().model ? pad("MODEL", w.model) + " " : "") + padStart("WORK", w.work) + " "
-        + (cols().detail ? padStart("OUT", w.out) + " " + padStart("CACHE", w.cache) + " " + padStart("CTX", w.ctx) + " " : "") + (cols().time ? padStart("TIME", w.time) + " " : "") + pad("PR", w.pr - 2) + "CI"}
+        + (cols().detail ? padStart("OUT", w.out) + " " + padStart("CACHE", w.cache) + " " + padStart("CTX", w.ctx) + " " : "") + (cols().time ? padStart("TIME", w.time) + " " : "") + (cols().burn ? pad("BURN", w.burn) + " " : "") + pad("PR", w.pr - 2) + "CI"}
     </text>
   );
 }
 
-/** One aligned row per seat. */
-export function SeatRow(props: { model: TerminalUiModel; seat: StateSeat; revision: Accessor<number>; pulse: Accessor<boolean>; now: Accessor<number>; width: Accessor<number>; open?: (url: string) => void }) {
+/**
+ * The last hour of a seat's token burn in eight 7.5-minute buckets, four braille cells: recorded sessions from before
+ * the hub opened, then the rises it has seen in the seat's running total, the headed run in progress included.
+ */
+export function burnSparkline(info: SeatInfo, key: string, now: number, burn?: TokenBurn): string {
+  burn?.observe(key, totalTokens(info.usage), now);
+  return sparkline(burnBuckets(burn ? burn.series(key, info.burn) : info.burn, now, 8));
+}
+
+/** One aligned row per seat. From 100 columns it also shows the last hour's burn. */
+export function SeatRow(props: { model: TerminalUiModel; seat: StateSeat; revision: Accessor<number>; pulse: Accessor<boolean>; now: Accessor<number>; width: Accessor<number>; open?: (url: string) => void; burn?: TokenBurn; truecolor?: boolean }) {
   const info = createMemo(() => { props.revision(); return seatInfo(props.model, props.seat); });
+  // Observed on every look, shown when the table has room for it.
+  const spark = createMemo(() => burnSparkline(info(), props.seat.id, props.now(), props.burn));
   const selected = createMemo(() => { props.revision(); return props.model.seatId === props.seat.id; });
   const cols = () => seatColumns(props.width());
   const w = SEAT_WIDTH;
@@ -341,6 +363,7 @@ export function SeatRow(props: { model: TerminalUiModel; seat: StateSeat; revisi
         <span style={{ fg: theme.dim }}>{cols().detail ? padStart(formatTokens(info().usage?.cachedInputTokens), w.cache) + " " : ""}</span>
         <span style={{ fg: contextColor(info().context) }}>{cols().detail ? padStart(formatTokens(info().context), w.ctx) + " " : ""}</span>
         <span style={{ fg: theme.dim }}>{cols().time ? padStart(elapsedText(info(), props.now()), w.time) + " " : ""}</span>
+        <span style={{ fg: paintHex(SPARK_COLOR, props.truecolor ?? true) }}>{cols().burn ? pad(spark(), w.burn) + " " : ""}</span>
       </text>
       <Show when={info().prUrl}><LinkText url={info().prUrl} label={pr()} open={props.open} /></Show>
       <text flexShrink={0} wrapMode="none">
@@ -496,7 +519,7 @@ const TICKET_WIDTH = { steps: 5, status: 12, seat: 13, pr: 8, work: 5 } as const
 const ticketTitleWidth = (width: number) => { const w = TICKET_WIDTH; return Math.max(10, width - 4 - (w.steps + 1) - 1 - (w.status + 1) - (w.seat + 1) - (w.pr + 1) - w.work); };
 
 /** The sprint section on the team screen: the whole ceremony, one labelled row per part and one row per ticket. */
-export function SprintCard(props: { sprint: TerminalSprint; model: TerminalUiModel; team?: StateTeam; session?: TerminalSession; pulse: Accessor<boolean>; now: Accessor<number>; width: Accessor<number>; open?: (url: string) => void }) {
+export function SprintCard(props: { sprint: TerminalSprint; model: TerminalUiModel; team?: StateTeam; session?: TerminalSession; pulse: Accessor<boolean>; now: Accessor<number>; width: Accessor<number>; open?: (url: string) => void; truecolor?: boolean }) {
   const loop = () => props.sprint.loop;
   const stage = () => loop().ceremony?.stage;
   const closedAt = () => loop().ceremony?.closure?.closedAt ?? loop().closedAt;
@@ -505,6 +528,8 @@ export function SprintCard(props: { sprint: TerminalSprint; model: TerminalUiMod
   const merged = () => loop().tickets.filter((ticket) => ticket.status === "merged").length;
   const seatName = (seatId: string) => displayText(props.team?.seats.find((seat) => seat.id === seatId)?.displayName ?? seatId, 30);
   const integrationUrl = () => loop().integration?.prUrl ?? loop().release?.prUrl;
+  const progress = () => sprintProgress({ stage: stage(), closed: !!closedAt(), merged: merged(), tickets: loop().tickets.length });
+  const fill = () => closedAt() ? STAGE_COLOR.closed : STAGE_COLOR[stage() ?? "planning"];
   const needsPlan = () => props.sprint.planningStage === "awaiting-review" && stage() === "proposal";
   const needsMerge = () => loop().integration?.status === "pr-open";
   const needsRetro = () => !closedAt() && !!loop().retro?.prUrl;
@@ -515,6 +540,10 @@ export function SprintCard(props: { sprint: TerminalSprint; model: TerminalUiMod
   return (
     <Section title={"SPRINT " + displayText(props.sprint.id, 40)}>
       <StagesField loop={loop()} tail={merged() + "/" + loop().tickets.length + " merged"} />
+      <Field label="progress">
+        <ProgressBar fraction={progress} color={fill} width={24} truecolor={props.truecolor ?? true} background={theme.background} />
+        <text fg={theme.dim} flexShrink={0} wrapMode="none">{String(Math.round(progress() * 100)).padStart(4) + "%"}</text>
+      </Field>
       <Field label="tokens">
         <text flexShrink={1} flexGrow={1}>
           <UsageSpans usage={loop().usage} now={props.now} />
