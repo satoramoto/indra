@@ -3,7 +3,7 @@ import type { ScrollBoxRenderable } from "@opentui/core";
 import { createSignal } from "solid-js";
 import { describe, expect, it, vi } from "vitest";
 import { StateInventory, type StateSnapshot } from "../src/state-domain.js";
-import { GOAL_INPUT_LIMIT, TerminalUiModel, type SessionReadResult, type StateSyncPort, type TerminalSession, type UpdatePort } from "../src/terminal-ui.js";
+import { GOAL_INPUT_LIMIT, TerminalUiModel, sessionSprint, type SessionReadResult, type StateSyncPort, type TerminalSession, type UpdatePort } from "../src/terminal-ui.js";
 import type { UpdateResult } from "../src/self-update.js";
 import type { StateSyncResult } from "../src/state-commit.js";
 import { TerminalApp } from "../src/terminal-ui-solid.js";
@@ -1002,7 +1002,7 @@ describe("persisted ceremony and allowed actions", () => {
     expect(fixture.goals.approve).not.toHaveBeenCalled();
   });
 
-  it("blocks new goals for open and legacy goals after restart, retaining closed history", async () => {
+  it("blocks new goals for open and legacy goals after restart, hiding closed goals from the sprint list", async () => {
     const closed = closeSession(ceremonySession("retro", "goal-closed"));
     const open = ceremonySession("retro", "goal-open");
     const fixture = await ceremonyHarness([closed, open]);
@@ -1013,7 +1013,9 @@ describe("persisted ceremony and allowed actions", () => {
       expect(model.input).toBeUndefined();
       expect(model.notice).toContain("goal-open (retro)");
       expect(model.notice).not.toContain("goal-closed");
-      expect(model.sprintsForTeam()).toHaveLength(2);
+      // A closed goal is finished (#59): it leaves the sprint list but stays on its seat's records.
+      expect(model.sprintsForTeam().map((sprint) => sprint.id)).toEqual(["goal-open"]);
+      expect(model.sessionsFor("seat-001").map((session) => session.id)).toEqual(["goal-closed", "goal-open"]);
     }
     fixture.sessions([closed]); await fixture.model.refresh();
     fixture.model.key("n"); expect(fixture.model.input).toEqual({ value: "" });
@@ -1163,7 +1165,7 @@ describe("persisted ceremony and allowed actions", () => {
     } finally { setup.renderer.destroy(); }
   });
 
-  it("names the retro PR in M's confirmation and retains publication and release evidence after closure", async () => {
+  it("names the retro PR in M's confirmation, then drops the closed sprint from the list while its records keep the evidence", async () => {
     const retro = ceremonySession("retro"); retro.loop!.retro!.prUrl = "https://github.com/example/indra/pull/201";
     const fixture = await ceremonyHarness([retro]);
     const closed = closeSession(retro);
@@ -1184,9 +1186,16 @@ describe("persisted ceremony and allowed actions", () => {
       expect(fixture.goals.sprint).toHaveBeenCalledExactlyOnceWith("merge", "goal-ceremony");
       expect(fixture.model.newGoalBlocked()).toBeUndefined();
       setRevision(fixture.model.revision); await setup.renderOnce();
+      // Closed means finished (#59): the sprint card leaves the list.
+      expect(fixture.model.sprintsForTeam().map((sprint) => sprint.id)).not.toContain("goal-ceremony");
       const frames = await scrollFrames(setup, "detail-scroll");
-      for (const text of ["Current stage: retro", "Closure: closed", "completed sprint history", "Published 2026-01-06T00:00:00Z", "docs/retros/goal-ceremony.md", "Release confirmed running", retro.loop!.retro!.prUrl!]) expect(visibleIn(frames, text), text).toBe(true);
-      expect(visibleIn(frames, "Release waiting:")).toBe(false);
+      expect(visibleIn(frames, "Current stage: retro")).toBe(false);
+      // The seat's record still carries the published retro and the recorded release.
+      const [record] = fixture.model.sessionsFor("seat-001");
+      const loop = sessionSprint(record!).loop;
+      expect(loop.closedAt).toBe("2026-01-06T00:00:00Z");
+      expect(loop.ceremony?.closure?.evidence).toMatchObject({ path: "docs/retros/goal-ceremony.md", prUrl: retro.loop!.retro!.prUrl, publishedAt: "2026-01-06T00:00:00Z" });
+      expect(loop.release).toEqual(retro.loop!.release);
       expect(fixture.model.ceremonyKeys()).not.toContain("M merge retro");
     } finally { setup.renderer.destroy(); }
   });
