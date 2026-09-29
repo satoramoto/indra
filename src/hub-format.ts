@@ -1,14 +1,14 @@
 import type { TokenUsage } from "./runtime-facts.js";
 
 /**
- * Pure presentation helpers for the terminal UI hub: pipeline icons, token and time formatting, and link building.
+ * Pure presentation helpers for the terminal UI hub: pipeline states, token and time formatting, and link building.
+ * Glyphs and colours live in `hub-style.ts`.
  * Nothing here reads files or the network; the inputs are Indra's recorded facts.
  */
 
 /** An assignment's pipeline, in order. */
 export const PIPELINE = ["build", "review", "fix", "ci", "merge"] as const;
 export type PipelineStage = typeof PIPELINE[number];
-export const PIPELINE_ICON: Record<PipelineStage, string> = { build: "🔨", review: "🔍", fix: "🩹", ci: "🧪", merge: "🔀" };
 /** `skipped` is a fix round that was never needed; `failed` is where a failed assignment stopped. */
 export type StageState = "done" | "active" | "pending" | "skipped" | "failed";
 export interface PipelineStep { stage: PipelineStage; state: StageState }
@@ -40,7 +40,6 @@ export function pipelineSteps(input: { status: string; step?: string; fixRounds?
 
 /** CI as recorded in the implementation ledger: the newest CI event of the newest attempt. */
 export type CiState = "passed" | "pending" | "failed";
-export const CI_DOT: Record<CiState, string> = { passed: "🟢", pending: "🟡", failed: "🔴" };
 
 /** 950 · 12.3k · 1.25M · 3.1B; unknown counters show as an en dash. */
 export function formatTokens(value: number | undefined): string {
