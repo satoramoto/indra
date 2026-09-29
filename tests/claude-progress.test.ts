@@ -60,6 +60,28 @@ describe("claudeProgress", () => {
     ])).toEqual(["12:34 ! rate_limit", "12:34 ! run failed: error_max_turns (9 turns)"]);
   });
 
+  it("redacts a thinking secret that straddles the hint cap", () => {
+    const secret = "ghp_" + "b".repeat(36);
+    const [printed] = run([`{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"${"x".repeat(70)} ${secret}"}]}}\n`]);
+    expect(printed).not.toContain("ghp_");
+    expect(printed).not.toContain("bbbb");
+    expect(printed.startsWith("12:34 ~ ")).toBe(true);
+    expect(printed.length).toBeLessThanOrEqual("12:34 ~ ".length + 80);
+  });
+
+  it("redacts a Bash command secret that straddles the line cap", () => {
+    const secret = "ghp_" + "c".repeat(36);
+    const events = [
+      `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"echo ${"x".repeat(170)} ${secret}"}}]}}`,
+      `{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}`,
+    ];
+    const [printed] = run([events.join("\n") + "\n"]);
+    expect(printed.startsWith("12:34 $ ✓ echo")).toBe(true);
+    expect(printed).not.toContain("ghp_");
+    expect(printed).not.toContain("cccc");
+    expect(printed.length).toBeLessThanOrEqual(200);
+  });
+
   it("redacts secrets before truncating", () => {
     const secret = "ghp_" + "a".repeat(36);
     const [printed] = run([`{"type":"assistant","message":{"content":[{"type":"text","text":"${"x".repeat(150)} ${secret}"}]}}\n`]);

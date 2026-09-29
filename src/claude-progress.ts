@@ -1,4 +1,4 @@
-import { formatProgressLine, guardStdout, isObject, line, LineSplitter, oneLine, relative, STATUS, str, type Json } from "./codex-progress.js";
+import { PROGRESS_MARK, formatProgressLine, guardStdout, isObject, line, LineSplitter, oneLine, relative, STATUS, str, type Json } from "./codex-progress.js";
 
 /**
  * Live, readable progress for a `claude --print --output-format stream-json --verbose` run, printed to the running
@@ -63,7 +63,7 @@ export class ClaudeProgressFormatter {
       if (block.type === "text" && oneLine(str(block.text) ?? "")) out.push(line("agent", oneLine(block.text as string)));
       else if (block.type === "thinking") {
         const hint = oneLine(str(block.thinking) ?? "").replace(/\*\*/g, "");
-        if (hint) out.push(line("thinking", hint.slice(0, 80)));
+        if (hint) out.push(line("thinking", hint));
       } else if (block.type === "tool_use" && str(block.id) && str(block.name)) {
         this.tools.set(block.id as string, { name: block.name as string, input: isObject(block.input) ? block.input : {} });
       }
@@ -101,6 +101,15 @@ export function describeClaudeLine(formatter: ClaudeProgressFormatter, raw: stri
   try { return formatter.describe(JSON.parse(raw)); } catch { return []; }
 }
 
+/** Longest thinking hint text. Applied to the already redacted line, never before redaction. */
+export const THINKING_HINT_CHARS = 80;
+
+function capThinking(text: string, printed: string): string {
+  if (!text.startsWith(`${PROGRESS_MARK.thinking} `)) return printed;
+  const head = printed.indexOf(`${PROGRESS_MARK.thinking} `) + 2;
+  return printed.length > head + THINKING_HINT_CHARS ? `${printed.slice(0, head + THINKING_HINT_CHARS - 3)}...` : printed;
+}
+
 export interface ClaudeProgressOptions {
   cwd?: string;
   write?: (line: string) => void;
@@ -117,7 +126,7 @@ export function claudeProgress(options: ClaudeProgressOptions = {}): { push(chun
   const emit = (lines: string[]) => {
     for (const raw of lines) {
       try {
-        for (const text of describeClaudeLine(formatter, raw)) write(formatProgressLine(text, now()));
+        for (const text of describeClaudeLine(formatter, raw)) write(capThinking(text, formatProgressLine(text, now())));
       } catch { /* progress output must never break the run */ }
     }
   };
