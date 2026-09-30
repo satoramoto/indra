@@ -10,7 +10,7 @@ import { HARNESS_CONTEXT_TOKEN_LIMIT } from "./harness-home.js";
 import { claimHeaded, firstMessage, HeadedStartError, headedAvailable, prepareTaskFiles, readLog, resultValidator, runHeaded, taskDocument } from "./headed-session.js";
 import { childEnv } from "./op-env.js";
 import { ownedProcesses, TREE_REFRESH_MS } from "./process-tree.js";
-import { AgentRunError, RuntimeEventStream, RuntimeFacts, RuntimeStop, recordedError } from "./runtime-facts.js";
+import { AgentRunError, RuntimeEventStream, RuntimeFacts, RuntimeStop, usageReporter, recordedError } from "./runtime-facts.js";
 
 export { claudePermissionArgs };
 
@@ -106,7 +106,7 @@ export class ClaudeRuntime implements AgentRuntime {
       const transcript = () => claudeTranscript(id);
       const response = await runHeaded({
         label: "Claude", cwd: this.cwd, files, validate: resultValidator(schema), launch: { command: "claude", args, env },
-        started: async () => { const path = await transcript(); started = !!path; return path; }, timeoutMs: options.timeoutMs ?? this.timeoutMs, signal: options.signal,
+        started: async () => { const path = await transcript(); started = !!path; return path; }, facts: evidence, onUsage: usageReporter(evidence, options.onUsage), timeoutMs: Math.min(options.timeoutMs ?? this.timeoutMs, this.timeoutMs), signal: options.signal,
       });
       await readLog(await transcript(), evidence);
       const facts = evidence.finish("succeeded");
@@ -123,13 +123,14 @@ export class ClaudeRuntime implements AgentRuntime {
   private async headlessMessage(prompt: string, schemaPath: string, sessionId?: string, options: MessageOptions = {}): Promise<RecordedAgentResult> {
     const evidence = new RuntimeFacts("claude", sessionId);
     let result: Record<string, unknown> | undefined;
-    const stream = new RuntimeEventStream((event) => { evidence.observe(event); if (event.type === "result") result = event; });
+    const reportUsage = usageReporter(evidence, options.onUsage);
+    const stream = new RuntimeEventStream((event) => { evidence.observe(event); reportUsage(); if (event.type === "result") result = event; });
     try {
       if (options.signal?.aborted) throw new RuntimeStop("Claude run cancelled.", "interrupted");
       const resumeId = sessionId === undefined ? undefined : claudeSessionId(sessionId);
       const schema = await readSchema(schemaPath);
       const args = ["--print", "--output-format", "stream-json", "--verbose", "--include-partial-messages", ...claudeModelArgs(this.roles), "--json-schema", JSON.stringify(schema), ...await claudePermissionArgs(this.cwd, this.write), ...(resumeId ? ["--resume", resumeId] : [])];
-      const timeoutMs = options.timeoutMs ?? this.timeoutMs;
+      const timeoutMs = Math.min(options.timeoutMs ?? this.timeoutMs, this.timeoutMs);
       if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new RuntimeStop("Claude timeout must be a positive number of milliseconds.");
       checkPromptSize(prompt);
       await this.run(args, prompt, timeoutMs, stream, options.signal);
@@ -140,7 +141,7 @@ export class ClaudeRuntime implements AgentRuntime {
       const facts = evidence.finish("succeeded");
       return { sessionId: `${CLAUDE_SESSION_PREFIX}${result.session_id}`, response: result.structured_output, usage: facts.usage, startedAt: facts.startedAt, finishedAt: facts.finishedAt, facts };
     } catch (error) {
-      stream.end();
+      try { stream.end(); } catch { /* callback already failed */ }
       throw recordedError(error, evidence);
     }
   }
@@ -158,6 +159,7 @@ export class ClaudeRuntime implements AgentRuntime {
       treeTimer.unref?.();
       let settled = false; let stdoutBytes = 0; let stderrBytes = 0; const progress = claudeProgress({ cwd: this.cwd });
       let failure: RuntimeStop | undefined;
+      let ending: Promise<unknown> | undefined;
       let killTimer: ReturnType<typeof setTimeout> | undefined;
       const stop = (kind: NodeJS.Signals) => {
         try {
@@ -168,17 +170,20 @@ export class ClaudeRuntime implements AgentRuntime {
       const finish = (error?: Error) => {
         if (settled) return;
         settled = true;
-        clearTimeout(timer); signal?.removeEventListener("abort", abort);
-        stream.end();
+        clearTimeout(timer); clearTimeout(killTimer); signal?.removeEventListener("abort", abort);
+        try { stream.end(); } catch { error ??= new RuntimeStop("Claude usage callback failed."); }
         if (error) reject(error); else resolveOutput();
       };
       const cancel = (message: string, status: "failed" | "interrupted" | "timed-out" = "failed") => {
         if (settled || failure) return;
         failure = new RuntimeStop(message, status);
-        // Keep escalation alive even if the parent exits first; its owned descendants can outlive it.
-        killTimer = setTimeout(() => stop("SIGKILL"), 1000);
-        // Continue bounded collection through shutdown; close fires after the stdout pipe has drained.
-        stop("SIGTERM");
+        // Refresh before signalling: detached tools must be recorded before their parent can exit.
+        ending = tree.then(async (run) => {
+          await run.refresh();
+          killTimer = setTimeout(() => stop("SIGKILL"), 1000);
+          stop("SIGTERM");
+          await run.end(1000);
+        });
       };
       const abort = () => cancel("Claude run cancelled.", "interrupted");
       const timer = setTimeout(() => cancel(`Claude run timed out after ${Math.round(timeoutMs / 60_000)} min.`, "timed-out"), timeoutMs);
@@ -188,7 +193,7 @@ export class ClaudeRuntime implements AgentRuntime {
         if (settled || stdoutBytes > CLAUDE_OUTPUT_LIMIT) return;
         stdoutBytes += Buffer.byteLength(part);
         if (stdoutBytes > CLAUDE_OUTPUT_LIMIT) cancel("Claude stdout exceeded the output limit.");
-        else { stream.push(part); progress.push(part); }
+        else { try { stream.push(part); } catch { cancel("Claude usage callback failed."); } progress.push(part); }
       });
       // Never echo provider diagnostics: they can contain prompt text, credentials or tool output.
       child.stderr.on("data", (part: string) => {
@@ -201,7 +206,7 @@ export class ClaudeRuntime implements AgentRuntime {
         if (process.platform === "win32" || !child.pid) clearTimeout(killTimer);
         clearInterval(treeTimer);
         const outcome = failure ?? (code === 0 ? undefined : new RuntimeStop(`Claude run failed (${code ?? "cancelled"}); diagnostics withheld.`, code === null ? "interrupted" : "failed"));
-        void tree.then((run) => run.end(1000)).catch(() => 0).then(() => finish(outcome));
+        void (ending ?? tree.then((run) => run.end(1000))).catch(() => 0).then(() => finish(outcome));
       });
       child.stdin.on("error", () => cancel("Claude could not read the prompt; diagnostics withheld."));
       child.stdin.end(prompt);

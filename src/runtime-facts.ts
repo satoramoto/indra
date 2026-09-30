@@ -173,6 +173,21 @@ export class RuntimeFacts {
   }
 }
 
+/** Publishes monotonic invocation snapshots; callers must terminate the run if the callback throws. */
+export function usageReporter(facts: RuntimeFacts, callback?: (usage: TokenUsage) => void): () => void {
+  let previous: TokenUsage = {};
+  return () => {
+    if (!callback) return;
+    const current = facts.finish("succeeded").usage;
+    if (!current) return;
+    const next = { ...previous };
+    for (const key of keys) if (current[key] !== undefined) next[key] = Math.max(previous[key] ?? 0, current[key]);
+    if (JSON.stringify(next) === JSON.stringify(previous)) return;
+    previous = next;
+    callback({ ...next });
+  };
+}
+
 /** Internal, controlled messages only; never wrap a provider's Error.message or raw output. */
 export class RuntimeStop extends Error {
   constructor(message: string, readonly status: Exclude<RunStatus, "succeeded"> = "failed") { super(message); }

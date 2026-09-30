@@ -268,3 +268,28 @@ describe("the pane during a headed run", () => {
     } finally { await rm(`${dir}.runtime`, { recursive: true, force: true }); }
   });
 });
+
+
+it.each(["codex", "claude"] as const)("enforces live usage callbacks in headed %s and cleans task files", async (engine) => {
+  const child = new Headed(); vi.mocked(spawn).mockReturnValue(child as unknown as ReturnType<typeof spawn>);
+  const onUsage = vi.fn(() => { throw new Error("budget reached"); });
+  const home = join(dir, "harness", "seat-004", "codex");
+  const runtime = engine === "codex" ? new CodexRuntime(dir, 60_000, { extraDirs: [] }, home, undefined, true) : new ClaudeRuntime(dir, 60_000, { extraDirs: [] }, undefined, true);
+  const run = failure(runtime.message("Build", schema, undefined, { onUsage }));
+  await launched();
+  if (engine === "claude") {
+    const args = call()[1]; const id = args[args.indexOf("--session-id") + 1];
+    await transcript(id, [{ type: "assistant", sessionId: id, message: { id: "msg-budget", usage: { input_tokens: 5, cache_read_input_tokens: 10, cache_creation_input_tokens: 20, output_tokens: 7 } } }]);
+  } else {
+    await mkdir(join(home, "sessions"), { recursive: true });
+    await writeFile(join(home, "sessions", "rollout-budget.jsonl"), [
+      { type: "session_meta", payload: { id: "budget-session", cwd: dir } },
+      { type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { input_tokens: 35, output_tokens: 7 } } } },
+    ].map((value) => JSON.stringify(value)).join("\n") + "\n");
+  }
+  const error = await run;
+  expect(onUsage).toHaveBeenCalledWith(expect.objectContaining({ inputTokens: 35, outputTokens: 7 }));
+  expect(error.facts.usage).toMatchObject({ inputTokens: 35, outputTokens: 7 });
+  expect(child.kill).toHaveBeenCalled();
+  expect((await readdir(join(dir, ".indra"))).filter((file) => /^(task|result)-/.test(file))).toEqual([]);
+});

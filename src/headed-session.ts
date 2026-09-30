@@ -26,6 +26,7 @@
  * session (`D`) and where its session log is, for live token totals.
  */
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { LiveUsageTail } from "./live-usage.js";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
@@ -164,6 +165,9 @@ export interface HeadedSpec {
   launch: HeadedLaunch;
   /** The CLI's session log once it has started its session; undefined before. */
   started(): Promise<string | undefined>;
+  /** Incremental log accounting, using the same collector as final evidence. */
+  facts?: RuntimeFacts;
+  onUsage?: () => void;
   timeoutMs: number;
   signal?: AbortSignal;
   /** The headed-run marker; defaults to the one set by useHeadedMarker. */
@@ -219,10 +223,11 @@ export async function runHeaded(spec: HeadedSpec): Promise<unknown> {
   let spawnError: NodeJS.ErrnoException | undefined;
   child.once("error", (error: NodeJS.ErrnoException) => { spawnError = error; });
   const startedAt = Date.now();
-  let seenStart = false; let previous: string | undefined;
+  let seenStart = false; let previous: string | undefined; let tail: LiveUsageTail | undefined;
   try {
     for (;;) {
       if (spec.signal?.aborted) throw new RuntimeStop(`${label} run cancelled.`, "interrupted");
+      if (tail) { await tail.read().catch(() => undefined); spec.onUsage?.(); }
       const text = await readFile(files.result, "utf8").catch(() => undefined);
       // A file that stopped changing between two polls is complete; one that fails then is a real answer, not a partial write.
       if (text !== undefined && (text === previous || !running)) return parsed(text, spec);
@@ -235,6 +240,7 @@ export async function runHeaded(spec: HeadedSpec): Promise<unknown> {
       if (!seenStart) {
         const log = await spec.started().catch(() => undefined);
         seenStart = !!log;
+        if (log && spec.facts) { tail = new LiveUsageTail(log, spec.facts.engine, undefined, spec.facts); await tail.read().catch(() => undefined); spec.onUsage?.(); }
         if (log && marker) await writeMarker(marker, { ...markerState, log }).catch(() => undefined);
         if (!seenStart && Date.now() - startedAt >= headedTiming.startupMs) throw new HeadedStartError(`${label} did not start a headed session within ${Math.round(headedTiming.startupMs / 1000)} s.`);
       }
