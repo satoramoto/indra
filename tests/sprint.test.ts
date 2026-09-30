@@ -2,6 +2,7 @@ import { mkdtemp, mkdir, readFile, writeFile, symlink, rm, realpath, readdir } f
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { readReviewEvidence, reviewOnce, reviewEvidencePath } from "../src/review-evidence.js";
 import { SprintError, SprintGitHub, retroPath } from "../src/sprint.js";
 import { processShell, type Shell } from "../src/command-shell.js";
 import { git } from "./state-checkout.js";
@@ -15,25 +16,14 @@ const path = retroPath(goal);
 const content = "# Retrospective\n\nRecorded facts. Owner proposals only.\n";
 const url = "https://github.com/test/project/pull/1";
 
-function policyEvidence(endpoint: string, head: string, protectedTarget = true) {
-  const base = "b".repeat(40); const blob = "c".repeat(40); const owners = "* @satori-miyamoto\n";
-  const prefix = "repos/test/project";
-  if (endpoint === `${prefix}/pulls/1`) return { state: "open", draft: false, auto_merge: null, head: { sha: head }, base: { ref: "main", sha: base, repo: { full_name: "test/project" } } };
-  if (endpoint === `${prefix}/branches/main/protection`) return { enforce_admins: { enabled: true }, required_status_checks: { contexts: ["checks"] },
-    required_pull_request_reviews: protectedTarget ? { required_approving_review_count: 1, require_code_owner_reviews: true, dismiss_stale_reviews: true, bypass_pull_request_allowances: { users: [], teams: [], apps: [] } } : null };
-  if (endpoint === `${prefix}/collaborators/satori-miyamoto/permission`) return { permission: "write", user: { login: "satori-miyamoto", permissions: { push: true } } };
-  if (endpoint === `${prefix}/git/trees/${base}?recursive=1`) return { truncated: false, tree: [{ path: ".github/CODEOWNERS", type: "blob", mode: "100644", sha: blob }] };
-  if (endpoint === `${prefix}/git/blobs/${blob}`) return { sha: blob, encoding: "base64", content: Buffer.from(owners).toString("base64"), size: Buffer.byteLength(owners) };
-  if (endpoint === `${prefix}/codeowners/errors?ref=${base}`) return { errors: [] };
-  return undefined;
-}
-
 class GitHub implements Shell {
   calls: { command: string; args: string[]; cwd: string }[] = [];
   state?: "OPEN" | "CLOSED" | "MERGED";
   checks = [{ name: "checks", bucket: "pass" }];
   reviews: { id: number; user: { login: string }; state: string; commit_id: string; body?: string; comments?: unknown[]; submitted_at?: string }[] = [];
-  reviewer = "satori-miyamoto";
+  reviewer = "owner";
+  comments: { body: string }[] = [];
+  reviewDecision = "";
   loseReview = false;
   refuseReview = false;
   files = [{ filename: path, status: "added" }];
@@ -45,7 +35,7 @@ class GitHub implements Shell {
   headBranch = `retro/${goal}`;
   baseBranch = "main";
   remoteUrl = "https://github.com/test/project.git";
-  protectedTarget = true;
+  protectedTarget = false;
   policyUnavailable = false;
   autoArmed = false;
   serverRejected = false;
@@ -64,27 +54,18 @@ class GitHub implements Shell {
       if (args.includes("push") && this.losePush) { this.losePush = false; return ok("", 1); }
       return result;
     }
-    if (command === "env") {
-      expect(args[0]).toMatch(/^GH_CONFIG_DIR=.*\/\.config\/gh-yahaha-bot$/);
-      expect(args[1]).toBe("gh");
-      args = args.slice(2);
-      if (args[0] === "api" && args[1] === "user") return ok(this.reviewer);
-      if (args[0] === "api" && args[1].endsWith("/reviews") && args.includes("POST")) {
-        if (this.refuseReview) return ok("", 1);
-        const review = JSON.parse(await readFile(args[args.indexOf("--input") + 1], "utf8"));
-        this.reviews.push({ id: this.reviews.length + 1, user: { login: this.reviewer }, state: review.event === "APPROVE" ? "APPROVED" : "CHANGES_REQUESTED", submitted_at: "2026-01-01T00:00:00.000Z", ...review });
-        return ok("", this.loseReview ? 1 : 0);
-      }
-      throw new Error("Unexpected reviewer command");
-    }
     if (command !== "gh") throw new Error("Unexpected command");
     if (args[0] === "api") {
+      if (args[1].includes("/comments?")) return ok(JSON.stringify([this.comments]));
+      if (args[1].endsWith("/comments") && args.includes("POST")) {
+        if (this.refuseReview) return ok("", 1);
+        this.comments.push(JSON.parse(await readFile(args[args.indexOf("--input") + 1], "utf8")));
+        return ok("", this.loseReview ? 1 : 0);
+      }
       if (args[1].includes("/files?")) return ok(JSON.stringify([this.files, ...(this.extraPage ? [[{ filename: "AGENTS.md", status: "modified" }]] : [])]));
       if (args[1].includes("/reviews?")) return ok(JSON.stringify([this.reviews]));
       if (args[1].includes("?state=all")) return ok(JSON.stringify([this.state ? [{ html_url: url }] : []]));
       if (this.policyUnavailable) return ok("", 1);
-      const policy = policyEvidence(args[1], this.head(), this.protectedTarget);
-      if (policy) return ok(JSON.stringify(policy));
     }
     if (args[0] === "pr" && args[1] === "create") {
       expect(await readFile(args[args.indexOf("--body-file") + 1], "utf8")).toContain(path);
@@ -94,7 +75,7 @@ class GitHub implements Shell {
     }
     if (args[0] === "pr" && args[1] === "view") return ok(JSON.stringify({
       state: this.state, headRefName: this.headBranch, baseRefName: this.baseBranch, headRefOid: this.head(), isCrossRepository: this.crossRepository,
-      isDraft: false, author: { login: this.author }, mergeCommit: this.state === "MERGED" ? { oid: this.head() } : null, reviewDecision: "",
+      isDraft: false, author: { login: this.author }, mergeCommit: this.state === "MERGED" ? { oid: this.head() } : null, reviewDecision: this.reviewDecision,
     }));
     if (args[0] === "pr" && args[1] === "checks") return ok(JSON.stringify(this.checks));
     if (args.includes("--disable-auto")) { this.autoArmed = false; return ok(); }
@@ -163,7 +144,7 @@ describe("whole-goal release proof", () => {
       return { code: 0, stdout: "", stderr: "" };
     });
     const github = new SprintGitHub({ run }, f.runtimeDir);
-    const inspect = vi.spyOn(github, "inspectMerge").mockResolvedValue({ url, state: "MERGED", headSha: report.lanePrs[0].headSha, mergedSha: report.lanePrs[0].mergedSha, reviewed: true, checksPassed: true });
+    const inspect = vi.spyOn(github, "inspectMerge").mockResolvedValue({ url, state: "MERGED", headSha: report.lanePrs[0].headSha, mergedSha: report.lanePrs[0].mergedSha, reviewer: "satori-miyamoto", reviewed: true, checksPassed: true });
     await expect(github.verifyGoalReport("test/project", ["src/**"], report, "b".repeat(40))).resolves.toBeUndefined();
     remoteHead = "e".repeat(40); await expect(github.verifyGoalReport("test/project", ["src/**"], report, "b".repeat(40))).rejects.toThrow("sprint head"); remoteHead = report.headSha;
     inspect.mockResolvedValueOnce({ url, state: "MERGED", headSha: report.lanePrs[0].headSha, mergedSha: report.lanePrs[0].mergedSha, reviewed: false, checksPassed: true });
@@ -302,9 +283,9 @@ describe("whole-goal release proof", () => {
     await f.github.reviewIntegration("test/project", goal, url, f.shell.head(), review);
     await f.github.reviewIntegration("test/project", goal, url, f.shell.head(), review);
     expect(review).toHaveBeenCalledTimes(1);
-    expect(f.shell.reviews).toHaveLength(1);
-    expect(f.shell.reviews[0]).toMatchObject({ state: "CHANGES_REQUESTED", commit_id: f.shell.head(), comments: [{ path, line: 1, side: "RIGHT", body: "Incorrect result" }] });
-    expect(f.shell.reviews[0].body).toContain("indra-integration-review:");
+    expect(f.shell.comments).toHaveLength(1);
+    expect(await readReviewEvidence(f.runtimeDir, url, f.shell.head())).toMatchObject({ verdict: "REQUEST_CHANGES", findings: [{ path, line: 1, reason: "Incorrect result" }] });
+    expect(f.shell.comments[0].body).toContain(f.shell.head());
     expect(f.shell.calls.some((call) => call.args.includes("merge"))).toBe(false);
   });
 });
@@ -323,19 +304,20 @@ describe("retrospective-only GitHub archival", () => {
     await github.reviewRetroPr("test/project", goal, content, url, shell.head(), review);
     await new SprintGitHub(shell, runtimeDir).reviewRetroPr("test/project", goal, content, url, shell.head(), review);
     expect(review).toHaveBeenCalledTimes(1);
-    expect(shell.reviews).toHaveLength(1);
-    expect(shell.reviews[0]).toMatchObject({ commit_id: shell.head(), user: { login: "satori-miyamoto" }, state: findings ? "CHANGES_REQUESTED" : "APPROVED",
-      comments: findings ? [{ path, line: 3, side: "RIGHT", body: "Missing recorded evidence." }] : [] });
+    expect(shell.comments).toHaveLength(1);
+    expect(await readReviewEvidence(runtimeDir, url, shell.head())).toMatchObject({ headSha: shell.head(), reviewer: "independent-agent", verdict: findings ? "REQUEST_CHANGES" : "APPROVE",
+      findings: findings ? [{ path, line: 3, reason: "Missing recorded evidence." }] : [] });
     expect((await github.inspectRetroPr("test/project", goal, content, url)).reviewed).toBe(!findings);
-    expect(shell.calls.filter((call) => call.command === "env").every((call) => call.args.includes("user") || call.args.some((arg) => arg.endsWith("/reviews")))).toBe(true);
+    expect(shell.calls.some((call) => call.command === "env")).toBe(false);
   });
 
   const replacement = content + "\nProduct draft history is unknown.\n";
-  async function rejectedArchive() {
+  async function rejectedArchive(local = false) {
     const f = await fixture(); await f.github.ensureRetroPr("test/project", goal, content);
-    await f.github.reviewRetroPr("test/project", goal, content, url, f.shell.head(), async () => ({ summary: "Correct the unsupported count", findings: [{ path, line: 3, reason: "Missing recorded Product history." }] }));
+    if (local) await f.github.reviewRetroPr("test/project", goal, content, url, f.shell.head(), async () => ({ summary: "Correct the unsupported count", findings: [{ path, line: 3, reason: "Missing recorded Product history." }] }));
+    else f.shell.reviews.push({ id: 1, user: { login: "satori-miyamoto" }, state: "CHANGES_REQUESTED", commit_id: f.shell.head(), submitted_at: "2026-01-01T00:00:00.000Z" });
     const rejection = (await f.github.inspectRetroPr("test/project", goal, content, url)).rejection!;
-    expect(rejection).toEqual({ reviewId: 1, headSha: f.shell.head(), submittedAt: "2026-01-01T00:00:00.000Z" });
+    expect(rejection).toEqual({ reviewId: local ? expect.stringMatching(/^agent:[a-f0-9]{64}$/) : 1, headSha: f.shell.head(), submittedAt: local ? expect.any(String) : "2026-01-01T00:00:00.000Z" });
     return { ...f, rejection };
   }
 
@@ -393,15 +375,15 @@ describe("retrospective-only GitHub archival", () => {
     if (["stale-review", "dismissed", "foreign-reviewer"].includes(problem)) expect((await f.github.inspectRetroPr("test/project", goal, content, url)).rejection).toBeUndefined();
   });
 
-  it("fails closed on the wrong review account or an unconfirmed verdict", async () => {
-    const { github, shell } = await fixture(); await github.ensureRetroPr("test/project", goal, content);
+  it("retains host approval with an ordinary account even when the optional comment fails", async () => {
+    const { github, shell, runtimeDir } = await fixture(); await github.ensureRetroPr("test/project", goal, content);
     const review = vi.fn(async () => ({ summary: "Reviewed", findings: [] }));
-    shell.reviewer = "owner";
-    await expect(github.reviewRetroPr("test/project", goal, content, url, shell.head(), review)).rejects.toThrow("satori-miyamoto");
-    expect(review).not.toHaveBeenCalled();
-    shell.reviewer = "satori-miyamoto"; shell.refuseReview = true;
-    await expect(github.reviewRetroPr("test/project", goal, content, url, shell.head(), review)).rejects.toThrow("not confirmed");
-    expect((await github.inspectRetroPr("test/project", goal, content, url)).reviewed).toBe(false);
+    shell.reviewer = "owner"; shell.refuseReview = true;
+    await github.reviewRetroPr("test/project", goal, content, url, shell.head(), review);
+    await new SprintGitHub(shell, runtimeDir).reviewRetroPr("test/project", goal, content, url, shell.head(), review);
+    expect((await github.inspectRetroPr("test/project", goal, content, url)).reviewed).toBe(true);
+    expect(review).toHaveBeenCalledTimes(1);
+    expect(shell.calls.some((call) => call.command === "env")).toBe(false);
   });
 
   it("does not post a stale review when the PR head changes during the reviewer run", async () => {
@@ -448,25 +430,23 @@ describe("retrospective-only GitHub archival", () => {
     expect(shell.autoArmed).toBe(false);
   });
 
-  it.each(["unprotected", "unreadable"])("never attempts an archival merge on an %s target", async (problem) => {
-    const { github, shell } = await fixture(); await github.ensureRetroPr("test/project", goal, content); shell.approve();
-    shell.protectedTarget = problem !== "unprotected"; shell.policyUnavailable = problem === "unreadable";
-    expect(await github.mergeRetroPr("test/project", goal, content, url, shell.head())).toMatchObject({ merged: false, reason: expect.stringContaining("Automatic merge blocked:") });
-    expect(shell.calls.some((call) => call.args[1] === "merge")).toBe(false);
-    expect(shell.state).toBe("OPEN");
+  it.each([false, true])("corrects a verified rejection and merges on new host approval despite historical GitHub changes requests (local rejection: %s)", async (local) => {
+    const f = await rejectedArchive(local); const old = f.shell.head();
+    if (local) f.shell.reviews.push({ id: 10, user: { login: "satori-miyamoto" }, state: "CHANGES_REQUESTED", commit_id: old, submitted_at: "2026-01-01T00:00:00.000Z" });
+    f.shell.reviewDecision = "CHANGES_REQUESTED"; f.shell.policyUnavailable = true;
+    const head = await f.github.correctRetroPr("test/project", goal, content, replacement, url, f.rejection);
+    expect((await f.github.mergeRetroPr("test/project", goal, replacement, url, head)).merged).toBe(false);
+    const review = vi.fn(async () => ({ summary: "Corrected evidence verified", findings: [] }));
+    await f.github.reviewRetroPr("test/project", goal, replacement, url, head, review);
+    f.shell.checks = []; expect((await f.github.mergeRetroPr("test/project", goal, replacement, url, head)).merged).toBe(false);
+    f.shell.checks = [{ name: "checks", bucket: "pass" }];
+    expect((await f.github.mergeRetroPr("test/project", goal, replacement, url, head)).merged).toBe(true);
+    expect(review).toHaveBeenCalledTimes(1);
+    expect(f.shell.calls.some((call) => call.command === "env" || call.args.some((arg) => /protection|permission|codeowners/i.test(arg)))).toBe(false);
+    expect(f.shell.reviews[0].commit_id).toBe(old);
   });
 
-  it.each(["DISMISSED", "CHANGES_REQUESTED"])("relies on the server to reject a same-head archival %s racing the mutation", async (verdict) => {
-    const { github, shell, remote } = await fixture(); await github.ensureRetroPr("test/project", goal, content); shell.approve();
-    const head = shell.head(); const main = git(remote, "rev-parse", "main").trim();
-    shell.mutateBeforeMerge = async () => { shell.reviews.push({ id: 2, user: { login: "satori-miyamoto" }, state: verdict, commit_id: head }); };
-    expect((await github.mergeRetroPr("test/project", goal, content, url, head)).merged).toBe(false);
-    expect(shell.serverRejected).toBe(true); expect(shell.state).toBe("OPEN"); expect(shell.head()).toBe(head);
-    expect(git(remote, "rev-parse", "main").trim()).toBe(main); expect(shell.autoArmed).toBe(false);
-    expect(shell.calls.filter((call) => call.args[1] === "merge").map((call) => call.args)).toEqual([["pr", "merge", url, "--squash", "--match-head-commit", head]]);
-  });
-
-  it.each(["stale", "author", "findings", "dismissed", "missing-ci", "skipped-ci"])("blocks archival with %s evidence", async (problem) => {
+  it.each(["stale", "author", "findings", "dismissed", "missing-ci", "skipped-ci", "unrelated-ci"])("blocks archival with %s evidence", async (problem) => {
     const { github, shell } = await fixture();
     await github.ensureRetroPr("test/project", goal, content); shell.approve();
     if (problem === "stale") shell.reviews[0].commit_id = "f".repeat(40);
@@ -475,6 +455,7 @@ describe("retrospective-only GitHub archival", () => {
     if (problem === "dismissed") shell.reviews[0].state = "DISMISSED";
     if (problem === "missing-ci") shell.checks = [];
     if (problem === "skipped-ci") shell.checks[0].bucket = "skipping";
+    if (problem === "unrelated-ci") shell.checks = [{ name: "docs", bucket: "pass" }];
     expect((await github.mergeRetroPr("test/project", goal, content, url, shell.head())).merged).toBe(false);
     expect(shell.calls.some((call) => call.args[1] === "merge" && !call.args.includes("--disable-auto"))).toBe(false);
   });
@@ -524,93 +505,13 @@ describe("retrospective-only GitHub archival", () => {
   });
 });
 
-describe("server-enforced bot review policy", () => {
-  const head = "a".repeat(40); const base = "b".repeat(40); const blobSha = "c".repeat(40);
-  const prefix = "repos/test/project";
-  const protectionPath = `${prefix}/branches/main/protection`;
-  const permissionPath = `${prefix}/collaborators/satori-miyamoto/permission`;
-  const treePath = `${prefix}/git/trees/${base}?recursive=1`;
-  const blobPath = `${prefix}/git/blobs/${blobSha}`;
-  const errorsPath = `${prefix}/codeowners/errors?ref=${base}`;
-  const reviews = () => ({ required_approving_review_count: 1, require_code_owner_reviews: true, dismiss_stale_reviews: true,
-    bypass_pull_request_allowances: { users: [], teams: [], apps: [] } });
-  const protection = () => ({ enforce_admins: { enabled: true }, required_pull_request_reviews: reviews(), required_status_checks: { contexts: ["checks"] } });
-  const permission = () => ({ permission: "write", user: { login: "satori-miyamoto", permissions: { push: true } } });
-  const owner = () => ({ path: ".github/CODEOWNERS", type: "blob", mode: "100644", sha: blobSha });
-  const blob = (content = "* @satori-miyamoto\n") => ({ sha: blobSha, encoding: "base64", content: Buffer.from(content).toString("base64"), size: Buffer.byteLength(content) });
-  class Policy implements Shell {
-    calls: string[][] = [];
-    replies = new Map<string, { code: number; stdout: string; stderr: string }>();
-    constructor(branch = "main") {
-      this.set(`${prefix}/pulls/1`, { state: "open", draft: false, auto_merge: null, head: { sha: head }, base: { ref: branch, sha: base, repo: { full_name: "test/project" } } });
-      this.set(`${prefix}/branches/${encodeURIComponent(branch)}/protection`, protection());
-      this.set(permissionPath, permission()); this.set(treePath, { truncated: false, tree: [owner()] });
-      this.set(blobPath, blob()); this.set(errorsPath, { errors: [] });
-    }
-    set(endpoint: string, value: unknown) { this.replies.set(endpoint, { code: 0, stdout: JSON.stringify(value), stderr: "" }); }
-    async run(command: string, args: string[]) {
-      expect(command).toBe("gh"); expect(args[0]).toBe("api"); expect(args.slice(2)).toEqual(["--method", "GET"]);
-      this.calls.push(args);
-      return this.replies.get(args[1]) ?? { code: 1, stdout: "", stderr: "unavailable" };
-    }
-  }
-  it.each(["main", "sprint/goal-retro"])("verifies the sole writable bot Code Owner at the immutable %s base using reads only", async (branch) => {
-    const shell = new Policy(branch);
-    expect(await new SprintGitHub(shell, "/tmp/indra-contract-gate.runtime").serverMergeBlocker(url, head)).toBeUndefined();
-    expect(shell.calls.map((args) => args[1])).toEqual([`${prefix}/pulls/1`, `${prefix}/branches/${encodeURIComponent(branch)}/protection`, permissionPath, treePath, blobPath, errorsPath]);
-  });
-  it.each([
-    ["absent review protection", protectionPath, { ...protection(), required_pull_request_reviews: null }],
-    ["generic review count without a named Code Owner", protectionPath, { ...protection(), required_pull_request_reviews: { ...reviews(), require_code_owner_reviews: false } }],
-    ["no required approval", protectionPath, { ...protection(), required_pull_request_reviews: { ...reviews(), required_approving_review_count: 0 } }],
-    ["stale approvals retained", protectionPath, { ...protection(), required_pull_request_reviews: { ...reviews(), dismiss_stale_reviews: false } }],
-    ["administrator bypass", protectionPath, { ...protection(), enforce_admins: { enabled: false } }],
-    ["review bypass", protectionPath, { ...protection(), required_pull_request_reviews: { ...reviews(), bypass_pull_request_allowances: { users: [{ login: "owner" }], teams: [], apps: [] } } }],
-    ["unknown bypass shape", protectionPath, { ...protection(), required_pull_request_reviews: { ...reviews(), bypass_pull_request_allowances: null } }],
-    ["no required CI", protectionPath, { ...protection(), required_status_checks: { contexts: [] } }],
-    ["read-only bot", permissionPath, { permission: "read", user: { login: "satori-miyamoto", permissions: { push: false } } }],
-    ["unverified write permission", permissionPath, { ...permission(), user: { login: "satori-miyamoto" } }],
-    ["wrong account", permissionPath, { ...permission(), user: { login: "owner", permissions: { push: true } } }],
-    ["missing CODEOWNERS", treePath, { truncated: false, tree: [] }],
-    ["truncated tree", treePath, { truncated: true, tree: [owner()] }],
-    ["symlink CODEOWNERS", treePath, { truncated: false, tree: [{ ...owner(), mode: "120000" }] }],
-    ["alternate owner", blobPath, blob("* @satori-miyamoto @owner\n")],
-    ["partial ownership", blobPath, blob("src/** @satori-miyamoto\n")],
-    ["ownership override", blobPath, blob("* @satori-miyamoto\ndocs/** @owner\n")],
-    ["incomplete owner bytes", blobPath, { ...blob(), size: 500 }],
-    ["GitHub rejects the rule", errorsPath, { errors: [{ message: "Owner cannot be resolved" }] }],
-  ])("fails closed for %s", async (_problem, endpoint, value) => {
-    const shell = new Policy(); shell.set(endpoint as string, value);
-    const blocker = await new SprintGitHub(shell, "/tmp/indra-contract-gate.runtime").serverMergeBlocker(url, head);
-    expect(blocker).toMatch(/^Automatic merge blocked:/); expect(blocker).toContain("docs/remodel-contract.md");
-  });
-  it.each(["forbidden", "unreadable", "unknown"])("keeps %s policy evidence blocked without leaking response text", async (problem) => {
-    const shell = new Policy(); shell.replies.set(protectionPath, { code: problem === "forbidden" ? 1 : 0, stdout: problem === "unknown" ? "[]" : "private response", stderr: "private stderr" });
-    const blocker = await new SprintGitHub(shell, "/tmp/indra-contract-gate.runtime").serverMergeBlocker(url, head);
-    expect(blocker).toMatch(/^Automatic merge blocked:/); expect(blocker).not.toContain("private");
-  });
-  it.each(["changed head", "foreign target", "already armed"])("rejects %s before inspecting policy", async (problem) => {
-    const shell = new Policy(); shell.set(`${prefix}/pulls/1`, { state: "open", draft: false,
-      auto_merge: problem === "already armed" ? { enabled_by: { login: "owner" } } : null,
-      head: { sha: problem === "changed head" ? "d".repeat(40) : head },
-      base: { ref: "main", sha: base, repo: { full_name: problem === "foreign target" ? "other/project" : "test/project" } } });
-    expect(await new SprintGitHub(shell, "/tmp/indra-contract-gate.runtime").serverMergeBlocker(url, head)).toMatch(/^Automatic merge blocked:/);
-    expect(shell.calls).toHaveLength(1);
-  });
-});
-
-
 describe("integration and revert automatic merge gate", () => {
   class Gate implements Shell {
     calls: string[][] = []; state = "OPEN"; head = "a".repeat(40); reviewHead = this.head; reviewer = "satori-miyamoto"; verdict = "APPROVED"; checks = [{ name: "checks", bucket: "pass" }]; outstanding = false; pending = false; lostResponse = false;
-    protectedTarget = true; policyUnavailable = false; autoArmed = false; serverRejected = false; mutateBeforeMerge?: () => void;
+    protectedTarget = false; policyUnavailable = false; autoArmed = false; serverRejected = false; mutateBeforeMerge?: () => void;
     async run(_command: string, args: string[]) {
       this.calls.push(args);
       let stdout = "";
-      if (args[0] === "api" && !args[1].includes("/reviews?")) {
-        const policy = policyEvidence(args[1], this.head, this.protectedTarget);
-        return { code: this.policyUnavailable ? 1 : 0, stdout: this.policyUnavailable ? "" : JSON.stringify(policy), stderr: "" };
-      }
       if (args[1] === "view") stdout = JSON.stringify({ state: this.state, headRefOid: this.head, mergeCommit: this.state === "MERGED" ? { oid: "b".repeat(40) } : null, isDraft: false, author: { login: "owner" }, reviewDecision: "" });
       if (args[1]?.includes("/reviews?")) stdout = JSON.stringify([[{ id: 1, user: { login: this.reviewer }, state: this.verdict, commit_id: this.reviewHead }, ...(this.outstanding ? [{ id: 2, user: { login: "other-reviewer" }, state: "CHANGES_REQUESTED", commit_id: this.head }] : [])]]);
       if (args[1] === "checks") stdout = JSON.stringify(this.checks);
@@ -643,13 +544,25 @@ describe("integration and revert automatic merge gate", () => {
     expect(shell.calls.filter((args) => args[1] === "merge")).toEqual([["pr", "merge", url, "--squash", "--match-head-commit", shell.head]]);
     expect(shell.autoArmed).toBe(false);
   });
-  it.each(["unprotected", "unreadable"])("does not attempt a merge on an %s target even with current approval and CI", async (problem) => {
-    const shell = new Gate(); shell.protectedTarget = problem !== "unprotected"; shell.policyUnavailable = problem === "unreadable";
-    expect(await new SprintGitHub(shell, "/tmp/indra-contract-gate.runtime").merge(url)).toMatchObject({ merged: false, reason: expect.stringContaining("Automatic merge blocked:") });
-    expect(shell.state).toBe("OPEN"); expect(shell.calls.some((args) => args[1] === "merge")).toBe(false);
+  it.each(["approved", "rejected", "missing", "stale", "wrong-pr", "failed-ci", "empty-ci", "unrelated-ci", "closed", "unverified"])("enforces host proof and CI without repository policy APIs (%s)", async (problem) => {
+    const shell = new Gate(); shell.protectedTarget = false; shell.verdict = "CHANGES_REQUESTED";
+    const runtime = await mkdtemp(join(tmpdir(), "indra-review-gate-")); roots.push(runtime);
+    if (problem !== "missing") await reviewOnce(runtime, url, problem === "stale" ? "b".repeat(40) : shell.head, async () => ({ summary: "Checked", findings: problem === "rejected" ? [{ path: "a.ts", line: 1, reason: "Wrong result" }] : [] }), async () => {});
+    if (problem === "wrong-pr") {
+      const file = reviewEvidencePath(runtime, url, shell.head); const proof = JSON.parse(await readFile(file, "utf8")); proof.prUrl = url + "2"; await writeFile(file, JSON.stringify(proof));
+      await expect(new SprintGitHub(shell, runtime).merge(url)).rejects.toThrow("proof is invalid"); return;
+    }
+    if (problem === "failed-ci") shell.checks[0].bucket = "fail";
+    if (problem === "empty-ci") shell.checks = [];
+    if (problem === "unrelated-ci") shell.checks = [{ name: "docs", bucket: "pass" }];
+    if (problem === "closed") shell.state = "CLOSED";
+    if (problem === "unverified") shell.pending = true;
+    expect((await new SprintGitHub(shell, runtime).merge(url)).merged).toBe(problem === "approved");
+    expect(shell.calls.some((args) => args.some((arg) => /protection|permission|codeowners/i.test(arg)))).toBe(false);
+    expect(shell.calls.some((args) => args.includes("--admin") || args.includes("--auto"))).toBe(false);
   });
   it.each(["DISMISSED", "CHANGES_REQUESTED"])("lets the server block same-head %s after client inspection", async (verdict) => {
-    const shell = new Gate(); const head = shell.head; shell.mutateBeforeMerge = () => { shell.verdict = verdict; };
+    const shell = new Gate(); shell.protectedTarget = true; const head = shell.head; shell.mutateBeforeMerge = () => { shell.verdict = verdict; };
     expect((await new SprintGitHub(shell, "/tmp/indra-contract-gate.runtime").merge(url)).merged).toBe(false);
     expect(shell.serverRejected).toBe(true); expect(shell.head).toBe(head); expect(shell.state).toBe("OPEN"); expect(shell.autoArmed).toBe(false);
     expect(shell.calls.filter((args) => args[1] === "merge")).toEqual([["pr", "merge", url, "--squash", "--match-head-commit", head]]);
