@@ -1,7 +1,7 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { watch, type FSWatcher } from "node:fs";
 import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { withFileLock } from "./state-commit.js";
 import { goalRuntimeFilename, teamRuntimeFilename, validateGoalReport, validateOwnedFiles, type GoalRuntimeRecord, type SchedulerRuntimeRecord, type WorkflowEvent } from "./goal-contract.js";
@@ -49,6 +49,8 @@ export function validateWorkflowEvent(value: unknown): WorkflowEvent {
   return structuredClone(value) as unknown as WorkflowEvent;
 }
 
+const localInboxNotifications = new Map<string, Set<(name: string) => void>>();
+
 /** Immutable inbox files and separate receipts: consumer writes never retrigger the inbox watcher. */
 export class WorkflowInbox {
   readonly directory: string;
@@ -75,6 +77,8 @@ export class WorkflowInbox {
       }
       const temporary = `${path}.${process.pid}.tmp`; await writeFile(temporary, bytes, { mode: 0o600 }); await rename(temporary, path);
     });
+    // The durable file is authoritative. Wake local hosts without awaiting their turns: a publisher may own one.
+    for (const notify of localInboxNotifications.get(resolve(this.directory)) ?? []) notify(`${name}.json`);
   }
   async drain(consumer: string, teamId: string, turn: (event: WorkflowEvent) => Promise<void>): Promise<void> {
     need(id(consumer) && id(teamId));
@@ -262,19 +266,23 @@ export async function runWorkflowHost(options: WorkflowHostOptions): Promise<voi
     // The receiver already knows this delivery exists. File notifications still carry other-process deliveries.
     drain();
   };
+  const notification = (name: string) => {
+    if (stopping || !name.endsWith(".json")) return;
+    const delivery = (async () => {
+      const bytes = await readFile(join(inbox.directory, name), "utf8"); need(bytes.length < 1_000_000);
+      const event = validateWorkflowEvent(JSON.parse(bytes));
+      if (!options.includeSchedulerIdle && event.kind === "queue-changed" && event.id.startsWith("scheduler-idle:")) {
+        await Promise.all([...tasks.keys()].map((key) => inbox.acknowledgeSchedulerIdle(key, teamId, event)));
+      } else drain();
+    })().catch(() => fail(new Error("Workflow inbox notification could not be verified."))).finally(() => { receipts.delete(delivery); });
+    receipts.add(delivery);
+  };
+  const directory = resolve(inbox.directory);
+  const listeners = localInboxNotifications.get(directory) ?? new Set<(name: string) => void>();
   const abort = () => { stopping = true; notify(); finish(); }; options.signal?.addEventListener("abort", abort, { once: true });
   try {
-    watchers.push(watch(inbox.directory, (_event, name) => {
-      if (!name?.toString().endsWith(".json")) return;
-      const delivery = (async () => {
-        const bytes = await readFile(join(inbox.directory, name.toString()), "utf8"); need(bytes.length < 1_000_000);
-        const event = validateWorkflowEvent(JSON.parse(bytes));
-        if (!options.includeSchedulerIdle && event.kind === "queue-changed" && event.id.startsWith("scheduler-idle:")) {
-          await Promise.all([...tasks.keys()].map((key) => inbox.acknowledgeSchedulerIdle(key, teamId, event)));
-        } else drain();
-      })().catch(() => fail(new Error("Workflow inbox notification could not be verified."))).finally(() => { receipts.delete(delivery); });
-      receipts.add(delivery);
-    }));
+    localInboxNotifications.set(directory, listeners); listeners.add(notification);
+    watchers.push(watch(inbox.directory, (_event, name) => { if (name) notification(name.toString()); }));
     if (options.mattermost) {
       watchers.push(watch(store.checkout, (_event, name) => { if (name?.toString() === "state.json") void readFile(join(store.checkout, "state.json"), "utf8").then((bytes) => wake("state", bytes)).catch(() => fail(new Error("Workflow state delivery failed."))); }));
       // Readiness/update receipts have a distinct watch from the Scheduler's own runtime journals.
@@ -308,6 +316,7 @@ export async function runWorkflowHost(options: WorkflowHostOptions): Promise<voi
     await ended;
   } finally {
     stopping = true; notify();
+    listeners.delete(notification); if (!listeners.size) localInboxNotifications.delete(directory);
     options.signal?.removeEventListener("abort", abort); watchers.forEach((watcher) => watcher.close()); socket?.close();
     if (server) await new Promise<void>((resolve) => server.close(() => resolve()));
     await active;
