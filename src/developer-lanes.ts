@@ -36,6 +36,9 @@ export interface DeveloperLaneServices {
 }
 
 export class LaneError extends Error { override name = "LaneError"; }
+export class LaneValidationError extends LaneError {
+  constructor(readonly check: LaneCheck) { super(`Check failed: ${check.command} (exit ${check.exitCode}). ${check.diagnostic}`); }
+}
 const SHA = /^[0-9a-f]{40}$/;
 const credential = ["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential"];
 const exists = (path: string) => lstat(path).then(() => true, (error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; return false; });
@@ -187,7 +190,7 @@ export class GitDeveloperLanes implements DeveloperLaneServices {
     if (summary.neededButUnowned.length) throw new LaneError(`Needed but unowned files: ${summary.neededButUnowned.join(", ")}`);
     journal.built = true; await persist();
   }
-  private async check(journal: LaneJournal, command: string, args: string[], headSha: string, persist: () => Promise<void>): Promise<void> {
+  private async check(journal: LaneJournal, command: string, args: string[], headSha: string, persist: () => Promise<void>, repairable = false): Promise<void> {
     const text = commandText(command, args);
     const saved = journal.checks.find((item) => item.headSha === headSha && item.command === text);
     let check: LaneCheck;
@@ -197,7 +200,10 @@ export class GitDeveloperLanes implements DeveloperLaneServices {
       check = { command: text, exitCode: result.code, headSha, diagnostic: redactSecrets(`${result.stdout}\n${result.stderr}`).slice(-20_000) };
       journal.checks.push(check); await persist();
     }
-    if (check.exitCode !== 0) throw new LaneError(`Check failed: ${text} (exit ${check.exitCode}). ${check.diagnostic}`);
+    if (check.exitCode !== 0) {
+      if (repairable && check.exitCode > 0 && check.exitCode < 128) throw new LaneValidationError(check);
+      throw new LaneError(`Check failed: ${text} (exit ${check.exitCode}). ${check.diagnostic}`);
+    }
   }
   async publish(lane: GoalLane, brief: GoalBrief, journal: LaneJournal, persist: () => Promise<void>): Promise<string> {
     const project = await this.project(brief); await this.verifyWorkspace(journal, project);
@@ -210,9 +216,9 @@ export class GitDeveloperLanes implements DeveloperLaneServices {
     }
     const head = await this.head(journal.worktree, "HEAD");
     await this.check(journal, "npm", ["ci"], head, persist);
-    await this.check(journal, "npm", ["run", "typecheck"], head, persist);
+    await this.check(journal, "npm", ["run", "typecheck"], head, persist, true);
     const tests = (await Promise.all(paths.filter((path) => /(?:^|\/)[^/]+\.(?:test|spec)\.[cm]?[jt]sx?$/.test(path)).map(async (path) => await exists(join(journal.worktree, path)) ? path : null))).filter((path): path is string => path !== null).sort();
-    if (tests.length) await this.check(journal, "env", ["NODE_OPTIONS=--experimental-ffi", "npx", "vitest", "run", ...tests], head, persist);
+    if (tests.length) await this.check(journal, "env", ["NODE_OPTIONS=--experimental-ffi", "npx", "vitest", "run", ...tests], head, persist, true);
     if (await this.head(journal.worktree, "HEAD") !== head || (await this.must("git", ["status", "--porcelain", "--untracked-files=all"], journal.worktree)).trim()) throw new LaneError("Checks changed the lane checkout; no unverified head may be pushed.");
     journal.headSha = head; await persist();
     await this.must("git", [...credential, "push", "-u", "origin", `HEAD:refs/heads/${lane.branch}`], journal.worktree);
