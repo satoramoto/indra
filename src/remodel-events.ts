@@ -53,6 +53,15 @@ export function validateWorkflowEvent(value: unknown): WorkflowEvent {
 export class WorkflowInbox {
   readonly directory: string;
   constructor(readonly runtimeDir: string) { this.directory = join(runtimeDir, "workflow-events"); }
+  private readonly consumerWrites = new Map<string, Promise<void>>();
+  /** Queue this host's receipts behind its active turn before acquiring the cross-process lock. */
+  private async withConsumer(consumer: string, work: () => Promise<void>): Promise<void> {
+    const previous = this.consumerWrites.get(consumer) ?? Promise.resolve();
+    const pending = previous.catch(() => {}).then(() => withFileLock(join(this.runtimeDir, `workflow-consumer-${consumer}.lock`), work));
+    this.consumerWrites.set(consumer, pending);
+    try { await pending; }
+    finally { if (this.consumerWrites.get(consumer) === pending) this.consumerWrites.delete(consumer); }
+  }
   async publish(input: WorkflowEvent): Promise<void> {
     const event = validateWorkflowEvent(input); need(event.kind !== "startup");
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
@@ -70,7 +79,7 @@ export class WorkflowInbox {
   async drain(consumer: string, teamId: string, turn: (event: WorkflowEvent) => Promise<void>): Promise<void> {
     need(id(consumer) && id(teamId));
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
-    await withFileLock(join(this.runtimeDir, `workflow-consumer-${consumer}.lock`), async () => {
+    await this.withConsumer(consumer, async () => {
       const receipt = join(this.runtimeDir, `workflow-receipts-${consumer}.json`);
       const handled = new Set<string>(JSON.parse(await readFile(receipt, "utf8").catch((e: NodeJS.ErrnoException) => { if (e.code !== "ENOENT") throw e; return "[]"; })));
       const entries: WorkflowEvent[] = [];
@@ -92,7 +101,7 @@ export class WorkflowInbox {
     const event = validateWorkflowEvent(input); need(id(consumer) && id(teamId));
     need(event.kind === "queue-changed" && event.id.startsWith("scheduler-idle:"));
     if (event.teamId !== teamId) return;
-    await withFileLock(join(this.runtimeDir, `workflow-consumer-${consumer}.lock`), async () => {
+    await this.withConsumer(consumer, async () => {
       const receipt = join(this.runtimeDir, `workflow-receipts-${consumer}.json`);
       const handled = new Set<string>(JSON.parse(await readFile(receipt, "utf8").catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; return "[]"; })));
       if (handled.has(event.id)) return;

@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { githubEvents, runWorkflowHost, validateWorkflowEvent, verifyWebhook, webhookHandler, WorkflowInbox } from "../src/remodel-events.js";
 import type { PlanningStore } from "../src/planning.js";
 import type { WorkflowEvent } from "../src/goal-contract.js";
+import * as stateCommit from "../src/state-commit.js";
 
 const fileNotifications = vi.hoisted(() => ({ suppressed: false }));
 vi.mock("node:fs", async (importOriginal) => {
@@ -94,6 +95,49 @@ describe("immutable delivery and restart receipts", () => {
     await started; await inbox.publish(queue()); await delivery; controller.abort(); await host;
     expect(seen).toEqual(["startup", "queue-changed"]);
     const restarted = vi.fn(async () => {}); await new WorkflowInbox(root).drain("consumer-one", "team-one", restarted); expect(restarted).not.toHaveBeenCalled();
+  });
+  it("keeps a long consumer turn alive while acknowledging scheduler idle without losing receipts", async () => {
+    const root = await directory(); const inbox = new WorkflowInbox(root); const controller = new AbortController();
+    const deferred = () => { let resolve!: () => void; const promise = new Promise<void>((done) => { resolve = done; }); return { promise, resolve }; };
+    const ready = deferred(); const started = deferred(); const release = deferred(); const idleSeen = deferred(); const received = deferred();
+    const seen: string[] = []; let activities = 0;
+    const withFileLock = stateCommit.withFileLock;
+    // Compress the production lock deadline, then hold real work past it; filesystem locks remain real.
+    const lockDeadline = vi.spyOn(stateCommit, "withFileLock").mockImplementation((file, work) => withFileLock(file, work, 25));
+    const acknowledge = WorkflowInbox.prototype.acknowledgeSchedulerIdle;
+    const idleObservation = vi.spyOn(WorkflowInbox.prototype, "acknowledgeSchedulerIdle").mockImplementation(async function (this: WorkflowInbox, consumer, teamId, event) {
+      idleSeen.resolve(); await acknowledge.call(this, consumer, teamId, event);
+    });
+    const host = runWorkflowHost({ store: store(root), teamId: "team-one", consumer: "seat-product", signal: controller.signal,
+      onReady: async () => ready.resolve(), activity: async (run) => { activities++; await run(); },
+      turn: async (event) => {
+        if (event.kind === "startup") return;
+        seen.push(event.id);
+        if (event.id === "long-turn") { started.resolve(); await release.promise; }
+        if (event.id === "after-long-turn") received.resolve();
+      },
+    });
+    const ended = host.then(() => { throw new Error("Host ended before its next business event."); });
+    void ended.catch(() => {});
+    try {
+      await Promise.race([ready.promise, ended]);
+      await inbox.publish(queue("long-turn")); await Promise.race([started.promise, ended]);
+      const activeDuringLongTurn = activities;
+      const idle: Extract<WorkflowEvent, { kind: "queue-changed" }> = { kind: "queue-changed", id: "scheduler-idle:team-one:long-turn", teamId: "team-one", at: "1970-01-01T00:00:00.000Z" };
+      await inbox.publish(idle); await idleSeen.promise;
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect(activities).toBe(activeDuringLongTurn);
+      await inbox.publish(queue("after-long-turn")); release.resolve();
+      await Promise.race([received.promise, ended]);
+      controller.abort(); await host;
+      expect(seen).toEqual(["long-turn", "after-long-turn"]);
+      const receipts: string[] = JSON.parse(await readFile(join(root, "workflow-receipts-seat-product.json"), "utf8"));
+      expect(receipts).toEqual(expect.arrayContaining(["long-turn", "after-long-turn", idle.id]));
+      expect(new Set(receipts).size).toBe(receipts.length);
+      const replay = vi.fn(async () => {}); await new WorkflowInbox(root).drain("seat-product", "team-one", replay); expect(replay).not.toHaveBeenCalled();
+    } finally {
+      release.resolve(); controller.abort(); await Promise.allSettled([host]); idleObservation.mockRestore(); lockDeadline.mockRestore();
+    }
   });
   it("delivers a durable UI-only idle hint after the activity lease releases and then settles receipt-only", async () => {
     const root = await directory(); const inbox = new WorkflowInbox(root); const controller = new AbortController();
