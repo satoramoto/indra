@@ -146,6 +146,11 @@ export function occupancy(model: TerminalUiModel, seat: StateSeat): { label: str
   const records = model.sessionsFor(seat.id);
   const session = currentSession(records);
   const newest = newestPlanningRecord(records);
+  if (model.team?.workflowModel === "goals-v1") {
+    const live = model.liveUsage[seat.id];
+    return live ? { label: "running session · " + engineLabel(live.engine), color: theme.text }
+      : { label: "current session evidence unavailable", color: theme.dim };
+  }
   if (model.sessionResult.connection !== "connected") return { label: "occupancy unknown", color: theme.wait, session: newest };
   if (newest?.status === "error" && !newest.sessionId) return { label: records.some((record) => !!record.sessionId) ? "runtime error · saved session" : "runtime record error", color: theme.bad, session: newest };
   if (!session?.sessionId) return { label: "no active session", color: theme.dim, session };
@@ -186,16 +191,13 @@ export const harnessText = (harness: SeatHarness | undefined) => harness ? displ
 const ROLE_SHORT: Record<string, string> = { "Team Lead": "lead", Developer: "dev", Product: "prod" };
 export const roleShort = (roles: readonly string[]) => roles.length ? roles.map((role) => ROLE_SHORT[role] ?? displayText(role, 10).toLowerCase()).join("+") : "–";
 
-/** What an open goal waits on from the owner: plan approval, or merging an integration, revert or retro PR. */
+/** Only the initial proposal waits on human approval. */
 export function ownerAction(session: TerminalSession): string | undefined {
   const loop = sessionSprint(session).loop;
   if (isFinishedSprint(loop)) return undefined;
   const stage = loop.ceremony?.stage;
   const id = displayText(session.id, 40);
   if (stage === "proposal" && session.stage === "awaiting-review") return `Proposal for ${id} waits for your plan approval`;
-  if (loop.integration?.status === "pr-open" && !!loop.integration.prUrl) return `Integration PR for ${id} waits for your merge`;
-  if (loop.integration?.status === "merged" && !!loop.integration.revertPrUrl) return `Revert PR for ${id} waits for your merge`;
-  if (stage === "retro" && loop.retro?.status === "pending" && !!loop.retro.prUrl) return `Retro PR for ${id} waits for your merge`;
   return undefined;
 }
 
@@ -206,6 +208,9 @@ export const needsOwner = (session: TerminalSession): boolean => !!ownerAction(s
 export function seatState(model: TerminalUiModel, seat: StateSeat): HubState {
   const live = model.live[seat.id];
   if (live?.problem || live?.process === "no credential" || live?.process === "no channel") return "failed";
+  if (live?.goal) return live.goal.progress?.failure || live.goal.status === "failed" ? "failed" : live.goal.status === "running" ? "running" : "waiting";
+  if (live?.product) return live.product.failure ? "failed" : live.product.queue.some((item) => item.status === "posted") ? "needs" : live.product.queue.length ? "waiting" : "idle";
+  if (live?.scheduler) return live.scheduler.failure ? "failed" : live.scheduler.activeDispatches.length ? "running" : live.scheduler.approvedQueue.length ? "waiting" : "idle";
   if (isDeveloper(seat) && live) {
     const status = live.assignment?.status;
     if (status === "failed") return "failed";
@@ -244,7 +249,7 @@ export function seatInfo(model: TerminalUiModel, seat: StateSeat): SeatInfo {
   const live = model.live[seat.id];
   const state = seatState(model, seat);
   const developer = !!live && isDeveloper(seat);
-  const held = developer ? live.assignment : undefined;
+  const held = developer && !live.goal ? live.assignment : undefined;
   const facts = held?.facts;
   const status = occupancy(model, seat);
   const records = model.sessionsFor(seat.id);
@@ -254,12 +259,19 @@ export function seatInfo(model: TerminalUiModel, seat: StateSeat): SeatInfo {
   const usage = developer ? model.withLiveUsage(seat.id, facts?.usage, facts?.sessionIds ?? [])
     : model.withLiveUsage(seat.id, sumUsage(open.map((session) => session.usage)), open.map((session) => session.sessionId));
   const processDown = !!live && live.process !== "running";
-  const task = held ? { text: displayText(held.title, 200), color: held.status === "failed" ? theme.bad : theme.text }
+  const workflow = live?.goal ? `Goal ${live.goal.goalId}: ${live.goal.title} · ${live.goal.status}`
+    : live?.product ? `${live.product.queue.filter((entry) => entry.status !== "approved").length} ranked proposals`
+    : live?.scheduler ? `${live.scheduler.approvedQueue.length} approved queued · ${live.scheduler.activeDispatches.length} active · ${live.scheduler.approvedQueue.filter((entry) => entry.blockedByGoalIds.length).length} overlap blockers`
+    : model.team?.workflowModel === "goals-v1" ? seat.roles.includes("Product") ? "Product queue unavailable" : seat.roles.includes("Team Lead") ? "Scheduler queue unavailable" : "No current goal" : undefined;
+  const task = workflow ? { text: displayText(workflow, 300), color: theme.text } : held ? { text: displayText(held.title, 200), color: held.status === "failed" ? theme.bad : theme.text }
     : processDown ? { text: processLabel(live), color: processColor[live.process] }
     : developer ? live.retry ? { text: "failed · T retry", color: theme.bad } : { text: "no assignment", color: theme.dim }
     : { text: status.label, color: status.color === theme.text ? theme.dim : status.color };
   const attention = state !== "needs" && state !== "failed" ? undefined
     : live?.problem ? displayText(live.problem, 300)
+    : live?.goal?.progress?.failure ? displayText(live.goal.progress.failure.message)
+    : live?.scheduler?.failure ? displayText(live.scheduler.failure.message)
+    : live?.product?.failure ? displayText(live.product.failure.message)
     : held?.status === "failed" ? displayText(held.title, 200) + " · failed"
     : developer && live.retry ? assignmentLine(live, 200)
     : records.map(ownerAction).find(Boolean) ?? (processDown ? processLabel(live) : status.label);
@@ -276,6 +288,37 @@ export function seatInfo(model: TerminalUiModel, seat: StateSeat): SeatInfo {
     ...(attention ? { attention } : {}),
     latest: developer ? threadActivity(live, 200) : activityLine(model, seat, 200),
   };
+}
+
+/** Shared records, displayed on the actual seat page; old outcome records remain separate. */
+export function WorkflowDetail(props: { live?: SeatLive; open?: (url: string) => void }) {
+  return <>
+    <Show when={props.live?.goal}>{(goal) => <box flexDirection="column" flexShrink={0}>
+      <text fg={theme.text} wrapMode="word">Current goal: {displayText(goal().goalId)} · {displayText(goal().title)} · {displayText(goal().status)}</text>
+      <text fg={theme.dim} wrapMode="word">Owned files: {displayText(goal().ownedFiles.join(", "), 2000)}</text>
+      <Show when={goal().progress} fallback={<text fg={theme.wait}>Lane progress unavailable.</text>}>
+        <For each={goal().progress?.lanes}>{(lane) => <box flexDirection="row" flexShrink={0}>
+          <text fg={theme.text}>{displayText(lane.id)} · {lane.status} · CI {lane.ci} · </text>
+          <LinkText url={lane.prUrl ?? undefined} label={lane.prUrl ? prLabel(lane.prUrl) ?? "PR" : "PR not opened"} open={props.open} />
+        </box>}</For>
+        <Show when={goal().progress?.failure}><text fg={theme.bad} wrapMode="word">{displayText(goal().progress?.failure?.message)}</text></Show>
+        <For each={goal().progress?.decisions}>{(text) => <text wrapMode="word" fg={theme.text}>Decision: {displayText(text)}</text>}</For>
+        <For each={goal().progress?.followUps}>{(text) => <text wrapMode="word" fg={theme.dim}>Follow-up: {displayText(text)}</text>}</For>
+        <For each={goal().progress?.neededButUnowned}>{(text) => <text wrapMode="word" fg={theme.wait}>Needed but unowned: {displayText(text)}</text>}</For>
+      </Show>
+    </box>}</Show>
+    <Show when={props.live?.scheduler}>{(scheduler) => <box flexDirection="column" flexShrink={0}>
+      <text fg={theme.text}>Scheduler · approved queue and active goals</text>
+      <For each={[...scheduler().approvedQueue].sort((a, b) => a.rank - b.rank)}>{(goal) => <text fg={theme.text} wrapMode="word">{goal.rank}. {displayText(goal.goalId)} · {goal.blockedByGoalIds.length ? "overlap blocked by " + displayText(goal.blockedByGoalIds.join(", ")) : "waiting for an idle Developer"}</text>}</For>
+      <For each={scheduler().activeDispatches}>{(goal) => <text fg={theme.text}>{displayText(goal.goalId)} → {displayText(goal.seatId)} · {goal.status}</text>}</For>
+      <Show when={scheduler().failure}><text fg={theme.bad} wrapMode="word">{displayText(scheduler().failure?.message)}</text></Show>
+    </box>}</Show>
+    <Show when={props.live?.product}>{(product) => <box flexDirection="column" flexShrink={0}>
+      <text fg={theme.text}>Product · ranked proposed queue</text>
+      <For each={[...product().queue].filter((item) => item.status !== "approved").sort((a, b) => a.proposal.rank - b.proposal.rank)}>{(item) => <text fg={theme.text} wrapMode="word">{item.proposal.rank}. {displayText(item.proposal.summary)} · {item.status === "posted" ? "awaiting owner approval" : "proposed"}</text>}</For>
+      <Show when={product().failure}><text fg={theme.bad} wrapMode="word">{displayText(product().failure?.message)}</text></Show>
+    </box>}</Show>
+  </>;
 }
 
 /** The window's colour: neutral, yellow above CONTEXT_WARN_SHARE of the cap. */
@@ -426,7 +469,7 @@ const buildStatus: Record<SprintBuild["status"], string> = {
   "reload-pending": "Pending reload: available build contains the integration; running build does not.",
   "update-pending": "Update pending: running and available builds do not contain the integration.",
   unavailable: "Build evidence unavailable; release is not confirmed.",
-  "revert-open": "Revert PR open; awaiting human merge confirmation.",
+  "revert-open": "Revert PR open; awaiting bot review and green CI.",
   reverted: "Reverted on main; running revert build is unverified.",
 };
 
@@ -435,7 +478,7 @@ export function releaseDetail(loop: SprintLoop): string {
   if (!loop.ceremony) return "Release completion is not recorded.";
   if (["planning", "proposal", "implement"].includes(loop.ceremony.stage)) return "Waiting for implementation to finish.";
   if (!loop.integration || loop.integration.status === "collecting") return "Release waiting: integration PR has not opened.";
-  if (loop.integration.status === "pr-open") return "Release waiting: integration PR needs the owner's merge and green CI.";
+  if (loop.integration.status === "pr-open") return "Release waiting: integration PR needs current-head bot approval and green CI.";
   if (loop.build?.status === "running") return "Build is running; waiting for the recorded transition to retro.";
   return "Release waiting: " + (loop.build?.reason || (loop.build ? buildStatus[loop.build.status] : "running application and bridge evidence is unavailable."));
 }
@@ -449,12 +492,13 @@ function publishedRetro(loop: SprintLoop) {
 export function retroDetail(loop: SprintLoop): string {
   const kind = loop.ceremony?.closure?.evidence.kind;
   if (kind === "release-reverted") return "No retro: the release was reverted before it ran.";
+  if (kind === "remodel-closure") return "No retro fabricated: historical goal closed for the remodel.";
   if (kind === "legacy-migration") return "No retro: finished before the ceremony; closed by legacy migration.";
   const published = publishedRetro(loop);
   if (published) return `Published ${published.publishedAt}.`;
   if (loop.retro?.status === "published") return "Publication recorded; waiting for goal closure.";
   if (loop.ceremony?.stage !== "retro") return "Waiting for the released build to be confirmed running.";
-  if (loop.retro?.prUrl) return "Retro waiting: PR needs the owner's merge, green CI and publication.";
+  if (loop.retro?.prUrl) return "Retro waiting: PR needs current-head bot approval, green CI and verified publication.";
   return "Retro waiting: Chick's draft and publication PR have not been recorded.";
 }
 
@@ -531,19 +575,19 @@ export function SprintCard(props: { sprint: TerminalSprint; model: TerminalUiMod
   const progress = () => sprintProgress({ stage: stage(), closed: !!closedAt(), merged: merged(), tickets: loop().tickets.length });
   const fill = () => closedAt() ? STAGE_COLOR.closed : STAGE_COLOR[stage() ?? "planning"];
   const needsPlan = () => props.sprint.planningStage === "awaiting-review" && stage() === "proposal";
-  const needsMerge = () => loop().integration?.status === "pr-open";
-  const needsRetro = () => !closedAt() && !!loop().retro?.prUrl;
   const title = () => ticketTitleWidth(props.width());
   /** The ticket table needs 90 columns; below that each ticket takes two rows. */
   const wide = () => props.width() >= 90;
   const w = TICKET_WIDTH;
   return (
     <Section title={"SPRINT " + displayText(props.sprint.id, 40)}>
-      <StagesField loop={loop()} tail={merged() + "/" + loop().tickets.length + " merged"} />
+      <StagesField loop={loop()} tail={loop().workflowModel ? "whole-goal ownership" : merged() + "/" + loop().tickets.length + " merged"} />
+      <Show when={!loop().workflowModel}>
       <Field label="progress">
         <ProgressBar fraction={progress} color={fill} width={24} truecolor={props.truecolor ?? true} background={theme.background} />
         <text fg={theme.dim} flexShrink={0} wrapMode="none">{String(Math.round(progress() * 100)).padStart(4) + "%"}</text>
       </Field>
+      </Show>
       <Field label="tokens">
         <text flexShrink={1} flexGrow={1}>
           <UsageSpans usage={loop().usage} now={props.now} />
@@ -553,7 +597,9 @@ export function SprintCard(props: { sprint: TerminalSprint; model: TerminalUiMod
       <FieldText label="goal" value={displayText(props.sprint.goal, 180)} />
       <LinkRow links={sprintLinks(props.team, props.session)} open={props.open} />
       <FieldText label="plan" value={proposalDetail(props.sprint)} glyph={needsPlan() ? GLYPH.state.needs : undefined} glyphColor={stateColor("needs", props.pulse())} />
-      <Show when={loop().tickets.length} fallback={<FieldText label="tickets" value="No tickets assigned yet." color={theme.dim} />}>
+      <Show when={loop().goal}><WorkflowDetail live={{ process: "running", goal: loop().goal }} open={props.open} /></Show>
+      <Show when={!loop().workflowModel}>
+      <Show when={loop().tickets.length} fallback={<FieldText label="tickets" value="No historical outcomes assigned." color={theme.dim} />}>
         <Show when={wide()}>
           <text fg={theme.dim} flexShrink={0} wrapMode="none">
             {"    " + pad("STEPS", w.steps) + " " + pad("TICKET", title()) + " " + pad("STATUS", w.status) + " " + pad("SEAT", w.seat) + " " + pad("PR", w.pr - 1) + "CI" + padStart("WORK", w.work)}
@@ -603,17 +649,18 @@ export function SprintCard(props: { sprint: TerminalSprint; model: TerminalUiMod
           );
         }}</For>
       </Show>
-      <Field label="integration" glyph={needsMerge() ? GLYPH.state.needs : undefined} glyphColor={stateColor("needs", props.pulse())}>
+      </Show>
+      <Field label="integration">
         <LinkText url={integrationUrl()} label={integrationUrl() ? GLYPH.pr + " " + (prLabel(integrationUrl(), true) ?? displayText(integrationUrl(), 200)) : "not opened"} open={props.open} />
         <Show when={loop().integration?.revertPrUrl}>
           <text fg={theme.dim} flexShrink={0}>{" " + GLYPH.separator + " revert "}</text>
           <LinkText url={loop().integration?.revertPrUrl} label={prText(loop().integration?.revertPrUrl, true)} open={props.open} />
         </Show>
       </Field>
-      <FieldText label="release" value={displayText(releaseDetail(loop()), 2000)} glyph={loop().release ? GLYPH.state.done : needsMerge() ? GLYPH.state.needs : undefined}
+      <FieldText label="release" value={displayText(releaseDetail(loop()), 2000)} glyph={loop().release ? GLYPH.state.done : undefined}
         glyphColor={loop().release ? theme.ok : stateColor("needs", props.pulse())} />
       <Show when={loop().build}><FieldText label="build" value={displayText(loop().build?.reason || buildStatus[loop().build!.status], 2000)} /></Show>
-      <FieldText label="retro" value={retroDetail(loop())} glyph={closedAt() ? GLYPH.state.done : needsRetro() ? GLYPH.state.needs : undefined}
+      <FieldText label="retro" value={retroDetail(loop())} glyph={closedAt() ? GLYPH.state.done : undefined}
         glyphColor={closedAt() ? theme.ok : stateColor("needs", props.pulse())} />
       <Show when={retro()?.path || retro()?.prUrl}>
         <Field label="document">
@@ -631,6 +678,7 @@ export function SprintStrip(props: { sprint: TerminalSprint; team?: StateTeam; s
   const detail = (): [string, string] => {
     const current = loop().ceremony?.stage;
     if (!current || current === "planning" || current === "proposal") return ["plan", proposalDetail(props.sprint)];
+    if (current === "implement" && loop().workflowModel) return ["goal", loop().goal?.status ?? "progress unavailable"];
     if (current === "implement") return ["tickets", loop().tickets.filter((ticket) => ticket.status === "merged").length + "/" + loop().tickets.length + " tickets merged"];
     if (current === "release") return ["release", releaseDetail(loop())];
     return ["retro", retroDetail(loop())];

@@ -6,7 +6,7 @@ import { createFrameClock, HeaderBar, IdleSplash } from "./hub-canvas.js";
 import { supportsTruecolor, TokenBurn } from "./hub-paint.js";
 import type { StateInventory } from "./state-domain.js";
 import type { MouseEvent } from "@opentui/core";
-import { displayText, GOAL_INPUT_LIMIT, sessionSprint, TerminalUiModel, type FocusRegion, type KeyMods, type SessionReadPort, type StateSyncPort, type UiApproval, type UiRetry, type UiRollback, type UiView, type UpdatePort } from "./terminal-ui.js";
+import { displayText, GOAL_INPUT_LIMIT, sessionSprint, TerminalUiModel, TerminalUiWorkflow, type WorkflowEventSource, type FocusRegion, type KeyMods, type SessionReadPort, type StateSyncPort, type UiApproval, type UiRetry, type UiRollback, type UiView, type UpdatePort } from "./terminal-ui.js";
 import { engineLabel } from "./session-snapshot.js";
 import type { GoalStarter, SeatProcessPort } from "./supervisor.js";
 import type { SessionPort } from "./session-mirror.js";
@@ -23,7 +23,7 @@ import { formatTokens, openableUrl, pipelineSteps, sumUsage, workTokens } from "
 import { GLYPH } from "./hub-style.js";
 import {
   ActivitySection, assignmentLine, AttentionSection, burnSparkline, CI_COLOR, clip, seatInfo, createTicker, elapsedText, Field, FieldText, HUB_STATE, isDeveloper, KeyLegend, LinkText, occupancy, pad,
-  PipelineLabels, prText, processColor, SeatHeader, SeatRow, Section, seatState, SprintCard, SprintStrip, stateColor, stateCounts, theme, threadActivity, UsageSpans,
+  PipelineLabels, prText, processColor, SeatHeader, SeatRow, Section, seatState, SprintCard, SprintStrip, stateColor, stateCounts, theme, threadActivity, UsageSpans, WorkflowDetail,
 } from "./hub-view.js";
 
 /** The end of a long goal, as many characters as fit in six wrapped lines, so the cursor stays visible. */
@@ -46,7 +46,6 @@ function confirmText(confirm: UiApproval | UiRollback | UiRetry, width: number):
     propose: ["Request Chick's proposal for ", "y request"],
     approve: ["Approve the proposal for ", "y approve"],
     integrate: ["Open the integration PR into main, for what merged, for sprint ", "y open"],
-    merge: [confirm.mergeKind === "revert" ? "Merge the revert PR on main for sprint " : confirm.mergeKind === "retro" ? "Merge the retro publication PR into main for sprint " : "Merge the release integration PR into main for sprint ", "y merge"],
     revert: ["Roll back sprint ", "y open a revert PR"],
   }[confirm.action];
   return question + displayText(confirm.goalId, 40) + " (" + displayText(confirm.goal, Math.max(10, width - 80)) + ")? " + yes
@@ -200,12 +199,12 @@ export function TerminalApp(props: TerminalAppProps) {
     const state = occupancy(props.model, selected);
     const hub = seatState(props.model, selected);
     const connected = props.model.sessionResult.connection === "connected";
-    // The open goals (a team holds at most one), or else the newest finished one: planning history stays off this screen.
-    const records = [...props.model.sessionsFor(selected.id)].sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""));
+    // Show current goals before historical records; whole-goal Developers use their runtime projection below.
+    const records = [...props.model.sessionsFor(selected.id)].filter((session) => !session.workflowModel || selected.roles.includes("Team Lead")).sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""));
     const openRecords = records.filter((session) => !isFinishedSprint(sessionSprint(session).loop));
     const sessions = (openRecords.length ? openRecords : records).slice(0, 2);
     const live = props.model.live[selected.id];
-    const held = live?.assignment;
+    const held = live?.goal ? undefined : live?.assignment;
     const facts = held?.facts;
     const leadUsage = props.model.withLiveUsage(selected.id, sumUsage(sessions.map((session) => session.usage)), sessions.map((session) => session.sessionId));
     const running = props.model.liveUsage[selected.id];
@@ -220,7 +219,7 @@ export function TerminalApp(props: TerminalAppProps) {
           <span style={{ fg: stateColor(hub, pulse()) }}>{HUB_STATE[hub].word}</span>
         </text>
         <Show when={live}>
-          <FieldText label="process" value={live!.process + (live!.updatePending ? " · update pending (restarts when idle)" : "") + (isDeveloper(selected) ? " (seat runner)" : " (planning bridge)") + sep + "s restart" + sep + "x stop"}
+          <FieldText label="process" value={live!.process + (live!.updatePending ? " · update pending (restarts when idle)" : "") + (selected.roles.includes("Product") ? " (Product runner)" : isDeveloper(selected) ? " (seat runner)" : " (planning bridge)") + sep + "s restart" + sep + "x stop"}
             glyph={live!.process === "running" ? undefined : GLYPH.state.failed} glyphColor={processColor[live!.process]} />
           <Show when={live!.problem}><FieldText label="problem" value={displayText(live!.problem, 300)} glyph={GLYPH.warn} glyphColor={stateColor("failed", pulse())} /></Show>
         </Show>
@@ -232,8 +231,11 @@ export function TerminalApp(props: TerminalAppProps) {
           </text>
         </Field>
         <FieldText label="burn" value={burnSparkline(seatInfo(props.model, selected), selected.id, now(), burn) + "  last hour"} color={theme.dim} />
-        <Show when={live && isDeveloper(selected)}>
-          <FieldText label="assignment" value={assignmentLine(live!, 160)} />
+        <WorkflowDetail live={live} open={open} />
+        <Show when={props.model.team?.workflowModel === "goals-v1" && selected.roles.includes("Product") && !live?.product}><FieldText label="workflow" value="Product queue unavailable." color={theme.wait} /></Show>
+        <Show when={props.model.team?.workflowModel === "goals-v1" && selected.roles.includes("Team Lead") && !live?.scheduler}><FieldText label="workflow" value="Scheduler queue unavailable." color={theme.wait} /></Show>
+        <Show when={live && isDeveloper(selected) && !live.goal && props.model.team?.workflowModel !== "goals-v1"}>
+          <FieldText label="historical" value={assignmentLine(live!, 160)} />
           <Show when={held}>
             <Field label="pr">
               <LinkText url={held?.prUrl} label={held?.prUrl ? prText(held?.prUrl, true) : "not opened"} open={open} />
@@ -258,7 +260,7 @@ export function TerminalApp(props: TerminalAppProps) {
         <For each={sessions}>{(session) => (
           <box flexDirection="column" flexShrink={0}>
             <FieldText label="goal" value={displayText(session.goal, 160)} />
-            <FieldText label="detail" value={displayText(session.stage) + sep + (connected ? "" : "Last ") + engineLabel(session.engine) + " session: " + (displayText(session.sessionId) || "not started")
+            <FieldText label="detail" value={session.workflowModel ? displayText(session.stage) + sep + (session.goalOwnerSeatId ? "Developer " + displayText(session.goalOwnerSeatId) : "awaiting Developer assignment") : displayText(session.stage) + sep + (connected ? "" : "Last ") + engineLabel(session.engine) + " session: " + (displayText(session.sessionId) || "not started")
               + sep + (session.runs ?? 0) + " runs" + sep + "work " + formatTokens(workTokens(session.usage)) + sep + "updated " + (displayText(session.updatedAt) || "not reported")} />
             <Show when={session.id === props.model.clarifyingGoal()?.id}>
               <FieldText label="proposal" value="P requests Chick's proposal here, or react :memo: on the goal post" glyph={GLYPH.state.needs} glyphColor={stateColor("needs", pulse())} />
@@ -374,6 +376,7 @@ export function TerminalApp(props: TerminalAppProps) {
       </Show>
 
       <box flexShrink={0} flexDirection="column" border={["top"]} borderColor={theme.rule}>
+        <Show when={props.model.workflowError}><text fg={theme.bad} wrapMode="word">{displayText(props.model.workflowError)}</text></Show>
         <Show when={newGoalHint()}><text fg={theme.dim} wrapMode="word">{displayText(newGoalHint(), 240)}</text></Show>
         <Show when={launchWarning()}>
           <text wrapMode="word"><span style={{ fg: stateColor("failed", pulse()) }}>{GLYPH.warn + " "}</span><span style={{ fg: theme.text }}>{displayText(launchWarning())}</span></text>
@@ -437,6 +440,8 @@ export function openLink(url: string, run: (file: string, args: string[]) => voi
 /** Start the Solid/OpenTUI screen; renderer ownership and terminal cleanup stay in this function. */
 export async function runTerminalUi(state: StateInventory, sessions: SessionReadPort, options: {
   pollMs?: number;
+  /** Host lifetime; every team has its own inbox consumer. Abort closes all sources. */
+  workflowEvents?: WorkflowEventSource;
   /**
    * Mirrors the selected seat's live session in the seat screen, and drives it (verified pane, headed run only) while
    * the owner has focused the session pane.
@@ -448,10 +453,10 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
   /** Hosts and controls the bridge and seat runners; they keep running after the UI quits. */
   processes?: SeatProcessPort;
   goals?: GoalStarter;
-  /** Syncs the state checkout with its remote before hosting processes, then every `syncMs`. */
+  /** Syncs the state checkout with its remote before hosting processes, then every `syncMs` for callers without a workflow event source. */
   sync?: StateSyncPort;
   syncMs?: number;
-  /** Pulls and builds new Indra code every `updateMs`; the UI reloads when `dist/` holds a newer build. */
+  /** Pulls and builds new Indra code (every `updateMs` only for legacy callers); the UI reloads when `dist/` holds a newer build. */
   update?: UpdatePort;
   updateMs?: number;
   /** The view to open on, saved by the previous UI before a reload. */
@@ -471,15 +476,17 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
   await model.refresh();
   const renderer = await createCliRenderer({ exitOnCtrlC: false, targetFps: 30 });
   const [revision, setRevision] = createSignal(model.revision);
-  model.changed = () => { if (active) setRevision(model.revision); };
+
   let active = true;
   let refreshing = false;
-  const publish = () => { if (active) { model.revision++; setRevision(model.revision); } };
+  const publish = () => { if (active) { model.revision++; setRevision(model.revision); void workflow.wake(); } };
   const driver = options.session ? new SessionDriver(model, options.session, publish) : undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
   let syncTimer: ReturnType<typeof setInterval> | undefined;
   let updateTimer: ReturnType<typeof setInterval> | undefined;
   let reloadNow = () => {};
+  const workflow = new TerminalUiWorkflow(model, options.workflowEvents, () => reloadNow());
+  model.changed = () => { if (active) { setRevision(model.revision); driver?.sync(); void workflow.wake(); } };
   const refresh = async () => {
     if (!active || refreshing) return;
     refreshing = true;
@@ -507,6 +514,7 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
     setRevision(model.revision);
   };
   return await new Promise<number>((resolve, reject) => {
+    let driveReleased: Promise<void> | undefined;
     const cleanup = (): boolean => {
       if (!active) return false;
       active = false;
@@ -515,14 +523,14 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
       if (updateTimer) clearInterval(updateTimer);
       options.signal?.removeEventListener("abort", finish);
       // Quitting while driving switches the pane's input back off; the seat keeps running.
-      void driver?.release();
+      driveReleased = driver?.release();
       renderer.destroy();
       return true;
     };
-    const finish = () => { if (cleanup()) resolve(0); };
+    const finish = () => { if (cleanup()) void Promise.all([workflow.stop(), driveReleased]).then(() => resolve(0), reject); };
     reloadNow = () => {
       const view = model.view();
-      if (options.reload && cleanup()) options.reload(view).then(resolve, reject);
+      if (options.reload && cleanup()) void Promise.all([workflow.stop(), driveReleased]).then(() => options.reload!(view)).then(resolve, reject);
     };
     // One screen rebuild per stdin chunk, not per key: a burst of keys otherwise exhausts OpenTUI's native renderables.
     const applyKey = keyInput(model, (current) => { if (active) setRevision(current); });
@@ -544,6 +552,7 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
       else if (action === "sprint") void model.sprintConfirmed();
       else if (action === "retry") void model.retryConfirmed();
       else if (action === "stop" || action === "restart") void model.control(action);
+      void workflow.wake();
     };
     const onFocus = (region: FocusRegion | undefined, seatId?: string) => {
       if (!active) return;
@@ -556,13 +565,13 @@ export async function runTerminalUi(state: StateInventory, sessions: SessionRead
     render(() => <TerminalApp model={model} revision={revision} onKey={key} onFocus={onFocus} onSessionScroll={onSessionScroll} onDrivePaste={onDrivePaste} session={options.session} transcript={options.transcript} openUrl={openUrl} />, renderer)
       .then(() => {
         if (!active) return;
-        timer = setInterval(() => { void refresh(); }, Math.max(500, options.pollMs ?? 2000));
-        void model.start();
-        if (options.sync) syncTimer = setInterval(() => { if (active) void model.syncState(); }, Math.max(5_000, options.syncMs ?? 60_000));
-        if (options.update) updateTimer = setInterval(() => { if (active) void model.updateCode(); }, Math.max(5_000, options.updateMs ?? 60_000));
+        if (!options.workflowEvents) timer = setInterval(() => { void refresh(); }, Math.max(500, options.pollMs ?? 2000));
+        void workflow.start().catch(() => { model.workflowError = "Startup reconciliation failed; restart Indra."; model.revision++; model.changed?.(); });
+        if (!options.workflowEvents && options.sync) syncTimer = setInterval(() => { if (active) void model.syncState(); }, Math.max(5_000, options.syncMs ?? 60_000));
+        if (!options.workflowEvents && options.update) updateTimer = setInterval(() => { if (active) void model.updateCode(); }, Math.max(5_000, options.updateMs ?? 60_000));
         options.signal?.addEventListener("abort", finish, { once: true });
         if (options.signal?.aborted) finish();
       })
-      .catch((error: unknown) => { cleanup(); reject(error); });
+      .catch((error: unknown) => { cleanup(); void Promise.all([workflow.stop(), driveReleased]).then(() => reject(error), reject); });
   });
 }

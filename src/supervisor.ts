@@ -10,7 +10,8 @@ import { ImplementationRecorder, implementationEligible } from "./implementation
 import { ownsSeatRecord, seatRecordName } from "./developer-maintenance.js";
 import { redactSecrets } from "./redact.js";
 import { childEnv } from "./op-env.js";
-import { readAssignmentFacts, seatHarness, type AssignmentFacts, type SeatHarness } from "./hub-facts.js";
+import { readAssignmentFacts, readGoalFacts, readProductFacts, readSchedulerFacts, seatHarness, type AssignmentFacts, type GoalSeatFacts, type SeatHarness } from "./hub-facts.js";
+import type { ProductRuntimeRecord, SchedulerRuntimeRecord } from "./goal-contract.js";
 import { loadSeatEngines } from "./seat-runtime.js";
 
 /** `no channel`: the seat's bot could not join its team's Mattermost team or home channel. */
@@ -27,6 +28,9 @@ export interface SeatLive {
   /** Running an older build than `dist/`; it is restarted at its next safe point. */
   updatePending?: boolean;
   assignment?: { title: string; status: string; prUrl?: string; goalId?: string; outcomeId?: string; facts?: AssignmentFacts };
+  goal?: GoalSeatFacts;
+  scheduler?: SchedulerRuntimeRecord;
+  product?: ProductRuntimeRecord;
   /** The seat's harness, model and effort; absent when the local seat-engines file cannot be read. */
   harness?: SeatHarness;
   /** Newest failed assignment still eligible to be queued for this Developer seat. */
@@ -81,7 +85,9 @@ function seatsOf(state: PlanningDocument): SeatRow[] {
 
 /** Active assignments keep a process busy, including legacy work awaiting migration. */
 function holdsWork(state: PlanningDocument, seatId: string): boolean {
-  return (state.planningGoals ?? []).some((goal) => (goal.assignments ?? []).some((item) => item.seatId === seatId && ACTIVE.includes(item.status)));
+  return (state.planningGoals ?? []).some((goal) => !goal.ceremony?.closure && (
+    goal.goalAssignment?.seatId === seatId && goal.goalAssignment.status !== "reported"
+    || (goal.assignments ?? []).some((item) => item.seatId === seatId && ACTIVE.includes(item.status))));
 }
 
 function newestFailedAssignment(state: PlanningDocument, seatId: string): AssignmentRetry | undefined {
@@ -199,7 +205,12 @@ export class Supervisor implements SeatProcessPort {
     const engines = await loadSeatEngines(this.store.runtimeDir, seats.map((seat) => seat.id)).catch(() => undefined);
     for (const seat of seats) {
       const { process, problem, target, record } = await this.processState(this.host(seat));
-      const held = (state.planningGoals ?? []).filter((goal) => goal.stage === "approved").flatMap((goal) => (goal.assignments ?? []).filter((item) => item.seatId === seat.id).map((assignment) => ({ goal, assignment })));
+      const team = (state.teams as { id: string; workflowModel?: string; seats: SeatRow[] }[]).find((team) => team.seats.some((item) => item.id === seat.id))!;
+      const ownedGoal = (state.planningGoals ?? []).find((goal) => goal.workflowModel === "goals-v1" && !goal.ceremony?.closure && goal.goalAssignment?.seatId === seat.id && goal.goalAssignment.status !== "reported");
+      const goal = ownedGoal && await readGoalFacts(this.store, ownedGoal);
+      const scheduler = seat.roles.includes("Team Lead") && team.workflowModel === "goals-v1" ? await readSchedulerFacts(this.store, team.id) : undefined;
+      const product = seat.roles.includes("Product") ? await readProductFacts(this.store, team.id, seat.id) : undefined;
+      const held = (state.planningGoals ?? []).filter((goal) => goal.workflowModel === undefined && !goal.ceremony?.closure && goal.stage === "approved").flatMap((goal) => (goal.assignments ?? []).filter((item) => item.seatId === seat.id).map((assignment) => ({ goal, assignment })));
       const current = held.find((item) => ACTIVE.includes(item.assignment.status))
         ?? held.filter((item) => item.assignment.status === "queued" && implementationEligible(item.goal)).sort((a, b) => a.assignment.updatedAt.localeCompare(b.assignment.updatedAt))[0];
       const activity = await this.store.readRuntimeFile<{ message?: unknown; at?: unknown }>(activityRecordName(seat.id)).catch(() => undefined);
@@ -207,6 +218,7 @@ export class Supervisor implements SeatProcessPort {
       const facts = current ? await readAssignmentFacts(this.store, seat.id, current.goal.id, current.assignment.outcomeId) : undefined;
       live[seat.id] = {
         process,
+        ...(goal ? { goal } : {}), ...(scheduler ? { scheduler } : {}), ...(product ? { product } : {}),
         ...(problem ? { problem } : {}),
         ...(record && stamp && record.build !== stamp.id ? { updatePending: true } : {}),
         ...(current ? { assignment: { title: current.goal.proposal?.outcomes.find((item) => item.id === current.assignment.outcomeId)?.title ?? current.assignment.outcomeId, status: current.assignment.status, prUrl: current.assignment.prUrl,
@@ -273,7 +285,8 @@ export class Supervisor implements SeatProcessPort {
     if (!stamp) return { pending, problems };
     await this.housekeeping();
     const seen = new Set<string>();
-    for (const seat of seatsOf(await this.store.read())) {
+    const state = await this.store.read();
+    for (const seat of seatsOf(state)) {
       const host = this.host(seat);
       if (seen.has(host.session)) continue;
       seen.add(host.session);
@@ -281,7 +294,11 @@ export class Supervisor implements SeatProcessPort {
       if (!record || record.build === stamp.id) continue;
       const label = host.hosted.kind === "bridge" ? "bridge" : seat.id;
       const age = Date.now() - Date.parse(record.startedAt);
-      if (!(age >= this.restartDebounceMs) || await readHeadedMarker(headedMarkerFile(this.checkout, record.readyNonce))) { pending.push(label); continue; }
+      // Goals-v1 has no later timer tick: its final idle event must be able to finish a deferred upgrade.
+      // Current-build equality, the live-run marker and the turn lease still coalesce and guard restarts.
+      const eventDriven = (state.teams as { workflowModel?: string; seats: SeatRow[] }[])
+        .some((team) => team.workflowModel === "goals-v1" && team.seats.some((item) => item.id === seat.id));
+      if ((!eventDriven && !(age >= this.restartDebounceMs)) || await readHeadedMarker(headedMarkerFile(this.checkout, record.readyNonce))) { pending.push(label); continue; }
       let stopped = false as boolean;
       const ran = await this.exclusive(host.session, async () => {
         try {
@@ -306,21 +323,30 @@ export class Supervisor implements SeatProcessPort {
     if (!await this.exclusive(host.session, async () => { await host.stop(); })) throw new Error(`Seat '${seatId}' is already being stopped or restarted.`);
   }
 
-  /** The owner's restart: forced, like stop, and never run twice at once for the same process. */
+  /** New-model seats restart only at an idle event boundary; legacy manual restart stays explicit. */
   async restart(seatId: string): Promise<void> {
     const host = this.host(await this.seat(seatId));
     let credentialProblem: string | undefined;
     const ran = await this.exclusive(host.session, async () => {
-      // A seat that exited for a missing credential may hold a revoked token: read a fresh one.
-      const noCredential = (await this.processState(host)).process === "no credential";
-      credentialProblem = await this.credential(true, noCredential);
-      await host.stop();
-      try { await host.start(); }
-      catch (error) { if (!shownOnSeat(error)) throw error; }
+      const state = await this.store.read();
+      const guarded = (state.teams as { workflowModel?: string; seats: { id: string }[] }[])
+        .some((team) => team.workflowModel === "goals-v1" && team.seats.some((seat) => seat.id === seatId));
+      const restart = async () => {
+        if (guarded && host.hosted.kind === "seat" && holdsWork(await this.store.read(), seatId)) throw new Error(`Seat ${seatId} holds active work; restart is deferred until its goal ends.`);
+        // A seat that exited for a missing credential may hold a revoked token: read a fresh one.
+        const noCredential = (await this.processState(host)).process === "no credential";
+        credentialProblem = await this.credential(true, noCredential);
+        await host.stop();
+        try { await host.start(); }
+        catch (error) { if (!shownOnSeat(error)) throw error; }
+      };
+      if (guarded) await withFileLock(turnLockFile(this.checkout, host.hosted), restart, 1000);
+      else await restart();
     });
     if (!ran) throw new Error(`Seat '${seatId}' is already being stopped or restarted.`);
     if (credentialProblem) throw new Error(credentialProblem);
   }
+
 }
 
 /**
