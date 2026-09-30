@@ -32,6 +32,7 @@ interface IntegrationRecovery {
   version: 1; github: string; goalId: string; branch: string; prUrl: string; headSha: string; baseSha: string; ownedFiles: string[];
   checkout: string; sharedGitDir: string; phase: "preparing" | "prepared" | "resolved" | "committed" | "pushed" | "cleaned";
   resultSha: string | null; decisions: string[]; failure: string | null;
+  workspace?: { dirty: string; ignored: string[] }; cleanup?: string | null;
 }
 export interface PrRetrospective { url: string; headSha: string; decisions: string | null; followUps: string | null }
 
@@ -130,7 +131,23 @@ export class SprintGitHub implements RetroArchive {
       if (Object.entries(identity).some(([key, value]) => JSON.stringify(record[key as keyof IntegrationRecovery]) !== JSON.stringify(value)) || record.checkout !== cwd || record.sharedGitDir !== shared || !["preparing", "prepared", "resolved", "committed", "pushed", "cleaned"].includes(record.phase) || (record.resultSha !== null && !SHA.test(record.resultSha)) || !Array.isArray(record.decisions) || record.decisions.some((item) => typeof item !== "string")) throw new SprintError(`Integration recovery identity is uncertain; preserved at ${journal}.`);
       const save = async () => { const temp = `${journal}.${process.pid}.tmp`; await writeFile(temp, JSON.stringify(record), { mode: 0o600 }); await rename(temp, journal); };
       const within = (files: string[]) => files.every((file) => ownedFiles.some((pattern) => ownedFileMatches(pattern, file)));
-      const files = async (args: string[]) => (await this.must("git", args, cwd)).stdout.split("\0").filter(Boolean);
+      const files = async (args: string[], directory = cwd) => (await this.must("git", args, directory)).stdout.split("\0").filter(Boolean);
+      const verifyCheckout = async () => {
+        if (!(await lstat(cwd)).isDirectory()) throw new SprintError("Integration recovery checkout is not an owned directory.");
+        const common = (await this.must("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd)).stdout.trim();
+        if (await realpath(common) !== shared || (await this.run("git", ["symbolic-ref", "-q", "HEAD"], cwd)).code !== 1) throw new SprintError("Integration recovery checkout ownership or detached identity changed.");
+      };
+      const verifyCommit = async (head: string, directory = cwd) => {
+        const parents = (await this.must("git", ["rev-list", "--parents", "-n", "1", head], directory)).stdout.trim().split(" ");
+        if (!SHA.test(head) || JSON.stringify(parents) !== JSON.stringify([head, headSha, baseSha]) || (record.resultSha && record.resultSha !== head) || !within(await files(["diff", "--name-only", "--no-renames", "-z", baseSha, head], directory))) throw new SprintError("Retained correction commit does not match its pinned history and approved scope.");
+      };
+      const inspectWorkspace = async () => {
+        const dirty = (await this.must("git", ["status", "--porcelain", "--untracked-files=all"], cwd)).stdout;
+        const ignored = await files(["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"]);
+        record.workspace = { dirty, ignored }; await save();
+        // These exact ignored root directories are regenerable check output; all other local artifacts remain protected.
+        if (dirty.trim() || ignored.some((path) => !["node_modules/", "dist/", "coverage/"].includes(path))) throw new SprintError("Integration correction has uncommitted or unknown ignored work; retained without cleanup.");
+      };
       const idle = async () => {
         // The AgentRuntime stops its verified owned tree. Any remaining owner or foreign user prevents reuse/removal.
         // lsof exit 1 with no output means no open files; unreadable/unsupported inspection fails closed.
@@ -145,13 +162,11 @@ export class SprintGitHub implements RetroArchive {
       try {
         if (!(await lstat(root)).isDirectory()) throw new SprintError("Integration recovery root ownership is uncertain.");
         const exists = await lstat(cwd).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; return undefined; });
-        if (exists && !exists.isDirectory()) throw new SprintError("Integration recovery checkout is not an owned directory.");
         if (!exists && record.phase === "preparing") await this.must("git", ["worktree", "add", "--detach", cwd, headSha], project);
-        else if (!exists && record.phase === "pushed" && record.resultSha) record.phase = "cleaned"; // Lost removal response; remote proof is checked below.
+        else if (!exists && record.phase === "pushed" && record.resultSha) { record.phase = "cleaned"; record.cleanup = null; } // Lost removal response; remote proof is checked below.
         else if (!exists && record.phase !== "cleaned") throw new SprintError("Integration recovery checkout is missing; retained work cannot be assumed safe.");
-        if (record.phase !== "cleaned") {
-          const common = (await this.must("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd)).stdout.trim();
-          if (await realpath(common) !== shared || (await this.run("git", ["symbolic-ref", "-q", "HEAD"], cwd)).code !== 1) throw new SprintError("Integration recovery checkout ownership or detached identity changed.");
+        if (record.phase !== "cleaned" && record.phase !== "pushed") {
+          await verifyCheckout();
           await idle();
           let head = (await this.must("git", ["rev-parse", "HEAD"], cwd)).stdout.trim();
           if (head !== headSha && !record.resultSha && record.phase !== "resolved") throw new SprintError("Resolver changed the pinned integration history without a host commit intent.");
@@ -189,15 +204,16 @@ export class SprintGitHub implements RetroArchive {
             head = (await this.must("git", ["rev-parse", "HEAD"], cwd)).stdout.trim();
           }
           // Also recovers a crash immediately after commit, before its result SHA was journaled.
-          const parents = (await this.must("git", ["rev-list", "--parents", "-n", "1", head], cwd)).stdout.trim().split(" ");
-          if (!SHA.test(head) || JSON.stringify(parents) !== JSON.stringify([head, headSha, baseSha]) || (record.resultSha && record.resultSha !== head) || !within(await files(["diff", "--name-only", "--no-renames", "-z", baseSha, head]))) throw new SprintError("Retained correction commit does not match its pinned history and approved scope.");
-          if ((await this.must("git", ["status", "--porcelain", "--untracked-files=all", "--ignored=matching"], cwd)).stdout.trim()) throw new SprintError("Integration correction has uncommitted or ignored work; retained without cleanup.");
+          await verifyCommit(head);
+          await inspectWorkspace();
           record.resultSha = head; record.phase = "committed"; await save();
           const current = await this.integrationScope(github, goalId, ownedFiles, prUrl, revert);
           if (![headSha, head].includes(current.headSha) || current.baseSha !== baseSha) throw new SprintError("Integration changed before publication; retained correction needs reconciliation.");
           if (current.headSha !== head) await this.must("git", [...GH_CREDENTIAL, "push", "origin", `HEAD:refs/heads/${branch}`], cwd);
         }
         const resultSha = record.resultSha;
+        // A published correction can be verified from the shared repository even when its retained checkout is busy or dirty.
+        if (resultSha && (record.phase === "pushed" || record.phase === "cleaned")) await verifyCommit(resultSha, project);
         const remote = (await this.must("gh", ["api", `repos/${github}/git/ref/heads/${branch}`, "--jq", ".object.sha"])).stdout.trim();
         if (!resultSha || remote !== resultSha) throw new SprintError("Corrected integration push is not verified.");
         record.phase = record.phase === "cleaned" ? "cleaned" : "pushed"; await save();
@@ -209,13 +225,18 @@ export class SprintGitHub implements RetroArchive {
           await this.must("gh", ["pr", "edit", prUrl, "--body-file", path]);
         }
         if (record.phase !== "cleaned") {
-          await idle();
-          if ((await this.must("git", ["status", "--porcelain", "--untracked-files=all", "--ignored=matching"], cwd)).stdout.trim() || (await this.must("git", ["rev-parse", "HEAD"], cwd)).stdout.trim() !== resultSha) throw new SprintError("Published correction has new or uncertain work; retained without cleanup.");
-          await this.must("git", ["worktree", "remove", cwd], project); // No --force; Git gets the final dirty-work veto.
-          record.phase = "cleaned";
+          try {
+            await verifyCheckout(); await idle(); await inspectWorkspace();
+            if ((await this.must("git", ["rev-parse", "HEAD"], cwd)).stdout.trim() !== resultSha) throw new SprintError("Published correction has new or uncertain work; retained without cleanup.");
+            await this.must("git", ["worktree", "remove", cwd], project); // No --force; Git gets the final dirty-work veto.
+            record.phase = "cleaned"; record.cleanup = null;
+          } catch (error) {
+            // Publication and its PR record are already verified. Cleanup cannot turn delivery into a failed correction.
+            record.cleanup = error instanceof Error ? redactSecrets(error.message).slice(0, 1000) : "Integration checkout cleanup was not confirmed.";
+          }
         }
         record.failure = null; await save();
-        return { headSha: resultSha, decisions: record.decisions };
+        return { headSha: resultSha, decisions: [...record.decisions, ...(record.cleanup ? [`Retained published correction checkout at ${cwd}: ${record.cleanup}`] : [])] };
       } catch (error) {
         record.failure = error instanceof Error ? redactSecrets(error.message).slice(0, 1000) : "Integration correction was not confirmed.";
         await save();
