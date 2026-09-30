@@ -1,11 +1,11 @@
 import { createHmac } from "node:crypto";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { githubEvents, runWorkflowHost, validateWorkflowEvent, verifyWebhook, webhookHandler, WorkflowInbox } from "../src/remodel-events.js";
+import { githubEvents, runWorkflowHost, validateWorkflowEvent, verifyWebhook, webhookHandler, workflowDigest, WorkflowInbox } from "../src/remodel-events.js";
 import type { PlanningStore } from "../src/planning.js";
 import type { WorkflowEvent } from "../src/goal-contract.js";
 import * as stateCommit from "../src/state-commit.js";
@@ -92,7 +92,11 @@ describe("immutable delivery and restart receipts", () => {
     let ready!: () => void; const started = new Promise<void>((resolve) => { ready = resolve; });
     let received!: () => void; const delivery = new Promise<void>((resolve) => { received = resolve; });
     const host = runWorkflowHost({ store: store(root), teamId: "team-one", consumer: "consumer-one", signal: controller.signal, onReady: async () => ready(), turn: async (event) => { seen.push(event.kind); if (event.kind !== "startup") received(); } });
-    await started; await inbox.publish(queue()); await delivery; controller.abort(); await host;
+    await started;
+    // Retain an event without the in-process publisher, exercising the other-process filesystem path.
+    const path = join(inbox.directory, `${workflowDigest("delivery-one")}.json`);
+    await writeFile(`${path}.tmp`, JSON.stringify(queue()), { mode: 0o600 }); await rename(`${path}.tmp`, path);
+    await delivery; controller.abort(); await host;
     expect(seen).toEqual(["startup", "queue-changed"]);
     const restarted = vi.fn(async () => {}); await new WorkflowInbox(root).drain("consumer-one", "team-one", restarted); expect(restarted).not.toHaveBeenCalled();
   });
@@ -139,7 +143,8 @@ describe("immutable delivery and restart receipts", () => {
       release.resolve(); controller.abort(); await Promise.allSettled([host]); idleObservation.mockRestore(); lockDeadline.mockRestore();
     }
   });
-  it("delivers a durable UI-only idle hint after the activity lease releases and then settles receipt-only", async () => {
+  it.each([false, true])("delivers a durable UI-only idle hint and settles receipt-only (missed file notification: %s)", async (missedNotification) => {
+    fileNotifications.suppressed = missedNotification;
     const root = await directory(); const inbox = new WorkflowInbox(root); const controller = new AbortController();
     const deferred = () => { let resolve!: () => void; const promise = new Promise<void>((done) => { resolve = done; }); return { promise, resolve }; };
     const slowStarted = deferred(); const release = deferred(); const idleSeen = deferred(); const receiptOnly = deferred(); const uiReady = deferred();
@@ -159,23 +164,33 @@ describe("immutable delivery and restart receipts", () => {
     const ui = runWorkflowHost({ store: store(root), teamId: "team-one", consumer: "ui-team-one", signal: controller.signal, includeSchedulerIdle: true,
       onReady: async () => uiReady.resolve(), turn: async (event) => { if (event.kind === "queue-changed" && event.id.startsWith("scheduler-idle:")) { expect(leased).toBe(false); idleSeen.resolve(); } },
     });
-    await uiReady.promise;
+    const uiEnded = ui.then(() => { throw new Error("UI host ended before idle delivery."); }); void uiEnded.catch(() => {});
+    await Promise.race([uiReady.promise, uiEnded]);
     const business = runWorkflowHost({ store: store(root), teamId: "team-one", consumer: "scheduler-team-one", signal: controller.signal, turn: primary,
       consumers: async () => [{ consumer: "release-goal-one", turn: slow }], onIdle,
       activity: async (run) => { activities++; leased = true; try { await run(); } finally { leased = false; } },
     });
+    const businessEnded = business.then(() => { throw new Error("Business host ended before idle receipts."); }); void businessEnded.catch(() => {});
+    const deadline = setTimeout(() => { controller.abort(); release.resolve(); }, 4_000);
     try {
-      await slowStarted.promise; expect(onIdle).not.toHaveBeenCalled(); expect(leased).toBe(true);
-      release.resolve(); await idleSeen.promise; await receiptOnly.promise;
+      await Promise.race([slowStarted.promise, businessEnded, uiEnded]); expect(onIdle).not.toHaveBeenCalled(); expect(leased).toBe(true);
+      release.resolve(); await Promise.race([idleSeen.promise, uiEnded, businessEnded]); await Promise.race([receiptOnly.promise, businessEnded, uiEnded]);
       expect(onIdle).toHaveBeenCalledTimes(1); expect(primary).toHaveBeenCalledTimes(1); expect(slow).toHaveBeenCalledTimes(1);
       expect(activities).toBe(1);
+      const retained = (await readdir(inbox.directory)).filter((name) => name.endsWith(".json"));
+      expect(retained).toHaveLength(1);
+      expect(JSON.parse(await readFile(join(inbox.directory, retained[0]), "utf8"))).toEqual(idleEvent);
+      for (const key of ["scheduler-team-one", "release-goal-one", "ui-team-one"]) {
+        // UI signals during its turn; draining below waits for its receipt commit before checking it.
+        await new WorkflowInbox(root).drain(key, "team-one", async () => { throw new Error("Idle hint was not durably acknowledged."); });
+      }
       expect(idleEvent!.kind === "queue-changed" && idleEvent!.id).toMatch(/^scheduler-idle:team-one:[a-f0-9]{64}$/);
       await inbox.publish(idleEvent!);
       const rerun = vi.fn(async () => {});
       await new WorkflowInbox(root).drain("scheduler-team-one", "team-one", rerun);
       await new WorkflowInbox(root).drain("release-goal-one", "team-one", rerun);
       expect(rerun).not.toHaveBeenCalled(); expect(onIdle).toHaveBeenCalledTimes(1);
-    } finally { controller.abort(); release.resolve(); await Promise.allSettled([business, ui]); receiptObservation.mockRestore(); }
+    } finally { clearTimeout(deadline); controller.abort(); release.resolve(); await Promise.allSettled([business, ui]); receiptObservation.mockRestore(); }
   });
   it.each([false, true])("authenticates the Mattermost socket and durably dispatches only home notifications (missed file notification: %s)", async (missedNotification) => {
     const root = await directory(); const controller = new AbortController(); let socket!: FakeSocket;
