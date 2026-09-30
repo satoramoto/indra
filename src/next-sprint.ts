@@ -49,6 +49,26 @@ export function selectNextCandidate(team: TeamRecord): CandidateSelection {
 export interface NextSprintRecord {
   key: string; status: "waiting" | "reserved" | "proposed"; reason?: string; goalId?: string;
 }
+/** Only a retro-closed sprint whose release omitted no outcome delivered every ticket of its source candidate. */
+const fullyReleased = (goal: PlanningGoal) => goal.ceremony?.closure?.evidence.kind === "retro-published"
+  && goal.ceremony.history.some((entry) => entry.stage === "release" && entry.evidence.kind === "implementation" && !entry.evidence.omissions?.length);
+
+/** Completes the candidate and tickets of each fully released sprint so dependent candidates can become eligible. */
+export function reconcileReleased(state: PlanningDocument, teamId: string, at: string): boolean {
+  const team = teamIn(state, teamId); let changed = false;
+  for (const goal of state.planningGoals ?? []) {
+    if (goal.teamId !== teamId || !goal.source || !fullyReleased(goal)) continue;
+    const candidate = team.sprintCandidates?.find((item) => item.id === goal.source!.candidateId);
+    if (!candidate || candidate.goalId !== goal.id || candidate.status !== "proposed") continue;
+    Object.assign(candidate, { status: "completed", updatedAt: at, updatedBySeatId: goal.seatId });
+    for (const ticket of team.backlog ?? []) {
+      if (goal.source.ticketIds.includes(ticket.id) && ticket.status === "planned") Object.assign(ticket, { status: "done", updatedAt: at, updatedBySeatId: goal.seatId });
+    }
+    changed = true;
+  }
+  return changed;
+}
+
 class Waiting extends Error {}
 const wait = (reason: string): never => { throw new Waiting(reason); };
 const teamIn = (state: PlanningDocument, id: string) => (state.teams as TeamRecord[]).find((team) => team.id === id)!;
@@ -107,10 +127,17 @@ export class NextSprint {
       try {
         // Recover an interrupted state commit before inspecting closure or reservation evidence.
         await this.store.update(() => {}, "Recover next sprint reservation");
-        const state = await this.store.read();
-        const closed = state.planningGoals?.find((goal) => goal.id === context.goal.id);
-        if (!closed?.ceremony?.closure || closureKey(closed) !== key) return wait("Sprint closure has not been verified.");
-        validateCeremony(closed);
+        let state = await this.store.read();
+        const verified = state.planningGoals?.find((goal) => goal.id === context.goal.id);
+        if (!verified?.ceremony?.closure || closureKey(verified) !== key) return wait("Sprint closure has not been verified.");
+        validateCeremony(verified);
+        // Deliver the completed sprint's tickets before selecting a successor that may depend on them.
+        if (reconcileReleased(structuredClone(state), verified.teamId, new Date().toISOString())) {
+          await this.store.update((current) => { reconcileReleased(current, verified.teamId, new Date().toISOString()); }, `Complete released sprint candidates for team ${verified.teamId}`);
+          state = await this.store.read();
+        }
+        const closed = state.planningGoals!.find((goal) => goal.id === verified.id)!;
+        if (!closed.ceremony?.closure) return wait("Sprint closure has not been verified.");
         if (latestClosed(state, closed.teamId)?.id !== closed.id) return;
         if (closed.ceremony.closure.evidence.kind === "legacy-migration") return wait("Legacy migration has no new sprint closure to propose from.");
         const id = nextGoalId(key);

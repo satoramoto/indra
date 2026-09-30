@@ -151,6 +151,24 @@ describe("next sprint closure adapter", () => {
     expect(JSON.stringify(await f.store.read())).not.toContain("next-sprint-waiting");
   });
 
+  it("completes a fully released backlog sprint before selecting a successor that depends on it", async () => {
+    const value = team();
+    value.sprintCandidates![1] = candidate("candidate-one", 1, ["ticket-one"], { status: "proposed", goalId: "goal-previous" });
+    value.backlog![0].status = "planned"; value.backlog![1].dependsOn = ["ticket-one"];
+    const previous = closedGoal(); previous.source = { candidateId: "candidate-one", ticketIds: ["ticket-one"] };
+    expect(selectNextCandidate(value).status).toBe("waiting");
+    const f = await fixture([previous], value);
+    await expect(f.handle(previous)).rejects.toThrow("waiting for Chick");
+    await expect(f.handle(previous)).rejects.toThrow("waiting for Chick");
+    const current = teamOf(await f.store.read());
+    expect(current.sprintCandidates!.find((item) => item.id === "candidate-one")).toMatchObject({ status: "completed", goalId: "goal-previous" });
+    expect(current.backlog![0].status).toBe("done");
+    const next = (await f.nextGoals()).filter((goal) => goal.id !== previous.id);
+    expect(next).toHaveLength(1); expect(next[0].source).toMatchObject({ candidateId: "candidate-two", ticketIds: ["ticket-two"] });
+    expect(current.sprintCandidates!.find((item) => item.id === "candidate-two")).toMatchObject({ status: "proposed", goalId: next[0].id });
+    expect(roots(f.chat)).toHaveLength(1);
+  });
+
   it("delivers large backlog citations and recovers a lost response without duplicating the approval post", async () => {
     const value = team();
     value.sprintCandidates = [candidate("candidate-one", 1, ["ticket-one", "ticket-two"])];
