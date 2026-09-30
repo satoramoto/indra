@@ -37,6 +37,21 @@ describe("state commits", () => {
     expect((await store.read()).planningGoals![0].brief.summary).toBe("Sharper");
   });
 
+  it("writes state with a failing owner signer configured, preserving identity and configuration", async () => {
+    const store = await fixture();
+    git(store.checkout, "config", "commit.gpgsign", "true");
+    git(store.checkout, "config", "gpg.program", "/usr/bin/false");
+    git(store.checkout, "config", "gpg.format", "openpgp");
+    const config = await readFile(join(store.checkout, ".git/config"), "utf8");
+    const identity = git(store.checkout, "log", "-1", "--format=%an <%ae>|%cn <%ce>");
+    expect(() => git(store.checkout, "commit", "--allow-empty", "-qm", "Would require signing")).toThrow();
+    await store.update(addGoal("goal-unsigned"), "Unattended state write");
+    expect(subjects(store.checkout).at(-1)).toBe("Unattended state write");
+    expect(git(store.checkout, "log", "-1", "--format=%an <%ae>|%cn <%ce>")).toBe(identity);
+    expect(git(store.checkout, "cat-file", "commit", "HEAD")).not.toContain("gpgsig");
+    expect(await readFile(join(store.checkout, ".git/config"), "utf8")).toBe(config);
+  });
+
   it("makes no commit when a write changes nothing", async () => {
     const store = await fixture();
     await store.update(addGoal("goal-one"), "Start planning goal goal-one");

@@ -64,7 +64,8 @@ export interface RetroArchive {
 
 /**
  * The GitHub side of a sprint: its integration branch, the one PR from it into main, merging a PR once CI is green,
- * and a revert PR on main. Every call is safe to repeat: it finds what an earlier call made before making anything.
+ * and a revert PR on main. Host commits retain owner identity but never invoke an interactive signer.
+ * Every call is safe to repeat: it finds what an earlier call made before making anything.
  */
 export class SprintGitHub implements RetroArchive {
   constructor(private readonly shell: Shell, private readonly runtimeDir: string) {}
@@ -205,7 +206,7 @@ export class SprintGitHub implements RetroArchive {
             const current = await this.integrationScope(github, goalId, ownedFiles, prUrl, revert);
             if (current.headSha !== headSha || current.baseSha !== baseSha) throw new SprintError("Integration changed during correction; retained work needs reconciliation.");
             record.phase = "resolved"; await save();
-            await this.must("git", ["commit", "-m", `Merge main into ${branch} within approved scope`], cwd);
+            await this.must("git", ["commit", "--no-gpg-sign", "-m", `Merge main into ${branch} within approved scope`], cwd);
             head = (await this.must("git", ["rev-parse", "HEAD"], cwd)).stdout.trim();
           }
           // Also recovers a crash immediately after commit, before its result SHA was journaled.
@@ -439,7 +440,7 @@ export class SprintGitHub implements RetroArchive {
           }
           await writeFile(join(worktree, path), markdown, { flag: "wx", mode: 0o644 });
           await this.must("git", ["add", "--", path], worktree);
-          await this.must("git", ["commit", "--only", "-m", `Archive retrospective for ${goalId}`, "--", path], worktree);
+          await this.must("git", ["commit", "--no-gpg-sign", "--only", "-m", `Archive retrospective for ${goalId}`, "--", path], worktree);
           await this.retroTree(worktree, "HEAD^", "HEAD", path, markdown);
           const pushed = await this.run("git", [...GH_CREDENTIAL, "push", "origin", `HEAD:refs/heads/${branch}`], worktree);
           if (pushed.code !== 0) throw new SprintError("Retrospective push was not confirmed; reconcile the branch on retry.");
@@ -508,7 +509,7 @@ export class SprintGitHub implements RetroArchive {
           if (!(await lstat(document)).isFile() || await readFile(document, "utf8") !== previous) throw new SprintError("The correction checkout does not contain the expected regular document.");
           await writeFile(document, markdown);
           await this.must("git", ["add", "--", path], worktree);
-          await this.must("git", ["commit", "--only", "-m", `Correct retrospective for ${goalId}`, "--", path], worktree);
+          await this.must("git", ["commit", "--no-gpg-sign", "--only", "-m", `Correct retrospective for ${goalId}`, "--", path], worktree);
           record.resultSha = (await this.must("git", ["rev-parse", "HEAD"], worktree)).stdout.trim();
           await verifyCommit(record.resultSha);
           const pending = `${file}.${process.pid}.tmp`; await writeFile(pending, JSON.stringify(record), { mode: 0o600 }); await rename(pending, file);
@@ -628,7 +629,7 @@ export class SprintGitHub implements RetroArchive {
     await this.run("gh", ["api", "-X", "DELETE", `repos/${github}/git/refs/heads/${branch}`]);
     try {
       await this.must("git", ["worktree", "add", "--no-track", "-b", branch, worktree, "origin/main"], project);
-      await this.must("git", ["revert", "--no-edit", mergedSha], worktree);
+      await this.must("git", ["revert", "--no-gpg-sign", "--no-edit", mergedSha], worktree);
       await this.must("git", [...GH_CREDENTIAL, "push", "origin", `HEAD:refs/heads/${branch}`], worktree);
       return await this.openPr(github, branch, title, body);
     } finally {
