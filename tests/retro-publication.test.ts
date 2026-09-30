@@ -5,7 +5,7 @@ import { advanceCeremony, startCeremony, type HumanApproval } from "../src/cerem
 import type { PlanningGoal, PlanningStore } from "../src/planning.js";
 import { createCeremonyAdapters, recordedRetroInput, RetroPublication, retroRetryDelayMs, retroRuntimeName, type RetroPublicationRecord } from "../src/retro-publication.js";
 import { buildRetroSnapshot, renderSprintRetro, RetroGenerationError, type RetroPriorAttempt, type SprintRetroDraft } from "../src/sprint-retro.js";
-import { SprintGitHub, type RetroArchive, type RetroPr } from "../src/sprint.js";
+import { SprintGitHub, type RetroArchive, type RetroPr, type RetroReview } from "../src/sprint.js";
 import { SeatRuntime } from "../src/seat-runtime.js";
 import { TEAM_LEAD_CODEX_CONFIG, codexConfigForRoles } from "../src/harness-home.js";
 import * as mattermost from "../src/planning-mattermost.js";
@@ -62,7 +62,7 @@ async function fixture() {
   };
   const services = {
     thread: vi.fn(async () => ({ ownUserId: "chick", posts: [...deliveries.values()].map((post) => ({ ...post, user_id: "chick", channel_id: "home", root_id: "root", create_at: Date.now() })) })),
-    review: vi.fn(async () => ({ summary: "Reviewed archive", findings: [] })),
+    review: vi.fn(async (_context: CeremonyContext, _worktree: string, _pr: RetroPr): Promise<RetroReview> => ({ summary: "Reviewed archive", findings: [] })),
   };
   const restart = () => new RetroPublication(archive, draft, services);
   const record = () => records.get(retroRuntimeName(goal.id)) as RetroPublicationRecord;
@@ -372,6 +372,133 @@ describe("recoverable retro publication", () => {
     expect(f.draft).toHaveBeenCalledTimes(2);
     expect(f.record().attempts[1].retry).toEqual({ id: expect.stringMatching(/^retro-merge-retry:/), at: new Date().toISOString() });
     expect(f.record().failure).toBeUndefined(); expect(f.record().authorization).toBeUndefined();
+  });
+
+  async function rejectedPublication(priorFailure = false) {
+    vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime("2026-01-01T01:00:00.000Z");
+    const f = await fixture(); goalsV1Retro(f); f.pr.reviewed = false; f.pr.checksPassed = false;
+    f.services.review.mockResolvedValueOnce({ summary: "Correct the unsupported Product count", findings: [{ path: "docs/retros/goal-one.md", line: 3, reason: "Product history is incomplete." }] });
+    vi.mocked(f.archive.reviewRetroPr).mockImplementation(async (_github, _goal, _markdown, _url, head, review) => {
+      const result = await review("/managed/review");
+      if (result.findings.length) f.pr.rejection = { headSha: head, reviewId: 7, submittedAt: new Date().toISOString() };
+      else f.pr.reviewed = true;
+    });
+    if (priorFailure) { f.draft.mockRejectedValueOnce(new Error("An actual earlier generation failure")); await f.restart().poll(f.context); vi.setSystemTime("2026-01-01T01:00:01.000Z"); }
+    const rejected = await f.restart().poll(priorFailure ? retryContext(f, "initial-draft-retry") : f.context);
+    expect(rejected).toMatchObject({ status: "pending", failure: { message: expect.stringContaining("rejected by satori-miyamoto"), retryable: true } });
+    const original = structuredClone(f.record()); const oldPosts = structuredClone([...f.deliveries]);
+    const corrected = structuredClone(original.frozen!.draft); corrected.snapshot.missing.push("Corrected missing Product history."); corrected.generation.sessionId = "corrected-retro-session";
+    corrected.markdown = await renderSprintRetro(corrected.snapshot, corrected.narrative, corrected.generation);
+    f.draft.mockResolvedValue(corrected);
+    const correction = vi.fn<NonNullable<RetroArchive["correctRetroPr"]>>(async (_github, _goal, previous, next, url, rejection) => {
+      expect(previous).toBe(original.frozen!.markdown); expect(next).toBe(corrected.markdown); expect(url).toBe(original.prUrl); expect(rejection.headSha).toBe(original.gate!.headSha);
+      if (f.pr.headSha !== rejection.headSha && f.pr.headSha !== "e".repeat(40)) throw new Error("Concurrent head moved");
+      f.pr.headSha = "e".repeat(40); f.pr.reviewed = false; delete f.pr.rejection; return f.pr.headSha;
+    });
+    f.archive.correctRetroPr = correction;
+    vi.setSystemTime("2026-01-01T01:00:02.000Z");
+    return { ...f, original, oldPosts, corrected, correction };
+  }
+
+  it("corrects a rejected frozen publication only after an explicit fresh retry, retaining successful and failed generation history", async () => {
+    const f = await rejectedPublication(true);
+    for (const event of [undefined, retryContext(f, "stale", { at: "2026-01-01T01:00:01.000Z" }).event, retryContext(f, "foreign", { goalId: "goal-other" }).event]) {
+      const result = await f.restart().poll({ ...f.context, event });
+      expect(result).toMatchObject({ status: "pending", failure: { message: expect.stringContaining("planning retry --goal goal-one") } });
+    }
+    expect(f.draft).toHaveBeenCalledTimes(2); expect(f.services.review).toHaveBeenCalledTimes(1);
+    const retry = retryContext(f, "correct-rejected-retro");
+    const correcting = f.draft.getMockImplementation()!;
+    f.draft.mockImplementationOnce(async (...args) => {
+      expect(f.record().attempts).toEqual([{ startedAt: new Date().toISOString(), retry: { id: retry.event.id, at: retry.event.at } }]);
+      expect(f.record().revisions![0]).toMatchObject({ frozen: f.original.frozen, attempts: f.original.attempts, postIds: f.original.postIds, review: f.original.review, headSha: f.original.gate!.headSha });
+      return await correcting(...args);
+    });
+    expect(await f.restart().poll(retry)).toEqual({ status: "pending", reason: "The retrospective archive is waiting for passing CI." });
+    expect(f.draft).toHaveBeenCalledTimes(3); expect(f.correction).toHaveBeenCalledTimes(1);
+    expect(f.draft.mock.calls.at(-1)![1]).toEqual([{ startedAt: f.original.attempts[0].startedAt, sessionId: null, invocationId: null, errorKind: "draft-error" }]);
+    const history = structuredClone(f.record().revisions);
+    expect(history![0].attempts.at(-1)!.generation!.status).toBe("succeeded");
+    expect(f.record().frozen!.markdown).toBe(f.corrected.markdown); expect(f.record().failure).toBeUndefined();
+    expect(f.services.review).toHaveBeenCalledTimes(2); expect(f.services.review.mock.calls[1][2].headSha).toBe("e".repeat(40));
+    const notice = f.record().correction!.notice!; expect(notice.message).toContain(`/blob/${f.original.gate!.headSha}/docs/retros/goal-one.md`); expect(notice.message).toContain(f.original.frozen!.sha256);
+    for (const [key, post] of f.oldPosts) expect(f.deliveries.get(key)).toEqual(post);
+    await f.restart().poll(retry); expect(f.draft).toHaveBeenCalledTimes(3); expect(f.archive.mergeRetroPr).not.toHaveBeenCalled();
+    f.pr.checksPassed = true;
+    expect((await f.restart().poll(f.context)).status).toBe("complete");
+    expect(f.record().revisions).toEqual(history); expect(f.record().prUrl).toBe(f.original.prUrl); expect(f.record().authorization).toBeUndefined();
+    expect(f.archive.mergeRetroPr).toHaveBeenCalledTimes(1); expect(f.archive.ensureRetroPr).toHaveBeenCalledWith("test/project", "goal-one", f.original.frozen!.markdown);
+  });
+
+  it.each(["reservation", "draft", "freeze-before-write", "freeze-response", "part-response", "notice-response", "push-response"])("recovers correction at the %s boundary without replaying model work", async (boundary) => {
+    const f = await rejectedPublication(); const retry = retryContext(f, "correction-retry");
+    const blockedBeforeFreeze = ["reservation", "draft", "freeze-before-write"].includes(boundary);
+    let failed = false; const save = f.context.store.saveRuntime.bind(f.context.store);
+    const saving = vi.spyOn(f.context.store, "saveRuntime").mockImplementation(async (name, value) => {
+      const record = value as RetroPublicationRecord;
+      const stop = !failed && record.correction && (boundary === "reservation" ? !record.frozen : ["freeze-before-write", "freeze-response"].includes(boundary) && record.frozen && !record.correction.notice);
+      if (stop) { failed = true; if (boundary !== "freeze-before-write") await save(name, value); throw new Error("Lost journal boundary"); }
+      await save(name, value);
+    });
+    if (boundary === "draft") f.draft.mockRejectedValueOnce(new Error("Correction generation failed"));
+    if (boundary === "part-response") f.losePost();
+    if (boundary === "notice-response") {
+      const post = f.context.post;
+      f.context.post = async (...args) => { const id = await post(...args); if (!failed && args[0].startsWith("retro-correction:")) { failed = true; throw new Error("Lost notice acknowledgement"); } return id; };
+    }
+    if (boundary === "push-response") {
+      const apply = f.correction.getMockImplementation()!;
+      f.correction.mockImplementationOnce(async (...args) => { await apply(...args); throw new Error("Lost correction push acknowledgement"); });
+    }
+    expect((await f.restart().poll(retry)).status).toBe("pending"); saving.mockRestore();
+    const reserved = structuredClone(f.record().attempts); const history = structuredClone(f.record().revisions);
+    const invocations = boundary === "reservation" ? 1 : 2;
+    expect(f.draft).toHaveBeenCalledTimes(invocations); expect(history).toHaveLength(1);
+    vi.setSystemTime("2026-01-01T01:00:03.000Z");
+    await f.restart().poll(f.context); await f.restart().poll(retryContext(f, retry.event.id));
+    expect(f.draft).toHaveBeenCalledTimes(invocations);
+    if (blockedBeforeFreeze) {
+      expect(f.record().frozen).toBeUndefined(); expect(f.record().failure?.retryable).toBe(true);
+      expect(f.record().attempts).toEqual(reserved);
+      await f.restart().poll(retryContext(f, "fresh-correction-recovery")); expect(f.draft).toHaveBeenCalledTimes(invocations + 1);
+    }
+    expect(f.record().frozen!.markdown).toBe(f.corrected.markdown); expect(f.record().revisions).toEqual(history);
+    expect(f.record().correction!.resultHeadSha).toBe("e".repeat(40));
+    expect([...f.deliveries.keys()].filter((key) => key.startsWith("retro-correction:"))).toHaveLength(1);
+    for (const [key, post] of f.oldPosts) expect(f.deliveries.get(key)).toEqual(post);
+    f.pr.checksPassed = true; expect((await f.restart().poll(f.context)).status).toBe("complete");
+  });
+
+  it("retains corrected frozen content as a visible blocker when the guarded archive update refuses a moved head", async () => {
+    const f = await rejectedPublication(); f.correction.mockRejectedValue(new Error("Concurrent archive head moved"));
+    const result = await f.restart().poll(retryContext(f, "correct-before-move"));
+    expect(result).toMatchObject({ status: "pending", failure: { message: expect.stringContaining("guarded archive update needs reconciliation") } });
+    const frozen = structuredClone(f.record().frozen); const history = structuredClone(f.record().revisions);
+    await f.restart().poll(f.context); await f.restart().poll(retryContext(f, "retry-after-move"));
+    expect(f.draft).toHaveBeenCalledTimes(2); expect(f.record().frozen).toEqual(frozen); expect(f.record().revisions).toEqual(history);
+    expect(f.archive.mergeRetroPr).not.toHaveBeenCalled();
+  });
+
+  it("does not reuse a retry identity retained in an earlier publication revision", async () => {
+    const f = await rejectedPublication(true); await f.restart().poll(retryContext(f, "first-correction"));
+    f.correction.mockResolvedValue(f.pr.headSha);
+    vi.setSystemTime("2026-01-01T01:00:03.000Z");
+    f.pr.reviewed = false; f.pr.rejection = { reviewId: 8, headSha: f.pr.headSha, submittedAt: new Date().toISOString() };
+    await f.restart().poll(f.context);
+    vi.setSystemTime("2026-01-01T01:00:04.000Z");
+    expect((await f.restart().poll(retryContext(f, "initial-draft-retry"))).status).toBe("pending");
+    expect(f.draft).toHaveBeenCalledTimes(3); expect(f.record().revisions).toHaveLength(1);
+  });
+
+  it("blocks closure if the corrected head moves after the guarded update returns", async () => {
+    const f = await rejectedPublication();
+    vi.mocked(f.archive.inspectRetroPr).mockImplementation(async () => {
+      if (f.correction.mock.calls.length) { f.pr.headSha = "f".repeat(40); f.pr.reviewed = true; f.pr.checksPassed = true; }
+      return structuredClone(f.pr);
+    });
+    const result = await f.restart().poll(retryContext(f, "correction-race"));
+    expect(result).toMatchObject({ status: "pending", failure: { message: expect.stringContaining("changed after its guarded update") } });
+    expect(f.archive.mergeRetroPr).not.toHaveBeenCalled(); expect(f.record().verifiedAt).toBeUndefined();
   });
 
   it("records failed draft attempts and never publishes unsupported model content", async () => {
