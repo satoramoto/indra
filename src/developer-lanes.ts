@@ -10,12 +10,13 @@ import { ensureProjectCheckout } from "./project-checkout.js";
 import { SprintGitHub } from "./sprint.js";
 import { schemaPathOf } from "./reload.js";
 import { redactSecrets } from "./redact.js";
-import { applyLaneWorker, laneAgentSummary, LANE_AGENT_SCHEMA, LANE_WORKER_PLAN_SCHEMA, LANE_WORKER_SCHEMA, runGoalAgent, type GoalAgentSession, type LaneAgentSummary, type LaneWorkerPlan, type LaneWorkerResult } from "./seat-runtime.js";
+import { applyLaneWorker, laneAgentSummary, laneWorkerResult, LANE_AGENT_SCHEMA, LANE_WORKER_PLAN_SCHEMA, LANE_WORKER_SCHEMA, runGoalAgent, type GoalAgentSession, type LaneAgentSummary, type LaneWorkerPlan, type LaneWorkerResult } from "./seat-runtime.js";
 
 export interface LaneCheck { command: string; exitCode: number; headSha: string; diagnostic: string }
 export interface LaneJournal {
   id: string; branch: string; worktree: string; baseSha: string; gitDir: string; prepared: boolean;
   sessions: GoalAgentSession[]; attempt: number; built: boolean; summary: LaneAgentSummary | null;
+  workerRejections?: { key: string; file: string; reason: string; at: string }[];
   checks: LaneCheck[]; prUrl: string | null; headSha: string | null; mergedSha: string | null;
   fixes: string[]; fixAttempts?: { key: string; attempt: number; status: "started" | "failed" | "complete" }[]; review: SavedReview | null; reviewWorktrees: Record<string, string>; cleaned: boolean;
 }
@@ -167,12 +168,33 @@ export class GitDeveloperLanes implements DeveloperLaneServices {
     }
     const results = await Promise.allSettled(plan.workers.map(async (worker) => {
       const workerBrief = { ...scoped, ownedFiles: [worker.file], exclusions: [...scoped.exclusions, ...plan.workers.filter((other) => other.file !== worker.file).map((other) => ({ files: [other.file], owner: `worker ${other.file}`, reason: "One file per worker" }))] };
-      const completedWorker = journal.sessions.find((session) => session.role === "worker" && session.status === "complete" && /^worker:\d+:/.test(session.key) && session.key.replace(/^worker:\d+:/, "") === worker.file);
-      if (leadStarted && !completedWorker) throw new LaneError("Interrupted lead is missing its completed worker provenance.");
-      const response = await this.agent(journal, persist, { key: completedWorker?.key ?? `worker:${journal.attempt}:${worker.file}`, role: "worker", brief: workerBrief, cwd: journal.worktree, schema: LANE_WORKER_SCHEMA,
-        instruction: `Own exactly ${worker.file}. Task: ${worker.task}. Your actual runtime is read-only. Return the complete final file in content (null to delete), with decisions/followUps/neededButUnowned. Never edit another file or run checks, commits, pushes, servers or other workers. Do not claim delivery or merge; the host validates/applies this one file.` }) as LaneWorkerResult;
-      laneAgentSummary(response);
-      if (response.neededButUnowned.length || !(response.content === null || typeof response.content === "string")) throw new LaneError("Worker needs unowned files or returned invalid content.");
+      const siblings = plan.workers.filter((other) => other.file !== worker.file);
+      const validate = (value: unknown) => {
+        const response = laneWorkerResult(value);
+        if (response.neededButUnowned.length) throw new LaneError(`Needed but unowned files: ${response.neededButUnowned.join(", ")}`);
+        for (const dependency of response.siblingDependencies) if (!siblings.some((other) => other.file === dependency.file)) throw new LaneError(`Sibling dependency is not assigned to another worker: ${dependency.file}`);
+        return response;
+      };
+      const reject = async (key: string, error: unknown) => {
+        const reason = redactSecrets(error instanceof Error ? error.message : "Invalid worker handoff.").slice(0, 1000);
+        if (!journal.workerRejections?.some((item) => item.key === key)) { (journal.workerRejections ??= []).push({ key, file: worker.file, reason, at: new Date().toISOString() }); await persist(); }
+        return new LaneError(`Worker ${worker.file} handoff rejected: ${reason} Explicit retry is required for a fresh response.`);
+      };
+      let completedWorker: GoalAgentSession | undefined;
+      for (const session of [...journal.sessions].reverse().filter((item) => item.role === "worker" && item.status === "complete" && /^worker:\d+:/.test(item.key) && item.key.replace(/^worker:\d+:/, "") === worker.file)) {
+        if (journal.workerRejections?.some((item) => item.key === session.key)) continue;
+        try { validate(session.result?.response); completedWorker = session; break; }
+        catch (error) { await reject(session.key, error); }
+      }
+      if (leadStarted && !completedWorker) throw new LaneError(`Interrupted lead is missing accepted worker provenance for ${worker.file}; its draft is preserved.`);
+      const key = completedWorker?.key ?? `worker:${journal.attempt}:${worker.file}`;
+      const rejection = journal.workerRejections?.find((item) => item.key === key);
+      if (rejection) throw await reject(key, new LaneError(rejection.reason));
+      const priorRejection = [...(journal.workerRejections ?? [])].reverse().find((item) => item.file === worker.file);
+      const value = await this.agent(journal, persist, { key, role: "worker", brief: workerBrief, cwd: journal.worktree, schema: LANE_WORKER_SCHEMA,
+        instruction: `Own exactly ${worker.file}. Task: ${worker.task}. Your actual runtime is read-only. Return the complete final file in content (null to delete), with decisions/followUps/neededButUnowned and siblingDependencies. Named sibling assignments: ${JSON.stringify(siblings)}. Earlier handoff rejection: ${priorRejection?.reason ?? "None"}. For an interface or behavior expected from a named sibling, return {file, requirement} in siblingDependencies using its exact file path; the lead reconciles all worker outputs together. This does not grant permission to edit that file. Use neededButUnowned only for blocking requests outside these named assignments. Do not wait for siblings. Never edit another file or run checks, commits, pushes, servers or other workers. Do not claim delivery or merge; the host validates/applies this one file.` });
+      let response: LaneWorkerResult;
+      try { response = validate(value); } catch (error) { throw await reject(key, error); }
       return { file: worker.file, response };
     }));
     // Never release the goal lock while a started sibling can still finish or persist its result.
@@ -183,7 +205,7 @@ export class GitDeveloperLanes implements DeveloperLaneServices {
     if (!leadStarted) for (const worker of workers) await applyLaneWorker(journal.worktree, worker.file, worker.response.content);
     requireLaneFiles(await this.paths(journal), lane, brief.ownedFiles);
     const response = await this.agent(journal, persist, { key: `lead:${journal.attempt}`, role: "lead", brief: scoped, cwd: journal.worktree, write: { extraDirs: [journal.gitDir] }, schema: LANE_AGENT_SCHEMA,
-      instruction: "Finish this lane's owned outcomes and integrate the workers' existing changes. Preserve any draft changes from interrupted earlier turns; do not discard or overwrite them blindly. You are the lead, with exclusive ownership only of the listed files. Add meaningful regression tests for changed behavior. Do not run checks, commit, push, create/merge PRs or spawn workers: the host runs the final targeted checks once and owns Git/PR operations. Return summary, all decisions/followUps and any neededButUnowned files. Stop every process you start." });
+      instruction: `Finish this lane's owned outcomes and integrate the workers' existing changes. Reconcile these structured worker dependencies inside the lane's owned scope: ${JSON.stringify(workers.map((worker) => ({ file: worker.file, siblingDependencies: worker.response.siblingDependencies })))}. Preserve any draft changes from interrupted earlier turns; do not discard or overwrite them blindly. You are the lead, with exclusive ownership only of the listed files. Add meaningful regression tests for changed behavior. Do not run checks, commit, push, create/merge PRs or spawn workers: the host runs the final targeted checks once and owns Git/PR operations. Return summary, all decisions/followUps and any neededButUnowned files. Stop every process you start.` });
     const summary = laneAgentSummary(response);
     journal.summary = { ...summary, decisions: [...plan.decisions, ...workers.flatMap((item) => item.response.decisions), ...summary.decisions], followUps: [...plan.followUps, ...workers.flatMap((item) => item.response.followUps), ...summary.followUps] };
     requireLaneFiles(await this.paths(journal), lane, brief.ownedFiles);

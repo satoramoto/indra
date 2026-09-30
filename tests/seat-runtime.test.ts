@@ -2,6 +2,7 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { Ajv2020 } from "ajv/dist/2020.js";
 import { loadSeatEngines, SEAT_ENGINES_FILE, SeatRuntime, type EngineFactory } from "../src/seat-runtime.js";
 
 const dirs: string[] = [];
@@ -62,7 +63,7 @@ describe("seat engine configuration and routing", () => {
   });
 });
 
-import { renderGoalBrief, runGoalAgent, type GoalAgentSession } from "../src/seat-runtime.js";
+import { laneWorkerResult, LANE_WORKER_SCHEMA, renderGoalBrief, runGoalAgent, type GoalAgentSession } from "../src/seat-runtime.js";
 import type { GoalBrief } from "../src/goal-contract.js";
 const goalBrief: GoalBrief = { version: 1, goalId: "goal-one", teamId: "team-one", seatId: "seat-003", header: { repo: "test/project", baseBranch: "sprint/goal-one", baseSha: "a".repeat(40), branch: "codex/goal-one/code", prTarget: "sprint/goal-one" }, outcomes: [{ number: 1, title: "Fix", description: "Preserve behavior", reason: "Mission", currentCode: ["src/a.ts"] }], ownedFiles: ["src/a.ts"], exclusions: [{ files: ["src/b.ts"], owner: "lane docs", reason: "Exclusive" }], swarm: "Single-file workers", retros: [{ goalId: "goal-old", path: "docs/retros/goal-old.md", summary: "Earlier lesson" }], redirects: [{ postId: "post", userId: "owner", at: "2026-09-01T00:00:00Z", message: "Preserve public API" }], reportFormat: "PR/head, exact commands/exits, Decisions, Follow-ups and needed-but-unowned" };
 it("gives both engines the identical standard brief and fresh read-only worker context", async () => {
@@ -88,4 +89,17 @@ it("does not automatically replay an interrupted agent intent", async () => {
   const sessions: GoalAgentSession[] = [{ key: "lead", role: "lead", status: "started", startedAt: "2026-09-01T00:00:00Z" }];
   await expect(runGoalAgent(create, { key: "lead", role: "lead", brief: goalBrief, cwd: directory, schema: "schema", instruction: "Recover" }, directory, sessions, async () => {})).rejects.toThrow("explicit retry");
   expect(create).not.toHaveBeenCalled();
+});
+
+it("requires structured sibling dependencies from new workers while preserving legacy blockers and accepted reports", () => {
+  const legacy = { summary: "File delivered", decisions: [], followUps: [], neededButUnowned: ["private/needed.ts"], content: "source" };
+  const validate = new Ajv2020({ strict: false }).compile(LANE_WORKER_SCHEMA);
+  expect(validate(legacy)).toBe(false);
+  const current = { ...legacy, neededButUnowned: [], siblingDependencies: [{ file: "src/b.ts", requirement: "Preserve the shared API" }] };
+  expect(validate(current)).toBe(true); expect(laneWorkerResult(current)).toEqual(current);
+  expect(validate({ ...current, siblingDependencies: ["src/b.ts (owned by its worker)"] })).toBe(false);
+  expect(laneWorkerResult(legacy)).toEqual({ ...legacy, siblingDependencies: [] });
+});
+it.each([null, ["src/b.ts"], [{ file: "src/b.ts", requirement: "" }], [{ file: "src/b.ts", requirement: "one" }, { file: "src/b.ts", requirement: "two" }]])("rejects malformed structured worker dependencies %j", (siblingDependencies) => {
+  expect(() => laneWorkerResult({ summary: "File", decisions: [], followUps: [], neededButUnowned: [], content: "source", siblingDependencies })).toThrow("Invalid structured sibling dependencies");
 });
