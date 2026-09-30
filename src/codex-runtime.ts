@@ -172,11 +172,11 @@ export class CodexRuntime implements AgentRuntime {
       if (options.onUsage) {
         const since = Date.now(); let tail: LiveUsageTail | undefined;
         const logHome = env.CODEX_HOME || join(homedir(), ".codex");
-        const cwds = [resolve(this.cwd)];
+        const cwds = realpath(this.cwd).then((canonical) => [resolve(this.cwd), canonical], () => [resolve(this.cwd)]);
         pollUsage = () => usageRead ??= (async () => {
           if (!evidence.sessionId) return;
           if (!tail) {
-            const log = await codexRollout(logHome, cwds, since, evidence.sessionId);
+            const log = await codexRollout(logHome, await cwds, since, evidence.sessionId);
             if (log) tail = new LiveUsageTail(log, "codex", undefined, evidence);
           }
           if (tail) await tail.read().catch(() => undefined);
