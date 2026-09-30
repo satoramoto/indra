@@ -1209,7 +1209,7 @@
                         "$ref": "#/$defs/ceremonySha"
                       },
                       "reviewer": {
-                        "const": "satori-miyamoto"
+                        "enum": ["independent-agent", "satori-miyamoto"]
                       },
                       "ci": {
                         "const": "passed"
@@ -1306,7 +1306,7 @@
               "$ref": "#/$defs/ceremonySha"
             },
             "reviewer": {
-              "const": "satori-miyamoto"
+              "enum": ["independent-agent", "satori-miyamoto"]
             },
             "checksPassed": {
               "const": true

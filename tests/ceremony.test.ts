@@ -67,6 +67,15 @@ async function store(goals: PlanningGoal[] = [], enabled = true): Promise<Planni
 }
 
 describe("ordered ceremony", () => {
+  it.each(["independent-agent", "satori-miyamoto"] as const)("retains %s current-head review evidence through release", (reviewer) => {
+    const item = staged("release"); prepare(item, "retro");
+    const { approval: _approval, mergePostId: _post, ...release } = running;
+    const evidence: RunningReleaseEvidence = { ...release, mergeVerification: { headSha: sha("a"), reviewCommitSha: sha("a"), reviewer, checksPassed: true } };
+    const ceremony = advanceCeremony(item, { to: "retro", at: at(7), evidence });
+    const last = ceremony.history.at(-1)!;
+    expect("evidence" in last && last.evidence).toEqual(evidence);
+    expect(() => advanceCeremony(item, { to: "retro", at: at(7), evidence: { ...evidence, mergeVerification: { ...evidence.mergeVerification!, reviewCommitSha: sha("b") } } })).toThrow("current-head independent review approval");
+  });
   it("has exactly five stages, and closes only with a published retro after entering retro", () => {
     expect(CEREMONY_STAGES).toEqual(["planning", "proposal", "implement", "release", "retro"]);
     const item = staged("retro");

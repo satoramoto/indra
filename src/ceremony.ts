@@ -1,7 +1,7 @@
 import { Ajv2020 } from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import type { PlanningGoal } from "./planning.js";
-import { validateGoalReport, type GoalReport } from "./goal-contract.js";
+import { isGoalReviewer, validateGoalReport, type GoalReport, type GoalReviewer } from "./goal-contract.js";
 
 /** Closure is deliberately not a sixth stage. The legacy goal.stage is only a compatibility projection. */
 export const CEREMONY_STAGES = ["planning", "proposal", "implement", "release", "retro"] as const;
@@ -20,7 +20,7 @@ export interface ImplementationEvidence {
   omissions?: { outcomeId: string; seatId: string; reason: string }[];
   partialApproval?: { source: "owner-command"; command: "planning integrate"; at: string };
 }
-export interface MergeVerification { headSha: string; reviewCommitSha: string; reviewer: "satori-miyamoto"; checksPassed: true }
+export interface MergeVerification { headSha: string; reviewCommitSha: string; reviewer: GoalReviewer; checksPassed: true }
 export interface RunningReleaseEvidence {
   kind: "release-running"; prUrl: string; mergedSha: string;
   /** Historical second-gate evidence remains readable, but is never synthesized for new releases. */
@@ -117,7 +117,7 @@ export const CEREMONY_SCHEMA_DEFS = {
     { if: { required: ["partialApproval"] }, then: { required: ["omissions"] } },
   ] },
   ceremonyRelease: { ...object({ kind: { const: "release-running" }, prUrl: ref("ceremonyPr"), mergedSha: sha, mergePostId: text,
-    approval, mergeVerification: object({ headSha: sha, reviewCommitSha: sha, reviewer: { const: "satori-miyamoto" }, checksPassed: { const: true } }), checksPassed: { const: true }, buildSha: sha, runningSha: sha, runningAt: time,
+    approval, mergeVerification: object({ headSha: sha, reviewCommitSha: sha, reviewer: { enum: ["independent-agent", "satori-miyamoto"] }, checksPassed: { const: true } }), checksPassed: { const: true }, buildSha: sha, runningSha: sha, runningAt: time,
     ancestry: object({ ancestorSha: sha, descendantSha: sha, verified: { const: true } }),
   }, ["kind", "prUrl", "mergedSha", "checksPassed", "buildSha", "runningSha", "runningAt"]), anyOf: [{ required: ["mergeVerification"] }, { required: ["mergePostId", "approval"] }] },
   ceremonyRetro: object({ kind: { const: "retro-published" }, path: { type: "string", pattern: "^docs/retros/[a-z][a-z0-9-]+\\.md$" },
@@ -169,7 +169,7 @@ addFormats.default(ajv);
 const implementationSchema = CEREMONY_SCHEMA_DEFS.ceremonyImplementation;
 Object.assign(CEREMONY_SCHEMA_DEFS, { ceremonyImplementation: { anyOf: [implementationSchema,
   object({ kind: { const: "implementation" }, outcomes: { type: "array", maxItems: 0 }, goalDelivery: object({ version: { const: 1 }, goalId: id, teamId: id, seatId: id, sprintBranch: text, headSha: sha,
-    lanePrs: { type: "array", minItems: 1, items: object({ laneId: id, url: ref("ceremonyPr"), headSha: sha, mergedSha: sha, reviewer: { const: "satori-miyamoto" }, ci: { const: "passed" } }) },
+    lanePrs: { type: "array", minItems: 1, items: object({ laneId: id, url: ref("ceremonyPr"), headSha: sha, mergedSha: sha, reviewer: { enum: ["independent-agent", "satori-miyamoto"] }, ci: { const: "passed" } }) },
     checks: { type: "array", minItems: 1, items: object({ command: text, exitCode: { type: "integer" } }) },
     decisions: { type: "array", items: text }, followUps: { type: "array", items: text }, neededButUnowned: { type: "array", items: text },
   }) }),
@@ -265,7 +265,7 @@ function validateRelease(goal: PlanningGoal, evidence: RunningReleaseEvidence): 
   if (evidence.ancestry) requireThat(evidence.ancestry.verified === true && evidence.ancestry.ancestorSha === evidence.mergedSha && evidence.ancestry.descendantSha === evidence.buildSha, "Release ancestry must verify the merged commit in this build.");
   requireThat(evidence.buildSha === evidence.mergedSha || evidence.ancestry, "A descendant release build requires verified ancestry from the merged commit.");
   if (evidence.mergeVerification) {
-    requireThat(evidence.mergeVerification.headSha === evidence.mergeVerification.reviewCommitSha && evidence.mergeVerification.reviewer === "satori-miyamoto" && evidence.mergeVerification.checksPassed === true, "Release requires current-head bot approval and passing CI.");
+    requireThat(evidence.mergeVerification.headSha === evidence.mergeVerification.reviewCommitSha && isGoalReviewer(evidence.mergeVerification.reviewer) && evidence.mergeVerification.checksPassed === true, "Release requires current-head independent review approval and passing CI.");
   } else {
     requireThat(evidence.approval && evidence.mergePostId, "Historical release requires its recorded approval.");
     validateHuman(evidence.approval, "planning merge", evidence.mergePostId, goal);

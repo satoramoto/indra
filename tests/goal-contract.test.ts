@@ -118,6 +118,12 @@ describe("standard goal and lane briefs", () => {
 });
 
 describe("goal reports", () => {
+  it.each(["independent-agent", "satori-miyamoto"] as const)("preserves the observed %s reviewer without relabeling history", (reviewer) => {
+    const value = report(); value.lanePrs[0].reviewer = reviewer;
+    expect(validateGoalReport(value)).toEqual(value);
+    expect(validateGoalReport(value).lanePrs[0].reviewer).toBe(reviewer);
+  });
+
   it("preserves failed check exit codes rather than converting them to success", () => {
     const value = report(); value.checks.push({ command: "npx vitest run tests/planning.test.ts", exitCode: 17 });
     expect(validateGoalReport(value)).toEqual(value);

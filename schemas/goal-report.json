@@ -71,7 +71,7 @@
           },
           "reviewer": {
             "type": "string",
-            "const": "satori-miyamoto"
+            "enum": ["independent-agent", "satori-miyamoto"]
           },
           "ci": {
             "type": "string",
