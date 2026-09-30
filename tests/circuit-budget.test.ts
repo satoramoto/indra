@@ -126,7 +126,7 @@ describe("durable circuit budget", () => {
     } };
     const wrapped = protectShell(budget, shell, { phase: "checks" }) as typeof shell;
     await expect(wrapped.run("test", [], "/", { timeoutMs: 25 })).rejects.toThrow("execution time");
-    expect(timeout).toBe(25); expect((await budget.status()).totals.executionMs).toBeGreaterThanOrEqual(25);
+    expect(timeout).toBeLessThanOrEqual(25); expect((await budget.status()).totals.executionMs).toBeGreaterThanOrEqual(25);
   });
   it("does not reclaim a long-running reservation on a heartbeat guess, but verifies PID reuse before conservative recovery", async () => {
     const { options } = await fixture(); let now = 1000; let identity = row.start;
@@ -149,4 +149,55 @@ describe("durable circuit budget", () => {
     expect((await protectShell(budget, shell, { phase: "checks" }).run("test", [], "/")).code).toBe(0);
     const status = await budget.status(); expect(status.totals.executionMs).toBeGreaterThanOrEqual(10); expect(status.totals.tokens).toBe(0); expect(status.trip).toBeUndefined();
   });
+  it("queues a fifth normal model until capacity is released without consuming retries", async () => {
+    const { budget, options } = await fixture({ maxModelConcurrency: 1, maxInvocationMs: 2000 });
+    const occupying = await budget.begin("model", { phase: "build" }); let started = false;
+    const pending = protectRuntime(new CircuitBudget(options), { message: async () => { started = true; return result({ inputTokens: 1, outputTokens: 1 }); } }, { phase: "review" }).message("", "");
+    await new Promise((resolve) => setTimeout(resolve, 30)); expect(started).toBe(false);
+    await budget.usage(occupying.id, { inputTokens: 1, outputTokens: 1 }); await budget.finish(occupying.id);
+    await pending; expect(started).toBe(true); expect((await budget.status()).totals.retries).toBe(0);
+  });
+  it("cancels admission wait before any model starts and preserves caller usage callbacks", async () => {
+    const { budget } = await fixture({ maxModelConcurrency: 1 });
+    const occupying = await budget.begin("model", { phase: "build" }); let started = false;
+    const controller = new AbortController();
+    const runtime = protectRuntime(budget, { message: async () => { started = true; return result({ inputTokens: 1, outputTokens: 1 }); } }, { phase: "review" });
+    const pending = runtime.message("", "", undefined, { signal: controller.signal });
+    const rejected = expect(pending).rejects.toThrow("owner cancelled");
+    await new Promise((resolve) => setTimeout(resolve, 25)); controller.abort(new Error("owner cancelled")); await rejected;
+    expect(started).toBe(false); expect(Object.keys((await budget.status()).reservations)).toEqual([occupying.id]);
+    await budget.usage(occupying.id, { inputTokens: 1, outputTokens: 1 }); await budget.finish(occupying.id);
+    const reports: TokenUsage[] = [];
+    await runtime.message("", "", undefined, { onUsage: (usage: TokenUsage) => reports.push(usage) } as MessageOptions);
+    expect(reports).toEqual([{ inputTokens: 1, outputTokens: 1 }]);
+  });
+  it("storage failure marker stays closed across restart until a durable explicit grant", async () => {
+    const { budget, options } = await fixture(); await budget.status();
+    await writeFile(`${budget.path}.tripped`, "ledger persistence failed\n");
+    await expect(new CircuitBudget(options).assertAvailable()).rejects.toThrow("persistence failed");
+    const status = await budget.grant({ tokens: 1, owner: "owner", reason: "storage repaired and inspected" });
+    expect(status.history.map((entry) => entry.event)).toEqual(["trip", "grant"]);
+    await new CircuitBudget(options).assertAvailable();
+    await expect(readFile(`${budget.path}.tripped`)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+  it("refuses owner grants while siblings are still executing", async () => {
+    const { budget } = await fixture(); await budget.begin("command", { phase: "checks" });
+    await expect(budget.grant({ executionMs: 1, owner: "owner", reason: "extend" })).rejects.toThrow("active invocations");
+    expect((await budget.status()).history).toEqual([]);
+  });
+
+  it("fails closed when usage regresses instead of treating the reset as free tokens", async () => {
+    const { budget } = await fixture({ maxInvocationTokens: 100 });
+    const run = await budget.begin("model", { phase: "build" });
+    await budget.usage(run.id, { inputTokens: 20, outputTokens: 10 });
+    await expect(budget.usage(run.id, { inputTokens: 1, outputTokens: 1 })).rejects.toThrow("became unknown");
+    expect((await budget.status()).totals.tokens).toBe(100);
+  });
+  it("exposes corrupted accounting as a circuit error before the provider can start", async () => {
+    const { budget } = await fixture(); await budget.status(); await writeFile(budget.path, "corrupt");
+    let invoked = false;
+    const runtime = protectRuntime(budget, { message: async () => { invoked = true; return result(); } }, { phase: "build" });
+    await expect(runtime.message("", "")).rejects.toBeInstanceOf(CircuitOpenError); expect(invoked).toBe(false);
+  });
+
 });

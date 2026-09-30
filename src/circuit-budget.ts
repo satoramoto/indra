@@ -61,10 +61,10 @@ const nonnegative = (value: unknown): value is number => Number.isSafeInteger(va
 const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
 const missing = (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT";
 const iso = (now: number) => new Date(now).toISOString();
-const label = (value: string) => typeof value === "string" && !["constructor", "prototype", "__proto__"].includes(value) && /^[a-zA-Z0-9][a-zA-Z0-9:_.\/-]{0,255}$/.test(value);
+const label = (value: string) => typeof value === "string" && !Object.hasOwn(Object.prototype, value) && value !== "prototype" && /^[a-zA-Z0-9][a-zA-Z0-9:_.\/-]{0,255}$/.test(value);
 
 export function validateCircuitPolicy(value: unknown): CircuitPolicy {
-  if (!object(value) || Object.keys(value).some((key) => !(key in DEFAULT_CIRCUIT_POLICY))) throw new Error("Invalid circuit policy keys.");
+  if (!object(value) || Object.keys(value).some((key) => !Object.hasOwn(DEFAULT_CIRCUIT_POLICY, key))) throw new Error("Invalid circuit policy keys.");
   const result = { ...DEFAULT_CIRCUIT_POLICY, ...value };
   if (!Object.values(result).every(positive)) throw new Error("Circuit policy limits must be positive finite safe integers.");
   return result as CircuitPolicy;
@@ -149,6 +149,8 @@ export class CircuitBudget {
       const handle = await open(temporary, "wx", 0o600);
       try { await handle.writeFile(`${JSON.stringify(ledger)}\n`); await handle.sync(); } finally { await handle.close(); }
       await rename(temporary, this.path);
+      const directory = await open(this.options.runtimeDir, "r");
+      try { await directory.sync(); } finally { await directory.close(); }
     } catch {
       // A separate sticky marker makes a partial storage failure visible to other live wrappers/restarts.
       await writeFile(`${this.path}.tripped`, "ledger persistence failed\n", { flag: "wx", mode: 0o600 }).catch(() => undefined);
@@ -238,10 +240,21 @@ export class CircuitBudget {
     return this.transaction((ledger) => {
       const run = ledger.reservations[id];
       if (!run) throw new Error("Unknown circuit invocation.");
+      if ([usage.inputTokens, usage.outputTokens].some((value) => value !== undefined && !nonnegative(value))
+        || (usage.inputTokens !== undefined && run.inputTokens !== undefined && usage.inputTokens < run.inputTokens)
+        || (usage.outputTokens !== undefined && run.outputTokens !== undefined && usage.outputTokens < run.outputTokens)) {
+        ledger.totals.tokens += Math.max(0, run.tokenLimit - run.tokens); run.tokens = Math.max(run.tokens, run.tokenLimit);
+        this.trip(ledger, "model token accounting became unknown"); this.assert(ledger);
+      }
       // Snapshots are monotonic within one invocation. Cache counters are already inside inputTokens.
       if (nonnegative(usage.inputTokens)) run.inputTokens = Math.max(run.inputTokens ?? 0, usage.inputTokens);
       if (nonnegative(usage.outputTokens)) run.outputTokens = Math.max(run.outputTokens ?? 0, usage.outputTokens);
-      const tokens = (run.inputTokens ?? 0) + (run.outputTokens ?? 0);
+      const sum = (run.inputTokens ?? 0) + (run.outputTokens ?? 0);
+      if (!nonnegative(sum) || !nonnegative(ledger.totals.tokens + Math.max(0, sum - run.tokens))) {
+        ledger.totals.tokens = Number.MAX_SAFE_INTEGER; run.tokens = Number.MAX_SAFE_INTEGER;
+        this.trip(ledger, "model token accounting overflow"); this.assert(ledger);
+      }
+      const tokens = sum;
       ledger.totals.tokens += Math.max(0, tokens - run.tokens); run.tokens = Math.max(run.tokens, tokens);
       if (run.tokens >= run.tokenLimit) this.trip(ledger, "invocation token budget exhausted");
       this.account(ledger); this.assert(ledger);
@@ -269,7 +282,8 @@ type BoundedShell = { run(command: string, args: string[], cwd: string, options?
 async function protectedRun<T>(budget: CircuitBudget, kind: "model" | "command", context: CircuitContext,
   options: { signal?: AbortSignal; timeoutMs?: number }, execute: (options: ObservedOptions) => Promise<T>): Promise<T> {
   if (options.signal?.aborted) throw options.signal.reason ?? new Error("Invocation aborted.");
-  const admission = await budget.status();
+  const accountingError = (error: unknown) => error instanceof CircuitOpenError ? error : new CircuitOpenError(budget.scopeId, "budget accounting unavailable");
+  const admission = await budget.status().catch((error) => { throw accountingError(error); });
   const deadline = Date.now() + Math.min(options.timeoutMs ?? admission.policy.maxInvocationMs, admission.policy.maxInvocationMs);
   let reservation: Reservation;
   while (true) {
@@ -278,7 +292,7 @@ async function protectedRun<T>(budget: CircuitBudget, kind: "model" | "command",
     if (remaining <= 0) throw new CircuitBusyError();
     try { reservation = await budget.begin(kind, context, Math.min(options.timeoutMs ?? admission.policy.maxInvocationMs, remaining)); break; }
     catch (error) {
-      if (!(error instanceof CircuitBusyError)) throw error;
+      if (!(error instanceof CircuitBusyError)) throw accountingError(error);
       await new Promise<void>((resolve, reject) => {
         const finish = () => { options.signal?.removeEventListener("abort", abort); resolve(); };
         const timer = setTimeout(finish, Math.min(budget.pollMs, remaining));
@@ -293,7 +307,7 @@ async function protectedRun<T>(budget: CircuitBudget, kind: "model" | "command",
   options.signal?.addEventListener("abort", forwardAbort, { once: true });
   if (options.signal?.aborted) forwardAbort();
   let queued = Promise.resolve(); let failure: unknown; let polling: Promise<void> | undefined;
-  const stop = (error: unknown) => { failure ??= error; controller.abort(error); };
+  const stop = (error: unknown) => { failure ??= accountingError(error); controller.abort(failure); };
   const onUsage = (usage: TokenUsage) => {
     queued = queued.then(() => budget.usage(reservation.id, usage)).catch(stop);
   };
