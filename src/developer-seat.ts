@@ -408,7 +408,7 @@ export class DeveloperSeat {
     // Every session is new: no session id is ever passed, so the reviewer never shares the builder's context.
     try { run = await circuitRuntime(this.runtimeFor(record.worktree, write), this.store.runtimeDir, record.goalId, "implement", `legacy:${record.outcomeId}:${role}:${reviewHead}`, role !== "developer" && role !== "reviewer").message(prompt, schema, undefined, { purpose: role === "developer" ? "build" : role === "reviewer" ? "review" : "fix" }); }
     catch (error) {
-      if (error instanceof AgentRunError) await this.event(record, { kind: "session", role, session: error.facts }, `session:${error.facts.invocationId}`);
+      if ((error instanceof AgentRunError || isCircuitOpen(error)) && error.facts) await this.event(record, { kind: "session", role, session: error.facts }, `session:${error.facts.invocationId}`);
       if (isCircuitOpen(error)) throw error;
       this.log(`Agent ${role} session error.`); throw new SeatError(sessionFailureNote(role, error));
     }

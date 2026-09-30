@@ -93,7 +93,7 @@ describe("repository seat personas", () => {
         return post;
       }),
     };
-    const runtime = { message: vi.fn().mockResolvedValue({ sessionId: "original", response: { summary: "Brief", reply: "What matters?", decisions: [], openQuestions: [] }, startedAt: "start", finishedAt: "finish" }) };
+    const runtime = { message: vi.fn().mockResolvedValue({ sessionId: "original", usage: { inputTokens: 1, outputTokens: 1 }, response: { summary: "Brief", reply: "What matters?", decisions: [], openQuestions: [] }, startedAt: "start", finishedAt: "finish" }) };
     const bridge = new PlanningBridge(store, withPersonaChat(chat, { ...profile, postPrefix: "First phrase." }), withPersonaRuntime(runtime, profile));
     await expect(bridge.start("Plan a feature", [])).rejects.toThrow("Response lost");
     const goal = (await store.read()).planningGoals![0];

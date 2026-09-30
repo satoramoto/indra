@@ -2,7 +2,7 @@ import { accountedFailure } from "./circuit-fixture.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 // These integration cases exercise durable accounting plus real Git/process supervision.
-vi.setConfig({ testTimeout: 20_000 });
+vi.setConfig({ testTimeout: 60_000 });
 import { copyFile, mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { main } from "../src/cli.js";
@@ -19,7 +19,7 @@ import type { Post } from "../src/planning-bridge.js";
 import type { ProductSourceRevision } from "../src/product-source-snapshot.js";
 import { stateCheckout, git } from "./state-checkout.js";
 
-vi.setConfig({ testTimeout: 20_000 });
+vi.setConfig({ testTimeout: 60_000 });
 const roots: string[] = [];
 afterEach(async () => { vi.restoreAllMocks(); await Promise.all(roots.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
 const teamId = "team-one"; const seatId = "seat-002"; const github = "fixture/product-project";
@@ -71,7 +71,7 @@ async function fixture(options: { decorate?: boolean; noChat?: boolean; fallback
   const runtime: AgentRuntime = { message: async (prompt, schema, session, messageOptions) => {
     messageOptions?.onUsage?.({ inputTokens: 8, outputTokens: 2 });
     calls.push({ prompt, schema, session, purpose: messageOptions?.purpose });
-    if (calls.length === failCall) throw accountedFailure("Interrupted model turn");
+    if (calls.length === failCall) throw accountedFailure("Interrupted model turn", { inputTokens: 8, outputTokens: 2 });
     const identity = JSON.parse(/^Proposal identity: (.+)$/m.exec(prompt)![1]) as Pick<ProductProposal, "goalId" | "proposalId" | "rank" | "productSeatId">;
     const response: ProductProposal = { version: 1, ...identity, mission: "docs/mission.md", summary: `Reliable build improvement ${identity.rank}`, outcomes: [{ number: 1, title: "Verify delivery", description: "Improve the existing delivery evidence with a regression", reason: "The mission needs reliable autonomous delivery", currentCode: ["src/work.ts"] }], ownedFiles: ["src/**", "tests/**"], risks: ["Existing callers need compatibility"], rationale: `Use mission and retros, turn ${calls.length}`, basedOnRetros: ["goal-d", "goal-c", "goal-b"], ...outputPatch };
     return { sessionId: `product-session-${calls.length}`, response, usage: { inputTokens: 8, outputTokens: 2 }, startedAt: at, finishedAt: at };

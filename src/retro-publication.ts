@@ -475,7 +475,7 @@ export async function createCeremonyAdapters({ store }: { store: PlanningStore }
       const runtime = withPersonaRuntime(new SeatRuntime(engines[context.goal.seatId] ?? "codex", cwd, undefined, undefined, undefined, seatHarnessDir(store.runtimeDir, context.goal.seatId), roles), profiles[context.goal.seatId]);
       return { message: async (...args) => {
         try { const run = await circuitRuntime(runtime, store.runtimeDir, context.goal.id, "retro", `retro-draft:${prior.length}`, prior.length > 0).message(...args); await context.recordRun(run); return run; }
-        catch (error) { if (error instanceof AgentRunError) await context.recordSession(error.facts); throw error; }
+        catch (error) { if ((error instanceof AgentRunError || isCircuitOpen(error)) && error.facts) await context.recordSession(error.facts); throw error; }
       } };
     });
   }, {
@@ -490,7 +490,7 @@ export async function createCeremonyAdapters({ store }: { store: PlanningStore }
         const run = await circuitRuntime(runtime, store.runtimeDir, context.goal.id, "retro", `retro-review:${pr.headSha}`).message(`You are a fresh reviewer in Indra. You did not draft this retrospective. Review ${pr.url} at HEAD ${pr.headSha} against AGENTS.md and the recorded facts in docs/retros/${context.goal.id}.md. Inspect the diff against origin/main. Flag only real bugs or project-rule violations, with the document path, line and a one-line reason; never style or naming. Suggestions must remain owner proposals. You are read-only without network. Do not edit files, commit, push, merge or post. Never include credentials in output. Indra will post your line comments and an approval or changes-requested verdict. Return JSON: summary and findings (path, line, reason; empty when there are none).`, schemaPathOf(import.meta.url, "retro-review.json"), undefined, { purpose: "review" });
         await context.recordRun(run);
         return run.response;
-      } catch (error) { if (error instanceof AgentRunError) await context.recordSession(error.facts); throw error; }
+      } catch (error) { if ((error instanceof AgentRunError || isCircuitOpen(error)) && error.facts) await context.recordSession(error.facts); throw error; }
     },
   });
   return { retro };

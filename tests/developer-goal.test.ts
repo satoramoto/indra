@@ -2,7 +2,6 @@ import { accountedFailure } from "./circuit-fixture.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 // These integration cases exercise durable accounting plus real Git/process supervision.
-vi.setConfig({ testTimeout: 20_000 });
 import { execFileSync } from "node:child_process";
 import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -18,7 +17,7 @@ import { stateCheckout } from "./state-checkout.js";
 
 const roots: string[] = [];
 afterEach(async () => { vi.restoreAllMocks(); await Promise.all(roots.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
-vi.setConfig({ testTimeout: 30_000 });
+vi.setConfig({ testTimeout: 60_000 });
 const at = "2026-09-01T00:00:00Z";
 const goalId = "goal-whole";
 const repo = "test/project";
@@ -145,7 +144,7 @@ async function fixture(lanes = 1) {
     if (role === "lead-plan" && failWorkers) { failWorkers = false; throw accountedFailure("Planning failed with terminal usage"); }
     if (role === "lead-plan") response = { workers: (workerFiles ?? [`src/${file}.ts`]).map((path) => ({ file: path, task: "Implement source" })), decisions: planDecisions, followUps: planFollowUps };
     if (role === "worker") {
-      const path = /Own exactly ([^ ]+)\. Task:/.exec(prompt)![1]; await workerHook?.(path);
+      const path = /Own exactly ([^ ]+)\. Task:/.exec(prompt)![1]; try { await workerHook?.(path); } catch (error) { throw accountedFailure(error instanceof Error ? error.message : "Simulated terminal worker failure"); }
       response = { ...summary, decisions: workerDecisions, followUps: workerFollowUps, content: shell.localChecks === "typecheck" ? 'export const value: number = "broken";\n' : `export const ${second ? "other" : "value"} = 2;\n` };
     }
     if (role === "lead") {

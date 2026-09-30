@@ -1,4 +1,8 @@
+import { accountedFailure } from "./circuit-fixture.js";
 import { afterEach, describe, expect, it } from "vitest";
+
+// This integration suite uses real Git and durable invocation accounting.
+vi.setConfig({ testTimeout: 20_000 });
 import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -68,15 +72,16 @@ async function handoffFixture(count = 2) {
     return processShell.run(command, args, cwd);
   } };
   const runtimeFor = (cwd: string, write?: WriteAccess): AgentRuntime => ({ message: async (prompt, _schema, session, options) => {
+    options?.onUsage?.({ inputTokens: 1, outputTokens: 1 });
     const role = options!.purpose!; const file = role === "worker" ? /Own exactly ([^ ]+)\. Task:/.exec(prompt)![1] : undefined;
     calls.push({ role, file, prompt, session, write }); let response: unknown = workerSummary;
     if (role === "lead-plan") response = plan;
     if (role === "worker") response = responses.get(file!);
     if (role === "lead") {
       leadDrafts.push(Object.fromEntries(await Promise.all(files.map(async (file) => [file, await readFile(join(cwd, file), "utf8")]))));
-      await leadHook?.(cwd);
+      try { await leadHook?.(cwd); } catch (error) { throw accountedFailure(error instanceof Error ? error.message : "Simulated terminal failure"); }
     }
-    return { sessionId: `fresh-${calls.length}`, response, startedAt: "2026-09-30T00:00:00Z", finishedAt: "2026-09-30T00:00:01Z" };
+    return { sessionId: `fresh-${calls.length}`, response, usage: { inputTokens: 1, outputTokens: 1 }, startedAt: "2026-09-30T00:00:00Z", finishedAt: "2026-09-30T00:00:01Z" };
   } });
   const services = () => new GitDeveloperLanes(store, shell, runtimeFor);
   let journal = services().create(lane, brief);
