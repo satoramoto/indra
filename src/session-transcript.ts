@@ -306,7 +306,7 @@ export class TranscriptLocator {
   }
 
   /** The newest log only this seat's runs write: its Codex harness home, or its active worktree's Claude project. */
-  async live(seatId: string, worktree: string | undefined, ownProjects = false): Promise<TranscriptLocation[]> {
+  async live(seatId: string, worktree: string | undefined): Promise<TranscriptLocation[]> {
     const found: TranscriptLocation[] = [];
     for (const day of await codexDays(this.codexSessions(seatId), 2)) {
       const path = await newestLog(day, (name) => name.startsWith("rollout-"));
@@ -320,14 +320,6 @@ export class TranscriptLocator {
           const path = await newestLog(join(root, claudeProjectDir(cwd)), (name) => UUID.test(name.slice(0, -".jsonl".length)));
           if (path) found.push({ engine: "claude", sessionId: path.slice(-42, -6), path });
         }
-      }
-    }
-    if (ownProjects) {
-      // Finite Product/goal runs have no public session handles. Search only this seat's isolated harness.
-      const root = this.claudeRoots(seatId)[0];
-      for (const project of await entries(root)) {
-        const path = await newestLog(join(root, project), (name) => UUID.test(name.slice(0, -".jsonl".length)));
-        if (path) found.push({ engine: "claude", sessionId: path.slice(-42, -6), path });
       }
     }
     return found;
@@ -346,24 +338,22 @@ export class TranscriptLocator {
   }
 
   /**
-   * The seat's current session log: the newest of the recorded session's log and, for a Developer seat, the newest
-   * log of its active work. `recordedHandle` is Chick's recorded planning session for a Team Lead seat.
+   * Finite seats require the verified current run. Historical seats retain their recorded/active-work fallback.
+   * `recordedHandle` is Chick's recorded planning session for a Team Lead seat.
    */
   async locate(seat: TranscriptSeat, recordedHandle?: string): Promise<TranscriptLocation | undefined> {
     if (!/^[a-z][a-z0-9-]+$/.test(seat.id)) return undefined;
-    const candidates: TranscriptLocation[] = [];
+    if (seat.roles.includes("Product")) return this.headed(seat.id);
     const lead = seat.roles.includes("Team Lead");
-    const product = seat.roles.includes("Product");
     const state = await this.store.read().catch(() => undefined);
-    const goal = state?.planningGoals?.some((goal) => goal.workflowModel === "goals-v1" && !goal.ceremony?.closure && goal.goalAssignment?.seatId === seat.id && goal.goalAssignment.status !== "reported");
-    const task = !lead && !product && !goal ? await seatTask(this.runtimeDir, seat.id) : undefined;
-    if (product || goal) {
-      const headed = await this.headed(seat.id);
-      if (headed) return headed;
-    }
-    const recorded = await this.recorded(seat.id, product || goal ? undefined : lead ? recordedHandle : task?.sessionId ?? recordedHandle);
+    const team = (state?.teams as { workflowModel?: string; seats: { id: string }[] }[] | undefined)?.find((team) => team.seats.some((item) => item.id === seat.id));
+    if (!lead && team?.workflowModel === "goals-v1") return this.headed(seat.id);
+    if (!lead && !team) return undefined;
+    const task = !lead ? await seatTask(this.runtimeDir, seat.id) : undefined;
+    const candidates: TranscriptLocation[] = [];
+    const recorded = await this.recorded(seat.id, lead ? recordedHandle : task?.sessionId ?? recordedHandle);
     if (recorded) candidates.push(recorded);
-    candidates.push(...await this.live(seat.id, task?.worktree, product || goal));
+    candidates.push(...await this.live(seat.id, task?.worktree));
     let best: { location: TranscriptLocation; at: number } | undefined;
     for (const location of candidates) {
       const at = await mtime(location.path);
