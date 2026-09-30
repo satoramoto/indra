@@ -117,9 +117,9 @@ export class StateGit {
     if (await this.dirty()) throw new StateCommitError(`${this.path} in ${this.checkout} has changes that are not committed. Indra commits its own state changes and will not commit these; commit or discard them, then retry.`);
   }
 
-  /** Commits only the state file, whatever else is staged. */
+  /** Commits only the state file, whatever else is staged, without invoking the owner's interactive signer. */
   async commit(message: string): Promise<void> {
-    await this.run(["commit", "--quiet", "--only", "-m", message, "--", this.path]);
+    await this.run(["commit", "--no-gpg-sign", "--quiet", "--only", "-m", message, "--", this.path]);
   }
 
   /** The subject of the last commit that changed the file, or "" when none did. */
@@ -157,7 +157,7 @@ export class StateGit {
       const [ahead, behind] = await counts();
       if (behind > 0 && ahead === 0) await this.run(["merge", "--ff-only", "--quiet", upstream]);
       else if (behind > 0) {
-        try { await this.run(["rebase", "--quiet", "--no-autostash", upstream]); }
+        try { await this.run(["rebase", "--no-gpg-sign", "--quiet", "--no-autostash", upstream]); }
         catch (error) {
           await this.run(["rebase", "--abort"]).catch(() => undefined);
           const now = (await this.run(["rev-parse", "HEAD"]).catch(() => "")).trim();
