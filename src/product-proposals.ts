@@ -8,7 +8,8 @@ import { assertProductQueueCapacity, productRuntimeFilename, validateOwnedFiles,
 import type { Post } from "./planning-bridge.js";
 import type { MattermostPlanningChat } from "./planning-mattermost.js";
 import { requireTeamHome, type PlanningDocument, type PlanningStore } from "./planning.js";
-import { ensureProjectCheckout } from "./project-checkout.js";
+import { ensureProjectCheckout, projectCheckoutPath } from "./project-checkout.js";
+import { ProductSnapshotError, ProductSourceSnapshots, type ProductSourceRevision } from "./product-source-snapshot.js";
 import { redactSecrets } from "./redact.js";
 import { schemaPathOf } from "./reload.js";
 import { loadSeatPersonas, personaPost } from "./seat-persona.js";
@@ -17,7 +18,7 @@ export const PRODUCT_QUEUE_CAP = 5;
 export type ProductChat = Pick<MattermostPlanningChat, "ownUserId" | "isBot" | "since" | "post">;
 export interface ProductProposalServices {
   store: PlanningStore; teamId: string; productSeatId: string;
-  /** The host binds this fallback to the team's managed project, never the state checkout. */
+  /** Retained for host compatibility; generation requires runtimeFor to bind the exact source snapshot. */
   runtime?: AgentRuntime;
   runtimeFor?: RuntimeFactory;
   chat?: ProductChat;
@@ -30,11 +31,12 @@ export class ProductTurnError extends Error {
 }
 type VettedEvent = Extract<WorkflowEvent, { kind: "proposal-vetted" }>;
 interface Team { id: string; workflowModel?: string; seats: { id: string; roles: string[]; externalIdentities: { mattermost: { userId: string } } }[] }
-interface Source { project: string; sha: string; files: string[]; mission: string; retros: { goalId: string; text: string }[] }
+interface Source { github: string; project: string; sha: string; files: string[]; mission: string; retros: { goalId: string; text: string }[] }
 interface ModelRun {
   goalId: string; proposalId: string; rank: number; sourceDigest: string | null;
   prompt: string; files: string[]; retroIds: string[]; status: "prepared" | "started" | "failed" | "complete";
   proposal: ProductProposal | null; sessionId: string | null; usage: unknown;
+  source?: ProductSourceRevision;
 }
 interface Delivery { digest: string; channelId: string; userId: string; since: number; messages: string[]; attempted: boolean; postId: string | null }
 interface ProductJournal {
@@ -85,7 +87,7 @@ export async function proposeGoals(services: ProductProposalServices, event: Wor
     const turn = new ProductTurn(services, record, journal);
     try { return await turn.run(event); }
     catch (error) {
-      const message = error instanceof ProductTurnError ? error.message : "Product turn failed; preserved runtime intent requires explicit retry.";
+      const message = error instanceof ProductTurnError || error instanceof ProductSnapshotError ? error.message : "Product turn failed; preserved runtime intent requires explicit retry.";
       record.failure = { at: now(), message, retryable: true }; await turn.save(); throw new ProductTurnError(message, true);
     }
   });
@@ -208,12 +210,17 @@ class ProductTurn {
     if (result.code !== 0) throw new ProductTurnError(`Product project read failed (git ${args[0]}, exit ${result.code}).`);
     return result.stdout;
   }
-  private async source(): Promise<Source> {
-    const { github } = requireTeamHome(await this.state(), this.services.teamId);
+  private async project(github?: string): Promise<string> {
+    github ??= requireTeamHome(await this.state(), this.services.teamId).github;
     const project = await ensureProjectCheckout(this.shell, this.services.store.runtimeDir, github);
     if (await realpath(project) !== join(await realpath(this.services.store.runtimeDir), "projects", ...github.split("/"))) throw new ProductTurnError("Product project checkout resolves outside its managed location.");
     const remote = (await this.command(project, ["remote", "get-url", "origin"])).trim();
     if (![ `https://github.com/${github}`, `https://github.com/${github}.git`, `git@github.com:${github}.git`, `ssh://git@github.com/${github}.git` ].includes(remote)) throw new ProductTurnError("Product checkout origin differs from the state-derived project.");
+    return realpath(project);
+  }
+  private async source(): Promise<Source> {
+    const { github } = requireTeamHome(await this.state(), this.services.teamId);
+    const project = await this.project(github);
     const sha = (await this.command(project, ["rev-parse", "--verify", "refs/remotes/origin/main"])).trim();
     if (!/^[0-9a-f]{40}$/.test(sha)) throw new ProductTurnError("Product project has no immutable origin/main.");
     const tree = (await this.command(project, ["ls-tree", "-r", "-z", sha])).split("\0").filter(Boolean).map((row) => /^(100644|100755) blob [0-9a-f]{40}\t(.+)$/.exec(row)).filter((row): row is RegExpExecArray => row !== null).map((row) => row[2]);
@@ -221,7 +228,7 @@ class ProductTurn {
     const mission = await this.command(project, ["show", `${sha}:docs/mission.md`]);
     const retros = await Promise.all(tree.filter((path) => /^docs\/retros\/[a-z][a-z0-9-]*\.md$/.test(path)).map(async (path) => ({ path, time: Number((await this.command(project, ["log", "-1", "--format=%ct", sha, "--", path])).trim()) })));
     retros.sort((a, b) => b.time - a.time || b.path.localeCompare(a.path));
-    return { project, sha, files: tree, mission, retros: await Promise.all(retros.slice(0, 3).map(async ({ path }) => ({ goalId: path.slice("docs/retros/".length, -3), text: await this.command(project, ["show", `${sha}:${path}`]) }))) };
+    return { github, project, sha, files: tree, mission, retros: await Promise.all(retros.slice(0, 3).map(async ({ path }) => ({ goalId: path.slice("docs/retros/".length, -3), text: await this.command(project, ["show", `${sha}:${path}`]) }))) };
   }
   private async meaningful(event: WorkflowEvent): Promise<boolean> {
     if (event.kind === "startup") return true;
@@ -240,24 +247,39 @@ class ProductTurn {
   }
   private async generate(event: WorkflowEvent): Promise<void> {
     const active = this.journal.active!;
-    const source = await this.source();
-    const runtime = this.services.runtimeFor?.(source.project) ?? this.services.runtime;
-    if (!runtime) throw new ProductTurnError("Product generation requires a read-only project-bound agent runtime.");
+    if (!this.services.runtimeFor) throw new ProductTurnError("Product generation requires runtimeFor to bind a read-only runtime to its immutable source snapshot.");
+    let source: Source | undefined;
+    let project: string | undefined;
     // A persisted finite budget, never a queue-changed/refinement feedback loop.
     while (active.remaining > 0) {
       let run = active.runId ? this.journal.runs[active.runId] : undefined;
       if (!run) {
+        source ??= await this.source();
         const target = active.refineGoalId ? this.record.queue.find((entry) => entry.proposal.goalId === active.refineGoalId && entry.status === "proposed" && entry.proposal.goalId !== this.record.pending?.goalId) : undefined;
         if (active.refineGoalId && !target) throw new ProductTurnError("The unpublished refinement target is no longer available.");
         const identity = target ? { goalId: target.proposal.goalId, proposalId: target.proposal.proposalId, rank: target.proposal.rank } : { goalId: `goal-${randomUUID()}`, proposalId: `proposal-${randomUUID()}`, rank: Math.max(0, ...this.record.queue.map((entry) => entry.proposal.rank)) + 1 };
-        const repo = requireTeamHome(await this.state(), this.services.teamId).github;
+        const repo = source.github;
         const prompt = [`Repo: ${repo}\nBase: origin/main at ${source.sha}\nRole: Product. Read-only proposal turn; no implementation branch or PR.`, `Proposal identity: ${JSON.stringify({ ...identity, productSeatId: this.services.productSeatId })}`, "Outcome (what must be true when done):\n1. Return one useful ProductProposal grounded in the mission and available recent retros. Keep the exact identity and rank above, mission docs/mission.md, numbered outcomes with reasons and existing repository-relative currentCode file pointers.\n2. Propose nonempty safe ownedFiles globs, concrete rationale and risks. Read current code at the immutable base; do not infer completion from another agent's text.\n3. Preserve published/approved scope. Propose only: no edits, posts, approvals, work dispatch, checks, commits, credentials or servers. Start no workers or background processes.", `Mode: ${target ? "Refine this unpublished proposal without changing its identity or rank" : "Add a distinct next ranked goal"}.\nTarget: ${JSON.stringify(target?.proposal ?? null)}`, `Current queue: ${JSON.stringify(this.record.queue.map(({ proposal, status }) => ({ proposal, status })))}`, `Existing goals: ${JSON.stringify((await this.state()).planningGoals?.map((goal) => ({ id: goal.id, summary: goal.goal, stage: goal.stage, closed: !!goal.ceremony?.closure })) ?? [])}`, `Trigger: ${JSON.stringify(event)}`, `Mission:\n${source.mission}`, `Recent retros (use only these goal IDs for basedOnRetros):\n${source.retros.map((retro) => `${retro.goalId}:\n${retro.text}`).join("\n\n") || "None available."}`, `Current code files (first 1000; the complete immutable Git tree remains readable):\n${source.files.slice(0, 1000).join("\n")}`, "Report only the strict ProductProposal output. Other seats own implementation, scheduling, release and approval. You are not alone in the repository; leave all checkouts and runtime resources unchanged."].join("\n\n");
         if (Buffer.byteLength(prompt, "utf8") > 240_000) throw new ProductTurnError("Product context exceeds the bounded prompt size.");
-        run = { ...identity, sourceDigest: target ? productProposalDigest(target.proposal) : null, prompt, files: source.files, retroIds: source.retros.map((retro) => retro.goalId), status: "prepared", proposal: null, sessionId: null, usage: null };
+        run = { ...identity, sourceDigest: target ? productProposalDigest(target.proposal) : null, prompt, files: source.files, retroIds: source.retros.map((retro) => retro.goalId), status: "prepared", proposal: null, sessionId: null, usage: null, source: { github: repo, sha: source.sha, snapshots: [] } };
         active.runId = randomUUID(); this.journal.runs[active.runId] = run; await this.journalSave();
       }
       if (run.status === "started" || run.status === "failed") throw new ProductTurnError("Interrupted Product context requires an explicit retry; accepted drafts are preserved.");
       if (run.status === "prepared") {
+        const github = requireTeamHome(await this.state(), this.services.teamId).github;
+        const recorded = /^Repo: ([^\n]+)\nBase: origin\/main at ([0-9a-f]{40})\nRole: Product\./.exec(run.prompt);
+        if (!recorded || recorded[1] !== github || (run.source && (run.source.github !== github || run.source.sha !== recorded[2]))) throw new ProductTurnError("Product's saved prompt no longer matches its recorded source base.");
+        // Older journals did not record a checkout. Recover only the immutable base in their saved prompt.
+        run.source ??= { github, sha: recorded[2], snapshots: [] };
+        let snapshot = run.source.snapshots.at(-1);
+        if (!snapshot || snapshot.status === "preserved") {
+          snapshot = { id: randomUUID(), status: "prepared" }; run.source.snapshots.push(snapshot); await this.journalSave();
+        }
+        project ??= source?.project ?? await this.project();
+        const snapshots = new ProductSourceSnapshots(this.shell, project, this.services.teamId, this.services.productSeatId);
+        const cwd = await snapshots.prepare(run.source, active.runId!, snapshot);
+        snapshot.status = "ready";
+        const runtime = this.services.runtimeFor(cwd);
         run.status = "started"; await this.journalSave();
         try {
           const result = await runtime.message(run.prompt, schemaPathOf(import.meta.url, "product-proposal.json"), undefined, { timeoutMs: DRAFT_TIMEOUT_MS, purpose: "product-proposal" });
@@ -285,9 +307,17 @@ class ProductTurn {
         this.emit({ kind: "queue-changed", id: queueEventId, teamId: this.services.teamId, at: now() });
         await this.save(); this.changed.push(proposal);
       }
+      const completedRunId = active.runId!;
       active.remaining--; active.runId = null;
       if (active.remaining === 0) { this.record.handledEventIds.push(active.causeId); this.journal.active = null; await this.save(); }
       await this.journalSave();
+      const snapshot = run.source?.snapshots.at(-1);
+      if (run.source && snapshot?.status === "ready") {
+        project ??= source?.project ?? await realpath(projectCheckoutPath(this.services.store.runtimeDir, run.source.github)).catch(() => undefined);
+        if (project && await new ProductSourceSnapshots(this.shell, project, this.services.teamId, this.services.productSeatId).retire(run.source, completedRunId, snapshot)) {
+          snapshot.status = "removed"; await this.journalSave();
+        }
+      }
     }
   }
   async run(event: WorkflowEvent): Promise<ProposalTurnResult> {
@@ -316,7 +346,12 @@ class ProductTurn {
       if (!this.record.failure && !this.journal.active) return this.result();
       this.record.failure = null;
       const active = this.journal.active; const run = active?.runId ? this.journal.runs[active.runId] : undefined;
-      if (active && run && (run.status === "failed" || run.status === "started")) active.runId = null;
+      if (run && ["prepared", "failed", "started"].includes(run.status)) {
+        // A fresh attempt keeps the reserved proposal and prompt/base, while preserving failed or uncertain source copies.
+        const snapshot = run.source?.snapshots.at(-1);
+        if (snapshot) snapshot.status = "preserved";
+        run.status = "prepared";
+      }
       await this.journalSave(); await this.save();
     } else if (!this.journal.active && await this.meaningful(event)) {
       const available = PRODUCT_QUEUE_CAP - this.record.queue.filter((entry) => entry.status !== "approved").length;
