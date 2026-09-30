@@ -200,4 +200,26 @@ describe("durable circuit budget", () => {
     await expect(runtime.message("", "")).rejects.toBeInstanceOf(CircuitOpenError); expect(invoked).toBe(false);
   });
 
+  it("accepts normalized invocation usage from a legacy result without facts", async () => {
+    const { budget } = await fixture();
+    const runtime: AgentRuntime = { message: async () => ({ ...result(), facts: undefined, usage: { inputTokens: 40, outputTokens: 3, cachedInputTokens: 30 } }) };
+    await protectRuntime(budget, runtime, { phase: "build" }).message("", "");
+    expect((await budget.status()).totals.tokens).toBe(43);
+  });
+  it("does not mistake raw provider or session usage for normalized invocation usage", async () => {
+    const { budget } = await fixture({ maxInvocationTokens: 100 });
+    const runtime: AgentRuntime = { message: async () => ({ ...result(), facts: undefined, usage: { input_tokens: 40, output_tokens: 3 } }) };
+    await expect(protectRuntime(budget, runtime, { phase: "build" }).message("", "")).rejects.toThrow("complete token usage");
+    expect((await budget.status()).totals.tokens).toBe(100);
+  });
+  it("uses authoritative facts before compatibility usage and does not fill unknown facts from it", async () => {
+    const { budget } = await fixture({ maxInvocationTokens: 100 });
+    const runtime: AgentRuntime = { message: async () => ({ ...result({ inputTokens: 20, outputTokens: 2 }), usage: { inputTokens: 90, outputTokens: 9 } }) };
+    await protectRuntime(budget, runtime, { phase: "build" }).message("", "");
+    expect((await budget.status()).totals.tokens).toBe(22);
+    const partial: AgentRuntime = { message: async () => ({ ...result({ inputTokens: 10 }), usage: { inputTokens: 10, outputTokens: 5 } }) };
+    await expect(protectRuntime(budget, partial, { phase: "review" }).message("", "")).rejects.toThrow("complete token usage");
+    expect((await budget.status()).totals.tokens).toBe(122);
+  });
+
 });
