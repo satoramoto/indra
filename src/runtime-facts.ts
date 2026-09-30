@@ -42,7 +42,8 @@ export function normalizeUsage(engine: RuntimeEngine, value: unknown): TokenUsag
   const outputDetails = jsonObject(value.output_tokens_details) ? value.output_tokens_details : undefined;
   return compact({
     inputTokens: engine === "codex" ? input : input !== undefined && cached !== undefined && written !== undefined ? input + cached + written : undefined,
-    uncachedInputTokens: engine === "claude" ? input : undefined,
+    // Codex input_tokens includes cached reads; uncached is derivable only when both are reported.
+    uncachedInputTokens: engine === "claude" ? input : input !== undefined && cached !== undefined && input >= cached ? input - cached : undefined,
     cachedInputTokens: cached, cacheWriteInputTokens: written,
     outputTokens: counter(value.output_tokens),
     reasoningOutputTokens: counter(engine === "codex" ? value.reasoning_output_tokens : outputDetails?.thinking_tokens),
@@ -71,6 +72,10 @@ function mergeClaudeUsage(left: TokenUsage | undefined, right: TokenUsage | unde
   return compact(result);
 }
 
+// Derived uncached input comes from the latest report only, so an earlier derivation cannot go stale.
+const mergeCodexUsage = (previous: TokenUsage | undefined, report: TokenUsage | undefined): TokenUsage | undefined =>
+  report ? compact({ ...previous, uncachedInputTokens: undefined, ...report }) : previous;
+
 const sessionHandle = (engine: RuntimeEngine, value: unknown): string | undefined => {
   if (typeof value !== "string") return undefined;
   if (engine === "claude") return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value) ? `claude:${value}` : undefined;
@@ -98,7 +103,7 @@ export class RuntimeFacts {
     if (this.engine === "codex") {
       if (event.type === "thread.started") this.sessionId ??= sessionHandle("codex", event.thread_id);
       // Each report supersedes the preceding snapshot, including a provider counter reset.
-      if (event.type === "turn.completed" || event.type === "turn.failed") this.cumulative = compact({ ...this.cumulative, ...normalizeUsage("codex", event.usage) });
+      if (event.type === "turn.completed" || event.type === "turn.failed") this.cumulative = mergeCodexUsage(this.cumulative, normalizeUsage("codex", event.usage));
       return;
     }
     // Keep top-level invocation accounting consistent with Claude's result.usage.
@@ -131,7 +136,7 @@ export class RuntimeFacts {
     if (this.engine === "codex") {
       if (entry.type === "session_meta" && jsonObject(entry.payload)) this.sessionId ??= sessionHandle("codex", entry.payload.id);
       if (entry.type === "event_msg" && jsonObject(entry.payload) && entry.payload.type === "token_count" && jsonObject(entry.payload.info)) {
-        this.cumulative = compact({ ...this.cumulative, ...normalizeUsage("codex", entry.payload.info.total_token_usage) });
+        this.cumulative = mergeCodexUsage(this.cumulative, normalizeUsage("codex", entry.payload.info.total_token_usage));
       }
       return;
     }
