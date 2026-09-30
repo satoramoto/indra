@@ -276,7 +276,7 @@ export class RetroPublication {
         pr = await this.archive.inspectRetroPr(record.github, context.goal.id, frozen.markdown, record.prUrl);
       }
       if (pr.state === "OPEN" && pr.rejection) {
-        record.failure = { at: pr.rejection.submittedAt, message: `The retrospective archive for ${context.goal.id} was rejected by satori-miyamoto on its current head (review ${pr.rejection.reviewId}); resolve the findings and run planning retry --goal ${context.goal.id} to publish a corrected revision.`, retryable: true };
+        record.failure = { at: pr.rejection.submittedAt, message: `The retrospective archive for ${context.goal.id} was rejected by ${typeof pr.rejection.reviewId === "number" ? "satori-miyamoto" : "independent-agent"} on its current head (review ${pr.rejection.reviewId}); resolve the findings and run planning retry --goal ${context.goal.id} to publish a corrected revision.`, retryable: true };
         const retry = freshDraftRetry(context, record, pr.rejection.submittedAt);
         if (!retry || !this.archive.correctRetroPr) { await this.save(context, record); return pending(record.failure.message, record.failure); }
         await this.verifyPosts(context, record);
