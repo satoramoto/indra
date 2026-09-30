@@ -274,20 +274,22 @@ describe("live Codex budget accounting", () => {
     expect(error.facts.usage?.inputTokens).toBe(100);
   });
 
-  it.each([false, true])("tails exact-session rollout while headless (resumed=%s), before turn.completed", async (resumed) => {
-    const { mkdtemp, mkdir, writeFile, rm } = await import("node:fs/promises");
+  it.each([[false, false], [true, false], [false, true], [true, true]])("tails exact-session rollout while headless (resumed=%s, symlink=%s), before turn.completed", async (resumed, symlinked) => {
+    const { mkdtemp, mkdir, writeFile, rm, symlink, realpath } = await import("node:fs/promises");
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
     const home = await mkdtemp(join(tmpdir(), "indra-live-codex-"));
     const onUsage = vi.fn(); const controller = new AbortController();
+    const cwd = symlinked ? join(home, "cwd-link") : home;
+    if (symlinked) await symlink(home, cwd);
     try {
-      const run = failure(new CodexRuntime(home, 60_000, undefined, home, undefined, false).message("Task", "/schema.json", resumed ? id : undefined,
+      const run = failure(new CodexRuntime(cwd, 60_000, undefined, home, undefined, false).message("Task", "/schema.json", resumed ? id : undefined,
         { signal: controller.signal, onUsage, ...(resumed ? { previousSessionUsage: { inputTokens: 60, outputTokens: 4 } } : {}) }));
       await vi.waitFor(() => expect(child.input).toBe("Task"));
       child.stdout.write(started);
       await mkdir(join(home, "sessions"));
       await writeFile(join(home, "sessions", "rollout-current.jsonl"), [
-        { type: "session_meta", payload: { id, cwd: home } },
+        { type: "session_meta", payload: { id, cwd: await realpath(home) } },
         { type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { input_tokens: 100, cached_input_tokens: 40, output_tokens: 9 } } } },
       ].map((value) => JSON.stringify(value)).join("\n") + "\n");
       await vi.waitFor(() => expect(onUsage).toHaveBeenCalled(), { timeout: 2000 });
@@ -297,6 +299,6 @@ describe("live Codex budget accounting", () => {
       const calls = onUsage.mock.calls.length;
       await new Promise((resolve) => setTimeout(resolve, 300));
       expect(onUsage).toHaveBeenCalledTimes(calls);
-    } finally { await rm(home, { recursive: true, force: true }); }
+    } finally { controller.abort(); child.close("", null); await rm(home, { recursive: true, force: true }); }
   });
 });
