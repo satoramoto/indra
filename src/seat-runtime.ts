@@ -56,7 +56,7 @@ export function renderGoalBrief(brief: import("./goal-contract.js").GoalBrief): 
 
 export interface LaneAgentSummary { summary: string; decisions: string[]; followUps: string[]; neededButUnowned: string[] }
 export interface LaneWorkerPlan { workers: { file: string; task: string }[]; decisions: string[]; followUps: string[] }
-export interface LaneWorkerResult extends LaneAgentSummary { content: string | null }
+export interface LaneWorkerResult extends LaneAgentSummary { content: string | null; siblingDependencies: { file: string; requirement: string }[] }
 export interface GoalAgentInvocation {
   key: string; role: "planner" | "lead-plan" | "worker" | "lead" | "reviewer" | "fix";
   brief: import("./goal-contract.js").GoalBrief; cwd: string; write?: WriteAccess;
@@ -70,7 +70,13 @@ export interface GoalAgentSession {
 const strings = { type: "array", items: { type: "string" } };
 const summaryProperties = { summary: { type: "string" }, decisions: strings, followUps: strings, neededButUnowned: strings };
 export const LANE_AGENT_SCHEMA = { type: "object", additionalProperties: false, required: Object.keys(summaryProperties), properties: summaryProperties };
-export const LANE_WORKER_SCHEMA = { type: "object", additionalProperties: false, required: [...Object.keys(summaryProperties), "content"], properties: { ...summaryProperties, content: { type: ["string", "null"] } } };
+export const LANE_WORKER_SCHEMA = { type: "object", additionalProperties: false, required: [...Object.keys(summaryProperties), "content", "siblingDependencies"], properties: {
+  ...summaryProperties, content: { type: ["string", "null"] },
+  neededButUnowned: { ...strings, description: "Blocking requests for files not assigned to this worker or a named sibling worker. Named sibling expectations belong in siblingDependencies, never here." },
+  siblingDependencies: { type: "array", maxItems: 31, items: { type: "object", additionalProperties: false, required: ["file", "requirement"], properties: {
+    file: { type: "string", description: "Exact path assigned to a different worker in this lane." }, requirement: { type: "string", description: "Interface or behavior the lane lead must reconcile with that worker's output." },
+  } } },
+} };
 export const LANE_WORKER_PLAN_SCHEMA = { type: "object", additionalProperties: false, required: ["workers", "decisions", "followUps"], properties: {
   workers: { type: "array", items: { type: "object", additionalProperties: false, required: ["file", "task"], properties: { file: { type: "string" }, task: { type: "string" } } } }, decisions: strings, followUps: strings,
 } };
@@ -96,7 +102,7 @@ export async function runGoalAgent(
   const intent: GoalAgentSession = { key: invocation.key, role: invocation.role, status: "started", startedAt: new Date().toISOString() };
   sessions.push(intent); await persist();
   try {
-    const result = await create(invocation.cwd, invocation.write).message(`${renderGoalBrief(invocation.brief)}\n\nRole: ${invocation.role}\n${invocation.instruction}\n\nYou are not alone in the repository. Preserve others' work. Never read credentials or real state/runtime checkouts. Never start a server or leave a process running. Stop and report needed-but-unowned files rather than modifying them.`, schema, undefined, { purpose: invocation.role });
+    const result = await create(invocation.cwd, invocation.write).message(`${renderGoalBrief(invocation.brief)}\n\nRole: ${invocation.role}\n${invocation.instruction}\n\nYou are not alone in the repository. Preserve others' work. Never read credentials or real state/runtime checkouts. Never start a server or leave a process running. ${invocation.role === "worker" ? "Never edit another file. Report named sibling expectations in siblingDependencies; stop and report any other needed-but-unowned files." : "Stop and report needed-but-unowned files rather than modifying them."}`, schema, undefined, { purpose: invocation.role });
     intent.status = "complete"; intent.result = result; await persist();
     return result.response;
   } catch (error) {
@@ -109,6 +115,15 @@ export function laneAgentSummary(value: unknown): LaneAgentSummary {
   const row = value as Partial<LaneAgentSummary> | null;
   if (!row || typeof row.summary !== "string" || ![row.decisions, row.followUps, row.neededButUnowned].every((items) => Array.isArray(items) && items.every((item) => typeof item === "string"))) throw new Error("Invalid lane agent report.");
   return { summary: row.summary, decisions: row.decisions!, followUps: row.followUps!, neededButUnowned: row.neededButUnowned! };
+}
+
+/** Missing dependency metadata is an old, compatible report; a nonempty ownership blocker is never reclassified. */
+export function laneWorkerResult(value: unknown): LaneWorkerResult {
+  const summary = laneAgentSummary(value); const row = value as Partial<LaneWorkerResult>;
+  if (!(row.content === null || typeof row.content === "string")) throw new Error("Invalid worker content; expected the complete file or null.");
+  const dependencies = row.siblingDependencies === undefined ? [] : row.siblingDependencies;
+  if (!Array.isArray(dependencies) || dependencies.length > 31 || dependencies.some((item) => !item || typeof item.file !== "string" || typeof item.requirement !== "string" || !item.requirement.trim()) || new Set(dependencies.map((item) => item.file)).size !== dependencies.length) throw new Error("Invalid structured sibling dependencies.");
+  return { ...summary, content: row.content, siblingDependencies: dependencies };
 }
 
 /** Read-only single-file workers return bytes; only this host writes their declared, checked path. */
