@@ -310,7 +310,7 @@ export class DeveloperSeat {
           for (;;) {
             // A fix or base merge changes the head. Reuse evidence only for the exact reviewed commit.
             await this.reviewAndFix(goal, outcome, record);
-            const checkedHead = await requireApprovedReview(this.shell, record.prUrl!, record.worktree);
+            const checkedHead = await requireApprovedReview(this.shell, record.prUrl!, record.worktree, this.store.runtimeDir);
             await this.event(record, { kind: "ci", result: "started", headSha: checkedHead });
             let checks: ShellResult;
             try { checks = await this.shell.run("gh", ["pr", "checks", record.prUrl!, "--watch"], record.worktree); }
@@ -328,6 +328,7 @@ export class DeveloperSeat {
             }
           }
         }
+        if (!await new SprintGitHub(this.shell, this.store.runtimeDir).mergeVerification(record.prUrl!)) throw new SeatError("Merged assignment lacks verified current-head review and passing CI.");
         await this.factsFor(goal.id, record.outcomeId).retain(record);
         await this.factsFor(goal.id, record.outcomeId).finish(record.attemptId!, "merged");
         await this.setStatus(goal.id, record.outcomeId, { status: "merged", prUrl: record.prUrl });
@@ -431,20 +432,13 @@ export class DeveloperSeat {
         let pr: { isDraft?: boolean; headRefName?: string; baseRefName?: string };
         try { pr = JSON.parse(view.stdout) as typeof pr; } catch { throw new SeatError("Could not inspect assignment PR."); }
         if (pr.headRefName !== branch || pr.baseRefName !== base) throw new SeatError("PR head or base does not match this sprint assignment; not merging.");
-        if (await requireApprovedReview(this.shell, prUrl!, project) !== checkedHead) throw new SeatError("PR head changed after CI; not merging.");
+        if (await requireApprovedReview(this.shell, prUrl!, project, this.store.runtimeDir) !== checkedHead) throw new SeatError("PR head changed after CI; not merging.");
         if (pr.isDraft === true) await this.sh("gh", ["pr", "ready", prUrl!], project);
-        const blocker = await new SprintGitHub(this.shell, this.store.runtimeDir).serverMergeBlocker(prUrl!, checkedHead);
-        if (blocker) throw new SeatError(blocker);
-        await this.event(record, { kind: "merge", result: "started", headSha: checkedHead });
-        let landed: boolean;
-        try {
-          await this.shell.run("gh", ["pr", "merge", prUrl!, "--squash", "--match-head-commit", checkedHead], project);
-          const state = await this.shell.run("gh", ["pr", "view", prUrl!, "--json", "state", "--jq", ".state"], project);
-          landed = state.code === 0 && state.stdout.trim() === "MERGED";
-        } catch {
-          await this.event(record, { kind: "merge", result: "failed", headSha: checkedHead });
-          throw new SeatError("Merge observation failed.");
-        }
+        const result = await new SprintGitHub(this.shell, this.store.runtimeDir).merge(prUrl!, async (head) => {
+          if (head !== checkedHead) throw new SeatError("PR head changed after CI; not merging.");
+          await this.event(record, { kind: "merge", result: "started", headSha: checkedHead });
+        });
+        const landed = result.merged;
         await this.event(record, { kind: "merge", result: landed ? "passed" : "failed", headSha: checkedHead });
         return landed;
       });
