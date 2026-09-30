@@ -305,3 +305,23 @@ it("can persist an accounting stop even while foreign-owner inspection is unavai
   await unavailable.stop("budget accounting unavailable");
   await expect(budget.assertAvailable()).rejects.toBeInstanceOf(CircuitOpenError);
 });
+
+
+it.each(["failure", "success"] as const)("preserves bounded provider facts when a circuit overrides a %s", async (outcome) => {
+  const { budget } = await fixture({ maxInvocationTokens: 100 });
+  const at = new Date().toISOString();
+  const facts = { invocationId: "observed", engine: "codex" as const, sessionId: "session",
+    startedAt: at, finishedAt: at, status: outcome === "failure" ? "timed-out" as const : "succeeded" as const,
+    usage: { inputTokens: 5 }, cumulativeUsage: { inputTokens: 12 } };
+  const runtime: AgentRuntime = { message: async () => {
+    const contaminated = { ...facts, diagnostic: "private provider diagnostic", usage: { ...facts.usage, prompt: "private prompt" } };
+    if (outcome === "failure") throw Object.assign(new Error("private provider diagnostic"), { facts: contaminated });
+    return { ...result(), facts: contaminated, response: "private provider response" };
+  } };
+  const error = await protectRuntime(budget, runtime, { phase: "proposal" }).message("", "").catch((error: unknown) => error);
+  expect(error).toBeInstanceOf(CircuitOpenError);
+  expect((error as CircuitOpenError).facts).toEqual(facts);
+  expect(JSON.stringify(error)).not.toContain("private");
+  expect((await budget.status()).totals.tokens).toBe(100);
+  await expect(budget.assertAvailable()).rejects.toBeInstanceOf(CircuitOpenError);
+});
