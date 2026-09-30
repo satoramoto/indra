@@ -1,3 +1,5 @@
+import { CircuitBudget, isCircuitOpen } from "./circuit-budget.js";
+import { circuitRuntime, circuitShell, productCircuitScope, withCircuitScope } from "./circuit-scope.js";
 import { createHash, randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { join } from "node:path";
@@ -85,10 +87,10 @@ export async function proposeGoals(services: ProductProposalServices, event: Wor
     const journal = await services.store.readRuntimeFile<ProductJournal>(productJournalFilename(services.teamId)) ?? { version: 1, teamId: services.teamId, seatId: services.productSeatId, active: null, runs: {}, vetting: {}, deliveries: {} };
     if (journal.version !== 1 || journal.teamId !== services.teamId || journal.seatId !== services.productSeatId || !journal.runs || !journal.vetting || !journal.deliveries || (journal.active && (!Number.isInteger(journal.active.remaining) || journal.active.remaining < 1 || journal.active.remaining > PRODUCT_QUEUE_CAP))) throw new ProductTurnError("Product recovery journal is invalid.");
     const turn = new ProductTurn(services, record, journal);
-    try { return await turn.run(event); }
+    try { return await withCircuitScope(services.store.runtimeDir, productCircuitScope(services.teamId, services.productSeatId), "product", () => turn.run(event)); }
     catch (error) {
-      const message = error instanceof ProductTurnError || error instanceof ProductSnapshotError ? error.message : "Product turn failed; preserved runtime intent requires explicit retry.";
-      record.failure = { at: now(), message, retryable: true }; await turn.save(); throw new ProductTurnError(message, true);
+      const message = isCircuitOpen(error) || error instanceof ProductTurnError || error instanceof ProductSnapshotError ? error.message : "Product turn failed; preserved runtime intent requires explicit retry.";
+      record.failure = { at: now(), message, retryable: !isCircuitOpen(error) }; await turn.save(); throw new ProductTurnError(message, true);
     }
   });
 }
@@ -97,7 +99,7 @@ class ProductTurn {
   private readonly shell: Shell;
   private readonly changed: ProductProposal[] = [];
   private refined = false;
-  constructor(private readonly services: ProductProposalServices, private readonly record: ProductRuntimeRecord, private readonly journal: ProductJournal) { this.shell = services.shell ?? processShell; }
+  constructor(private readonly services: ProductProposalServices, private readonly record: ProductRuntimeRecord, private readonly journal: ProductJournal) { this.shell = circuitShell(services.shell ?? processShell); }
   private async state() { return this.services.store.read(); }
   private team(state: PlanningDocument): Team {
     const team = (state.teams as Team[]).find((item) => item.id === this.services.teamId);
@@ -279,7 +281,7 @@ class ProductTurn {
         const snapshots = new ProductSourceSnapshots(this.shell, project, this.services.teamId, this.services.productSeatId);
         const cwd = await snapshots.prepare(run.source, active.runId!, snapshot);
         snapshot.status = "ready";
-        const runtime = this.services.runtimeFor(cwd);
+        const runtime = circuitRuntime(this.services.runtimeFor(cwd), this.services.store.runtimeDir, productCircuitScope(this.services.teamId, this.services.productSeatId), "product", `draft:${active.runId}:${snapshot.id}`, run.source.snapshots.length > 1);
         run.status = "started"; await this.journalSave();
         try {
           const result = await runtime.message(run.prompt, schemaPathOf(import.meta.url, "product-proposal.json"), undefined, { timeoutMs: DRAFT_TIMEOUT_MS, purpose: "product-proposal" });
@@ -323,6 +325,7 @@ class ProductTurn {
   async run(event: WorkflowEvent): Promise<ProposalTurnResult> {
     const key = event.kind === "startup" ? `product-startup:${this.services.teamId}` : event.id;
     const retry = event.kind === "retry" || event.kind === "product-retry";
+    if (retry) await new CircuitBudget({ runtimeDir: this.services.store.runtimeDir, scopeId: productCircuitScope(this.services.teamId, this.services.productSeatId) }).assertAvailable();
     // A retry is one durable attempt, including when it fails or the host restarts before receipt.
     if (retry && this.record.handledEventIds.includes(key)) return this.result();
     if (this.record.failure && !retry) {

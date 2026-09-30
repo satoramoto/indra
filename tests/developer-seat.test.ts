@@ -1,5 +1,9 @@
+import { accountedFailure } from "./circuit-fixture.js";
 import { reviewEvidencePath } from "../src/review-evidence.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+// These integration cases exercise durable accounting plus real Git/process supervision.
+vi.setConfig({ testTimeout: 20_000 });
 import { Ajv2020 } from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
@@ -155,13 +159,14 @@ class FakeCodex {
   keepFindings = false;
   fail = false;
   factory = (cwd: string, write?: WriteAccess): AgentRuntime => ({
-    message: async (prompt: string, schema: string, sessionId?: string): Promise<AgentResult> => {
+    message: async (prompt: string, schema: string, sessionId?: string, options?: import("../src/codex-runtime.js").MessageOptions): Promise<AgentResult> => {
+      options?.onUsage?.({ inputTokens: 1, outputTokens: 1 });
       // Record the sandbox arguments CodexRuntime would pass for this write access.
       this.runs.push({ cwd, sandbox: sandboxArgs(write), schema, sessionId, prompt });
-      if (this.fail) throw new Error("codex down");
+      if (this.fail) throw accountedFailure("codex down");
       if (prompt.includes("Outcome: every review finding")) { this.afterFix?.(); if (!this.keepFindings) this.findings = []; }
       const response = schema.endsWith("review.json") ? { findings: this.findings, summary: "Reviewed" } : { prUrl: PR, summary: "Done" };
-      return { sessionId: `session-${this.runs.length}`, response, startedAt: "t0", finishedAt: "t1" };
+      return { sessionId: `session-${this.runs.length}`, response, usage: { inputTokens: 1, outputTokens: 1 }, startedAt: "t0", finishedAt: "t1" };
     },
   });
 }
@@ -228,7 +233,7 @@ describe("developer seat", () => {
     // The assignment handler preserves only SeatError/ProjectCheckoutError messages.
     expect(await assignment("outcome-1")).toMatchObject({ status: "failed", note: `build: gh pr edit failed (exit ${code}).` });
     const record = await store.readRuntimeFile<SeatTaskRecord>(RECORD);
-    expect(calls).toHaveBeenCalledWith("gh", ["pr", "edit", PR, "--base", "sprint/goal-abc"], record!.worktree);
+    expect(calls).toHaveBeenCalledWith("gh", ["pr", "edit", PR, "--base", "sprint/goal-abc"], record!.worktree, expect.objectContaining({ signal: expect.any(AbortSignal), timeoutMs: expect.any(Number) }));
     expect(codex.runs).toHaveLength(1);
     expect(shell.calls.some((call) => call.startsWith("gh pr merge"))).toBe(false);
     expect(chat.messages.join("\n")).not.toMatch(/private stdout|private stderr/);
@@ -624,20 +629,20 @@ describe("developer seat", () => {
 
   it("keeps reported usage for a failed agent session without storing its diagnostics", async () => {
     const { store, codex, make, assignment } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
-    codex.factory = () => ({ message: async () => { throw new AgentRunError("private diagnostics", { invocationId: "failed-run", engine: "codex", startedAt: "2026-01-01T00:00:00Z", finishedAt: "2026-01-01T00:00:05Z", status: "failed", usage: { inputTokens: 42, outputTokens: 7 } }); } });
+    codex.factory = () => ({ message: async () => { throw new AgentRunError("private diagnostics", { invocationId: "failed-run", engine: "codex", startedAt: "2026-01-01T00:00:00Z", finishedAt: "2026-01-01T00:00:05Z", status: "failed", usageComplete: true, usage: { inputTokens: 42, outputTokens: 7 } }); } });
     await make().tick();
     expect((await assignment("outcome-1")).status).toBe("failed");
     const facts = await new ImplementationRecorder(store, "seat-002", "goal-abc", "outcome-1").read();
-    expect(facts.attempts[0].events).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "session", session: expect.objectContaining({ invocationId: "failed-run", status: "failed", usage: { inputTokens: 42, outputTokens: 7 } }) })]));
+    expect(facts.attempts[0].events).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "session", session: expect.objectContaining({ invocationId: "failed-run", status: "failed", usageComplete: true, usage: { inputTokens: 42, outputTokens: 7 } }) })]));
     expect(JSON.stringify(facts)).not.toContain("private diagnostics");
     expect(await readFile(join(store.checkout, "state.json"), "utf8")).not.toContain("failed-run");
   });
 
-  it("says a session timed out, and after how long, in the assignment note", async () => {
+  it("trips after a timed-out session whose final consumption is unknown", async () => {
     const { codex, make, assignment } = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
     codex.factory = () => ({ message: async () => { throw new AgentRunError("Codex run timed out after 60 min.", { invocationId: "slow-run", engine: "codex", startedAt: "2026-01-01T00:00:00Z", finishedAt: "2026-01-01T01:00:02Z", status: "timed-out" }); } });
     await make().tick();
-    expect(await assignment("outcome-1")).toMatchObject({ status: "failed", note: "build: Agent developer session timed out after 60 min." });
+    expect(await assignment("outcome-1")).toMatchObject({ status: "failed", note: expect.stringContaining("Circuit open") });
   });
 
   it("fails on an agent error using runtime-neutral wording without recording its output", async () => {
@@ -847,7 +852,7 @@ describe("developer seat", () => {
     expect(await assignment("outcome-1")).toMatchObject({ status: "merged", prUrl: PR });
   });
 
-  it.each([undefined, SPRINT])("grants a fresh conflict budget when a failed assignment is explicitly re-queued (%j)", async (integration) => {
+  it.each([undefined, SPRINT])("preserves the aggregate repair allowance when a failed assignment is explicitly re-queued (%j)", async (integration) => {
     const { store, shell, codex, make, assignment } = await setup([reviewing()], integration);
     await retainRecord(store, shell);
     shell.mainStatus = [conflicting];
@@ -868,17 +873,17 @@ describe("developer seat", () => {
 
     const retried = (await store.readRuntimeFile<SeatTaskRecord>(RECORD))!;
     expect(retried).toMatchObject({ branch: saved.branch, worktree: saved.worktree, prUrl: PR, conflictRounds: 2 });
-    expect(retried.sessions).toHaveLength(4);
+    expect(retried.sessions).toHaveLength(3);
     expect(retried.sessions.slice(0, 2)).toEqual(saved.sessions);
     const history = await new ImplementationRecorder(store, "seat-002", "goal-abc", "outcome-1").read();
     expect(history.attempts).toHaveLength(2);
     expect(history.attempts[0].terminal?.status).toBe("failed");
     expect(history.attempts[0].events.some((event) => event.retained?.conflictRounds === 2)).toBe(true);
     expect(history.attempts[1].events.filter((event) => event.kind === "conflict" && event.result === "started").map((event) => event.round)).toEqual([1, 2]);
-    expect(codex.runs).toHaveLength(4);
+    expect(codex.runs).toHaveLength(3);
     for (const run of codex.runs.slice(2)) expect(run.prompt).toContain(`Merging origin/${integration?.branch ?? "sprint/goal-abc"}`);
     expect(shell.calls.some((call) => call.startsWith("git worktree add"))).toBe(false);
-    expect(await assignment("outcome-1")).toMatchObject({ status: "merged", prUrl: PR });
+    expect(await assignment("outcome-1")).toMatchObject({ status: "failed", prUrl: PR, note: expect.stringContaining("Circuit open") });
   });
 
   it.each(["running", "in-review"] as const)("preserves an exhausted conflict budget when a %s assignment restarts", async (status) => {

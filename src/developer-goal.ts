@@ -1,3 +1,5 @@
+import { CircuitBudget, isCircuitOpen } from "./circuit-budget.js";
+import { withCircuitScope } from "./circuit-scope.js";
 import { createHash } from "node:crypto";
 import type { AgentRuntime, WriteAccess } from "./codex-runtime.js";
 import type { Shell } from "./command-shell.js";
@@ -15,8 +17,8 @@ interface GoalJournal {
 }
 const id = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const now = () => new Date().toISOString();
-const failureFor = (error: unknown): WorkflowFailure => ({ at: now(), retryable: true,
-  message: error instanceof LaneError ? redactSecrets(error.message) : "Developer goal turn failed; preserved journals and worktrees require an explicit retry." });
+const failureFor = (error: unknown): WorkflowFailure => ({ at: now(), retryable: !isCircuitOpen(error),
+  message: isCircuitOpen(error) ? error.message : error instanceof LaneError ? redactSecrets(error.message) : "Developer goal turn failed; preserved journals and worktrees require an explicit retry." });
 const aggregateFailure = (failures: GoalFailures) => failures.goal ?? Object.values(failures.lanes)[0] ?? null;
 const validFailure = (value: WorkflowFailure | null) => !!value && Number.isFinite(Date.parse(value.at)) && typeof value.message === "string" && typeof value.retryable === "boolean";
 function rejectedLegacyWorker(lane: LaneJournal): boolean {
@@ -71,7 +73,7 @@ export class DeveloperGoal {
     const mine = "goalId" in event && event.goalId ? eligible.filter((goal) => goal.id === event.goalId) : eligible.filter((goal) => goal.goalAssignment!.status !== "reported");
     if (!mine.length) return idle;
     if (mine.length !== 1) throw new LaneError("Developer event does not identify exactly one whole-goal assignment.");
-    return this.store.withGoalLock(mine[0].id, async () => {
+    return withCircuitScope(this.store.runtimeDir, mine[0].id, "implement", () => this.store.withGoalLock(mine[0].id, async () => {
       const current = await this.store.read();
       const goal = current.planningGoals?.find((item) => item.id === mine[0].id);
       if (!goal || !wholeGoalEligible(goal, this.seatId) || (goal.goalAssignment!.status === "reported" && laneEvent)) return idle;
@@ -112,6 +114,7 @@ export class DeveloperGoal {
       if (event.kind !== "startup" && record.handledEventIds.includes(event.id)) return idle;
       if (journal.consumedRetryIds && (!Array.isArray(journal.consumedRetryIds) || journal.consumedRetryIds.some((item) => typeof item !== "string" || !item.trim()))) throw new LaneError("Invalid saved retry identities.");
       if (event.kind === "retry" && journal.consumedRetryIds?.includes(event.id)) return idle;
+      if (event.kind === "retry") await new CircuitBudget({ runtimeDir: this.store.runtimeDir, scopeId: goal.id }).assertAvailable();
       if (record.plan) {
         developerPlan(record.plan, goal);
         if (record.plan.goalId !== goal.id || record.lanes.length !== record.plan.lanes.length || record.plan.lanes.some((lane) => !record.lanes.some((item) => item.id === lane.id && item.branch === lane.branch && JSON.stringify(item.ownedFiles) === JSON.stringify(lane.ownedFiles)))) throw new LaneError("Persisted lane progress differs from its approved plan.");
@@ -252,7 +255,7 @@ export class DeveloperGoal {
         failures.goal = failureFor(error); record.failure = aggregateFailure(failures); await persist();
         this.log(failures.goal.message); return { events: emitted, report: null };
       }
-    });
+    }));
   }
   private acceptEvent(event: WorkflowEvent, goal: PlanningGoal, record: GoalRuntimeRecord, journal: GoalJournal): boolean {
     if (["ci", "review", "merge", "conflict"].includes(event.kind)) {

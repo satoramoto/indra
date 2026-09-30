@@ -1,14 +1,15 @@
+import { isCircuitOpen } from "./circuit-budget.js";
+import { circuitShell } from "./circuit-scope.js";
+import { processShell } from "./command-shell.js";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { execFile } from "node:child_process";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import { CEREMONY_STAGES, validateCeremony, type CeremonyStage } from "./ceremony.js";
 import type { CeremonyRuntimeFacts } from "./ceremony-ports.js";
 import type { AgentResult, AgentRuntime } from "./codex-runtime.js";
 import { implementationSeatWallTimes, type ImplementationFacts } from "./implementation-facts.js";
 import type { PlanningGoal } from "./planning.js";
-import { childEnv } from "./op-env.js";
 import { redactSecrets } from "./redact.js";
 import { schemaPathOf } from "./reload.js";
 import { normalizeUsage } from "./runtime-facts.js";
@@ -630,13 +631,11 @@ export async function draftSprintRetro(input: RetroInput, runtimeFor: (cwd: stri
   let run: AgentResult; let generation: RetroGeneration | undefined;
   try {
     // Codex requires a Git cwd. No source checkout, history, hooks or repository instructions are copied.
-    await new Promise<void>((resolve, reject) => {
-      execFile("git", ["init", "--quiet", "--template="], { cwd, env: childEnv() }, (error) => error
-        ? reject(new RetroGenerationError("Could not prepare the isolated retro workspace.", undefined, "workspace")) : resolve());
-    });
+    const initialized = await circuitShell(processShell).run("git", ["init", "--quiet", "--template="], cwd);
+    if (initialized.code !== 0) throw new RetroGenerationError("Could not prepare the isolated retro workspace.", undefined, "workspace");
     const failedKind = (value?: RetroGeneration): RetroErrorKind => value?.status === "timed-out" || value?.status === "interrupted" ? value.status : "runtime-failed";
     try { run = await runtimeFor(cwd).message(retroPrompt(snapshot), schema, undefined, { purpose: "retro" }); }
-    catch (error) { const failed = generationOf(error, false); throw new RetroGenerationError("Retro generation failed; no retrospective was rendered.", failed, failedKind(failed)); }
+    catch (error) { if (isCircuitOpen(error)) throw error; const failed = generationOf(error, false); throw new RetroGenerationError("Retro generation failed; no retrospective was rendered.", failed, failedKind(failed)); }
     generation = generationOf(run, true);
     if (!generation?.sessionId || priorSessions.has(generation.sessionId) || generation.startedAt < snapshot.cutoffAt) throw new RetroGenerationError("Retro generation did not return a fresh session after the cutoff.", generation, "not-fresh");
     if (generation.status !== "succeeded") throw new RetroGenerationError("Retro generation failed; no retrospective was rendered.", generation, failedKind(generation));

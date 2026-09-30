@@ -1,4 +1,8 @@
+import { accountedFailure } from "./circuit-fixture.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// These integration cases exercise durable accounting plus real Git/process supervision.
+vi.setConfig({ testTimeout: 20_000 });
 import { copyFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { homeChannelId, PlanningStore, teamProject, validateOutcomeSeats, validatePlanningGoal, type PlanningGoal } from "../src/planning.js";
@@ -101,7 +105,7 @@ class FakeRuntime implements AgentRuntime {
     this.sessions.push(sessionId);
     this.prompts.push(prompt);
     const response = schemaPath.endsWith("proposal.json") ? { summary: "Roadmap", outcomes: this.outcomes, risks: [], openQuestions: [] } : { reply: "What matters most?", summary: "Explore project", decisions: [], openQuestions: ["Priority?"] };
-    return { sessionId: sessionId ?? "session-1", response, startedAt: "2026-01-01T00:00:00Z", finishedAt: "2026-01-01T00:01:00Z" };
+    return { sessionId: sessionId ?? "session-1", response, usage: { inputTokens: 1, outputTokens: 1 }, startedAt: "2026-01-01T00:00:00Z", finishedAt: "2026-01-01T00:01:00Z" };
   }
 }
 
@@ -169,7 +173,7 @@ describe("planning bridge", () => {
     const bridge = new PlanningBridge(store, chat, runtime);
     const goal = await bridge.start("Explore project");
     chat.react(goal.mattermost.rootPostId, MEMO);
-    const failing: AgentRuntime = { message: async () => { throw new Error("runtime down secret-token"); } };
+    const failing: AgentRuntime = { message: async (_prompt, _schema, _session, options) => { options?.onUsage?.({ inputTokens: 1, outputTokens: 1 }); throw accountedFailure("runtime down secret-token"); } };
     await new PlanningBridge(store, chat, failing).poll();
     expect((await store.read()).planningGoals?.[0].stage).toBe("clarifying");
     const failures = chat.posts.filter((post) => post.message.includes("Drafting the proposal failed"));
@@ -553,7 +557,7 @@ describe("plan approval", () => {
     const goal = await new PlanningBridge(store, chat, runtime).start("Explore project");
     await PlanningBridge.requestProposal(store, goal.id);
     let attempts = 0;
-    const failing: AgentRuntime = { message: async () => { attempts += 1; throw new Error("invalid proposal: outcome-3 assigned to a non-Developer seat, push https://bot:ghp_secret123@github.com/x failed"); } };
+    const failing: AgentRuntime = { message: async (_prompt, _schema, _session, options) => { options?.onUsage?.({ inputTokens: 1, outputTokens: 1 }); attempts += 1; throw accountedFailure("invalid proposal: outcome-3 assigned to a non-Developer seat, push https://bot:ghp_secret123@github.com/x failed"); } };
     const broken = new PlanningBridge(store, chat, failing);
     await broken.poll();
     await broken.poll();
@@ -824,7 +828,7 @@ describe("whole-goal queue contract", () => {
     if (mode !== "review") {
       const acquired = deferred(); locked = store.withGoalLock("goal-a", async () => { acquired.resolve(); await held.promise; }); await acquired.promise;
     }
-    const message = vi.fn(async (): Promise<AgentResult> => { started.resolve(); await held.promise; return { sessionId: "review-a", startedAt: at, finishedAt: at, response: { summary: "Approved", findings: [] } }; });
+    const message = vi.fn(async (): Promise<AgentResult> => { started.resolve(); await held.promise; return { sessionId: "review-a", usage: { inputTokens: 1, outputTokens: 1 }, startedAt: at, finishedAt: at, response: { summary: "Approved", findings: [] } }; });
     vi.spyOn(SprintGitHub.prototype, "verifyGoalReport").mockResolvedValue(undefined);
     vi.spyOn(SprintGitHub.prototype, "integrationScope").mockResolvedValue({ headSha: MAIN_SHA, baseSha: MAIN_SHA, conflicting: false });
     vi.spyOn(SprintGitHub.prototype, "reviewIntegration").mockImplementation(async (_repo, _goal, _url, _sha, review) => { await review("/fixture/reviewer"); gh.reviewed = true; });
@@ -889,7 +893,7 @@ describe("whole-goal queue contract", () => {
     await store.saveRuntime(productRuntimeFilename("team-001"), product);
     const chat = new FakeChat(); chat.posts.push({ id: "root-goal-vet", user_id: "george", channel_id: "channel", root_id: "", message: "Proposal", create_at: Date.parse(at) });
     const corrected = validateProductProposal({ ...source, ownedFiles: ["src/planning.ts", "tests/planning.test.ts"] });
-    const message = vi.fn(async (): Promise<AgentResult> => ({ sessionId: "fresh", startedAt: at, finishedAt: at, response: corrected }));
+    const message = vi.fn(async (): Promise<AgentResult> => ({ sessionId: "fresh", usage: { inputTokens: 1, outputTokens: 1 }, startedAt: at, finishedAt: at, response: corrected }));
     const result = await scheduler(store, chat, { message }).turn(startup);
     expect(result.record.failure).toBeNull();
     expect(result.events.find((event) => event.kind === "proposal-vetted")).toMatchObject({ id: `proposal-vetted:${source.proposalId}:${workflowDigest(validateProductProposal(source))}:${workflowDigest(corrected)}`, vetting: { ownedFiles: corrected.ownedFiles, leadSeatId: "seat-001" } });
@@ -922,11 +926,11 @@ describe("whole-goal queue contract", () => {
     vi.spyOn(SprintGitHub.prototype, "integrationScope").mockResolvedValue({ headSha: MAIN_SHA, baseSha: MAIN_SHA, conflicting: false });
     vi.spyOn(SprintGitHub.prototype, "reviewIntegration").mockImplementation(async (_repo, _goal, _url, _sha, review) => { await review("/fixture/reviewer"); gh.reviewed = true; });
     vi.spyOn(SprintGitHub.prototype, "merge").mockResolvedValue({ merged: false, reason: "CI pending" });
-    const message = vi.fn<AgentRuntime["message"]>().mockResolvedValue({ sessionId: "fresh-review", startedAt: at, finishedAt: at, response: { summary: "Approved", findings: [] } });
+    const message = vi.fn<AgentRuntime["message"]>().mockResolvedValue({ sessionId: "fresh-review", usage: { inputTokens: 1, outputTokens: 1 }, startedAt: at, finishedAt: at, response: { summary: "Approved", findings: [] } });
     const runtimeFor = vi.fn(() => ({ message }));
     const bridge = new Bridge(store, new FakeChat(), new FakeRuntime(), 20, gh, {}, { projectContext: async () => structuredClone(context), runtimeFor });
     const result = await bridge.turn({ kind: "developer-report", id: "review-timeout-report", goalId, teamId: "team-001", seatId: "seat-003", report: reportFor(goalId), at });
-    expect(message).toHaveBeenCalledExactlyOnceWith(expect.stringContaining(`at ${MAIN_SHA}`), expect.stringContaining("retro-review.json"), undefined, { purpose: "review", timeoutMs: DEVELOPER_SESSION_TIMEOUT_MS });
+    expect(message).toHaveBeenCalledExactlyOnceWith(expect.stringContaining(`at ${MAIN_SHA}`), expect.stringContaining("retro-review.json"), undefined, expect.objectContaining({ purpose: "review", timeoutMs: 30 * 60_000, signal: expect.any(AbortSignal) }));
     expect(runtimeFor).toHaveBeenCalledExactlyOnceWith("/fixture/reviewer");
     expect(DEVELOPER_SESSION_TIMEOUT_MS).toBe(60 * 60_000);
     expect(result.record.failure!.message).toContain("CI pending");

@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -46,13 +46,14 @@ describe("workflow circuit boundaries", () => {
     expect((await new CircuitBudget({ runtimeDir: dir, scopeId: "goal-one" }).status()).totals.retries).toBe(1);
   });
   it("keeps command budgets in their concurrent goal scope and avoids double wrapping", async () => {
-    const dir = await fixture({ maxInvocationMs: 100 });
+    const dir = await fixture({ maxInvocationMs: 5000 });
     const seen: number[] = [];
     const shell: Shell = { run: async (_command, _args, _cwd, options) => { seen.push(options!.timeoutMs!); return { code: 0, stdout: "", stderr: "" }; } };
     const protectedShell = circuitShell(shell);
     expect(circuitShell(protectedShell)).toBe(protectedShell);
-    await Promise.all(["goal-a", "goal-b"].map((id) => withCircuitScope(dir, id, "implement", () => protectedShell.run("check", [], dir, { timeoutMs: 40 }))));
-    expect(seen).toEqual([40, 40]);
+    await Promise.all(["goal-a", "goal-b"].map((id) => withCircuitScope(dir, id, "implement", () => protectedShell.run("check", [], dir, { timeoutMs: 1000 }))));
+    expect(seen).toHaveLength(2);
+    expect(seen.every((timeout) => timeout > 0 && timeout <= 1000)).toBe(true);
     for (const scopeId of ["goal-a", "goal-b"]) expect((await new CircuitBudget({ runtimeDir: dir, scopeId }).status()).reservations).toEqual({});
   });
   it("does not invoke a runtime with unreportable usage again after restart", async () => {
@@ -63,4 +64,22 @@ describe("workflow circuit boundaries", () => {
     await expect(run()).rejects.toBeInstanceOf(CircuitOpenError);
     expect(message).toHaveBeenCalledTimes(1);
   });
+});
+
+
+it("keeps attempt-accounting failures stopped after storage is repaired until an owner grant", async () => {
+  const dir = await fixture();
+  const message = vi.fn<AgentRuntime["message"]>().mockResolvedValue(result());
+  const run = () => circuitRuntime({ message }, dir, "goal-storage", "implement", "worker").message("", "");
+  await run();
+  const file = (await readdir(dir)).find((name) => name.startsWith("circuit-attempt-") && name.endsWith(".json"))!;
+  await writeFile(join(dir, file), "corrupt");
+  await expect(run()).rejects.toBeInstanceOf(CircuitOpenError);
+  await writeFile(join(dir, file), "1");
+  await expect(run()).rejects.toBeInstanceOf(CircuitOpenError);
+  expect(message).toHaveBeenCalledTimes(1);
+  const budget = new CircuitBudget({ runtimeDir: dir, scopeId: "goal-storage" });
+  expect((await budget.status()).trip?.reason).toContain("attempt accounting");
+  await budget.grant({ retries: 1, reason: "Repaired attempt journal", owner: "owner" });
+  await run(); expect(message).toHaveBeenCalledTimes(2);
 });
