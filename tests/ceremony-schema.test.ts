@@ -65,6 +65,16 @@ describe("additive ceremony v1 schema contract", () => {
     expect(proof("ceremonyRelease", { kind: "release-running", mergedSha: "a".repeat(40) })).toBe(false);
     expect(proof("ceremonyRetro", { kind: "retro-published", path: "docs/retros/goal-one.md" })).toBe(false);
   });
+  it.each(["independent-agent", "satori-miyamoto"])("accepts %s release and lane evidence without requiring another account", (reviewer) => {
+    const release = ajv.compile({ $defs: schema.$defs, $ref: "#/$defs/ceremonyRelease" });
+    const sha = "a".repeat(40);
+    const evidence = { kind: "release-running", prUrl: "https://github.com/owner/project/pull/2", mergedSha: sha,
+      mergeVerification: { headSha: sha, reviewCommitSha: sha, reviewer, checksPassed: true },
+      checksPassed: true, buildSha: sha, runningSha: sha, runningAt: time };
+    expect(release(evidence), JSON.stringify(release.errors)).toBe(true);
+    expect(evidence.mergeVerification.reviewer).toBe(reviewer);
+    expect(release({ ...evidence, mergeVerification: { ...evidence.mergeVerification, reviewer: "unverified-reviewer" } })).toBe(false);
+  });
   it("accepts exact release builds and verified ancestry proof, rejecting incomplete or unverified proof", () => {
     const proof = ajv.compile({ $defs: schema.$defs, $ref: "#/$defs/ceremonyRelease" });
     const release = { kind: "release-running", prUrl: "https://github.com/owner/project/pull/2", mergedSha: "a".repeat(40), mergePostId: "merge-post",

@@ -43,10 +43,10 @@ export function sprintSummary(goal: PlanningGoal, seats: Map<string, string>, om
 }
 export function integrationMessage(goal: PlanningGoal, prUrl: string, omissions: ImplementationEvidence["omissions"]): string {
   const partial = omissions?.length ? `\n\n**Owner-authorized omissions**\n${omissions.map((item) => `- ${item.outcomeId}: ${item.reason}`).join("\n")}` : "";
-  return `**Sprint ${goal.id} is ready: ${prUrl}**\nThis PR takes \`${sprintBranch(goal.id)}\` into main. The sprint merges automatically after a fresh satori-miyamoto approval on the current head and green CI. Release then verifies the running build; the retro is posted and archived through the same review and CI gate.${partial}`;
+  return `**Sprint ${goal.id} is ready: ${prUrl}**\nThis PR takes \`${sprintBranch(goal.id)}\` into main. The sprint merges automatically after a fresh independent agent approval on the current head and green CI. Release then verifies the running build; the retro is posted and archived through the same review and CI gate.${partial}`;
 }
 export function revertMessage(goal: PlanningGoal, prUrl: string): string {
-  return `**Rollback of sprint ${goal.id}: ${prUrl}**\nThis PR on main reverts the sprint's merge commit ${goal.integration!.mergedSha!.slice(0, 7)}. The revert merges automatically after a fresh satori-miyamoto approval on the current head and green CI.`;
+  return `**Rollback of sprint ${goal.id}: ${prUrl}**\nThis PR on main reverts the sprint's merge commit ${goal.integration!.mergedSha!.slice(0, 7)}. The revert merges automatically after a fresh independent agent approval on the current head and green CI.`;
 }
 /** Chick's prompts are contracts: the outcome and its acceptance, what Indra does next, the constraints and the schema. */
 export function prompt(goal: PlanningGoal, input: string, drafting: boolean, developers: Seat[]): string {
