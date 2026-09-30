@@ -336,7 +336,10 @@ function phaseFacts(input: RetroInput, stages: RetroEvidenceSnapshot["stages"], 
   const failed = (message: string, known: number | null) => known === null ? null : failures.filter((item) => item.message === message).length;
 
   const turns = turnsIn("planning");
-  let drafts = turnsIn("proposal");
+  // Product drafts before publication; Chick's stage-window turns are not Product attempts.
+  // Retained Product runs can be reused by retries and do not establish complete attempt/failure totals.
+  let drafts = goal.workflowModel === "goals-v1" ? null : turnsIn("proposal");
+  if (goal.workflowModel === "goals-v1") missing.add("Complete Product proposal attempt history is unavailable; draft attempt and failure totals are unknown.");
   // A drafted proposal without any recorded draft session means the history is incomplete, not zero attempts.
   if (drafts === 0 && goal.proposal) drafts = null;
   const implement = goal.ceremony!.history.find((entry) => entry.stage === "implement")!;

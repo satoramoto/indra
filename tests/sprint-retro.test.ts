@@ -484,6 +484,46 @@ const lateGeneration = (): RetroGeneration => ({ ...generation(), startedAt: at(
 const phaseValue = (snapshot: RetroEvidenceSnapshot, phase: string, id: string) => snapshot.phases.find((item) => item.phase === phase)!.facts.find((item) => item.evidenceId === id)!.value;
 
 describe("per-phase process reflection", () => {
+  it.each([2, 12])("keeps Product draft totals unknown with a Chick turn at second %s", async (chickStart) => {
+    const data = goalsV1Input();
+    // Product finishes drafting before publication creates both durable planning and proposal stages.
+    data.goal.createdAt = at(10);
+    data.goal.ceremony!.history[0].enteredAt = at(10);
+    const productSeatId = data.goal.goalProposal!.productSeatId;
+    data.facts.seats.push({ seatId: productSeatId, wallTimeMs: 8_000 });
+    data.facts.sessions.push({ seatId: productSeatId, sessionId: "product-draft", startedAt: at(1), finishedAt: at(9), usage: counters() });
+    // Neither Chick's turns nor one retained Product success establishes complete attempt/failure history.
+    const chick = data.facts.sessions.find((row) => row.seatId === data.goal.seatId)!;
+    Object.assign(chick, { startedAt: at(chickStart), finishedAt: at(chickStart + 1) });
+    validatePlanningGoal(data.goal);
+
+    const snapshot = buildRetroSnapshot(data);
+    expect(phaseValue(snapshot, "proposal", "proposal-drafts")).toBeNull();
+    expect(phaseValue(snapshot, "proposal", "proposal-draft-failures")).toBeNull();
+    const gap = "Complete Product proposal attempt history is unavailable; draft attempt and failure totals are unknown.";
+    expect(snapshot.missing).toContain(gap);
+    expect(snapshot.choices.phaseReflections.some((item) => ["proposal-drafts", "proposal-draft-failures"].includes(item.evidenceId))).toBe(false);
+    const markdown = await renderSprintRetro(snapshot, narrative(snapshot), generation());
+    expect(markdown).toContain("| Draft attempts | unknown | proposal-drafts |");
+    expect(markdown).toContain("| Failed draft attempts | unknown | proposal-draft-failures |");
+    for (const output of [retroPrompt(snapshot), markdown]) {
+      expect(output).toContain(gap);
+      expect(output).not.toContain("The proposal was drafted in");
+      expect(output).not.toContain("with no failed drafts");
+    }
+  });
+
+  it("preserves legacy draft counts and the guard against zero attempts for an existing proposal", () => {
+    const data = input();
+    expect(phaseValue(buildRetroSnapshot(data), "proposal", "proposal-drafts")).toBeNull();
+    expect(phaseValue(buildRetroSnapshot(data), "proposal", "proposal-draft-failures")).toBeNull();
+    data.facts.sessions.push({ seatId: data.goal.seatId, sessionId: "legacy-draft", startedAt: at(11), finishedAt: at(12), usage: counters() });
+    const snapshot = buildRetroSnapshot(data);
+    expect(phaseValue(snapshot, "proposal", "proposal-drafts")).toBe(1);
+    expect(phaseValue(snapshot, "proposal", "proposal-draft-failures")).toBe(0);
+    expect(snapshot.choices.phaseReflections).toContainEqual({ phase: "proposal", evidenceId: "proposal-drafts", kind: "worked", text: "The proposal was drafted in 1 attempt(s) with no failed drafts." });
+  });
+
   it("does not invent historical human-approval timing for automatic releases", () => {
     const data = realistic();
     const release = data.goal.ceremony!.history.find((entry) => entry.stage === "retro")!.evidence;
