@@ -335,7 +335,12 @@ export function protectRuntime(budget: CircuitBudget, runtime: AgentRuntime, con
       const report = (usage: TokenUsage) => { bounded.onUsage?.(usage); options.onUsage?.(usage); };
       try {
         const result = await runtime.message(prompt, schemaPath, sessionId, { ...options, ...bounded, onUsage: report } as ObservedOptions);
-        if (result.facts?.usage) report(result.facts.usage);
+        // Legacy/injected runtimes can return normalized invocation usage without a facts envelope.
+        // Raw provider counters and lifetime/session envelopes are not invocation evidence.
+        const fallback = object(result.usage) && (Object.hasOwn(result.usage, "inputTokens") || Object.hasOwn(result.usage, "outputTokens"))
+          ? { inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens } as TokenUsage : undefined;
+        const finalUsage = result.facts?.usage ?? fallback;
+        if (finalUsage) report(finalUsage);
         return result;
       } catch (error) {
         const facts = (error as { facts?: { usage?: TokenUsage } })?.facts;
