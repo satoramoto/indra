@@ -9,7 +9,7 @@ import { SprintGitHub, type RetroArchive, type RetroPr } from "../src/sprint.js"
 import { SeatRuntime } from "../src/seat-runtime.js";
 import { TEAM_LEAD_CODEX_CONFIG, codexConfigForRoles } from "../src/harness-home.js";
 import * as mattermost from "../src/planning-mattermost.js";
-import { goalRuntimeFilename, type GoalReport } from "../src/goal-contract.js";
+import { goalRuntimeFilename, type GoalReport, type WorkflowEvent } from "../src/goal-contract.js";
 import { releaseAttemptsName } from "../src/sprint.js";
 import { developerGoalJournalName } from "../src/developer-goal.js";
 import type { GoalAgentSession } from "../src/seat-runtime.js";
@@ -251,6 +251,127 @@ describe("recoverable retro publication", () => {
     expect([...f.deliveries.values()].filter((post) => !post.mergePost)).toHaveLength(1);
     expect(f.archive.ensureRetroPr).toHaveBeenCalledWith("test/project", "goal-one", frozen!.markdown);
     expect([...f.deliveries.values()][0].message).toBe(frozen!.markdown);
+  });
+
+  it("requires an explicit retry after a failed goals-v1 draft on ordinary delivered events", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime("2026-01-01T01:00:00.000Z");
+    const f = await fixture(); goalsV1Retro(f);
+    f.draft.mockRejectedValue(new Error("Draft unavailable"));
+    const initial = await f.restart().poll(f.context);
+    const events: WorkflowEvent[] = [
+      { kind: "startup", teamId: f.context.goal.teamId, at: new Date().toISOString() },
+      { kind: "build-running", id: "build-one", teamId: f.context.goal.teamId, goalId: f.context.goal.id, buildSha: "b".repeat(40), runningSha: "b".repeat(40), at: new Date().toISOString() },
+      { kind: "ci", id: "ci-one", teamId: f.context.goal.teamId, goalId: f.context.goal.id, laneId: null, prUrl: f.pr.url, headSha: f.pr.headSha, state: "passed", at: new Date().toISOString() },
+      { kind: "queue-changed", id: "queue-one", teamId: f.context.goal.teamId, at: new Date().toISOString() },
+    ];
+    vi.setSystemTime("2026-01-01T02:00:00.000Z");
+    for (const event of events) {
+      const context = { ...f.context, event };
+      expect((await f.restart().poll(context)).status).toBe("pending");
+    }
+    expect(f.draft).toHaveBeenCalledTimes(1);
+    expect(f.record().attempts).toHaveLength(1);
+    expect(initial).toMatchObject({ status: "pending", failure: { at: "2026-01-01T01:00:00.000Z", message: expect.stringContaining("planning retry --goal goal-one"), retryable: true } });
+    expect(f.archive.ensureRetroPr).not.toHaveBeenCalled();
+  });
+
+  const retryContext = (f: Awaited<ReturnType<typeof fixture>>, id: string, changes: Partial<Extract<WorkflowEvent, { kind: "retry" }>> = {}) => ({
+    ...f.context, event: { kind: "retry" as const, id, goalId: f.context.goal.id, teamId: f.context.goal.teamId, at: new Date().toISOString(), reason: "The draft problem was resolved", ...changes },
+  });
+
+  it("consumes a fresh matching retry with its attempt before drafting and refuses replay after restart", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime("2026-01-01T01:00:00.000Z");
+    const f = await fixture(); goalsV1Retro(f);
+    f.draft.mockRejectedValueOnce(new Error("First attempt failed")); await f.restart().poll(f.context);
+    const failedAt = new Date().toISOString();
+    vi.setSystemTime("2026-01-01T01:00:01.000Z");
+    for (const changes of [{ at: failedAt }, { at: at(59) }, { goalId: "goal-other" }, { teamId: "team-other" }, { id: "" }]) {
+      await f.restart().poll(retryContext(f, "invalid-retry", changes));
+    }
+    expect(f.draft).toHaveBeenCalledTimes(1); expect(f.record().attempts).toHaveLength(1);
+    const retry = retryContext(f, "retry-one");
+    f.draft.mockImplementationOnce(async () => {
+      expect(f.record().attempts.at(-1)).toEqual({ startedAt: new Date().toISOString(), retry: { id: "retry-one", at: retry.event.at } });
+      vi.setSystemTime("2026-01-01T01:00:03.000Z");
+      throw new Error("Retry also failed");
+    });
+    await f.restart().poll(retry);
+    expect(f.draft).toHaveBeenCalledTimes(2); expect(f.record().attempts).toHaveLength(2);
+    vi.setSystemTime("2026-01-01T01:00:04.000Z");
+    await f.restart().poll(retry); // Same event delivered again after process restart.
+    await f.restart().poll(retryContext(f, "retry-one")); // Changing the time cannot reuse a consumed identity.
+    await f.restart().poll(retryContext(f, "queued-during-draft", { at: "2026-01-01T01:00:02.000Z" }));
+    expect(f.draft).toHaveBeenCalledTimes(2); expect(f.record().attempts).toHaveLength(2);
+    expect((await f.restart().poll(retryContext(f, "retry-two"))).status).toBe("complete");
+    expect(f.draft).toHaveBeenCalledTimes(3); expect(f.record().failure).toBeUndefined();
+  });
+
+  it("retains a consumed retry when its reservation acknowledgement is lost before model invocation", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime("2026-01-01T01:00:00.000Z");
+    const f = await fixture(); goalsV1Retro(f);
+    f.draft.mockRejectedValueOnce(new Error("First attempt failed")); await f.restart().poll(f.context);
+    vi.setSystemTime("2026-01-01T01:00:01.000Z"); const retry = retryContext(f, "reserved-retry");
+    const save = f.context.store.saveRuntime.bind(f.context.store);
+    const fail = vi.spyOn(f.context.store, "saveRuntime").mockImplementationOnce(async (name, record) => { await save(name, record); throw new Error("Lost reservation acknowledgement"); });
+    const interrupted = await f.restart().poll(retry); fail.mockRestore();
+    const reservation = structuredClone(f.record().attempts[1]);
+    expect(reservation).toEqual({ startedAt: new Date().toISOString(), retry: { id: retry.event.id, at: retry.event.at } });
+    expect(interrupted).toMatchObject({ status: "pending", failure: { at: reservation.startedAt, retryable: true } });
+    expect(f.draft).toHaveBeenCalledTimes(1);
+    vi.setSystemTime("2026-01-01T01:00:02.000Z");
+    await f.restart().poll(f.context); await f.restart().poll(retryContext(f, retry.event.id));
+    expect(f.draft).toHaveBeenCalledTimes(1); expect(f.record().attempts).toHaveLength(2);
+    expect((await f.restart().poll(retryContext(f, "recovery-retry"))).status).toBe("complete");
+    expect(f.record().attempts[1]).toEqual(reservation);
+    expect(f.draft.mock.calls.at(-1)![1]).toContainEqual({ startedAt: reservation.startedAt, sessionId: null, invocationId: null, errorKind: "unrecorded" });
+  });
+
+  it.each(["failed", "unfinished"])("recovers an old %s goals-v1 journal only on a fresh retry while preserving its evidence", async (kind) => {
+    vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime("2026-01-01T01:00:00.000Z");
+    const f = await fixture(); goalsV1Retro(f);
+    const attempts: RetroPublicationRecord["attempts"] = [{ startedAt: at(8), ...(kind === "failed" ? { finishedAt: at(9), errorKind: "draft-error" } : {}) }];
+    f.records.set(retroRuntimeName(f.context.goal.id), { version: 1, goalId: f.context.goal.id, github: "test/project", attempts: structuredClone(attempts) });
+    const blocked = await f.restart().poll(f.context);
+    expect(blocked).toMatchObject({ status: "pending", failure: { retryable: true } });
+    expect(f.record().failure).toEqual(blocked.status === "pending" ? blocked.failure : undefined);
+    expect(f.draft).not.toHaveBeenCalled(); expect(f.record().attempts).toEqual(attempts);
+    expect((await f.restart().poll(retryContext(f, "recover-old-journal"))).status).toBe("complete");
+    expect(f.draft).toHaveBeenCalledTimes(1); expect(f.record().attempts[0]).toEqual(attempts[0]);
+    expect(f.record().frozen).toBeDefined(); expect(f.record().failure).toBeUndefined();
+    expect(f.draft.mock.calls[0][1]).toEqual([{ startedAt: at(8), sessionId: null, invocationId: null, errorKind: kind === "failed" ? "draft-error" : "unrecorded" }]);
+  });
+
+  it("automatically reconciles frozen content through delivery, review, CI and merge after a successful retry", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime("2026-01-01T01:00:00.000Z");
+    const f = await fixture(); goalsV1Retro(f);
+    f.draft.mockRejectedValueOnce(new Error("First attempt failed")); await f.restart().poll(f.context);
+    vi.setSystemTime("2026-01-01T01:00:01.000Z"); f.losePost();
+    const delivery = await f.restart().poll(retryContext(f, "retry-to-freeze"));
+    expect(delivery).toMatchObject({ status: "pending" }); expect(delivery).not.toHaveProperty("failure");
+    const frozen = structuredClone(f.record().frozen); expect(frozen).toBeDefined(); expect(f.record().failure).toBeUndefined();
+    expect(f.archive.ensureRetroPr).not.toHaveBeenCalled();
+    f.pr.reviewed = false; f.pr.checksPassed = false;
+    const ordinary = { ...f.context, event: { kind: "queue-changed" as const, id: "publication-wakeup", teamId: f.context.goal.teamId, at: new Date().toISOString() } };
+    expect(await f.restart().poll(ordinary)).toEqual({ status: "pending", reason: "The retrospective archive needs a fresh review on its current head." });
+    expect(f.services.review).toHaveBeenCalledTimes(1); expect(f.archive.mergeRetroPr).not.toHaveBeenCalled();
+    f.pr.reviewed = true;
+    expect(await f.restart().poll(ordinary)).toEqual({ status: "pending", reason: "The retrospective archive is waiting for passing CI." });
+    f.pr.checksPassed = true;
+    expect((await f.restart().poll(ordinary)).status).toBe("complete");
+    expect(f.archive.mergeRetroPr).toHaveBeenCalledTimes(1); expect(f.draft).toHaveBeenCalledTimes(2);
+    expect(f.record().frozen).toEqual(frozen); expect(f.record().failure).toBeUndefined();
+    expect(f.record().authorization).toBeUndefined();
+  });
+
+  it("keeps planning merge as an explicit compatibility retry without a second authorization", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime("2026-01-01T01:00:00.000Z");
+    const f = await fixture(); goalsV1Retro(f);
+    f.draft.mockRejectedValueOnce(new Error("First attempt failed")); await f.restart().poll(f.context);
+    vi.setSystemTime("2026-01-01T01:00:01.000Z");
+    await expect(f.restart().merge(f.context)).resolves.toContain("merged");
+    expect(f.draft).toHaveBeenCalledTimes(2);
+    expect(f.record().attempts[1].retry).toEqual({ id: expect.stringMatching(/^retro-merge-retry:/), at: new Date().toISOString() });
+    expect(f.record().failure).toBeUndefined(); expect(f.record().authorization).toBeUndefined();
   });
 
   it("records failed draft attempts and never publishes unsupported model content", async () => {

@@ -11,7 +11,7 @@ import { PlanningStore, developerSeats, missingTeamMessage, requireTeamHome, tea
 import { processShell, type Shell } from "./developer-seat.js";
 import { SprintGitHub, sprintBranch, releaseAttemptsName, type ReleaseAttempts } from "./sprint.js";
 import { PROPOSE_EMOJI, APPROVE_EMOJI, rootMessage, proposalMessage, approvalMessage, outcomeLines, sprintSummary, integrationMessage, revertMessage, prompt, type Seat } from "./planning-text.js";
-import { goalRuntimeFilename, productRuntimeFilename, teamRuntimeFilename, ownedFilesOverlap, validateGoalBrief, validateGoalReport, validateProductProposal, type GoalBrief, type GoalRuntimeRecord, type ProductProposal, type ProductRuntimeRecord, type SchedulerRuntimeRecord, type WorkflowEvent } from "./goal-contract.js";
+import { goalRuntimeFilename, productRuntimeFilename, teamRuntimeFilename, ownedFilesOverlap, validateGoalBrief, validateGoalReport, validateProductProposal, type GoalBrief, type GoalRuntimeRecord, type ProductProposal, type ProductRuntimeRecord, type SchedulerRuntimeRecord, type WorkflowEvent, type WorkflowFailure } from "./goal-contract.js";
 import { validateWorkflowEvent, workflowDigest, type WorkflowConsumer } from "./remodel-events.js";
 import { redactSecrets } from "./redact.js";
 
@@ -49,11 +49,13 @@ interface SchedulerWorkRecord {
 const schedulerWorkName = (teamId: string, key: string) => `scheduler-work-${teamId}-${key}`;
 const workflowFailure = (error: unknown): NonNullable<SchedulerRuntimeRecord["failure"]> => ({ at: new Date().toISOString(), message: error instanceof Error ? redactSecrets(error.message).slice(0, 1000) : "Scheduler work failed; retry the retained event.", retryable: true });
 /** Release/retro adapters return pending until they have verified external evidence. */
-export type CeremonyProgress<T> = { status: "pending"; reason: string } | { status: "complete"; evidence: T };
+export type CeremonyProgress<T> = { status: "pending"; reason: string; failure?: WorkflowFailure } | { status: "complete"; evidence: T };
 export interface CeremonyContext {
   store: PlanningStore;
   goal: PlanningGoal;
   runtime: AgentRuntime;
+  /** The delivered finite-turn event; only a fresh matching retry may restart a failed draft. */
+  event?: WorkflowEvent;
   /** Stable keys reconcile accepted posts after crashes. Use mergePost for the retro PR's human gate. */
   post(key: string, message: string, mergePost?: "retro"): Promise<string>;
   recordRun(run: Awaited<ReturnType<AgentRuntime["message"]>>): Promise<void>;
@@ -64,7 +66,7 @@ export interface CeremonyAdapters {
   release?: { poll(context: CeremonyContext & { mergeApproval?: { postId: string; approval: HumanApproval } }): Promise<CeremonyProgress<RunningReleaseEvidence>> };
   retro?: {
     poll(context: CeremonyContext): Promise<CeremonyProgress<PublishedRetroEvidence>>;
-    /** Called only from a verified human checkmark on an adapter post or the owner's M command. */
+    /** Compatibility retry from a verified human checkmark or the owner's planning merge command. */
     merge?(context: CeremonyContext, approval?: HumanApproval): Promise<string>;
   };
 }
@@ -301,7 +303,7 @@ export class PlanningBridge {
         const landed = await this.github.inspectMerge(landedUrl);
         if (landed.state === "MERGED" && landed.mergedSha && landed.reviewed && landed.checksPassed) emit({ kind: "merge", id: `integration-merged:${landedUrl}:${landed.headSha}`, teamId: event.teamId, goalId: current.id, laneId: null, prUrl: landedUrl, headSha: landed.headSha, mergedSha: landed.mergedSha, at: committed.updatedAt });
       }
-      await this.ceremonyProgress(goal.id);
+      work.failure = await this.ceremonyProgress(goal.id, event) ?? work.failure;
       const finished = (await this.store.read()).planningGoals!.find((item) => item.id === goal.id)!;
       if (finished.ceremony?.closure) emit({ kind: "goal-closed", id: `closed:${goal.id}`, teamId: event.teamId, goalId: goal.id, at: finished.ceremony.closure.closedAt });
     }));
@@ -541,16 +543,16 @@ export class PlanningBridge {
     if (integration?.revertPrUrl) await this.postIntent(goal, metadata, `revert-pr:${goal.id}`, revertNotice(goal, integration.revertPrUrl), Date.parse(goal.createdAt), "revert");
   }
 
-  private context(goal: PlanningGoal): CeremonyContext {
+  private context(goal: PlanningGoal, event?: WorkflowEvent): CeremonyContext {
     return {
-      store: this.store, goal: structuredClone(goal), runtime: this.runtime,
+      store: this.store, goal: structuredClone(goal), runtime: this.runtime, event,
       post: async (key, message, mergePost) => await this.postIntent(goal, await this.metadata(goal.id), `adapter:${goal.id}:${key}`, message, Date.parse(goal.createdAt), mergePost),
       recordRun: async (run) => await this.recordRun(goal, run),
       recordSession: async (facts) => await this.recordSession(goal, facts),
     };
   }
 
-  private async ceremonyProgress(id: string): Promise<void> {
+  private async ceremonyProgress(id: string, event?: WorkflowEvent): Promise<WorkflowFailure | undefined> {
     let goal = (await this.store.read()).planningGoals!.find((item) => item.id === id)!;
     if (!goal.ceremony || goal.ceremony.closure) return;
     const metadata = await this.metadata(id);
@@ -568,9 +570,9 @@ export class PlanningBridge {
       return;
     }
     if (goal.ceremony.stage === "release" && goal.integration?.status === "merged") {
-      const progress = await this.adapters.release?.poll({ ...this.context(goal), mergeApproval: metadata.mergeApproval }) ?? { status: "pending" as const, reason: "Waiting for the running-build verification adapter." };
+      const progress = await this.adapters.release?.poll({ ...this.context(goal, event), mergeApproval: metadata.mergeApproval }) ?? { status: "pending" as const, reason: "Waiting for the running-build verification adapter." };
       Object.assign(metadata, await this.metadata(id));
-      if (progress.status === "pending") { metadata.waiting = { stage: "release", reason: progress.reason }; await this.store.saveRuntime(id, metadata); return; }
+      if (progress.status === "pending") { metadata.waiting = { stage: "release", reason: progress.reason }; await this.store.saveRuntime(id, metadata); return progress.failure; }
       if (!progress.evidence.mergeVerification) throw new Error("Running release requires verified current-head bot approval and green CI.");
       await this.store.update((state) => {
         const found = state.planningGoals!.find((item) => item.id === id)!;
@@ -582,10 +584,10 @@ export class PlanningBridge {
       await this.announceStages(goal, metadata);
     }
     if (goal.ceremony?.stage === "retro") {
-      const progress = await this.adapters.retro?.poll(this.context(goal)) ?? { status: "pending" as const, reason: "Waiting for the retrospective publication and archival adapter." };
+      const progress = await this.adapters.retro?.poll(this.context(goal, event)) ?? { status: "pending" as const, reason: "Waiting for the retrospective publication and archival adapter." };
       // Adapters may have posted through context.post; keep their delivery journal when saving the wait reason.
       const latest = await this.metadata(id);
-      if (progress.status === "pending") { latest.waiting = { stage: "retro", reason: progress.reason }; await this.store.saveRuntime(id, latest); return; }
+      if (progress.status === "pending") { latest.waiting = { stage: "retro", reason: progress.reason }; await this.store.saveRuntime(id, latest); return progress.failure; }
       const own = await this.chat.ownUserId();
       const published = (await this.chat.since(goal.mattermost.channelId, Date.parse(goal.createdAt) - 5000)).find((post) => post.id === progress.evidence.postId && post.root_id === goal.mattermost.rootPostId && post.channel_id === goal.mattermost.channelId && post.user_id === own);
       if (!published) throw new Error("Retro thread publication has not been confirmed.");
