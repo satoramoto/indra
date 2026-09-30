@@ -1,3 +1,7 @@
+import { CircuitBudget } from "../src/circuit-budget.js";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CeremonyContext } from "../src/planning-bridge.js";
@@ -29,14 +33,17 @@ function goalAtRetro(): PlanningGoal {
   goal.ceremony = advanceCeremony(goal, { to: "retro", at: at(6), evidence: { kind: "release-running", prUrl: goal.integration!.prUrl!, mergedSha: "b".repeat(40), mergePostId: "release-post", approval: { source: "owner-command", command: "planning merge", at: at(4) }, checksPassed: true, buildSha: "b".repeat(40), runningSha: "b".repeat(40), runningAt: at(5) } });
   return goal;
 }
+const circuitDirs: string[] = [];
+afterEach(async () => { await Promise.all(circuitDirs.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
 async function fixture() {
+  const runtimeDir = await mkdtemp(join(tmpdir(), "indra-retro-circuit-")); circuitDirs.push(runtimeDir);
   const goal = goalAtRetro();
   const state = { planningGoals: [goal], teams: [{ id: goal.teamId, project: { github: "test/project" }, seats: [{ id: goal.seatId, roles: ["Team Lead"] }], externalIdentities: { mattermost: { homeChannelId: "home" } } }] };
   const records = new Map<string, object>();
   const deliveries = new Map<string, { id: string; message: string; mergePost?: string }>();
   let lostPost = false;
   const context: CeremonyContext = { goal, runtime: { message: vi.fn() }, store: {
-    checkout: "/nonexistent-retro-test-state", runtimeDir: "/nonexistent-retro-test-state.runtime",
+    checkout: "/nonexistent-retro-test-state", runtimeDir,
     read: async () => structuredClone(state), readRuntimeFile: async (name: string) => structuredClone(records.get(name)),
     saveRuntime: async (name: string, value: object) => { records.set(name, structuredClone(value)); },
   } as unknown as PlanningStore,
@@ -191,7 +198,7 @@ describe("recoverable retro publication", () => {
         expect(session).toBeUndefined(); expect(options?.purpose).toBe("review");
         expect(schema).toMatch(/schemas\/retro-review.json$/);
         expect(prompt).toContain(f.pr.headSha);
-        return { sessionId: "fresh-review", startedAt: at(10), finishedAt: at(11), response: { summary: "Reviewed", findings: [] } };
+        return { sessionId: "fresh-review", usage: { inputTokens: 1, outputTokens: 1 }, startedAt: at(10), finishedAt: at(11), response: { summary: "Reviewed", findings: [] } };
       });
       const adapters = await createCeremonyAdapters({ store: f.context.store });
       await adapters.retro!.poll(f.context);
@@ -695,4 +702,18 @@ describe("recoverable retro publication", () => {
     expect((await f.restart().poll(f.context)).status).toBe("pending");
     expect(f.archive.ensureRetroPr).toHaveBeenCalledTimes(1);
   });
+});
+
+
+it("keeps a retrospective circuit trip nonretryable through the draft failure path", async () => {
+  const f = await fixture();
+  const budget = new CircuitBudget({ runtimeDir: f.context.store.runtimeDir, scopeId: f.context.goal.id, policy: { maxTokens: 1 } });
+  await budget.status();
+  f.draft.mockImplementationOnce(async () => {
+    await budget.protectRuntime({ message: async () => ({ sessionId: "over-budget", response: {}, startedAt: at(8), finishedAt: at(9), usage: { inputTokens: 2, outputTokens: 1 } }) }, { phase: "retro" }).message("", "");
+    throw new Error("Circuit unexpectedly allowed excess spend");
+  });
+  expect(await f.restart().poll(f.context)).toMatchObject({ status: "pending", failure: { retryable: false, message: expect.stringContaining("Circuit open") } });
+  expect(await f.restart().poll(f.context)).toMatchObject({ status: "pending", failure: { retryable: false } });
+  expect(f.draft).toHaveBeenCalledTimes(1);
 });

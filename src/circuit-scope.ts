@@ -52,6 +52,7 @@ export function circuitRuntime(runtime: AgentRuntime, runtimeDir: string, scopeI
       });
     } catch (error) {
       if (error instanceof CircuitOpenError) throw error;
+      await budget.stop("invocation attempt accounting unavailable");
       throw new CircuitOpenError(scopeId, "invocation attempt accounting unavailable");
     }
     return budget.protectRuntime(runtime, { phase, operationId: key }).message(...args);

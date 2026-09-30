@@ -1,3 +1,4 @@
+import { isCircuitOpen } from "./circuit-budget.js";
 import { dirname, join } from "node:path";
 import { lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
@@ -246,6 +247,7 @@ export class SprintGitHub implements RetroArchive {
       } catch (error) {
         record.failure = error instanceof Error ? redactSecrets(error.message).slice(0, 1000) : "Integration correction was not confirmed.";
         await save();
+        if (isCircuitOpen(error)) throw error;
         throw new SprintError(`${record.failure} Recovery retained at ${cwd}; identity and retry journal: ${journal}.`);
       }
     });

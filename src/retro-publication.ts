@@ -1,3 +1,5 @@
+import { CircuitBudget, isCircuitOpen } from "./circuit-budget.js";
+import { circuitRuntime, circuitShell, withCircuitScope } from "./circuit-scope.js";
 import { createHash, randomUUID } from "node:crypto";
 import { readdir } from "node:fs/promises";
 import { ceremonyRuntimeName, type BridgeCeremonyRecord, type CeremonyAdapters, type CeremonyContext, type CeremonyProgress, type Post } from "./planning-bridge.js";
@@ -175,6 +177,7 @@ export class RetroPublication {
 
   private async advance(context: CeremonyContext, record: RetroPublicationRecord, reserved = false): Promise<CeremonyProgress<PublishedRetroEvidence>> {
     if (!record.frozen) {
+      await new CircuitBudget({ runtimeDir: context.store.runtimeDir, scopeId: context.goal.id }).assertAvailable();
       const failures = record.attempts.length;
       const finite = context.goal.workflowModel === "goals-v1" || !!record.correction;
       const retry = finite ? freshDraftRetry(context, record) : undefined;
@@ -201,6 +204,7 @@ export class RetroPublication {
       let draft: SprintRetroDraft;
       try { draft = await this.draft(context, prior); }
       catch (error) {
+        if (isCircuitOpen(error)) throw error;
         attempt.finishedAt = new Date().toISOString();
         if (error instanceof RetroGenerationError) { attempt.generation = error.generation; attempt.errorKind = error.kind; }
         else attempt.errorKind = "draft-error";
@@ -248,7 +252,8 @@ export class RetroPublication {
         record.correction.resultHeadSha = await this.archive.correctRetroPr(record.github, context.goal.id, previous.frozen.markdown, frozen.markdown, previous.prUrl, previous.rejection);
         record.prUrl = previous.prUrl;
         delete record.failure;
-      } catch {
+      } catch (error) {
+        if (isCircuitOpen(error)) throw error;
         record.failure = { at: record.correction.retry.at, message: `The corrected retrospective for ${context.goal.id} is frozen; its guarded archive update needs reconciliation. Preserve both revisions and resolve the PR head or publication problem.`, retryable: true };
         await this.save(context, record); return pending(record.failure.message, record.failure);
       }
@@ -278,6 +283,7 @@ export class RetroPublication {
       if (pr.state === "OPEN" && pr.rejection) {
         record.failure = { at: pr.rejection.submittedAt, message: `The retrospective archive for ${context.goal.id} was rejected by ${typeof pr.rejection.reviewId === "number" ? "satori-miyamoto" : "independent-agent"} on its current head (review ${pr.rejection.reviewId}); resolve the findings and run planning retry --goal ${context.goal.id} to publish a corrected revision.`, retryable: true };
         const retry = freshDraftRetry(context, record, pr.rejection.submittedAt);
+        if (retry) await new CircuitBudget({ runtimeDir: context.store.runtimeDir, scopeId: context.goal.id }).assertAvailable();
         if (!retry || !this.archive.correctRetroPr) { await this.save(context, record); return pending(record.failure.message, record.failure); }
         await this.verifyPosts(context, record);
         const revision: RetroPublicationRevision = structuredClone({ frozen, attempts: record.attempts, postIds, prUrl: pr.url, headSha: pr.headSha, rejection: pr.rejection,
@@ -313,11 +319,19 @@ export class RetroPublication {
   }
 
   async poll(context: CeremonyContext): Promise<CeremonyProgress<PublishedRetroEvidence>> {
+    return withCircuitScope(context.store.runtimeDir, context.goal.id, "retro", () => this.pollInScope(context));
+  }
+  private async pollInScope(context: CeremonyContext): Promise<CeremonyProgress<PublishedRetroEvidence>> {
     let retained: RetroPublicationRecord | undefined;
     try {
       const record = await this.load(context); retained = record;
       return await this.advance(context, record);
-    } catch {
+    } catch (error) {
+      if (isCircuitOpen(error)) {
+        const failure = { at: new Date().toISOString(), message: error.message, retryable: false };
+        if (retained) { retained.failure = failure; await this.save(context, retained); }
+        return pending(error.message, failure);
+      }
       const record = retained;
       if (record && (context.goal.workflowModel === "goals-v1" || record.correction) && !record.frozen && record.attempts.length) {
         record.failure = draftFailure(record);
@@ -374,7 +388,7 @@ async function developerJournalFacts(store: PlanningStore, goalId: string, seatI
 }
 
 /** Read only persisted evidence. Missing attempt coverage and unrecorded wall time stay explicitly unknown. */
-export async function recordedRetroInput(context: CeremonyContext, retroAttempts: RetroPriorAttempt[] = [], github = new SprintGitHub(processShell, context.store.runtimeDir)): Promise<RetroInput> {
+export async function recordedRetroInput(context: CeremonyContext, retroAttempts: RetroPriorAttempt[] = [], github = new SprintGitHub(circuitShell(processShell), context.store.runtimeDir)): Promise<RetroInput> {
   const { goal, store } = context;
   const record = await store.readRuntimeFile<BridgeCeremonyRecord>(ceremonyRuntimeName(goal.id));
   const facts: RetroInput["facts"] = structuredClone(record?.facts ?? { seats: [], sessions: [], reviews: [], rounds: [], failures: [] });
@@ -451,7 +465,7 @@ export async function createCeremonyAdapters({ store }: { store: PlanningStore }
     const roles = all.find((seat) => seat.id === context.goal.seatId)?.roles;
     return new SeatRuntime(engines[context.goal.seatId] ?? "codex", cwd, undefined, undefined, undefined, seatHarnessDir(store.runtimeDir, context.goal.seatId), roles);
   };
-  const retro = new RetroPublication(new SprintGitHub(processShell, store.runtimeDir), async (context, prior) => {
+  const retro = new RetroPublication(new SprintGitHub(circuitShell(processShell), store.runtimeDir), async (context, prior) => {
     const state = await store.read();
     const all = (state.teams as { seats: { id: string; roles?: string[] }[] }[]).flatMap((team) => team.seats);
     const engines = await loadSeatEngines(store.runtimeDir, all.map((seat) => seat.id));
@@ -460,7 +474,7 @@ export async function createCeremonyAdapters({ store }: { store: PlanningStore }
     return await draftSprintRetro(input, (cwd) => {
       const runtime = withPersonaRuntime(new SeatRuntime(engines[context.goal.seatId] ?? "codex", cwd, undefined, undefined, undefined, seatHarnessDir(store.runtimeDir, context.goal.seatId), roles), profiles[context.goal.seatId]);
       return { message: async (...args) => {
-        try { const run = await runtime.message(...args); await context.recordRun(run); return run; }
+        try { const run = await circuitRuntime(runtime, store.runtimeDir, context.goal.id, "retro", `retro-draft:${prior.length}`, prior.length > 0).message(...args); await context.recordRun(run); return run; }
         catch (error) { if (error instanceof AgentRunError) await context.recordSession(error.facts); throw error; }
       } };
     });
@@ -473,7 +487,7 @@ export async function createCeremonyAdapters({ store }: { store: PlanningStore }
     review: async (context, cwd, pr) => {
       const runtime = await runtimeFor(context, cwd);
       try {
-        const run = await runtime.message(`You are a fresh reviewer in Indra. You did not draft this retrospective. Review ${pr.url} at HEAD ${pr.headSha} against AGENTS.md and the recorded facts in docs/retros/${context.goal.id}.md. Inspect the diff against origin/main. Flag only real bugs or project-rule violations, with the document path, line and a one-line reason; never style or naming. Suggestions must remain owner proposals. You are read-only without network. Do not edit files, commit, push, merge or post. Never include credentials in output. Indra will post your line comments and an approval or changes-requested verdict. Return JSON: summary and findings (path, line, reason; empty when there are none).`, schemaPathOf(import.meta.url, "retro-review.json"), undefined, { purpose: "review" });
+        const run = await circuitRuntime(runtime, store.runtimeDir, context.goal.id, "retro", `retro-review:${pr.headSha}`).message(`You are a fresh reviewer in Indra. You did not draft this retrospective. Review ${pr.url} at HEAD ${pr.headSha} against AGENTS.md and the recorded facts in docs/retros/${context.goal.id}.md. Inspect the diff against origin/main. Flag only real bugs or project-rule violations, with the document path, line and a one-line reason; never style or naming. Suggestions must remain owner proposals. You are read-only without network. Do not edit files, commit, push, merge or post. Never include credentials in output. Indra will post your line comments and an approval or changes-requested verdict. Return JSON: summary and findings (path, line, reason; empty when there are none).`, schemaPathOf(import.meta.url, "retro-review.json"), undefined, { purpose: "review" });
         await context.recordRun(run);
         return run.response;
       } catch (error) { if (error instanceof AgentRunError) await context.recordSession(error.facts); throw error; }

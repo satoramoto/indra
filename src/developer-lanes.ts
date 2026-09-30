@@ -1,3 +1,4 @@
+import { circuitRuntime, circuitShell } from "./circuit-scope.js";
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, realpath, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
@@ -77,7 +78,7 @@ export function laneBrief(goal: GoalBrief, lane: GoalLane, others: readonly Goal
 
 /** All effects are finite and awaited. No watch, sleep, detached process, rebase, force push or unprotected merge. */
 export class GitDeveloperLanes implements DeveloperLaneServices {
-  constructor(private readonly store: PlanningStore, private readonly shell: Shell, private readonly runtimeFor: (cwd: string, write?: WriteAccess) => AgentRuntime) {}
+  constructor(private readonly store: PlanningStore, private readonly shell: Shell, private readonly runtimeFor: (cwd: string, write?: WriteAccess) => AgentRuntime) { this.shell = circuitShell(shell); }
   private async run(command: string, args: string[], cwd: string): Promise<ShellResult> { return this.shell.run(command, args, cwd); }
   private async must(command: string, args: string[], cwd: string): Promise<string> {
     const result = await this.run(command, args, cwd);
@@ -105,7 +106,11 @@ export class GitDeveloperLanes implements DeveloperLaneServices {
     return sha;
   }
   private async agent(journal: { sessions: GoalAgentSession[] }, persist: () => Promise<void>, options: Parameters<typeof runGoalAgent>[1]): Promise<unknown> {
-    return runGoalAgent(this.runtimeFor, options, join(this.store.runtimeDir, "goal-agent-schemas"), journal.sessions, persist);
+    const retry = options.role === "fix";
+    const logicalKey = options.role === "reviewer" ? options.key.replace(/:[0-9]+$/, "")
+      : options.key.replace(/^(plan|workers|worker|lead):[0-9]+(?=:|$)/, "$1");
+    const operation = `${options.brief.header.branch}:${logicalKey}`;
+    return runGoalAgent((cwd, write) => circuitRuntime(this.runtimeFor(cwd, write), this.store.runtimeDir, options.brief.goalId, "implement", operation, retry), options, join(this.store.runtimeDir, "goal-agent-schemas"), journal.sessions, persist);
   }
   async plan(brief: GoalBrief, sessions: GoalAgentSession[], persist: () => Promise<void>): Promise<unknown> {
     const project = await this.project(brief);

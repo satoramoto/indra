@@ -1,4 +1,8 @@
+import { accountedFailure } from "./circuit-fixture.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+// These integration cases exercise durable accounting plus real Git/process supervision.
+vi.setConfig({ testTimeout: 20_000 });
 import { execFileSync } from "node:child_process";
 import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -124,7 +128,7 @@ async function fixture(lanes = 1) {
   ] : [{ id: "code", branch: `codex/${goalId}/code`, ownedFiles: ["src/**", "tests/**"], dependsOn: [] }] };
   const shell = new LocalGitHub(project);
   const calls: { role: string; write?: WriteAccess; cwd: string; prompt: string; session?: string }[] = [];
-  let findings = false; let failLead = false; let failFix = false;
+  let findings = false; let failLead = false; let failFix = false; let failWorkers = false;
   let workerFiles: string[] | undefined;
   let workerHook: ((file: string) => Promise<void>) | undefined;
   const fixDrafts: string[] = [];
@@ -133,36 +137,58 @@ async function fixture(lanes = 1) {
   const planDecisions = ["Lead plan isolates one source file"];
   const planFollowUps = ["Lead plan leaves a documented follow-up"];
   const runtimeFor = (cwd: string, write?: WriteAccess): AgentRuntime => ({ message: async (prompt, _schema, session, options) => {
+    options?.onUsage?.({ inputTokens: 1, outputTokens: 1 });
     const role = options!.purpose!; calls.push({ role, write, cwd, prompt, session });
     const second = prompt.includes(`Branch: codex/${goalId}/second`); const file = second ? "b" : "a";
     let response: unknown = summary;
     if (role === "planner") response = plan;
+    if (role === "lead-plan" && failWorkers) { failWorkers = false; throw accountedFailure("Planning failed with terminal usage"); }
     if (role === "lead-plan") response = { workers: (workerFiles ?? [`src/${file}.ts`]).map((path) => ({ file: path, task: "Implement source" })), decisions: planDecisions, followUps: planFollowUps };
     if (role === "worker") {
       const path = /Own exactly ([^ ]+)\. Task:/.exec(prompt)![1]; await workerHook?.(path);
       response = { ...summary, decisions: workerDecisions, followUps: workerFollowUps, content: shell.localChecks === "typecheck" ? 'export const value: number = "broken";\n' : `export const ${second ? "other" : "value"} = 2;\n` };
     }
     if (role === "lead") {
-      if (failLead) { failLead = false; await writeFile(join(cwd, `src/${file}.ts`), "export const value = 7;\n"); throw new Error("Interrupted lead"); }
+      if (failLead) { failLead = false; await writeFile(join(cwd, `src/${file}.ts`), "export const value = 7;\n"); throw accountedFailure("Interrupted lead"); }
       await writeFile(join(cwd, `tests/${file}.test.ts`), shell.localChecks ? 'import { strict as assert } from "node:assert";\nimport test from "node:test";\nimport { value } from "../src/a.ts";\ntest("value is recovered", () => assert.equal(value, 3));\n' : "// regression coverage fixture\n");
     }
     if (role === "fix") {
       fixDrafts.push(await readFile(join(cwd, `src/${file}.ts`), "utf8"));
       await writeFile(join(cwd, `src/${file}.ts`), shell.keepLocalFailure ? (shell.localChecks === "typecheck" ? 'export const value: number = "still broken";\n' : "export const value = 4;\n") : "export const value = 3;\n");
-      if (failFix) { failFix = false; throw new Error("Interrupted fix"); }
+      if (failFix) { failFix = false; throw accountedFailure("Interrupted fix"); }
       shell.ci = "pass";
     }
     if (role === "reviewer") { response = { findings: findings ? [`src/${file}.ts:1: Exact bug requiring regression`] : [], summary: "Reviewed" }; findings = false; }
-    return { sessionId: `session-${calls.length}`, response, startedAt: at, finishedAt: at };
+    return { sessionId: `session-${calls.length}`, response, usage: { inputTokens: 1, outputTokens: 1 }, startedAt: at, finishedAt: at };
   } });
   const runner = () => new DeveloperSeat(store, { id: seatId, displayName: "Developer", username: "developer", roles: ["Developer"] }, { post: vi.fn() }, shell, runtimeFor);
   const current = () => store.readRuntimeFile<GoalRuntimeRecord>(goalRuntimeFilename(goalId));
   const ciEvent = async (name = "ci-one"): Promise<Extract<WorkflowEvent, { kind: "ci" }>> => { const lane = (await current())!.lanes.find((item) => item.status !== "merged")!; return { kind: "ci", id: name, teamId: "team-one", goalId, laneId: lane.id, prUrl: lane.prUrl!, headSha: lane.headSha!, state: "passed", at }; };
   return { store, shell, calls, runner, current, ciEvent, plan, brief, runtimeFor, fixDrafts, workerDecisions, workerFollowUps, planDecisions, planFollowUps,
+    failWorkerPlanning: () => { failWorkers = true; },
     setWorkers: (files: string[], hook: (file: string) => Promise<void>) => { workerFiles = files; workerHook = hook; }, failFix: () => { failFix = true; }, setFindings: () => { findings = true; }, failLead: () => { failLead = true; } };
 }
 
 describe("finite production Developer goal orchestration", () => {
+  it("charges only the retried planner when workers and lead have not run before", async () => {
+    const f = await fixture();
+    await writeFile(join(f.store.runtimeDir, "circuit-policy.json"), JSON.stringify({ maxPhaseRetries: 1 }));
+    f.failWorkerPlanning();
+    await f.runner().turn(event());
+    expect((await f.current())!.failure).not.toBeNull();
+    await f.runner().turn(event("retry"));
+    expect((await f.current())!.failure).toBeNull();
+    expect(f.calls.map((call) => call.role)).toEqual(["planner", "lead-plan", "lead-plan", "worker", "lead", "reviewer"]);
+  });
+  it("persists a token trip from the real goal runner and rejects ordinary retry without starting more work", async () => {
+    const f = await fixture();
+    await writeFile(join(f.store.runtimeDir, "circuit-policy.json"), JSON.stringify({ maxTokens: 1 }));
+    await f.runner().turn(event());
+    expect((await f.current())!.failure).toMatchObject({ retryable: false, message: expect.stringContaining("Circuit open") });
+    expect(f.calls).toHaveLength(1);
+    await expect(f.runner().turn(event("retry"))).rejects.toThrow("Circuit open");
+    expect(f.calls).toHaveLength(1);
+  });
   it("executes actual one-file workers/leads and fresh reviews before CI, then reports only an observed merged sprint", async () => {
     const f = await fixture(); const first = await f.runner().turn(event());
     expect(first.report).toBeNull(); expect((await f.current())!.failure).toBeNull();
