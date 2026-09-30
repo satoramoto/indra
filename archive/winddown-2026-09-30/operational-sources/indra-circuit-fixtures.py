@@ -1,0 +1,26 @@
+from pathlib import Path
+p=Path('src/circuit-scope.ts');s=p.read_text().replace('mkdir, readFile, rename, writeFile','mkdir, open, readFile, rename')
+s=s.replace('const current = new AsyncLocalStorage<CircuitScope>();','const current = new AsyncLocalStorage<CircuitScope>();\nconst wrappedShells = new WeakSet<Shell>();')
+s=s.replace('  return { run: (command, args, cwd, options) => {','  if (wrappedShells.has(shell)) return shell;\n  const wrapped: Shell = { run: (command, args, cwd, options) => {',1)
+s=s.replace('  } };\n}\n\n/** Repair', '  } };\n  wrappedShells.add(wrapped);\n  return wrapped;\n}\n\n/** Repair',1)
+s=s.replace('        await writeFile(`${path}.tmp`, `${count + 1}\\n`, { mode: 0o600 });\n        await rename(`${path}.tmp`, path);','''        const file = await open(`${path}.tmp`, "w", 0o600);
+        try { await file.writeFile(`${count + 1}\\n`); await file.sync(); } finally { await file.close(); }
+        await rename(`${path}.tmp`, path);
+        const directory = await open(runtimeDir, "r");
+        try { await directory.sync(); } finally { await directory.close(); }''')
+s=s.replace('budget.protectRuntime(runtime, { phase, operationId })','budget.protectRuntime(runtime, { phase, operationId: key })');p.write_text(s)
+p=Path('src/developer-lanes.ts');s=p.read_text().replace('const operation = `${options.brief.header.branch}:${options.key}`;', 'const operation = `${options.brief.header.branch}:${options.role === "reviewer" ? options.key.replace(/:[0-9]+$/, "") : options.key}`;');p.write_text(s)
+p=Path('src/developer-seat.ts');s=p.read_text().replace('            catch {\n              await this.event(record, { kind: "ci"', '            catch (error) {\n              if (isCircuitOpen(error)) throw error;\n              await this.event(record, { kind: "ci"')
+s=s.replace('    let run: AgentResult;\n    // Every session', '    let run: AgentResult;\n    const reviewHead = role === "reviewer" ? (await this.sh("git", ["rev-parse", "HEAD"], record.worktree)).stdout.trim() : "";\n    // Every session')
+s=s.replace('`legacy:${record.outcomeId}:${role}`', '`legacy:${record.outcomeId}:${role}:${reviewHead}`');p.write_text(s)
+# Simulated providers explicitly report their known usage, including failures.
+p=Path('tests/developer-goal.test.ts');s=p.read_text().replace('    const role = options!.purpose!;', '    options?.onUsage?.({ inputTokens: 1, outputTokens: 1 });\n    const role = options!.purpose!;').replace('return { sessionId: `session-${calls.length}`, response,', 'return { sessionId: `session-${calls.length}`, response, usage: { inputTokens: 1, outputTokens: 1 },');p.write_text(s)
+p=Path('tests/planning.test.ts');s=p.read_text().replace('return { sessionId: sessionId ?? "session-1", response,', 'return { sessionId: sessionId ?? "session-1", response, usage: { inputTokens: 1, outputTokens: 1 },')
+s=s.replace('{ sessionId: "review-a", startedAt:', '{ sessionId: "review-a", usage: { inputTokens: 1, outputTokens: 1 }, startedAt:').replace('{ sessionId: "fresh", startedAt:', '{ sessionId: "fresh", usage: { inputTokens: 1, outputTokens: 1 }, startedAt:').replace('{ sessionId: "fresh-review", startedAt:', '{ sessionId: "fresh-review", usage: { inputTokens: 1, outputTokens: 1 }, startedAt:')
+s=s.replace('undefined, { purpose: "review", timeoutMs: DEVELOPER_SESSION_TIMEOUT_MS });','undefined, expect.objectContaining({ purpose: "review", timeoutMs: 30 * 60_000, signal: expect.any(AbortSignal) }));');p.write_text(s)
+p=Path('tests/product-seat.test.ts');s=p.read_text().replace('    calls.push({ prompt, schema, session, purpose:', '    messageOptions?.onUsage?.({ inputTokens: 8, outputTokens: 2 });\n    calls.push({ prompt, schema, session, purpose:').replace('usage: { tokens: 10 }','usage: { inputTokens: 8, outputTokens: 2 }');p.write_text(s)
+p=Path('tests/developer-seat.test.ts');s=p.read_text().replace('message: async (prompt: string, schema: string, sessionId?: string):', 'message: async (prompt: string, schema: string, sessionId?: string, options?: import("../src/codex-runtime.js").MessageOptions):').replace('      // Record the sandbox', '      options?.onUsage?.({ inputTokens: 1, outputTokens: 1 });\n      // Record the sandbox').replace('return { sessionId: `session-${this.runs.length}`, response,', 'return { sessionId: `session-${this.runs.length}`, response, usage: { inputTokens: 1, outputTokens: 1 },');p.write_text(s)
+p=Path('tests/retro-publication.test.ts');s=p.read_text();s='import { mkdtemp, rm } from "node:fs/promises";\nimport { tmpdir } from "node:os";\nimport { join } from "node:path";\n'+s
+s=s.replace('async function fixture() {\n  const goal', 'const circuitDirs: string[] = [];\nafterEach(async () => { await Promise.all(circuitDirs.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });\nasync function fixture() {\n  const runtimeDir = await mkdtemp(join(tmpdir(), "indra-retro-circuit-")); circuitDirs.push(runtimeDir);\n  const goal').replace('runtimeDir: "/nonexistent-retro-test-state.runtime",','runtimeDir,')
+# locate reviewer result in next pass if no usage
+s=s.replace('return { sessionId: "fresh-review",', 'return { sessionId: "fresh-review", usage: { inputTokens: 1, outputTokens: 1 },');p.write_text(s)

@@ -1,0 +1,52 @@
+import { writeFile, readFile } from 'node:fs/promises';
+import { pathToFileURL } from 'node:url';
+import { build } from '/Users/ryan/The Source/indra/node_modules/vite/dist/node/index.js';
+import { createPlanningStore } from '/Users/ryan/The Source/indra/dist/cli.js';
+import { closeLegacyGoals } from '/Users/ryan/The Source/indra/src/legacy-closure.ts';
+
+const appDir = '/Users/ryan/The Source/indra';
+const checkout = '/Users/ryan/The Source/indra-state';
+const sha = 'b7c53da3e0707b054aed760b4e6a67d969748011';
+const store = createPlanningStore(checkout);
+const initialSync = await store.sync();
+if (initialSync.outcome !== 'synced') throw new Error(`Initial state sync is ${initialSync.outcome}; activation stopped.`);
+const before = await store.read();
+if ((before.planningGoals ?? []).some((goal: any) => !goal.ceremony)) throw new Error('Unexpected unmigrated legacy evidence requires inspection.');
+const preservedGoals = (before.planningGoals ?? []).filter((goal: any) => goal.ceremony.closure).map((goal: any) => [goal.id, JSON.stringify(goal)]);
+const identity = (team: any) => JSON.stringify({ ...team, workflowModel: undefined, seats: team.seats.map(({ roles, ...seat }: any) => seat) });
+const beforeTeam = before.teams.find((team: any) => team.id === 'team-001');
+if (!beforeTeam || beforeTeam.workflowModel) throw new Error('Expected historical team configuration changed; inspect before activation.');
+const teamIdentity = identity(beforeTeam);
+
+const bundle: any = await build({ configFile: false, root: appDir, logLevel: 'silent', build: { write: false, target: 'node26', minify: false, lib: { entry: `${appDir}/src/state-schema.ts`, formats: ['es'], fileName: () => 'state-schema.mjs' }, rollupOptions: { external: [/^node:/] } } });
+const chunks = (Array.isArray(bundle) ? bundle : [bundle]).flatMap((result: any) => result.output).filter((output: any) => output.type === 'chunk');
+if (chunks.length !== 1) throw new Error('Unexpected schema helper bundle shape.');
+const helper = '/private/tmp/indra-first-cycle-state-schema.mjs';
+await writeFile(helper, chunks[0].code, { mode: 0o600 });
+const { syncStateSchema } = await import(pathToFileURL(helper).href);
+const schema = await syncStateSchema(checkout, { sha, appDir });
+if (!['unchanged', 'committed'].includes(schema.outcome) || (schema.sync && schema.sync.outcome !== 'synced')) throw new Error(`Schema sync is ${schema.outcome}; activation stopped.`);
+console.log(JSON.stringify({ schema }));
+
+const migration = await store.migrateLegacyGoals();
+if (migration.some((result: any) => result.status !== 'migrated')) throw new Error('Legacy migration conflict; activation stopped.');
+const closures = await closeLegacyGoals(store);
+if (closures.some((result: any) => result.status === 'conflict')) throw new Error('Historical closure conflict; activation stopped.');
+const retiredSprints = await store.retireLegacySprints();
+await store.update((state: any) => {
+  if ((state.planningGoals ?? []).some((goal: any) => !goal.ceremony?.closure)) throw new Error('Open historical goals still block activation.');
+  const team = state.teams.find((item: any) => item.id === 'team-001');
+  const product = team?.seats.find((seat: any) => seat.id === 'seat-002');
+  if (!team || team.workflowModel || identity(team) !== teamIdentity || product?.displayName !== 'George Duke' || JSON.stringify(product.roles) !== '["Developer"]') throw new Error('Team identity or role configuration changed.');
+  team.workflowModel = 'goals-v1';
+  product.roles = ['Product'];
+}, 'Activate goals-v1 for Yahaha with George Duke as Product');
+const sync = await store.sync();
+if (sync.outcome !== 'synced') throw new Error(`Activation state sync is ${sync.outcome}.`);
+const after = await store.read();
+const team = after.teams.find((item: any) => item.id === 'team-001');
+if (identity(team) !== teamIdentity) throw new Error('Team identity changed unexpectedly.');
+for (const [id, value] of preservedGoals) if (JSON.stringify(after.planningGoals.find((goal: any) => goal.id === id)) !== value) throw new Error('Closed history changed unexpectedly.');
+const result = { schema: schema.outcome, migration, closures, retiredSprints, sync, historyPreserved: true, team: { id: team.id, workflowModel: team.workflowModel, seats: team.seats.map(({ id, displayName, roles }: any) => ({ id, displayName, roles })) } };
+await writeFile('/private/tmp/indra-first-cycle-state-activation-result.json', JSON.stringify(result, null, 2) + '\n', { mode: 0o600 });
+console.log(JSON.stringify(result, null, 2));
