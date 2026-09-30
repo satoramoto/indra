@@ -9,7 +9,7 @@ import type { AgentResult, AgentRuntime } from "../src/codex-runtime.js";
 import { CEREMONY_STAGES } from "../src/ceremony.js";
 import type { ImplementationFacts } from "../src/implementation-facts.js";
 import { TEAM_LEAD_CODEX_CONFIG, engineHome, seatHarnessDir } from "../src/harness-home.js";
-import type { PlanningGoal } from "../src/planning.js";
+import { validatePlanningGoal, type PlanningGoal } from "../src/planning.js";
 import { SeatRuntime } from "../src/seat-runtime.js";
 import {
   buildRetroSnapshot, draftSprintRetro, renderSprintRetro, retroPrompt, validateRetroNarrative,
@@ -50,6 +50,33 @@ function input(): RetroInput {
     failures: [{ at: at(24), outcomeId: "outcome-one", message: "Build failed", retries: 2 }],
   }, implementation: [{ version: 1, goalId: "goal-one", outcomeId: "outcome-one", seatId: "seat-two", attempts: [{ id: "attempt-1", cause: "claim", claimedAt: at(20), terminal: { status: "merged", at: at(29) }, events: [] }] }] };
 }
+const PRODUCT_GOAL_ID = "goal-b802a303-4685-4a02-bdd1-f6eb6b5cb14c";
+/** Whole-goal Product proposal, reported lane delivery and protected release already running. */
+function goalsV1Input(goalId = PRODUCT_GOAL_ID): RetroInput {
+  const data = input(); const g = data.goal;
+  const proposalId = "proposal-7fe8ce27-30df-4bd8-8ae5-a9f7da86a118";
+  g.id = goalId; g.workflowModel = "goals-v1"; g.participantSeatIds = []; g.ownedFiles = ["src/change.ts"];
+  g.goalProposal = { version: 1, goalId, proposalId, productSeatId: "seat-product", rank: 1, mission: "docs/mission.md", summary: "Ship the change",
+    outcomes: [{ number: 1, title: "Change", description: "Deliver the change", reason: "Mission", currentCode: ["src/change.ts"] }],
+    ownedFiles: g.ownedFiles, risks: [], rationale: "Useful", basedOnRetros: [] };
+  g.goalAssignment = { seatId: "seat-two", status: "reported", updatedAt: at(30) };
+  g.integration!.branch = `sprint/${goalId}`; g.integration!.prUrl = "https://github.com/owner/project/pull/2";
+  delete g.proposal; delete g.assignments; delete data.implementation;
+  const approval = g.ceremony!.history.find((entry) => entry.stage === "implement")!;
+  approval.evidence = { kind: "approval", proposalId, proposalPostId: g.mattermost.rootPostId, approval: { source: "owner-command", command: "planning approve", at: at(20) } };
+  const release = g.ceremony!.history.find((entry) => entry.stage === "release")!;
+  release.evidence = { kind: "implementation", outcomes: [], goalDelivery: { version: 1, goalId, teamId: g.teamId, seatId: "seat-two", sprintBranch: g.integration!.branch, headSha: "c".repeat(40),
+    lanePrs: [{ laneId: "lane-one", url: pr, headSha: "a".repeat(40), mergedSha: "c".repeat(40), reviewer: "satori-miyamoto", ci: "passed" }],
+    checks: [{ command: "npm run typecheck", exitCode: 0 }], decisions: [], followUps: [], neededButUnowned: [] } };
+  const running = g.ceremony!.history.find((entry) => entry.stage === "retro")!.evidence;
+  delete running.approval; delete running.mergePostId; running.prUrl = g.integration!.prUrl!;
+  running.mergeVerification = { headSha: "c".repeat(40), reviewCommitSha: "c".repeat(40), reviewer: "satori-miyamoto", checksPassed: true };
+  for (const row of [...data.facts.reviews, ...data.facts.rounds, ...data.facts.failures]) row.outcomeId = "lane-one";
+  data.lanePrs = [{ url: pr, headSha: "a".repeat(40), decisions: "Preserved the approved boundary", followUps: null }];
+  data.releaseAttempts = { version: 1, goalId, startedAt: at(30), conflicts: [], merges: [{ prUrl: g.integration!.prUrl!, headSha: "c".repeat(40), at: at(35) }] };
+  data.retroAttempts = Array.from({ length: 20 }, (_, index) => ({ startedAt: new Date(Date.parse(at(40)) + (index + 1) * 400).toISOString(), errorKind: "draft-error" }));
+  return data;
+}
 function narrative(snapshot: RetroEvidenceSnapshot): RetroNarrative {
   const phaseReflections = CEREMONY_STAGES.flatMap((phase) => snapshot.choices.phaseReflections.filter((item) => item.phase === phase).slice(0, 1));
   return { observations: [snapshot.choices.observations.find((item) => item.kind === "went-well")!, snapshot.choices.observations.find((item) => item.kind === "went-poorly")!], phaseReflections, ownerProposals: snapshot.choices.ownerProposals.slice(0, 1) };
@@ -62,6 +89,54 @@ const UNRECORDED_RELEASE = { phase: "release", evidenceId: "release-integration-
 const RECORDING_PROPOSAL = { evidenceId: "release-integration-conflicts", kind: "owner-proposal", text: "Consider recording integration PR conflict and merge rounds.", phase: "release" };
 
 describe("bounded retro evidence and numeric accounting", () => {
+  it.each([PRODUCT_GOAL_ID, "goal-one", "goal-2b118e79"])("preserves Product goal %s through the snapshot, prompt and rendered retro", async (goalId) => {
+    const data = goalsV1Input(goalId);
+    validatePlanningGoal(data.goal);
+    const snapshot = buildRetroSnapshot(data);
+    expect(snapshot.goalId).toBe(goalId);
+    expect(snapshot.retroAttempts).toMatchObject({ failed: 20, firstErrorKind: "draft-error", lastErrorKind: "draft-error", sessions: 0 });
+    expect(snapshot.sessions).toHaveLength(data.facts.sessions.length);
+    const message = vi.fn<AgentRuntime["message"]>().mockResolvedValue(run(snapshot));
+    const draft = await draftSprintRetro(data, () => ({ message }));
+    expect(draft.snapshot.goalId).toBe(goalId);
+    expect(message.mock.calls[0][0]).toContain(`"goalId":"${goalId}"`);
+    expect(draft.markdown.split("\n")[0]).toBe(`# Sprint retrospective: ${goalId}`);
+  });
+
+  it.each([
+    `goal-${"a1".repeat(18)}`,
+    `${PRODUCT_GOAL_ID}-extra`,
+    PRODUCT_GOAL_ID.replace("b802", "g802"),
+    PRODUCT_GOAL_ID.replace("-4a02-", "-5a02-"),
+    PRODUCT_GOAL_ID.replace("-bdd1-", "-7dd1-"),
+  ])("rejects a token-shaped or noncanonical goal identity: %s", (goalId) => {
+    expect(() => buildRetroSnapshot(goalsV1Input(goalId))).toThrow("Invalid retro evidence identity");
+  });
+
+  it.each([PRODUCT_GOAL_ID, `ghp_${"a1".repeat(20)}`, "bad identity"])("still rejects an unsafe generic identity: %s", (seatId) => {
+    const data = input(); data.facts.sessions[0].seatId = seatId;
+    expect(() => buildRetroSnapshot(data)).toThrow("Invalid retro evidence identity");
+  });
+
+  it("keeps goal-shaped and credential-shaped strings redacted in free-text evidence", async () => {
+    const data = goalsV1Input();
+    const token = `ghp_${"a1".repeat(20)}`; const opaque = "z9".repeat(20);
+    const unsafe = `Finding for ${PRODUCT_GOAL_ID}: token=private-value ${token} ${opaque}.`;
+    const redacted = "Finding for [redacted]: token=[redacted] [redacted] [redacted].";
+    data.facts.reviews[0].findings = [unsafe]; data.facts.failures[0].message = unsafe;
+    data.lanePrs![0].decisions = unsafe; data.lanePrs![0].followUps = unsafe; data.missing = [unsafe];
+    const snapshot = buildRetroSnapshot(data);
+    expect(snapshot.reviews[0].findings).toEqual([redacted]);
+    expect(snapshot.failures[0].message).toBe(redacted);
+    expect(snapshot.lanePrs![0]).toMatchObject({ decisions: redacted, followUps: redacted });
+    expect(snapshot.missing).toContain(redacted);
+    const markdown = await renderSprintRetro(snapshot, narrative(snapshot), generation());
+    for (const output of [JSON.stringify(snapshot), retroPrompt(snapshot), markdown]) {
+      for (const secret of ["private-value", token, opaque]) expect(output).not.toContain(secret);
+    }
+    expect(markdown.split("\n")[0]).toBe(`# Sprint retrospective: ${PRODUCT_GOAL_ID}`);
+  });
+
   it("freezes actual lane sections and recorded integration rounds without filling missing history with zero", async () => {
     const data = input(); const headSha = "a".repeat(40); const baseSha = "b".repeat(40);
     data.lanePrs = [{ url: pr, headSha, decisions: "Preserved the approved boundary", followUps: null }];

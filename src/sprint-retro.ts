@@ -118,6 +118,11 @@ function identity(value: string): string {
   if (typeof value !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9:._/-]{0,159}$/.test(value) || safeText(value) !== value) throw new Error("Invalid retro evidence identity.");
   return value;
 }
+function goalIdentity(value: string): string {
+  // Product generates goal-<randomUUID()>; only this typed UUID v4 bypasses free-text token heuristics.
+  if (typeof value === "string" && value.length === 41 && /^goal-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(value)) return value;
+  return identity(value);
+}
 function handle(value: string): string {
   // Handles stay in local accounting, never in the prompt/document. UUIDs are legitimate, not free text.
   if (typeof value !== "string" || !/^(?:claude:)?[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(value)) throw new Error("Invalid retro runtime handle.");
@@ -283,7 +288,7 @@ export function buildRetroSnapshot(input: RetroInput): RetroEvidenceSnapshot {
     if (![row.headSha, row.baseSha, ...(row.resultSha ? [row.resultSha] : [])].every((sha) => /^[a-f0-9]{40}$/.test(sha)) || !["running", "pushed", "blocked"].includes(row.status)) throw new Error("Invalid integration correction evidence.");
     return { headSha: row.headSha, baseSha: row.baseSha, resultSha: row.resultSha ?? null, status: row.status, decisions: row.decisions.map(safeText) };
   });
-  return bounded({ version: 2, goalId: identity(goal.id), leadSeatId: identity(goal.seatId), cutoffAt,
+  return bounded({ version: 2, goalId: goalIdentity(goal.id), leadSeatId: identity(goal.seatId), cutoffAt,
     release: { prUrl: safeText(released.prUrl), runningAt: time(released.runningAt) }, seats, sessions, reviews, rounds, failures, stages, phases, retroAttempts, missing: [...missing].sort(compare), choices, ...(lanePrs ? { lanePrs } : {}), ...(integrationCorrections ? { integrationCorrections } : {}) });
 }
 
