@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readdir } from "node:fs/promises";
 import { ceremonyRuntimeName, type BridgeCeremonyRecord, type CeremonyAdapters, type CeremonyContext, type CeremonyProgress, type Post } from "./planning-bridge.js";
 import { type CeremonyStage, type HumanApproval, type PublishedRetroEvidence, validateCeremony } from "./ceremony.js";
@@ -7,7 +7,7 @@ import { requireTeamHome, type PlanningStore } from "./planning.js";
 import { processShell, type SeatTaskRecord } from "./developer-seat.js";
 import { seatRecordName } from "./developer-maintenance.js";
 import { retroPath, SprintGitHub, releaseAttemptsName, type ReleaseAttempts, type RetroArchive, type RetroPr, type RetroReview } from "./sprint.js";
-import { goalRuntimeFilename, validateGoalReport, type GoalRuntimeRecord } from "./goal-contract.js";
+import { goalRuntimeFilename, validateGoalReport, type GoalRuntimeRecord, type WorkflowFailure } from "./goal-contract.js";
 import { draftSprintRetro, renderSprintRetro, RetroGenerationError, type RetroGeneration, type RetroInput, type RetroPriorAttempt, type SprintRetroDraft } from "./sprint-retro.js";
 import { readImplementationFacts } from "./implementation-facts.js";
 import { loadSeatEngines, SeatRuntime, type GoalAgentSession } from "./seat-runtime.js";
@@ -19,17 +19,22 @@ import { CHICK_USERNAME, MattermostPlanningChat, readChickToken } from "./planni
 import { opCredential } from "./service-account.js";
 import { schemaPathOf } from "./reload.js";
 import { redactSecrets } from "./redact.js";
+import { validateWorkflowEvent } from "./remodel-events.js";
 
 /** The store still checks the companion schema before writing any ceremony state. */
 export const ceremonyReadiness: CeremonyWriteReadiness = { version: 1, consumers: { planning: 1, developer: 1, release: 1, retro: 1, tui: 1 } };
 export const retroRuntimeName = (goalId: string) => { retroPath(goalId); return `retro-publication-${goalId}`; };
 const digest = (content: string) => createHash("sha256").update(content).digest("hex");
-const pending = (reason: string): CeremonyProgress<PublishedRetroEvidence> => ({ status: "pending", reason });
+const pending = (reason: string, failure?: WorkflowFailure): CeremonyProgress<PublishedRetroEvidence> => ({ status: "pending", reason, ...(failure ? { failure } : {}) });
 
 export interface RetroPublicationRecord {
   version: 1; goalId: string; github: string;
   /** Older records have neither finishedAt nor errorKind; a missing finishedAt on a new attempt means it was aborted. */
-  attempts: { startedAt: string; finishedAt?: string; errorKind?: string; generation?: RetroGeneration }[];
+  attempts: { startedAt: string; finishedAt?: string; errorKind?: string; generation?: RetroGeneration;
+    /** Consumed atomically with the reservation, before model work; retained across failed or interrupted turns. */
+    retry?: { id: string; at: string } }[];
+  /** A recoverable goals-v1 draft blocker; frozen content clears it without discarding attempt history. */
+  failure?: WorkflowFailure;
   frozen?: { draft: SprintRetroDraft; parts: string[]; markdown: string; sha256: string };
   postIds?: string[];
   prUrl?: string;
@@ -52,6 +57,20 @@ export function retroRetryDelayMs(failures: number): number {
 export function priorRetroAttempts(attempts: RetroPublicationRecord["attempts"]): RetroPriorAttempt[] {
   return attempts.map((attempt) => ({ startedAt: attempt.startedAt, sessionId: attempt.generation?.sessionId ?? null, invocationId: attempt.generation?.invocationId ?? null,
     errorKind: attempt.errorKind ?? (attempt.generation?.status === "timed-out" || attempt.generation?.status === "interrupted" ? attempt.generation.status : attempt.generation ? "runtime-failed" : "unrecorded") }));
+}
+/** A previous goals-v1 attempt without frozen content always needs a new explicit retry, including old journals. */
+function draftFailure(record: RetroPublicationRecord): WorkflowFailure {
+  const last = record.attempts.at(-1)!;
+  return { at: last.finishedAt ?? last.startedAt, message: `Chick's retrospective draft for ${record.goalId} failed or was interrupted (attempt ${record.attempts.length}); run planning retry --goal ${record.goalId} after resolving the failure.`, retryable: true };
+}
+function freshDraftRetry(context: CeremonyContext, record: RetroPublicationRecord): { id: string; at: string } | undefined {
+  if (context.event?.kind !== "retry") return;
+  const event = validateWorkflowEvent(context.event);
+  if (event.kind !== "retry" || event.goalId !== context.goal.id || event.teamId !== context.goal.teamId || !event.id.trim()
+    || record.attempts.some((attempt) => attempt.retry?.id === event.id)) return;
+  const last = record.attempts.at(-1);
+  if (last && !(Date.parse(event.at) > Date.parse(last.finishedAt ?? last.startedAt))) return;
+  return { id: event.id, at: event.at };
 }
 /** The persona attribution belongs to the thread post only; the archive holds the frozen parts exactly. */
 const archiveOf = (parts: string[]) => parts.join("");
@@ -140,17 +159,25 @@ export class RetroPublication {
   }
 
   async poll(context: CeremonyContext): Promise<CeremonyProgress<PublishedRetroEvidence>> {
+    let retained: RetroPublicationRecord | undefined;
     try {
       const record = await this.load(context);
+      retained = record;
       if (!record.frozen) {
         const failures = record.attempts.length;
-        if (failures && context.goal.workflowModel !== "goals-v1") {
+        const finite = context.goal.workflowModel === "goals-v1";
+        const retry = finite ? freshDraftRetry(context, record) : undefined;
+        if (failures && finite && !retry) {
+          record.failure = draftFailure(record); await this.save(context, record);
+          return pending(record.failure.message, record.failure);
+        }
+        if (failures && !finite) {
           const last = record.attempts.at(-1)!;
           const retryAt = Date.parse(last.finishedAt ?? last.startedAt) + retroRetryDelayMs(failures);
           if (!(Date.now() >= retryAt)) return pending(`Chick's retrospective draft failed or was interrupted ${failures} time(s); the next attempt starts after ${new Date(Number.isFinite(retryAt) ? retryAt : Date.now()).toISOString()}.`);
         }
         const prior = priorRetroAttempts(record.attempts);
-        record.attempts.push({ startedAt: new Date().toISOString() });
+        record.attempts.push({ startedAt: new Date().toISOString(), ...(retry ? { retry } : {}) });
         await this.save(context, record);
         const attempt = record.attempts.at(-1)!;
         let draft: SprintRetroDraft;
@@ -159,11 +186,13 @@ export class RetroPublication {
           attempt.finishedAt = new Date().toISOString();
           if (error instanceof RetroGenerationError) { attempt.generation = error.generation; attempt.errorKind = error.kind; }
           else attempt.errorKind = "draft-error";
+          if (finite) record.failure = draftFailure(record);
           await this.save(context, record);
-          return pending(context.goal.workflowModel === "goals-v1" ? "Chick's retrospective draft failed or was interrupted; deliver a retry event after resolving the failure." : "Chick's retrospective draft failed or was interrupted; it will be retried with backoff.");
+          return pending(record.failure?.message ?? "Chick's retrospective draft failed or was interrupted; it will be retried with backoff.", record.failure);
         }
         if (draft.snapshot.goalId !== context.goal.id || draft.snapshot.leadSeatId !== context.goal.seatId || draft.markdown !== await renderSprintRetro(draft.snapshot, draft.narrative, draft.generation)) {
           Object.assign(attempt, { finishedAt: new Date().toISOString(), errorKind: "unverified-content", generation: draft.generation });
+          if (finite) record.failure = draftFailure(record);
           await this.save(context, record);
           throw new Error("Retrospective content was not rendered from this goal's recorded facts.");
         }
@@ -174,6 +203,7 @@ export class RetroPublication {
         attempt.finishedAt = new Date().toISOString();
         attempt.generation = draft.generation;
         record.frozen = { draft, parts: messages, markdown, sha256: digest(markdown) };
+        delete record.failure;
         await this.save(context, record);
       }
       const frozen = record.frozen;
@@ -220,6 +250,13 @@ export class RetroPublication {
       return { status: "complete", evidence: { kind: "retro-published", path: retroPath(context.goal.id), prUrl: pr.url, baseBranch: "main", mergedSha: pr.mergedSha,
         postId: postIds.at(-1)!, publishedAt: record.verifiedAt, factsOnly: true, suggestions: "owner-proposals-only" } };
     } catch {
+      const record = retained;
+      if (context.goal.workflowModel === "goals-v1" && record && !record.frozen && record.attempts.length) {
+        record.failure = draftFailure(record);
+        // A lost reservation acknowledgement still blocks replay. A later turn recovers from the retained attempt.
+        try { await this.save(context, record); } catch { /* Preserve the blocker even when the runtime journal is unavailable. */ }
+        return pending(record.failure.message, record.failure);
+      }
       // Neither provider diagnostics nor local paths may enter a thread or the state journal.
       return pending("Retrospective publication or archival verification is pending; retry after resolving the delivery or PR problem.");
     }
@@ -227,7 +264,8 @@ export class RetroPublication {
 
   /** Compatibility retry; authorization is the approved goal, never a second human action. */
   async merge(context: CeremonyContext, _historicalApproval?: HumanApproval): Promise<string> {
-    const result = await this.poll(context);
+    const result = await this.poll({ ...context, event: { kind: "retry", id: `retro-merge-retry:${randomUUID()}`, teamId: context.goal.teamId, goalId: context.goal.id,
+      at: new Date().toISOString(), reason: "Explicit planning merge compatibility retry" } });
     if (result.status === "pending") throw new Error(result.reason);
     return `Retrospective archive merged: ${result.evidence.prUrl}. Closure follows verified thread delivery and archival merge.`;
   }
