@@ -1,6 +1,8 @@
 /** Shared contracts for the goal workflow. This module owns no processes, storage or lane behavior. */
 export const WORKFLOW_MODEL = "goals-v1" as const;
-export const GOAL_REVIEWER = "satori-miyamoto" as const;
+export const GOAL_REVIEWER = "independent-agent" as const;
+export type GoalReviewer = typeof GOAL_REVIEWER | "satori-miyamoto";
+export const isGoalReviewer = (value: unknown): value is GoalReviewer => value === GOAL_REVIEWER || value === "satori-miyamoto";
 
 export class GoalContractError extends Error {
   override name = "GoalContractError";
@@ -37,7 +39,7 @@ export interface GoalLaneReport {
   url: string;
   headSha: string;
   mergedSha: string;
-  reviewer: typeof GOAL_REVIEWER;
+  reviewer: GoalReviewer;
   ci: "passed";
 }
 
@@ -354,8 +356,8 @@ export function validateGoalReport(value: unknown): GoalReport {
   if (sprintBranch !== `sprint/${goalId}`) fail("The report must identify this goal's sprint branch.");
   const lanePrs = array(input.lanePrs, "Lane PRs", 1).map((item): GoalLaneReport => {
     const row = object(item, ["laneId", "url", "headSha", "mergedSha", "reviewer", "ci"], "Lane PR");
-    if (row.reviewer !== GOAL_REVIEWER || row.ci !== "passed") fail("Every reported lane requires bot approval and passing CI.");
-    return { laneId: identifier(row.laneId, "Lane ID"), url: prUrl(row.url, "Lane PR URL"), headSha: sha(row.headSha, "Lane head"), mergedSha: sha(row.mergedSha, "Lane merge commit"), reviewer: GOAL_REVIEWER, ci: "passed" };
+    if (!isGoalReviewer(row.reviewer) || row.ci !== "passed") fail("Every reported lane requires independent review approval and passing CI.");
+    return { laneId: identifier(row.laneId, "Lane ID"), url: prUrl(row.url, "Lane PR URL"), headSha: sha(row.headSha, "Lane head"), mergedSha: sha(row.mergedSha, "Lane merge commit"), reviewer: row.reviewer as GoalReviewer, ci: "passed" };
   });
   unique(lanePrs.map((lane) => lane.laneId), "Reported lanes");
   unique(lanePrs.map((lane) => lane.url), "Reported PRs");

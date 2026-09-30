@@ -8,7 +8,6 @@ import { DeveloperGoal, developerGoalJournalName } from "../src/developer-goal.j
 import { changedPaths, type LaneJournal } from "../src/developer-lanes.js";
 import { PlanningStore, type PlanningGoal } from "../src/planning.js";
 import { goalRuntimeFilename, type GoalBrief, type GoalRuntimeRecord, type LanePlan, type WorkflowEvent } from "../src/goal-contract.js";
-import { SprintGitHub } from "../src/sprint.js";
 import { processShell } from "../src/command-shell.js";
 import type { AgentRuntime, WriteAccess } from "../src/codex-runtime.js";
 import { stateCheckout } from "./state-checkout.js";
@@ -25,12 +24,12 @@ const ready = { version: 1 as const, consumers: { planning: 1 as const, develope
 const git = (cwd: string, ...args: string[]) => execFileSync("git", ["-c", "commit.gpgsign=false", ...args], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 const event = (kind: "startup" | "retry" = "startup"): WorkflowEvent => kind === "startup" ? { kind, teamId: "team-one", at } : { kind, id: `retry-${Date.now()}`, teamId: "team-one", goalId, reason: "Explicit recovery", at };
 const summary = { summary: "Implemented owned outcome", decisions: ["Host owns Git and checks"], followUps: [], neededButUnowned: [] };
-interface Pull { url: string; branch: string; base: string; head: string; merged: boolean; mergedSha: string | null; reviews: { id: number; user: { login: string }; state: string; commit_id: string; body: string }[] }
+interface Pull { url: string; branch: string; base: string; head: string; merged: boolean; mergedSha: string | null; comments: { body: string }[]; reviews: { id: number; user: { login: string }; state: string; commit_id: string; body: string }[] }
 
 class LocalGitHub implements Shell {
   bodies: string[] = [];
   prs = new Map<string, Pull>(); calls: { command: string; args: string[]; cwd: string }[] = [];
-  ci = "pending"; failLog = "tests/a.test.ts: expected 2, got 1"; mergeBlocker: string | undefined;
+  ci = "pending"; failLog = "tests/a.test.ts: expected 2, got 1";
   tamperBase = false; tamperHead = false; loseCreate = false;
   localChecks: "typecheck" | "tests" | null = null; keepLocalFailure = false;
   constructor(readonly project: string) {}
@@ -56,14 +55,14 @@ class LocalGitHub implements Shell {
       this.bodies.push(await readFile(args[args.indexOf("--body-file") + 1], "utf8"));
       const branch = args[args.indexOf("--head") + 1]; const url = `https://github.com/${repo}/pull/${this.prs.size + 1}`;
       const head = git(this.project, "rev-parse", branch); const base = git(this.project, "rev-parse", sprint);
-      this.prs.set(url, { url, branch, head, base, merged: false, mergedSha: null, reviews: [] });
+      this.prs.set(url, { url, branch, head, base, merged: false, mergedSha: null, comments: [], reviews: [] });
       if (this.loseCreate) { this.loseCreate = false; throw new Error("Lost create response"); }
       return ok(url);
     }
     if (args[0] === "api" && args[1] === "user") return ok("satori-miyamoto");
     let pr: Pull | undefined;
     if (args[0] === "pr") pr = this.prs.get(args[2]);
-    if (args[0] === "api") { const number = /\/pulls\/(\d+)/.exec(args[1])?.[1]; pr = this.prs.get(`https://github.com/${repo}/pull/${number}`); }
+    if (args[0] === "api") { const number = /\/(?:pulls|issues)\/(\d+)/.exec(args[1])?.[1]; pr = this.prs.get(`https://github.com/${repo}/pull/${number}`); }
     if (!pr) throw new Error(`No fixture PR for ${args.join(" ")}`);
     pr.head = git(this.project, "rev-parse", pr.branch);
     if (args[0] === "pr" && args[1] === "edit") { this.bodies.push(await readFile(args[args.indexOf("--body-file") + 1], "utf8")); return ok(); }
@@ -77,6 +76,10 @@ class LocalGitHub implements Shell {
     if (args[0] === "pr" && args[1] === "view") {
       if (args.includes("--jq")) return ok(pr.head);
       return ok(JSON.stringify({ state: pr.merged ? "MERGED" : "OPEN", headRefOid: pr.head, isDraft: false, author: { login: "owner" }, mergeCommit: pr.mergedSha ? { oid: pr.mergedSha } : null, reviewDecision: "" }));
+    }
+    if (args[0] === "api" && args[1].includes("/comments")) {
+      if (args.includes("POST")) { pr.comments.push(JSON.parse(await readFile(args.at(-1)!, "utf8"))); return ok(); }
+      return ok(JSON.stringify([pr.comments]));
     }
     if (args[1].includes("/reviews") && args.includes("POST")) {
       const input = JSON.parse(await readFile(args.at(-1)!, "utf8"));
@@ -152,11 +155,10 @@ async function fixture(lanes = 1) {
     if (role === "reviewer") { response = { findings: findings ? [`src/${file}.ts:1: Exact bug requiring regression`] : [], summary: "Reviewed" }; findings = false; }
     return { sessionId: `session-${calls.length}`, response, startedAt: at, finishedAt: at };
   } });
-  const blocker = vi.spyOn(SprintGitHub.prototype, "serverMergeBlocker").mockImplementation(async () => shell.mergeBlocker);
   const runner = () => new DeveloperSeat(store, { id: seatId, displayName: "Developer", username: "developer", roles: ["Developer"] }, { post: vi.fn() }, shell, runtimeFor);
   const current = () => store.readRuntimeFile<GoalRuntimeRecord>(goalRuntimeFilename(goalId));
   const ciEvent = async (name = "ci-one"): Promise<Extract<WorkflowEvent, { kind: "ci" }>> => { const lane = (await current())!.lanes.find((item) => item.status !== "merged")!; return { kind: "ci", id: name, teamId: "team-one", goalId, laneId: lane.id, prUrl: lane.prUrl!, headSha: lane.headSha!, state: "passed", at }; };
-  return { store, shell, calls, runner, current, ciEvent, plan, brief, runtimeFor, blocker, fixDrafts, workerDecisions, workerFollowUps, planDecisions, planFollowUps,
+  return { store, shell, calls, runner, current, ciEvent, plan, brief, runtimeFor, fixDrafts, workerDecisions, workerFollowUps, planDecisions, planFollowUps,
     setWorkers: (files: string[], hook: (file: string) => Promise<void>) => { workerFiles = files; workerHook = hook; }, failFix: () => { failFix = true; }, setFindings: () => { findings = true; }, failLead: () => { failLead = true; } };
 }
 
@@ -167,13 +169,15 @@ describe("finite production Developer goal orchestration", () => {
     expect(f.calls.map((call) => call.role)).toEqual(["planner", "lead-plan", "worker", "lead", "reviewer"]);
     expect(f.calls.filter((call) => ["worker", "reviewer", "planner", "lead-plan"].includes(call.role)).every((call) => !call.write)).toBe(true);
     expect(f.calls.every((call) => call.session === undefined && call.prompt.includes("Outcome (what must be true when done)"))).toBe(true);
-    expect(f.shell.prs.size).toBe(1); expect([...f.shell.prs.values()][0].reviews[0].state).toBe("APPROVED");
+    expect(f.shell.prs.size).toBe(1); expect([...f.shell.prs.values()][0].comments[0].body).toContain("Independent agent review: APPROVE");
+    expect([...f.shell.prs.values()][0].reviews).toEqual([]);
+    expect(f.shell.calls.some((call) => call.args.some((arg) => arg.startsWith("GH_CONFIG_DIR=")) || call.args.some((arg) => arg.includes("/protection") || arg.includes("CODEOWNERS")))).toBe(false);
     expect(f.shell.calls.some((call) => call.args.includes("--watch") || call.args.includes("--auto"))).toBe(false);
     const pending = await f.runner().turn(await f.ciEvent("untrusted-pass"));
     expect(pending.report).toBeNull(); expect(f.shell.calls.some((call) => call.args[0] === "pr" && call.args[1] === "merge")).toBe(false);
     f.shell.ci = "pass"; const done = await f.runner().turn(await f.ciEvent());
     expect(done.report?.lanePrs).toHaveLength(1); expect(done.report?.checks.map((check) => check.exitCode)).toEqual([0, 0, 0]);
-    expect(f.blocker).toHaveBeenCalled(); expect((await f.store.read()).planningGoals![0].goalAssignment!.status).toBe("reported");
+    expect(done.report?.lanePrs[0].reviewer).toBe("independent-agent"); expect((await f.store.read()).planningGoals![0].goalAssignment!.status).toBe("reported");
     expect(done.events.some((item) => item.kind === "developer-report")).toBe(true);
     const before = f.calls.length; const replay = await f.runner().turn({ kind: "approval", id: "replay-report", teamId: "team-one", goalId, at });
     expect(replay.report).toEqual(done.report); expect(f.calls).toHaveLength(before);
@@ -318,11 +322,10 @@ describe("finite production Developer goal orchestration", () => {
     expect((await f.current())!.report).toBeNull();
     const done = await f.runner().turn(await f.ciEvent("ci-after-fix")); expect(done.report).not.toBeNull();
   });
-  it.each(["base", "head", "server-policy"])("preserves work and reports no success for invalid %s evidence", async (problem) => {
+  it.each(["base", "head"])("preserves work and reports no success for invalid %s evidence", async (problem) => {
     const f = await fixture(); await f.runner().turn(event()); f.shell.ci = "pass";
     if (problem === "base") f.shell.tamperBase = true;
     if (problem === "head") f.shell.tamperHead = true;
-    if (problem === "server-policy") f.shell.mergeBlocker = "Automatic merge blocked: Missing server review protection.";
     const result = await f.runner().turn(await f.ciEvent());
     expect(result.report).toBeNull(); expect((await f.current())!.failure).not.toBeNull();
     expect([...f.shell.prs.values()][0].merged).toBe(false);

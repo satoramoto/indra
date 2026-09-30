@@ -3,7 +3,7 @@ import { lstat, mkdir, realpath, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import type { AgentRuntime, WriteAccess } from "./codex-runtime.js";
 import type { Shell, ShellResult } from "./command-shell.js";
-import { assertOwnedFilesWithin, ownedFileMatches, validateGoalBrief, type GoalBrief, type GoalLane, type GoalReport } from "./goal-contract.js";
+import { assertOwnedFilesWithin, ownedFileMatches, validateGoalBrief, type GoalBrief, type GoalLane, type GoalReport, type GoalReviewer } from "./goal-contract.js";
 import { postReviewOnce, type SavedReview } from "./developer-review.js";
 import type { PlanningStore } from "./planning.js";
 import { ensureProjectCheckout } from "./project-checkout.js";
@@ -22,7 +22,7 @@ export interface LaneJournal {
 }
 export interface LaneObservation {
   url: string; headSha: string; baseSha: string; state: "OPEN" | "CLOSED" | "MERGED"; mergedSha: string | null;
-  reviewed: boolean; ci: "pending" | "passed" | "failed"; ciFailure: string; conflict: boolean; files: string[];
+  reviewed: boolean; reviewer?: GoalReviewer; ci: "pending" | "passed" | "failed"; ciFailure: string; conflict: boolean; files: string[];
 }
 export interface DeveloperLaneServices {
   plan(brief: GoalBrief, sessions: GoalAgentSession[], persist: () => Promise<void>): Promise<unknown>;
@@ -289,7 +289,7 @@ export class GitDeveloperLanes implements DeveloperLaneServices {
     if (after.head.sha !== pr.head.sha || after.base.sha !== pr.base.sha || after.state !== pr.state || proof.headSha !== pr.head.sha) throw new LaneError("PR changed while its event was being verified.");
     const state = pr.merged ? "MERGED" : pr.state === "closed" ? "CLOSED" : "OPEN";
     if (state === "MERGED" && (!SHA.test(pr.merge_commit_sha ?? "") || proof.mergedSha !== pr.merge_commit_sha)) throw new LaneError("Merged PR commit is not verified.");
-    return { url, headSha: pr.head.sha, baseSha: pr.base.sha, state, mergedSha: pr.merge_commit_sha, reviewed: proof.reviewed, ci: proof.checksPassed ? "passed" : ciFailure ? "failed" : "pending", ciFailure, conflict: pr.mergeable === false, files: paths };
+    return { url, headSha: pr.head.sha, baseSha: pr.base.sha, state, mergedSha: pr.merge_commit_sha, reviewed: proof.reviewed, reviewer: proof.reviewer, ci: proof.checksPassed ? "passed" : ciFailure ? "failed" : "pending", ciFailure, conflict: pr.mergeable === false, files: paths };
   }
   async review(lane: GoalLane, brief: GoalBrief, journal: LaneJournal, observation: LaneObservation, persist: () => Promise<void>): Promise<void> {
     const project = await this.project(brief);
@@ -301,7 +301,7 @@ export class GitDeveloperLanes implements DeveloperLaneServices {
     if ((await this.run("git", ["symbolic-ref", "--quiet", "HEAD"], worktree)).code !== 1) throw new LaneError("Reviewer checkout is not detached.");
     if (await this.head(worktree, "HEAD") !== head || await realpath((await this.must("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], worktree)).trim()) !== await realpath(join(project, ".git")) || (await this.must("git", ["status", "--porcelain", "--untracked-files=all"], worktree)).trim()) throw new LaneError("Reviewer checkout is not the clean immutable PR head.");
     await postReviewOnce({ store: this.store, recordName: `goal-${brief.goalId}-lane-${lane.id}`, prUrl: observation.url, worktree, shell: this.shell,
-      review: () => this.agent(journal, persist, { key: `review:${head}:${journal.attempt}`, role: "reviewer", brief, cwd: worktree, schema: schemaPathOf(import.meta.url, "review.json"), instruction: `You are the fresh read-only reviewer of ${observation.url} at ${head}, independent of the writer. Review its actual diff against ${observation.baseSha}. Flag only AGENTS.md review checks and correctness/regression gaps. Prior findings: ${JSON.stringify(journal.review?.findings ?? [])}. Run no tests or builds. Do not edit, commit, push, merge or post; the host posts your line findings and APPROVE/REQUEST_CHANGES verdict as satori-miyamoto. Return findings as path:line: reason on changed lines, plus summary.` }),
+      review: () => this.agent(journal, persist, { key: `review:${head}:${journal.attempt}`, role: "reviewer", brief, cwd: worktree, schema: schemaPathOf(import.meta.url, "review.json"), instruction: `You are the fresh read-only reviewer of ${observation.url} at ${head}, independent of the writer. Review its actual diff against ${observation.baseSha}. Flag only AGENTS.md review checks and correctness/regression gaps. Prior findings: ${JSON.stringify(journal.review?.findings ?? [])}. Run no tests or builds. Do not edit, commit, push, merge or post; the host records your line findings and APPROVE/REQUEST_CHANGES verdict as independent-agent and publishes an informational PR comment. Return findings as path:line: reason on changed lines, plus summary.` }),
       onReview: async (review) => { journal.review = review; await persist(); },
     });
     await this.noProcesses(worktree, project);

@@ -183,12 +183,12 @@ Merging this PR lands the whole sprint on main; \`planning rollback --goal goal-
 
   it.each([{ selected: undefined }, { selected: [] }])("renders integration without omissions (%j)", ({ selected }) => {
     expect(integrationMessage(goal(), "https://github.com/test/project/pull/9", selected)).toBe(`**Sprint goal-text is ready: https://github.com/test/project/pull/9**
-This PR takes \`sprint/goal-text\` into main. The sprint merges automatically after a fresh satori-miyamoto approval on the current head and green CI. Release then verifies the running build; the retro is posted and archived through the same review and CI gate.`);
+This PR takes \`sprint/goal-text\` into main. The sprint merges automatically after a fresh independent agent approval on the current head and green CI. Release then verifies the running build; the retro is posted and archived through the same review and CI gate.`);
   });
 
   it("renders integration with omissions in their recorded order", () => {
     expect(integrationMessage(goal(), "https://github.com/test/project/pull/9", omissions)).toBe(`**Sprint goal-text is ready: https://github.com/test/project/pull/9**
-This PR takes \`sprint/goal-text\` into main. The sprint merges automatically after a fresh satori-miyamoto approval on the current head and green CI. Release then verifies the running build; the retro is posted and archived through the same review and CI gate.
+This PR takes \`sprint/goal-text\` into main. The sprint merges automatically after a fresh independent agent approval on the current head and green CI. Release then verifies the running build; the retro is posted and archived through the same review and CI gate.
 
 **Owner-authorized omissions**
 - outcome-2: Owner chose a smaller release.
@@ -198,7 +198,7 @@ Keep the reason.`);
 
   it("renders the revert post with the seven-character merge SHA", () => {
     expect(revertMessage(goal(), "https://github.com/test/project/pull/10")).toBe(`**Rollback of sprint goal-text: https://github.com/test/project/pull/10**
-This PR on main reverts the sprint's merge commit 1234567. The revert merges automatically after a fresh satori-miyamoto approval on the current head and green CI.`);
+This PR on main reverts the sprint's merge commit 1234567. The revert merges automatically after a fresh independent agent approval on the current head and green CI.`);
   });
 
   it("renders the clarification prompt with the exact serialized brief and human whitespace", () => {

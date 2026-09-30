@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { AgentRuntime, WriteAccess } from "./codex-runtime.js";
 import type { Shell } from "./command-shell.js";
 import { GitDeveloperLanes, LaneError, LaneValidationError, laneBrief, type DeveloperLaneServices, type LaneJournal } from "./developer-lanes.js";
-import { goalRuntimeFilename, validateGoalBrief, validateGoalReport, validateLanePlan, type GoalBrief, type GoalLane, type GoalLaneProgress, type GoalReport, type GoalRuntimeRecord, type WorkflowEvent, type WorkflowFailure } from "./goal-contract.js";
+import { GOAL_REVIEWER, goalRuntimeFilename, validateGoalBrief, validateGoalReport, validateLanePlan, type GoalBrief, type GoalLane, type GoalLaneProgress, type GoalReport, type GoalRuntimeRecord, type WorkflowEvent, type WorkflowFailure } from "./goal-contract.js";
 import { teamProject, type PlanningGoal, type PlanningStore } from "./planning.js";
 import { laneAgentSummary, type GoalAgentSession } from "./seat-runtime.js";
 import { redactSecrets } from "./redact.js";
@@ -187,10 +187,10 @@ export class DeveloperGoal {
             laneProgress.status = "reviewing"; await persist();
             // Review starts on opening, independent of CI state.
             await this.services.review(lane, scoped, saved, observation, persist);
-            emit({ kind: "review", id: `review:${goal.id}:${lane.id}:${saved.review!.id}`, goalId: goal.id, teamId: goal.teamId, laneId: lane.id, prUrl: saved.prUrl!, headSha: observation.headSha, reviewer: "satori-miyamoto", state: saved.review!.findings.length ? "changes-requested" : "approved", findings: saved.review!.comments.map((item) => ({ path: item.path, line: item.line, reason: item.body })), at: now() });
+            emit({ kind: "review", id: `review:${goal.id}:${lane.id}:${saved.review!.id}`, goalId: goal.id, teamId: goal.teamId, laneId: lane.id, prUrl: saved.prUrl!, headSha: observation.headSha, reviewer: GOAL_REVIEWER, state: saved.review!.findings.length ? "changes-requested" : "approved", findings: saved.review!.comments.map((item) => ({ path: item.path, line: item.line, reason: item.body })), at: now() });
             observation = await this.services.observe(lane, scoped, saved);
           }
-          laneProgress.headSha = observation.headSha; laneProgress.ci = observation.ci; laneProgress.review = observation.reviewed ? "approved" : saved.review?.findings.length ? "changes-requested" : "pending"; laneProgress.reviewer = saved.review ? "satori-miyamoto" : null;
+          laneProgress.headSha = observation.headSha; laneProgress.ci = observation.ci; laneProgress.review = observation.reviewed ? "approved" : saved.review?.findings.length ? "changes-requested" : "pending"; laneProgress.reviewer = observation.reviewer ?? null;
           laneProgress.findings = saved.review?.comments.map((item) => ({ path: item.path, line: item.line, reason: item.body })) ?? [];
           const findings = saved.review?.headSha === observation.headSha ? saved.review.findings : [];
           const problem = findings.length ? findings.join("\n") : observation.ci === "failed" ? observation.ciFailure : observation.conflict ? `PR ${observation.url} conflicts with sprint commit ${observation.baseSha}.` : null;
@@ -240,7 +240,7 @@ export class DeveloperGoal {
         if (!record.failure && record.lanes.every((lane) => lane.status === "merged")) {
           const complete = await this.services.finish(workingBrief, plan.lanes.map((lane) => ({ lane, journal: journal.lanes[lane.id] })));
           const report = validateGoalReport({ version: 1, goalId: goal.id, teamId: goal.teamId, seatId: this.seatId, sprintBranch: goal.integration!.branch, headSha: complete.headSha,
-            lanePrs: record.lanes.map((lane) => ({ laneId: lane.id, url: lane.prUrl, headSha: lane.headSha, mergedSha: lane.mergedSha, reviewer: "satori-miyamoto", ci: "passed" })), checks: complete.checks,
+            lanePrs: record.lanes.map((lane) => ({ laneId: lane.id, url: lane.prUrl, headSha: lane.headSha, mergedSha: lane.mergedSha, reviewer: lane.reviewer, ci: "passed" })), checks: complete.checks,
             decisions: record.lanes.flatMap((lane) => lane.decisions), followUps: [...record.lanes.flatMap((lane) => lane.followUps), ...complete.followUps], neededButUnowned: [] });
           if (report.checks.some((check) => check.exitCode !== 0)) throw new LaneError("The final sprint report cannot hide failed checks.");
           record.report = report; record.assignment = { seatId: this.seatId, status: "reported", updatedAt: now() }; emit(reportEvent(report)); await persist();
