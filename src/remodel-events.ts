@@ -24,7 +24,7 @@ export function validateWorkflowEvent(value: unknown): WorkflowEvent {
     "developer-report": ["goalId", "seatId", "report"], ci: ["goalId", "laneId", "prUrl", "headSha", "state"],
     review: ["goalId", "laneId", "prUrl", "headSha", "reviewer", "state", "findings"], merge: ["goalId", "laneId", "prUrl", "headSha", "mergedSha"],
     "build-running": ["goalId", "buildSha", "runningSha"], redirect: ["goalId", "redirect"], "goal-closed": ["goalId"], "seat-idle": ["seatId"],
-    retry: ["goalId", "reason"], "queue-changed": [], conflict: ["goalId", "laneId", "prUrl", "headSha", "baseSha"],
+    retry: ["goalId", "reason"], "product-retry": ["seatId", "reason"], "queue-changed": [], conflict: ["goalId", "laneId", "prUrl", "headSha", "baseSha"],
     "agent-completed": ["goalId", "laneId", "agentId", "status", "headSha", "report"],
   };
   need(Object.hasOwn(fields, value.kind)); const extra = fields[value.kind];
@@ -41,7 +41,7 @@ export function validateWorkflowEvent(value: unknown): WorkflowEvent {
   }
   if (value.kind === "redirect") { const r = value.redirect; need(object(r) && Object.keys(r).length === 4 && text(r.postId) && text(r.userId) && text(r.message) && instant(r.at)); }
   if (value.kind === "proposal-vetted") { const v = value.vetting; need(object(v) && Object.keys(v).length === 5 && v.proposalId !== undefined && id(v.proposalId) && id(v.leadSeatId) && instant(v.at) && Array.isArray(v.notes) && v.notes.every(text)); validateOwnedFiles(v.ownedFiles); }
-  if (value.kind === "retry") need(text(value.reason));
+  if (value.kind === "retry" || value.kind === "product-retry") need(text(value.reason));
   if (value.kind === "agent-completed") need(text(value.agentId) && ["succeeded", "failed"].includes(String(value.status)));
   if ("report" in value && value.report !== null) {
     const report = validateGoalReport(value.report); need(report.teamId === value.teamId && report.goalId === value.goalId && (!value.seatId || report.seatId === value.seatId));
@@ -215,6 +215,7 @@ export async function runWorkflowHost(options: WorkflowHostOptions): Promise<voi
     }).finally(() => { active = undefined; if (!stopping && [...tasks.values()].some((task) => task.dirty)) pump(); });
   };
   const deliver = async (key: string, event: WorkflowEvent, turn: (event: WorkflowEvent) => Promise<void>) => {
+    if (event.kind === "product-retry" && key !== event.seatId) return;
     if (!options.includeSchedulerIdle && event.kind === "queue-changed" && event.id.startsWith("scheduler-idle:")) return;
     await turn(event);
     completed.add(`${key}:${event.kind === "startup" ? `startup:${event.at}` : event.id}`);

@@ -466,6 +466,7 @@ export type WorkflowEvent = { kind: "startup"; teamId: string; at: string } | Wo
   | { kind: "goal-closed"; goalId: string }
   | { kind: "seat-idle"; seatId: string }
   | { kind: "retry"; goalId: string; reason: string }
+  | { kind: "product-retry"; seatId: string; reason: string }
   | { kind: "queue-changed" }
   | { kind: "conflict"; goalId: string; laneId: string; prUrl: string; headSha: string; baseSha: string }
   | { kind: "agent-completed"; goalId: string; laneId: string; agentId: string; status: "succeeded" | "failed"; headSha: string | null; report: GoalReport | null }

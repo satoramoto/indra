@@ -23,8 +23,11 @@ export interface ProductProposalServices {
   chat?: ProductChat;
   shell?: Shell;
 }
-export interface ProposalTurnResult { status: "disabled" | "idle" | "proposed" | "refined"; proposals: ProductProposal[] }
-export class ProductTurnError extends Error { override name = "ProductTurnError"; }
+export interface ProposalTurnResult { status: "disabled" | "blocked" | "idle" | "proposed" | "refined"; proposals: ProductProposal[] }
+export class ProductTurnError extends Error {
+  override name = "ProductTurnError";
+  constructor(message: string, readonly recorded = false) { super(message); }
+}
 type VettedEvent = Extract<WorkflowEvent, { kind: "proposal-vetted" }>;
 interface Team { id: string; workflowModel?: string; seats: { id: string; roles: string[]; externalIdentities: { mattermost: { userId: string } } }[] }
 interface Source { project: string; sha: string; files: string[]; mission: string; retros: { goalId: string; text: string }[] }
@@ -67,9 +70,9 @@ function validateRecord(record: ProductRuntimeRecord, services: ProductProposalS
 
 /** One lock covers the queue, model intent, delivery and durable publication across processes. */
 export async function proposeGoals(services: ProductProposalServices, event: WorkflowEvent): Promise<ProposalTurnResult> {
-  if (!event || event.teamId !== services.teamId) return idle();
+  if (!event || event.teamId !== services.teamId || (event.kind === "product-retry" && event.seatId !== services.productSeatId)) return idle();
   if (!Number.isFinite(Date.parse(event.at)) || (event.kind !== "startup" && (typeof event.id !== "string" || !event.id.trim()))) throw new ProductTurnError("Invalid Product event identity.");
-  if (!["startup", "proposal", "proposal-vetted", "approval", "goal-closed", "redirect", "retry", "queue-changed"].includes(event.kind)) return idle();
+  if (!["startup", "proposal", "proposal-vetted", "approval", "goal-closed", "redirect", "retry", "product-retry", "queue-changed"].includes(event.kind)) return idle();
   const name = productRuntimeFilename(services.teamId);
   return services.store.withGoalLock(name, async () => {
     const state = await services.store.read();
@@ -83,7 +86,7 @@ export async function proposeGoals(services: ProductProposalServices, event: Wor
     try { return await turn.run(event); }
     catch (error) {
       const message = error instanceof ProductTurnError ? error.message : "Product turn failed; preserved runtime intent requires explicit retry.";
-      record.failure = { at: now(), message, retryable: true }; await turn.save(); throw new ProductTurnError(message);
+      record.failure = { at: now(), message, retryable: true }; await turn.save(); throw new ProductTurnError(message, true);
     }
   });
 }
@@ -289,17 +292,27 @@ class ProductTurn {
   }
   async run(event: WorkflowEvent): Promise<ProposalTurnResult> {
     const key = event.kind === "startup" ? `product-startup:${this.services.teamId}` : event.id;
+    const retry = event.kind === "retry" || event.kind === "product-retry";
+    // A retry is one durable attempt, including when it fails or the host restarts before receipt.
+    if (retry && this.record.handledEventIds.includes(key)) return this.result();
+    if (this.record.failure && !retry) {
+      // The host receipts this turn: retain incoming vetting even while generation/delivery is blocked.
+      if (event.kind === "proposal-vetted" && !this.record.handledEventIds.includes(key) && await this.vet(event)) {
+        this.record.handledEventIds.push(key); await this.save();
+      }
+      return this.result();
+    }
+    if (retry) { this.record.handledEventIds.push(key); await this.save(); }
     await this.reconcile();
     if (this.journal.active && this.record.handledEventIds.includes(this.journal.active.causeId)) { this.journal.active = null; await this.journalSave(); }
-    // Scope-correcting vetting can be durable before its delivery intent. Recover that exact
-    // verified revision before receipt deduplication or model-retry guards can return early.
-    if (this.record.pending || event.kind === "startup" || event.kind === "proposal-vetted" || event.kind === "retry") await this.publishNext();
-    if (this.record.handledEventIds.includes(key)) return this.result();
+    // Recover a saved vetted revision before startup deduplication, but leave recorded failures
+    // at the event boundary so the host can consume an operator's explicit retry.
+    if (this.record.pending || event.kind === "startup" || event.kind === "proposal-vetted" || retry) await this.publishNext();
+    if (!retry && this.record.handledEventIds.includes(key)) return this.result();
     if (event.kind === "proposal-vetted") { if (!await this.vet(event)) return this.result(); await this.publishNext(); this.record.handledEventIds.push(key); await this.save(); return this.result(); }
     // Own queue/proposal receipts settle. They never generate or invalidate a draft awaiting vetting.
     if (event.kind === "queue-changed" || event.kind === "proposal") { await this.publishNext(); return this.result(); }
-    if (this.record.failure && event.kind !== "retry") return this.result();
-    if (event.kind === "retry") {
+    if (retry) {
       if (!this.record.failure && !this.journal.active) return this.result();
       this.record.failure = null;
       const active = this.journal.active; const run = active?.runId ? this.journal.runs[active.runId] : undefined;
@@ -317,6 +330,6 @@ class ProductTurn {
     this.record.failure = null; await this.save(); return this.result();
   }
   private result(): ProposalTurnResult {
-    return { status: this.changed.length ? this.refined ? "refined" : "proposed" : "idle", proposals: [...new Map(this.changed.map((proposal) => [proposal.proposalId, proposal])).values()] };
+    return { status: this.record.failure ? "blocked" : this.changed.length ? this.refined ? "refined" : "proposed" : "idle", proposals: [...new Map(this.changed.map((proposal) => [proposal.proposalId, proposal])).values()] };
   }
 }
