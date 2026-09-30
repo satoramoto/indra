@@ -374,18 +374,18 @@ describe("recoverable retro publication", () => {
     expect(f.record().failure).toBeUndefined(); expect(f.record().authorization).toBeUndefined();
   });
 
-  async function rejectedPublication(priorFailure = false) {
+  async function rejectedPublication(priorFailure = false, localReview = false) {
     vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime("2026-01-01T01:00:00.000Z");
     const f = await fixture(); goalsV1Retro(f); f.pr.reviewed = false; f.pr.checksPassed = false;
     f.services.review.mockResolvedValueOnce({ summary: "Correct the unsupported Product count", findings: [{ path: "docs/retros/goal-one.md", line: 3, reason: "Product history is incomplete." }] });
     vi.mocked(f.archive.reviewRetroPr).mockImplementation(async (_github, _goal, _markdown, _url, head, review) => {
       const result = await review("/managed/review");
-      if (result.findings.length) f.pr.rejection = { headSha: head, reviewId: 7, submittedAt: new Date().toISOString() };
+      if (result.findings.length) f.pr.rejection = { headSha: head, reviewId: localReview ? `agent:${"a".repeat(64)}` : 7, submittedAt: new Date().toISOString() };
       else f.pr.reviewed = true;
     });
     if (priorFailure) { f.draft.mockRejectedValueOnce(new Error("An actual earlier generation failure")); await f.restart().poll(f.context); vi.setSystemTime("2026-01-01T01:00:01.000Z"); }
     const rejected = await f.restart().poll(priorFailure ? retryContext(f, "initial-draft-retry") : f.context);
-    expect(rejected).toMatchObject({ status: "pending", failure: { message: expect.stringContaining("rejected by satori-miyamoto"), retryable: true } });
+    expect(rejected).toMatchObject({ status: "pending", failure: { message: expect.stringContaining(`rejected by ${localReview ? "independent-agent" : "satori-miyamoto"}`), retryable: true } });
     const original = structuredClone(f.record()); const oldPosts = structuredClone([...f.deliveries]);
     const corrected = structuredClone(original.frozen!.draft); corrected.snapshot.missing.push("Corrected missing Product history."); corrected.generation.sessionId = "corrected-retro-session";
     corrected.markdown = await renderSprintRetro(corrected.snapshot, corrected.narrative, corrected.generation);
@@ -399,6 +399,16 @@ describe("recoverable retro publication", () => {
     vi.setSystemTime("2026-01-01T01:00:02.000Z");
     return { ...f, original, oldPosts, corrected, correction };
   }
+
+  it("recovers local agent rejection only through a fresh retry, retaining its proof identity", async () => {
+    const f = await rejectedPublication(false, true);
+    await f.restart().poll(f.context); expect(f.draft).toHaveBeenCalledTimes(1);
+    await f.restart().poll(retryContext(f, "correct-local-rejection"));
+    expect(f.record().revisions![0].rejection.reviewId).toBe(`agent:${"a".repeat(64)}`);
+    expect(f.services.review).toHaveBeenCalledTimes(2); expect(f.draft).toHaveBeenCalledTimes(2);
+    f.pr.checksPassed = true; expect((await f.restart().poll(f.context)).status).toBe("complete");
+    expect(f.services.review).toHaveBeenCalledTimes(2);
+  });
 
   it("corrects a rejected frozen publication only after an explicit fresh retry, retaining successful and failed generation history", async () => {
     const f = await rejectedPublication(true);

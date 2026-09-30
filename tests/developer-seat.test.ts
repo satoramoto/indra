@@ -1,9 +1,9 @@
-import { SprintGitHub } from "../src/sprint.js";
+import { reviewEvidencePath } from "../src/review-evidence.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { git, stateCheckout } from "./state-checkout.js";
 import { type PlanningGoal, PlanningStore } from "../src/planning.js";
 import { DeveloperSeat, loadDeveloperSeat, processShell, type SeatChat, type SeatTaskRecord, type Shell, type ShellResult } from "../src/developer-seat.js";
@@ -60,6 +60,8 @@ class FakeChat implements SeatChat {
 class FakeShell implements Shell {
   calls: string[] = [];
   checksCode = 0;
+  checks = [{ name: "checks", bucket: "pass" }];
+  closed = false;
   merges: { code: number; stderr: string; merged: boolean }[] = [];
   merged = false;
   draft = false;
@@ -91,11 +93,6 @@ class FakeShell implements Shell {
   onFirst?: () => Promise<void>;
   async run(command: string, args: string[], cwd: string): Promise<ShellResult> {
     if (this.onFirst) { const hook = this.onFirst; this.onFirst = undefined; await hook(); }
-    if (command === "env") {
-      expect(args[0]).toMatch(/GH_CONFIG_DIR=.*\/\.config\/gh-yahaha-bot$/);
-      expect(args[1]).toBe("gh");
-      command = "gh"; args = args.slice(2);
-    }
     const line = `${command} ${args.join(" ")} @${cwd}`;
     this.calls.push(line);
     // `gh repo clone` makes the checkout Indra then moves into place.
@@ -115,12 +112,15 @@ class FakeShell implements Shell {
       return { code: this.abortCode, stdout: "", stderr: "" };
     }
     if (line.startsWith("gh api repos/satoramoto/indra/pulls/9 --method GET")) return { code: 0, stdout: JSON.stringify(this.maintenancePR), stderr: "" };
+    if (line.startsWith("gh api") && args.some((arg) => arg.includes("/reviews?"))) return { code: 0, stdout: "[[]]", stderr: "" };
     if (line.startsWith("gh api") && args.includes("--paginate")) return { code: 0, stdout: JSON.stringify([this.comments]), stderr: "" };
     if (command === "gh" && args.join(" ") === "api user --jq .login") return { code: 0, stdout: "satori-miyamoto", stderr: "" };
     if (line.startsWith("gh api") && args.includes("POST")) {
       const body = JSON.parse(await readFile(args.at(-1)!, "utf8"));
-      this.comments.push({ body: body.body, user: { login: "satori-miyamoto" }, commit_id: body.commit_id, state: body.event === "APPROVE" ? "APPROVED" : "CHANGES_REQUESTED" });
+      this.comments.push({ body: body.body, user: { login: "owner" }, commit_id: this.headSha, state: "COMMENTED" });
     }
+    if (line.startsWith("gh pr view") && args.includes("state,mergeCommit,headRefOid,isDraft,author,reviewDecision")) return { code: 0, stdout: JSON.stringify({ state: this.merged ? "MERGED" : this.closed ? "CLOSED" : "OPEN", headRefOid: this.headSha, mergeCommit: this.merged ? { oid: "c".repeat(40) } : null, isDraft: this.draft, author: { login: "owner" }, reviewDecision: "" }), stderr: "" };
+    if (line.startsWith("gh pr checks") && args.includes("--json")) return { code: this.checksCode, stdout: JSON.stringify(this.checks), stderr: "" };
     if (line.startsWith("gh pr view") && args.includes("headRefOid")) return { code: 0, stdout: this.headSha, stderr: "" };
     if (line.startsWith("gh pr merge") && this.draft) return { code: 1, stdout: "", stderr: "GraphQL: Pull Request is still a draft (mergePullRequest)" };
     if (line.startsWith("gh pr merge")) {
@@ -167,7 +167,6 @@ class FakeCodex {
 }
 
 async function setup(assignments: Assignment[], integration: object = SPRINT) {
-  vi.spyOn(SprintGitHub.prototype, "serverMergeBlocker").mockResolvedValue(undefined);
   const store = await fixture(assignments, "approved", { github: "satoramoto/indra" }, integration);
   const chat = new FakeChat(); const shell = new FakeShell(); const codex = new FakeCodex();
   shell.baseRef = (integration as { branch?: string } | undefined)?.branch ?? "sprint/goal-abc";
@@ -193,9 +192,26 @@ async function retainRecord(store: PlanningStore, shell: FakeShell, changes: Par
 const reviewing = (): Assignment => ({ outcomeId: "outcome-1", seatId: "seat-002", status: "in-review", updatedAt: "2026-01-01T00:00:00Z", prUrl: PR });
 
 describe("developer seat", () => {
-  it("cannot use the legacy path to bypass the shared server review policy", async () => {
-    const f = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]);
-    vi.spyOn(SprintGitHub.prototype, "serverMergeBlocker").mockResolvedValue("Automatic merge blocked: required bot protection is absent.");
+  it.each(["missing", "rejected", "stale", "wrong-pr", "missing-ci", "unrelated-ci", "closed"])("blocks the legacy merge path with %s proof despite informational comments", async (problem) => {
+    const f = await setup([queued("outcome-1", "2026-01-01T00:00:00Z")]); f.codex.findings = [];
+    const run = f.shell.run.bind(f.shell);
+    vi.spyOn(f.shell, "run").mockImplementation(async (command, args, cwd) => {
+      const result = await run(command, args, cwd);
+      if (command === "gh" && args[1] === "checks" && args.includes("--watch")) {
+        const file = reviewEvidencePath(f.store.runtimeDir, PR, f.shell.headSha);
+        if (problem === "missing") await rm(file);
+        else if (["rejected", "stale", "wrong-pr"].includes(problem)) {
+          const proof = JSON.parse(await readFile(file, "utf8"));
+          if (problem === "rejected") { proof.findings = [{ path: "src/foo.ts", line: 1, reason: "Regression" }]; proof.verdict = "REQUEST_CHANGES"; }
+          if (problem === "stale") proof.headSha = "f".repeat(40);
+          if (problem === "wrong-pr") proof.prUrl = PR + "1";
+          await writeFile(file, JSON.stringify(proof));
+        } else if (problem === "missing-ci") f.shell.checks = [];
+        else if (problem === "unrelated-ci") f.shell.checks = [{ name: "docs", bucket: "pass" }];
+        else f.shell.closed = true;
+      }
+      return result;
+    });
     await f.seat.tick();
     expect((await f.assignment("outcome-1")).status).toBe("failed");
     expect(f.shell.calls.some((call) => call.startsWith("gh pr merge"))).toBe(false);
@@ -373,10 +389,10 @@ describe("developer seat", () => {
       `git worktree add --no-track -b ${BRANCH} ${worktree} origin/sprint/goal-abc @${project}`,
       `gh pr edit ${PR} --base sprint/goal-abc @${worktree}`,
       `gh pr checks ${PR} --watch @${worktree}`,
-      `gh pr merge ${PR} --squash --match-head-commit ${shell.headSha} @${project}`,
+      `gh pr merge ${PR} --squash --match-head-commit ${shell.headSha} @${dirname(store.runtimeDir)}`,
       `git worktree remove --force ${worktree} @${project}`,
     ]));
-    expect(shell.comments.map((item) => item.state)).toEqual(["CHANGES_REQUESTED", "APPROVED"]);
+    expect(shell.comments.map((item) => item.body.match(/review: (\w+)/)?.[1])).toEqual(["REQUEST_CHANGES", "APPROVE"]);
     // Three new sessions: none resumes another. Build and fix write with network; the reviewer is read-only.
     const write = ["--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true", "--add-dir", join(project, ".git")];
     expect(codex.runs.map((run) => [run.schema.split("/").at(-1), run.sessionId, run.sandbox])).toEqual([["developer.json", undefined, write], ["review.json", undefined, ["--sandbox", "read-only"]], ["developer.json", undefined, write], ["review.json", undefined, ["--sandbox", "read-only"]]]);
@@ -425,7 +441,7 @@ describe("developer seat", () => {
     const project = join(store.runtimeDir, "projects", "satoramoto", "indra");
     const ready = shell.calls.indexOf(`gh pr ready ${PR} @${project}`);
     expect(ready).toBeGreaterThan(0);
-    expect(shell.calls[ready + 1]).toBe(`gh pr merge ${PR} --squash --match-head-commit ${shell.headSha} @${project}`);
+    expect(shell.calls.indexOf(`gh pr merge ${PR} --squash --match-head-commit ${shell.headSha} @${dirname(store.runtimeDir)}`)).toBeGreaterThan(ready);
     expect(shell.calls.filter((call) => call.startsWith("gh pr ready"))).toEqual([`gh pr ready ${PR} @${project}`]);
     expect((await assignment("outcome-1")).status).toBe("merged");
   });
@@ -483,7 +499,7 @@ describe("developer seat", () => {
       ownPush(worktree),
       `gh pr checks ${PR} --watch @${worktree}`,
       `gh pr view ${PR} --json isDraft,headRefName,baseRefName,state @${project}`,
-      `gh pr merge ${PR} --squash --match-head-commit ${shell.headSha} @${project}`,
+      `gh pr merge ${PR} --squash --match-head-commit ${shell.headSha} @${dirname(store.runtimeDir)}`,
     ]));
     onlyOwnPushes(shell.calls, worktree);
     expect(codex.runs).toHaveLength(2);
@@ -503,7 +519,7 @@ describe("developer seat", () => {
       ownPush(worktree),
       `gh pr checks ${PR} --watch @${worktree}`,
       `gh pr view ${PR} --json isDraft,headRefName,baseRefName,state @${join(store.runtimeDir, "projects", "satoramoto", "indra")}`,
-      `gh pr merge ${PR} --squash --match-head-commit ${shell.headSha} @${join(store.runtimeDir, "projects", "satoramoto", "indra")}`,
+      `gh pr merge ${PR} --squash --match-head-commit ${shell.headSha} @${dirname(store.runtimeDir)}`,
     ]));
     onlyOwnPushes(shell.calls, worktree);
     const write = ["--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true", "--add-dir", join(store.runtimeDir, "projects", "satoramoto", "indra", ".git")];
@@ -562,7 +578,7 @@ describe("developer seat", () => {
     expect(await assignment("outcome-1")).toMatchObject({ status: "failed", note: "ci: merge conflict with sprint/goal-abc could not be resolved" });
     expect(chat.messages.at(-1)).toContain("merge conflict with sprint/goal-abc could not be resolved");
     expect(codex.runs.filter((run) => run.prompt.includes("stopped with conflicts"))).toHaveLength(2);
-    expect(shell.calls.filter((call) => call.startsWith("gh pr checks"))).toHaveLength(2);
+    expect(shell.calls.filter((call) => call.startsWith("gh pr checks") && call.includes("--watch"))).toHaveLength(2);
     expect(shell.calls.at(-1)).toBe(`git merge --abort @${worktree}`);
     onlyOwnPushes(shell.calls, worktree);
   });
@@ -953,7 +969,7 @@ describe("developer seat", () => {
     expect((await store.readRuntimeFile<SeatTaskRecord>(RECORD))?.step).toBe("review");
     await store.update((state) => { state.planningGoals![0].assignments![0].status = "queued"; }, "Re-queue interrupted review");
     await make().tick();
-    expect(shell.comments.map((item) => item.state)).toEqual(["CHANGES_REQUESTED", "APPROVED"]);
+    expect(shell.comments.map((item) => item.body.match(/review: (\w+)/)?.[1])).toEqual(["REQUEST_CHANGES", "APPROVE"]);
     expect(codex.runs.filter((run) => run.schema.endsWith("review.json"))).toHaveLength(2);
     expect(codex.runs.find((run) => run.prompt.includes("Outcome: every review finding"))?.prompt).toContain("Bug in foo");
     expect((await assignment("outcome-1")).status).toBe("merged");
