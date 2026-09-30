@@ -4,7 +4,7 @@ import { implementationFactsName, type ImplementationFacts } from "./implementat
 import { CLAUDE_MODEL, DEVELOPER_CLAUDE_EFFORT, PRODUCT_CLAUDE_EFFORT, TEAM_LEAD_CLAUDE_EFFORT } from "./claude-runtime.js";
 import { DEVELOPER_CODEX_MODEL, DEVELOPER_CODEX_REASONING_EFFORT, PRODUCT_CODEX_MODEL, PRODUCT_CODEX_REASONING_EFFORT, TEAM_LEAD_CODEX_MODEL, TEAM_LEAD_CODEX_REASONING_EFFORT } from "./harness-home.js";
 import { parseUsage, sumUsage, totalTokens, type CiState, type SeatStep } from "./hub-format.js";
-import type { RuntimeEngine, TokenUsage } from "./runtime-facts.js";
+import { jsonObject, type RuntimeEngine, type TokenUsage } from "./runtime-facts.js";
 import type { PlanningGoal } from "./planning.js";
 import { goalRuntimeFilename, productRuntimeFilename, projectGoalRuntime, teamRuntimeFilename, validateProductProposal, type GoalRuntimeProjection, type GoalRuntimeRecord, type ProductRuntimeRecord, type SchedulerRuntimeRecord } from "./goal-contract.js";
 
@@ -41,7 +41,10 @@ export async function readSchedulerFacts(store: RuntimeFileReader, teamId: strin
   } catch { return; }
 }
 
-export async function readProductFacts(store: RuntimeFileReader, teamId: string, seatId: string): Promise<ProductRuntimeRecord | undefined> {
+/** Activity comes from the Product journal; a missing live token log alone never proves idleness. */
+export interface ProductSeatFacts extends ProductRuntimeRecord { runState?: "active" | "idle" }
+
+export async function readProductFacts(store: RuntimeFileReader, teamId: string, seatId: string): Promise<ProductSeatFacts | undefined> {
   try {
     const record = await store.readRuntimeFile<ProductRuntimeRecord>(productRuntimeFilename(teamId));
     if (record?.version !== 1 || record.teamId !== teamId || record.seatId !== seatId || !Array.isArray(record.queue)) return;
@@ -50,7 +53,22 @@ export async function readProductFacts(store: RuntimeFileReader, teamId: string,
       if (item.proposal.productSeatId !== seatId || !["proposed", "posted", "approved"].includes(item.status)) return;
     }
     if (record.failure && typeof record.failure.message !== "string") return;
-    return structuredClone(record);
+    const facts: ProductSeatFacts = structuredClone(record);
+    delete facts.runState;
+    try {
+      const journal = await store.readRuntimeFile<unknown>(`product-journal-${productRuntimeFilename(teamId)}`);
+      if (jsonObject(journal) && journal.version === 1 && journal.teamId === teamId && journal.seatId === seatId
+        && jsonObject(journal.runs) && jsonObject(journal.vetting) && jsonObject(journal.deliveries)
+        && Object.values(journal.runs).every((run) => jsonObject(run) && typeof run.status === "string" && ["prepared", "started", "failed", "complete"].includes(run.status))) {
+        const active = journal.active;
+        if (active === null) facts.runState = "idle";
+        else if (jsonObject(active) && typeof active.causeId === "string" && active.causeId.trim()
+          && Number.isInteger(active.remaining) && Number(active.remaining) >= 1 && Number(active.remaining) <= 5
+          && (active.refineGoalId === null || typeof active.refineGoalId === "string" && active.refineGoalId.trim())
+          && (active.runId === null || typeof active.runId === "string" && active.runId.trim() && jsonObject(journal.runs[active.runId]))) facts.runState = "active";
+      }
+    } catch { /* Keep the valid queue and failure even when journal activity cannot be read. */ }
+    return facts;
   } catch { return; }
 }
 

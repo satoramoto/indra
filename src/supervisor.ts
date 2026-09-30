@@ -10,8 +10,8 @@ import { ImplementationRecorder, implementationEligible } from "./implementation
 import { ownsSeatRecord, seatRecordName } from "./developer-maintenance.js";
 import { redactSecrets } from "./redact.js";
 import { childEnv } from "./op-env.js";
-import { readAssignmentFacts, readGoalFacts, readProductFacts, readSchedulerFacts, seatHarness, type AssignmentFacts, type GoalSeatFacts, type SeatHarness } from "./hub-facts.js";
-import type { ProductRuntimeRecord, SchedulerRuntimeRecord } from "./goal-contract.js";
+import { readAssignmentFacts, readGoalFacts, readProductFacts, readSchedulerFacts, seatHarness, type AssignmentFacts, type GoalSeatFacts, type ProductSeatFacts, type SeatHarness } from "./hub-facts.js";
+import type { SchedulerRuntimeRecord } from "./goal-contract.js";
 import { loadSeatEngines } from "./seat-runtime.js";
 
 /** `no channel`: the seat's bot could not join its team's Mattermost team or home channel. */
@@ -30,7 +30,7 @@ export interface SeatLive {
   assignment?: { title: string; status: string; prUrl?: string; goalId?: string; outcomeId?: string; facts?: AssignmentFacts };
   goal?: GoalSeatFacts;
   scheduler?: SchedulerRuntimeRecord;
-  product?: ProductRuntimeRecord;
+  product?: ProductSeatFacts;
   /** The seat's harness, model and effort; absent when the local seat-engines file cannot be read. */
   harness?: SeatHarness;
   /** Newest failed assignment still eligible to be queued for this Developer seat. */

@@ -7,7 +7,7 @@ import { describe, expect, it, vi } from "vitest";
 import { StateInventory, type StateSnapshot } from "../src/state-domain.js";
 import { TerminalUiModel, type TerminalSession } from "../src/terminal-ui.js";
 import { openLink, TerminalApp } from "../src/terminal-ui-solid.js";
-import { HUB_GRID, sprintLinks } from "../src/hub-view.js";
+import { HUB_GRID, occupancy, seatInfo, sprintLinks } from "../src/hub-view.js";
 import type { SeatLive, SeatProcessPort } from "../src/supervisor.js";
 import type { CeremonyStage } from "../src/session-snapshot.js";
 import { CEREMONY_STAGES, LocalSessionReader } from "../src/session-snapshot.js";
@@ -18,11 +18,13 @@ import {
 import { normalizeUsage } from "../src/runtime-facts.js";
 import { allGlyphs, faded, GLYPH, PALETTE, PULSE_MS } from "../src/hub-style.js";
 import { HelpOverlay } from "../src/help-overlay.js";
-import { assignmentFacts, seatHarness } from "../src/hub-facts.js";
+import { assignmentFacts, readProductFacts, seatHarness } from "../src/hub-facts.js";
 import { ansi256Rgb, paint, STAGE_COLOR } from "../src/hub-paint.js";
 import type { ImplementationFacts } from "../src/implementation-facts.js";
 import type { SeatTaskRecord } from "../src/developer-seat.js";
 import type { RuntimeRecord } from "../src/planning.js";
+import { productRuntimeFilename, type ProductProposal, type ProductRuntimeRecord } from "../src/goal-contract.js";
+import { productJournalFilename } from "../src/product-proposals.js";
 
 const states = (steps: ReturnType<typeof pipelineSteps>) => steps.map((step) => step.state).join(" ");
 
@@ -580,6 +582,89 @@ describe("per-cell polish", () => {
 });
 
 describe("three-role goal hub", () => {
+  const completedJournal = { version: 1, teamId: "team-001", seatId: "seat-002", active: null, runs: { finished: { status: "complete" } }, vetting: {}, deliveries: {} };
+  async function productHub(journal: unknown) {
+    const state = structuredClone(snapshot); state.teams[0].workflowModel = "goals-v1"; state.teams[0].seats[1].roles = ["Product"];
+    const proposal: ProductProposal = { version: 1, goalId: "goal-next", proposalId: "proposal-next", productSeatId: "seat-002", rank: 1, mission: "docs/mission.md", summary: "Improve recovery", outcomes: [{ number: 1, title: "Improve", description: "Improve reliability", reason: "Mission", currentCode: ["src/work.ts"] }], ownedFiles: ["src/work.ts"], risks: [], rationale: "Useful improvement", basedOnRetros: [] };
+    const record: ProductRuntimeRecord = { version: 1, teamId: "team-001", seatId: "seat-002", queue: Array.from({ length: 5 }, (_, index) => ({ proposal: { ...proposal, goalId: `goal-${index}`, proposalId: `proposal-${index}`, rank: index + 1 }, status: index ? "proposed" : "posted", vetting: null, rootPostId: index ? null : ids.proposal, proposalPostId: index ? null : ids.proposal })), events: [], handledEventIds: [], pending: null, failure: null, updatedAt: ago(1) };
+    const product = await readProductFacts({ readRuntimeFile: async <T,>(name: string) => {
+      if (name === productRuntimeFilename("team-001")) return structuredClone(record) as T;
+      expect(name).toBe(productJournalFilename("team-001"));
+      if (journal instanceof Error) throw journal;
+      return structuredClone(journal) as T | undefined;
+    } }, "team-001", "seat-002");
+    const facts: Record<string, SeatLive> = { "seat-002": { process: "running", product, attach: { kind: "tmux", target: "indra:product" } } };
+    const model = new TerminalUiModel(new StateInventory({ read: async () => state }), { readSessions: async () => ({ connection: "connected", sessions: [] }) }, { ensureAll: async () => [], read: async () => facts, stop: async () => {}, restart: async () => {} });
+    await model.refresh(); model.restore({ page: "team", teamId: "team-001" });
+    return { model, live: facts["seat-002"], seat: state.teams[0].seats[1] };
+  }
+
+  it("shows the posted Product approval action after a completed run, with neutral idle occupancy and real failure precedence", async () => {
+    const { model, live, seat } = await productHub(completedJournal);
+    expect(model.sessionsFor(seat.id)).toEqual([]); expect(model.liveUsage).toEqual({});
+    expect(live.product?.runState).toBe("idle");
+    expect(occupancy(model, seat).label).toBe("no active session");
+    expect(seatInfo(model, seat)).toMatchObject({ state: "needs", attention: "Proposal awaits your approval: Improve recovery" });
+    const [revision, setRevision] = createSignal(model.revision);
+    const setup = await testRender(() => <TerminalApp model={model} revision={revision} onKey={() => {}} />, { width: 120, height: 54 });
+    try {
+      await setup.renderOnce(); let frame = setup.captureCharFrame();
+      expect(frame).toContain("NEEDS YOU · 1"); expect(frame).toContain("Proposal awaits your approval: Improve recovery");
+      expect(frame).not.toContain("current session evidence unavailable");
+      model.restore({ page: "seat", teamId: "team-001", seatId: seat.id }); setRevision((n) => n + 1);
+      await setup.renderOnce(); frame = setup.captureCharFrame(); expect(frame).toContain("no active session");
+      expect(frame).not.toContain("current session evidence unavailable");
+      live.product!.failure = { message: "Product source could not be read", retryable: true, at: ago(1) };
+      await model.refresh(); model.restore({ page: "team", teamId: "team-001" }); setRevision((n) => n + 1);
+      await setup.renderOnce(); frame = setup.captureCharFrame();
+      expect(frame).toContain("Product source could not be read"); expect(frame).not.toContain("Proposal awaits your approval");
+      expect(seatInfo(model, seat).state).toBe("failed"); expect(occupancy(model, seat).label).toBe("current session evidence unavailable");
+      live.problem = "Product host credentials are unavailable";
+      expect(seatInfo(model, seat).attention).toBe("Product host credentials are unavailable");
+    } finally { setup.renderer.destroy(); }
+  });
+
+  it.each([
+    ["missing", undefined], ["unreadable", new Error("Unreadable journal")],
+    ["wrong team", { ...completedJournal, teamId: "team-other" }], ["wrong seat", { ...completedJournal, seatId: "seat-other" }],
+    ["wrong version", { ...completedJournal, version: 2 }], ["missing activity", { ...completedJournal, active: undefined }],
+    ["malformed activity", { ...completedJournal, active: false }], ["malformed runs", { ...completedJournal, runs: [] }],
+    ["malformed run status", { ...completedJournal, runs: { finished: { status: "unknown" } } }],
+  ])("keeps %s Product activity unknown without hiding its posted proposal", async (_name, journal) => {
+    const { model, live, seat } = await productHub(journal);
+    expect(live.product).toBeDefined(); expect(live.product?.runState).toBeUndefined();
+    expect(occupancy(model, seat).label).toBe("current session evidence unavailable");
+    expect(seatInfo(model, seat).attention).toBe("Proposal awaits your approval: Improve recovery");
+  });
+
+  it("keeps a headless active Product turn active when no live token log exists", async () => {
+    const { model, live, seat } = await productHub({ ...completedJournal, active: { causeId: "redirect:one", remaining: 1, refineGoalId: "goal-1", runId: "working" }, runs: { working: { status: "started" } } });
+    expect(model.liveUsage).toEqual({}); expect(live.product?.runState).toBe("active");
+    expect(occupancy(model, seat).label).toBe("current session evidence unavailable");
+    live.product!.queue = [];
+    expect(seatInfo(model, seat).state).toBe("running");
+    live.process = "stopped";
+    expect(seatInfo(model, seat).state).toBe("waiting");
+    expect(occupancy(model, seat).label).toBe("current session evidence unavailable");
+  });
+
+  it("does not let an idle journal hide pending delivery, a stopped host, disconnected readings or a live session", async () => {
+    const { model, live, seat } = await productHub(completedJournal);
+    live.product!.pending = { goalId: "goal-0", proposalId: "proposal-0", deliveryId: "delivery-0", message: "Pending proposal" };
+    expect(occupancy(model, seat).label).toBe("current session evidence unavailable");
+    live.product!.pending = null; live.process = "stopped";
+    expect(occupancy(model, seat).label).toBe("current session evidence unavailable");
+    live.process = "running"; model.sessionResult.connection = "error";
+    expect(occupancy(model, seat).label).toBe("current session evidence unavailable");
+    model.sessionResult.connection = "connected"; model.liveUsage[seat.id] = { engine: "claude", usage: { outputTokens: 1 } };
+    expect(occupancy(model, seat).label).toBe("running session · Claude Code");
+    model.liveUsage = {};
+    model.sessionResult.sessions = [{ ...hubSession(), seatId: seat.id, status: "running", sessionId: undefined }];
+    expect(occupancy(model, seat).label).toBe("current session evidence unavailable");
+    model.sessionResult.sessions[0].status = "error";
+    expect(occupancy(model, seat).label).toBe("current session evidence unavailable");
+  });
+
   it("renders whole-goal lanes, scheduler overlap and ranked Product proposals in their actual seat views", async () => {
     const { projectGoalRuntime } = await import("../src/goal-contract.js");
     const state = structuredClone(snapshot); state.teams[0].workflowModel = "goals-v1"; state.teams[0].seats[1].roles = ["Product"];
