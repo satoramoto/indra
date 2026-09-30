@@ -32,6 +32,11 @@ function store(runtimeDir: string, repo = "test/project"): PlanningStore {
 }
 
 describe("finite workflow event validation", () => {
+  it("validates a seat-scoped Product retry without a synthetic goal or approval fields", () => {
+    const event = { kind: "product-retry", id: "product-retry-one", teamId: "team-one", seatId: "seat-product", reason: "Resolved model failure", at };
+    expect(validateWorkflowEvent(event)).toEqual(event);
+    for (const invalid of [{ ...event, goalId: "goal-fabricated" }, { ...event, seatId: "../seat" }, { ...event, seatId: null }, { ...event, reason: "" }, { ...event, approved: true }]) expect(() => validateWorkflowEvent(invalid)).toThrow();
+  });
   it("accepts the finite startup event but rejects extra fields, unknown variants, unsafe identities and mismatched reports", () => {
     expect(validateWorkflowEvent({ kind: "startup", teamId: "team-one", at })).toEqual({ kind: "startup", teamId: "team-one", at });
     for (const event of [{ ...queue(), secret: "do-not-retain" }, { ...queue(), kind: "poll" }, { ...queue(), teamId: "../team" }, { ...queue(), at: "later" }, { ...queue(), id: "" }, { kind: "startup", teamId: "team-one", at, id: "extra" }, { ...queue(), kind: "developer-report", goalId: "goal-one", seatId: "seat-one", report: null }]) expect(() => validateWorkflowEvent(event)).toThrow();
@@ -48,6 +53,18 @@ describe("finite workflow event validation", () => {
 });
 
 describe("immutable delivery and restart receipts", () => {
+  it("delivers Product retry only to its seat while other consumers receipt it without work", async () => {
+    const root = await directory(); const inbox = new WorkflowInbox(root);
+    await inbox.publish({ kind: "product-retry", id: "product-retry-one", teamId: "team-one", seatId: "seat-product", reason: "Resolved model failure", at });
+    for (const consumer of ["scheduler-one", "seat-developer", "seat-product"]) {
+      const seen: string[] = []; const controller = new AbortController();
+      await runWorkflowHost({ store: store(root), teamId: "team-one", consumer, signal: controller.signal,
+        onReady: async () => controller.abort(), turn: async (event) => { seen.push(event.kind); },
+      });
+      expect(seen).toEqual(consumer === "seat-product" ? ["startup", "product-retry"] : ["startup"]);
+      const replay = vi.fn(async () => {}); await inbox.drain(consumer, "team-one", replay); expect(replay).not.toHaveBeenCalled();
+    }
+  });
   it("reconciles duplicate deliveries, retries interrupted consumers and keeps separate durable consumer receipts", async () => {
     const root = await directory(); const inbox = new WorkflowInbox(root);
     await Promise.all([inbox.publish(queue()), inbox.publish(queue())]);

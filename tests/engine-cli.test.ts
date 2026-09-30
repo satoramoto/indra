@@ -5,11 +5,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentRuntime, MessageOptions, WriteAccess } from "../src/codex-runtime.js";
 import type { CeremonyAdapters, PlanningChat } from "../src/planning-bridge.js";
 import { processShell, type RuntimeFactory } from "../src/developer-seat.js";
-import { createPlanningBridge, createPlanningStore, developerEventTurn, main, uiWorkflowEvents, workflowDelivery } from "../src/cli.js";
+import { createPlanningBridge, createPlanningStore, developerEventTurn, main, parseOptions, uiWorkflowEvents, workflowDelivery } from "../src/cli.js";
 import { SprintGitHub } from "../src/sprint.js";
 import { PlanningStore } from "../src/planning.js";
 import { loadSeatPersonas, type SeatPersona } from "../src/seat-persona.js";
-import { runWorkflowHost, type WorkflowHostOptions } from "../src/remodel-events.js";
+import { WorkflowInbox, runWorkflowHost, type WorkflowHostOptions } from "../src/remodel-events.js";
 import { ProductSeat } from "../src/product-seat.js";
 import * as projectCheckouts from "../src/project-checkout.js";
 import * as op from "../src/op-env.js";
@@ -107,6 +107,31 @@ const configure = (value: unknown) => writeFile(join(`${checkout}.runtime`, "sea
 const planning = (action: string) => main(["planning", action, ...(action === "serve" ? [] : ["--goal", "goal-1"]), "--state", checkout]);
 
 describe("goals-v1 production event wiring", () => {
+  it("queues Product recovery for the configured seat without a goal, credentials or state writes", async () => {
+    const state = await new PlanningStore(checkout).read();
+    const team = state.teams[0] as { workflowModel?: string; seats: { id: string; roles: string[] }[] };
+    team.workflowModel = "goals-v1"; team.seats.find((seat) => seat.id === "seat-dev")!.roles = ["Product"];
+    const before = structuredClone(state); const writes = vi.spyOn(PlanningStore.prototype, "publishProductProposal");
+    expect(await main(["planning", "retry", "--seat", "seat-dev", "--state", checkout])).toBe(0);
+    const events: WorkflowEvent[] = []; await new WorkflowInbox(`${checkout}.runtime`).drain("seat-dev", "team-001", async (event) => { events.push(event); });
+    expect(events).toMatchObject([{ kind: "product-retry", teamId: "team-001", seatId: "seat-dev", reason: expect.any(String) }]);
+    expect(events[0]).not.toHaveProperty("goalId"); expect(state).toEqual(before); expect(writes).not.toHaveBeenCalled();
+    expect(fakes.calls).toEqual([]); expect(fakes.posts).toEqual([]); expect(fakes.token).not.toHaveBeenCalled();
+  });
+  it.each(["missing", "developer", "team-lead", "legacy", "mixed"])("rejects a %s Product retry target without publishing an event", async (target) => {
+    const state = await new PlanningStore(checkout).read();
+    const team = state.teams[0] as { workflowModel?: string; seats: { id: string; roles: string[] }[] };
+    team.workflowModel = target === "legacy" ? undefined : "goals-v1";
+    if (target === "legacy" || target === "mixed") team.seats[1].roles = target === "mixed" ? ["Product", "Developer"] : ["Product"];
+    const seat = target === "missing" ? "seat-missing" : target === "team-lead" ? "seat-lead" : "seat-dev";
+    expect(await main(["planning", "retry", "--seat", seat, "--state", checkout])).toBe(1);
+    const turn = vi.fn(async () => {}); await new WorkflowInbox(`${checkout}.runtime`).drain("seat-dev", "team-001", turn);
+    expect(turn).not.toHaveBeenCalled(); expect(fakes.token).not.toHaveBeenCalled(); expect(fakes.calls).toEqual([]);
+  });
+  it("requires exactly one retry target and limits seat targeting to retry", () => {
+    expect(parseOptions(["planning", "retry", "--goal", "goal-one", "--state", checkout])).toMatchObject({ action: "retry", goal: "goal-one" });
+    for (const args of [["planning", "retry"], ["planning", "retry", "--goal", "goal-one", "--seat", "seat-dev"], ["planning", "retry", "--seat", "seat-dev", "--seat", "seat-dev"], ["planning", "approve", "--seat", "seat-dev"]]) expect(() => parseOptions(args)).toThrow("Usage:");
+  });
   it.each(["codex", "claude"])("adapts Product's %s runtime factory without confusing write capability and timeout", async (engine) => {
     const state = await new PlanningStore(checkout).read();
     const team = state.teams[0] as { workflowModel?: string; project?: { github: string }; seats: { id: string; roles: string[] }[] };

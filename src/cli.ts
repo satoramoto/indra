@@ -230,7 +230,7 @@ export async function runConsistencyCheck(state: StateInventory, reader: TeamMem
 }
 
 /** Planning actions on one existing goal, each taking `--goal GOAL_ID`. */
-const GOAL_ACTIONS = ["approve", "propose", "integrate", "merge", "rollback", "retry"] as const;
+const GOAL_ACTIONS = ["approve", "propose", "integrate", "merge", "rollback"] as const;
 type GoalAction = typeof GOAL_ACTIONS[number];
 const isGoalAction = (action: string | undefined): action is GoalAction => (GOAL_ACTIONS as readonly (string | undefined)[]).includes(action);
 
@@ -252,9 +252,9 @@ async function seatServices(store: PlanningStore, username: string, seatId?: str
   };
 }
 
-type Options = { mode: "help" } | { mode: "seat"; seatId: string; checkout: string; readyNonce?: string } | { mode: "state"; checkout: string; once: boolean } | { mode: "ui"; checkout: string } | { mode: "mattermost"; slug: string } | { mode: "mattermost"; checkout: string; once: boolean } | { mode: "planning"; action: "start" | "serve" | "host" | "status" | GoalAction; checkout: string; goal?: string; participants: string[]; readyNonce?: string };
+type Options = { mode: "help" } | { mode: "seat"; seatId: string; checkout: string; readyNonce?: string } | { mode: "state"; checkout: string; once: boolean } | { mode: "ui"; checkout: string } | { mode: "mattermost"; slug: string } | { mode: "mattermost"; checkout: string; once: boolean } | { mode: "planning"; action: "start" | "serve" | "host" | "status" | "retry" | GoalAction; checkout: string; goal?: string; seatId?: string; participants: string[]; readyNonce?: string };
 
-const usage = "Usage: npm start -- [--state PATH] [--once] | --ui [--state PATH] | --mattermost [--state PATH] [--once] | --mattermost --team SLUG | planning start --goal TEXT [--participant SEAT_ID] [--state PATH] | planning propose|approve|integrate|merge|rollback --goal GOAL_ID [--state PATH] | planning serve|host|status [--state PATH] | seat run --seat SEAT_ID [--state PATH]\nPlanning serves only Chick's Yahaha thread, in the team's home channel and project from state. Reply in the thread to clarify; react :memo: on Chick's goal post to request a draft, and :white_check_mark: on the proposal post to approve it.\nEach approved goal is a sprint on branch sprint/GOAL_ID; its seats' PRs target that branch, and one integration PR takes it into main. The ceremony is planning -> proposal -> implement -> release -> retro, followed by closure. Draft failures stay in proposal. integrate explicitly authorizes a partial release and records omitted outcomes once no seat is active. merge merges the applicable integration, revert or retro PR once its gates pass; it does not complete release. Release waits for the new build to run, and closure waits for the retro thread post and archival merge. rollback opens a PR on main reverting the merged sprint.";
+const usage = "Usage: npm start -- [--state PATH] [--once] | --ui [--state PATH] | --mattermost [--state PATH] [--once] | --mattermost --team SLUG | planning start --goal TEXT [--participant SEAT_ID] [--state PATH] | planning propose|approve|integrate|merge|rollback --goal GOAL_ID [--state PATH] | planning retry (--goal GOAL_ID | --seat PRODUCT_SEAT_ID) [--state PATH] | planning serve|host|status [--state PATH] | seat run --seat SEAT_ID [--state PATH]\nPlanning serves only Chick's Yahaha thread, in the team's home channel and project from state. Reply in the thread to clarify; react :memo: on Chick's goal post to request a draft, and :white_check_mark: on the proposal post to approve it.\nEach approved goal is a sprint on branch sprint/GOAL_ID; its seats' PRs target that branch, and one integration PR takes it into main. The ceremony is planning -> proposal -> implement -> release -> retro, followed by closure. Draft failures stay in proposal. integrate explicitly authorizes a partial release and records omitted outcomes once no seat is active. merge merges the applicable integration, revert or retro PR once its gates pass; it does not complete release. Release waits for the new build to run, and closure waits for the retro thread post and archival merge. rollback opens a PR on main reverting the merged sprint.";
 
 export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_REPO): Options {
   if (args.length === 1 && (args[0] === "--help" || args[0] === "-h")) return { mode: "help" };
@@ -275,21 +275,22 @@ export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_
   }
   if (args[0] === "planning") {
     const action = args[1];
-    if (action !== "start" && action !== "serve" && action !== "host" && action !== "status" && !isGoalAction(action)) throw new StateDataError(usage);
-    let checkout: string | undefined; let goal: string | undefined; let readyNonce: string | undefined;
+    if (action !== "start" && action !== "serve" && action !== "host" && action !== "status" && action !== "retry" && !isGoalAction(action)) throw new StateDataError(usage);
+    let checkout: string | undefined; let goal: string | undefined; let seatId: string | undefined; let readyNonce: string | undefined;
     const participants: string[] = [];
     for (let index = 2; index < args.length; index++) {
       const key = args[index]; const value = args[++index];
       if (!value || value.startsWith("--")) throw new StateDataError(usage);
       if (key === "--state" && !checkout) checkout = value;
       else if (key === "--goal" && !goal) goal = value;
+      else if (key === "--seat" && action === "retry" && !seatId) seatId = value;
       else if (key === "--participant" && action === "start") participants.push(value);
       else if (key === "--ready-nonce" && !readyNonce && action === "serve" && /^[a-f0-9-]{36}$/.test(value)) readyNonce = value;
       else throw new StateDataError(usage);
     }
-    if ((action === "start" || isGoalAction(action)) !== !!goal) throw new StateDataError(usage);
+    if (action === "retry" ? !!goal === !!seatId : (action === "start" || isGoalAction(action)) !== !!goal) throw new StateDataError(usage);
     const projectRoot = appRootOf(import.meta.url);
-    return { mode: "planning", action, checkout: resolve(checkout || stateEnv || resolve(projectRoot, "..", "indra-state")), goal, participants, ...(readyNonce ? { readyNonce } : {}) };
+    return { mode: "planning", action, checkout: resolve(checkout || stateEnv || resolve(projectRoot, "..", "indra-state")), goal, participants, ...(seatId ? { seatId } : {}), ...(readyNonce ? { readyNonce } : {}) };
   }
   let mattermost = false;
   let checkout: string | undefined;
@@ -346,7 +347,8 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
           try { await runWorkflowHost({ store, teamId: product.teamId, consumer: product.id, signal: signals.signal,
             onReady: async () => { if (options.readyNonce) await signalReady(options.checkout, options.readyNonce); },
             turn: async (event) => {
-              if (!["startup", "proposal-vetted", "approval", "goal-closed", "redirect", "queue-changed", "retry"].includes(event.kind)) return;
+              if (!["startup", "proposal-vetted", "approval", "goal-closed", "redirect", "queue-changed", "retry", "product-retry"].includes(event.kind)) return;
+              if (event.kind === "product-retry" && event.seatId !== product.id) return;
               const fresh = await loadProductSeat(store, product.id); if (!fresh) throw new Error("The Product seat is no longer configured.");
               const project = requireTeamHome(await store.read(), product.teamId).github;
               const cwd = await ensureProjectCheckout(processShell, store.runtimeDir, project);
@@ -354,6 +356,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
               const result = await withFileLock(turnLockFile(options.checkout, { kind: "seat", seatId: product.id }), () => new ProductSeat(productServices).turn(event), 24 * 60 * 60_000);
               if (result.status === "disabled") throw new Error("The goals-v1 Product service is unavailable in this build. Install the Product lane before starting this seat.");
               const record = await store.readRuntimeFile<ProductRuntimeRecord>(productRuntimeFilename(product.teamId));
+              if (record?.failure) console.log(`Product ${product.id} blocked: ${record.failure.message} Use planning retry --seat ${product.id} --state PATH after resolving it.`);
               for (const entry of record?.queue ?? []) if (entry.status === "proposed" && !entry.vetting) {
                 const proposal = validateProductProposal(entry.proposal);
                 await inbox.publish({ kind: "proposal", id: `proposal:${workflowDigest(proposal)}`, teamId: product.teamId, goalId: proposal.goalId, proposalId: proposal.proposalId, at: new Date().toISOString() });
@@ -468,6 +471,12 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       }
       const store = createPlanningStore(options.checkout);
       if (options.action === "retry") {
+        if (options.seatId) {
+          const product = await loadProductSeat(store, options.seatId);
+          if (!product) throw new StateDataError("A seat retry requires a configured goals-v1 Product seat.");
+          await new WorkflowInbox(store.runtimeDir).publish({ kind: "product-retry", id: `owner-product-retry:${product.id}:${randomUUID()}`, teamId: product.teamId, seatId: product.id, at: new Date().toISOString(), reason: "Owner requested Product recovery after resolving the recorded blocker." });
+          console.log(`Queued one finite Product retry for ${product.id}; no goal or proposal approval is created.`); return 0;
+        }
         const goal = (await store.read()).planningGoals?.find((goal) => goal.id === options.goal);
         if (!goal || goal.workflowModel !== "goals-v1" || goal.ceremony?.closure) throw new StateDataError("A retry requires an open goals-v1 goal.");
         await new WorkflowInbox(store.runtimeDir).publish({ kind: "retry", id: `owner-retry:${goal.id}:${randomUUID()}`, teamId: goal.teamId, goalId: goal.id, at: new Date().toISOString(), reason: "Owner requested reconciliation after resolving the recorded blocker." });

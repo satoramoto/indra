@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { main } from "../src/cli.js";
+import { WorkflowInbox, runWorkflowHost } from "../src/remodel-events.js";
 import { ProductSeat, loadProductSeat } from "../src/product-seat.js";
 import { productJournalFilename, productProposalDigest, type ProductChat } from "../src/product-proposals.js";
 import { productRuntimeFilename, type ProductProposal, type ProductRuntimeRecord, type WorkflowEvent } from "../src/goal-contract.js";
@@ -58,10 +60,10 @@ async function fixture(options: { decorate?: boolean; noChat?: boolean; fallback
   const chat: ProductChat = options.decorate ? withPersonaChat(rawChat, (await loadSeatPersonas())[seatId]) : rawChat;
   const calls: { prompt: string; schema: string; session?: string; purpose?: string }[] = [];
   const contexts: { cwd: string; write?: WriteAccess }[] = [];
-  let failNext = false; let outputPatch: Partial<ProductProposal> = {};
+  let failCall = 0; let outputPatch: Partial<ProductProposal> = {};
   const runtime: AgentRuntime = { message: async (prompt, schema, session, messageOptions) => {
     calls.push({ prompt, schema, session, purpose: messageOptions?.purpose });
-    if (failNext) { failNext = false; throw new Error("Interrupted model turn"); }
+    if (calls.length === failCall) throw new Error("Interrupted model turn");
     const identity = JSON.parse(/^Proposal identity: (.+)$/m.exec(prompt)![1]) as Pick<ProductProposal, "goalId" | "proposalId" | "rank" | "productSeatId">;
     const response: ProductProposal = { version: 1, ...identity, mission: "docs/mission.md", summary: `Reliable build improvement ${identity.rank}`, outcomes: [{ number: 1, title: "Verify delivery", description: "Improve the existing delivery evidence with a regression", reason: "The mission needs reliable autonomous delivery", currentCode: ["src/work.ts"] }], ownedFiles: ["src/**", "tests/**"], risks: ["Existing callers need compatibility"], rationale: `Use mission and retros, turn ${calls.length}`, basedOnRetros: ["goal-d", "goal-c", "goal-b"], ...outputPatch };
     return { sessionId: `product-session-${calls.length}`, response, usage: { tokens: 10 }, startedAt: at, finishedAt: at };
@@ -82,9 +84,10 @@ async function fixture(options: { decorate?: boolean; noChat?: boolean; fallback
     const post: Post = { id: `human-${posts.length}`, user_id: "human", channel_id: "home", root_id: "", message: "Prioritize safer recovery behavior", create_at: Date.now() }; posts.push(post);
     return { kind: "redirect", id: `redirect:${post.id}`, goalId: null, teamId, at, redirect: { postId: post.id, userId: post.user_id, message: post.message, at: new Date(post.create_at).toISOString() } };
   };
-  const retry = (): WorkflowEvent => ({ kind: "retry", id: `retry-${Date.now()}`, goalId: "goal-recovery", teamId, reason: "Explicit recovery", at });
+  let retries = 0;
+  const retry = (): WorkflowEvent => ({ kind: "product-retry", id: `retry-${++retries}`, seatId, teamId, reason: "Explicit recovery", at });
   return { store, project, commands, requests, posts, calls, contexts, runner, current, vet, approve, redirect, retry,
-    failModel: () => { failNext = true; }, patchOutput: (patch: Partial<ProductProposal>) => { outputPatch = patch; }, losePost: () => { losePost = true; }, hidePosts: (value: boolean) => { hidePosts = value; }, foreignBot: () => { foreignBot = true; }, badPost: () => { badPost = true; } };
+    failModel: (after = 0) => { failCall = calls.length + after + 1; }, patchOutput: (patch: Partial<ProductProposal>) => { outputPatch = patch; }, losePost: () => { losePost = true; }, hidePosts: (value: boolean) => { hidePosts = value; }, foreignBot: () => { foreignBot = true; }, badPost: () => { badPost = true; } };
 }
 
 describe("finite Product seat with real store and own-bot delivery", () => {
@@ -156,18 +159,18 @@ describe("finite Product seat with real store and own-bot delivery", () => {
   });
   it("recovers a delivered post after its acknowledgment is lost without sending a duplicate", async () => {
     const f = await fixture(); await f.runner().turn(startup); f.losePost();
-    await expect(f.runner().turn(await f.vet())).rejects.toThrow(); expect(f.posts).toHaveLength(1); expect((await f.current()).pending).not.toBeNull();
+    await expect(f.runner().turn(await f.vet())).resolves.toMatchObject({ status: "blocked" }); expect(f.posts).toHaveLength(1); expect((await f.current()).pending).not.toBeNull();
     await f.runner().turn(f.retry()); expect(f.posts).toHaveLength(1); expect((await f.store.read()).planningGoals).toHaveLength(1); expect((await f.current()).pending).toBeNull();
   });
   it("keeps ambiguous post delivery blocked instead of resending, then recovers when GET confirms it", async () => {
-    const f = await fixture(); await f.runner().turn(startup); f.losePost(); await expect(f.runner().turn(await f.vet())).rejects.toThrow();
-    f.hidePosts(true); await expect(f.runner().turn(f.retry())).rejects.toThrow("no second POST"); expect(f.posts).toHaveLength(1);
+    const f = await fixture(); await f.runner().turn(startup); f.losePost(); await expect(f.runner().turn(await f.vet())).resolves.toMatchObject({ status: "blocked" });
+    f.hidePosts(true); await expect(f.runner().turn(f.retry())).resolves.toMatchObject({ status: "blocked" }); expect((await f.current()).failure?.message).toContain("no second POST"); expect(f.posts).toHaveLength(1);
     f.hidePosts(false); await f.runner().turn(f.retry()); expect(f.posts).toHaveLength(1); expect((await f.current()).pending).toBeNull();
   });
   it("recovers a lost state-publication response using the exact durable goal and verified root", async () => {
     const f = await fixture(); await f.runner().turn(startup); const publish = f.store.publishProductProposal.bind(f.store);
     vi.spyOn(f.store, "publishProductProposal").mockImplementationOnce(async (...args) => { await publish(...args); throw new Error("Lost state ACK"); });
-    await expect(f.runner().turn(await f.vet())).rejects.toThrow(); expect((await f.store.read()).planningGoals).toHaveLength(1);
+    await expect(f.runner().turn(await f.vet())).resolves.toMatchObject({ status: "blocked" }); expect((await f.store.read()).planningGoals).toHaveLength(1);
     await f.runner().turn(f.retry()); expect(f.posts).toHaveLength(1); expect(f.store.publishProductProposal).toHaveBeenCalledTimes(1);
   });
   it("accepts only exact revision-bound vetting by the actual Team Lead", async () => {
@@ -186,19 +189,79 @@ describe("finite Product seat with real store and own-bot delivery", () => {
     expect(queue).toHaveLength(5); expect(queue[0]).toEqual(posted); expect(queue[4].vetting).toBeNull(); expect(f.calls).toHaveLength(6);
     await f.runner().turn(old); expect((await f.current()).queue[4].vetting).toBeNull(); expect(f.posts.filter((post) => post.user_id === "product-user")).toHaveLength(1);
   });
-  it("retains accepted drafts across a failed fresh context and consumes only its bounded retry budget", async () => {
-    const f = await fixture(); f.failModel(); await expect(f.runner().turn(startup)).rejects.toThrow(); expect(f.calls).toHaveLength(1);
-    await f.runner().turn(startup); expect(f.calls).toHaveLength(1);
-    await f.runner().turn(f.retry()); expect(f.calls).toHaveLength(6); expect((await f.current()).queue).toHaveLength(5);
-    await f.runner().turn(startup); expect(f.calls).toHaveLength(6);
+  it("retains accepted drafts across a failed fresh context and consumes each retry only once", async () => {
+    const f = await fixture(); f.failModel(2); await expect(f.runner().turn(startup)).resolves.toMatchObject({ status: "blocked" });
+    const accepted = structuredClone((await f.current()).queue); expect(accepted).toHaveLength(2); expect(f.calls).toHaveLength(3);
+    const retry = f.retry(); f.failModel(); await expect(f.runner().turn(retry)).resolves.toMatchObject({ status: "blocked" });
+    expect(f.calls).toHaveLength(4); expect((await f.current()).handledEventIds).toContain(retry.kind !== "startup" && retry.id);
+    for (const event of [startup, retry, { kind: "queue-changed", id: "ordinary-wakeup", teamId, at } as WorkflowEvent]) await f.runner().turn(event);
+    expect(f.calls).toHaveLength(4); expect((await f.current()).queue).toEqual(accepted);
+    await f.runner().turn({ ...f.retry(), teamId: "another-team" });
+    await f.runner().turn({ kind: "product-retry", id: "another-seat", seatId: "seat-003", teamId, reason: "Wrong seat", at });
+    expect(f.calls).toHaveLength(4); expect((await f.current()).failure).not.toBeNull();
+    await f.runner().turn(f.retry()); expect(f.calls).toHaveLength(7); expect((await f.current()).queue).toHaveLength(5);
+    expect((await f.current()).queue.slice(0, 2)).toEqual(accepted);
+    await f.runner().turn(startup); expect(f.calls).toHaveLength(7);
+  });
+  it("retains vetting delivered while generation is blocked so receipted evidence survives recovery", async () => {
+    const f = await fixture(); f.failModel(2); await f.runner().turn(startup);
+    const vetted = await f.vet();
+    await expect(f.runner().turn(vetted)).resolves.toMatchObject({ status: "blocked" });
+    expect((await f.current()).handledEventIds).toContain(vetted.id);
+    expect((await f.current()).queue[0].vetting).toEqual(vetted.vetting);
+    expect(f.posts).toHaveLength(0); expect(f.calls).toHaveLength(3);
+    await f.runner().turn(f.retry());
+    expect(f.posts).toHaveLength(1); expect(f.calls).toHaveLength(6); expect((await f.current()).queue).toHaveLength(5);
+    expect((await f.store.read()).planningGoals).toMatchObject([{ stage: "awaiting-review", ownedFiles: vetted.vetting.ownedFiles }]);
+    await f.runner().turn(vetted); expect(f.posts).toHaveLength(1);
+  });
+  it("recovers the first failed turn through the real seat retry CLI, host restart and verified publication", async () => {
+    const f = await fixture(); f.failModel();
+    await expect(f.runner().turn(startup)).resolves.toMatchObject({ status: "blocked" });
+    expect((await f.store.read()).planningGoals).toHaveLength(0); expect((await f.current()).queue).toHaveLength(0);
+    const before = await readFile(join(f.store.checkout, "state.json"), "utf8");
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    expect(await main(["planning", "retry", "--seat", seatId, "--state", f.store.checkout])).toBe(0);
+    expect(await readFile(join(f.store.checkout, "state.json"), "utf8")).toBe(before);
+    const seen: WorkflowEvent[] = [];
+    const restart = async () => {
+      const controller = new AbortController();
+      await runWorkflowHost({ store: f.store, teamId, consumer: seatId, signal: controller.signal,
+        onReady: async () => controller.abort(), turn: async (event) => { seen.push(event); await f.runner().turn(event); },
+      });
+    };
+    await restart();
+    expect(seen.map((event) => event.kind)).toEqual(["startup", "product-retry"]);
+    expect(seen[1]).toMatchObject({ teamId, seatId }); expect(seen[1]).not.toHaveProperty("goalId");
+    expect(f.calls).toHaveLength(6); expect((await f.current()).queue).toHaveLength(5); expect((await f.current()).failure).toBeNull();
+    expect((await f.store.read()).planningGoals).toHaveLength(0); expect(f.posts).toHaveLength(0);
+    const inbox = new WorkflowInbox(f.store.runtimeDir); await inbox.publish(await f.vet());
+    await restart(); await restart();
+    expect(f.calls).toHaveLength(6); expect(f.posts).toHaveLength(1);
+    expect((await f.store.read()).planningGoals).toMatchObject([{ stage: "awaiting-review", mattermost: { rootPostId: f.posts[0].id }, ceremony: { stage: "proposal" } }]);
+    expect((await f.store.read()).planningGoals![0].goalAssignment).toBeUndefined();
+    expect(f.requests.filter((request) => request.method === "POST")).toHaveLength(1);
+  });
+  it("lets a restarted host consume a queued recovery when an old publication failure remains unresolved", async () => {
+    const f = await fixture(); await f.runner().turn(startup); f.losePost();
+    await f.runner().turn(await f.vet()); f.hidePosts(true);
+    const retry = f.retry(); const inbox = new WorkflowInbox(f.store.runtimeDir); await inbox.publish(retry);
+    const controller = new AbortController(); const statuses: string[] = [];
+    await runWorkflowHost({ store: f.store, teamId, consumer: seatId, signal: controller.signal,
+      onReady: async () => controller.abort(), turn: async (event) => { statuses.push((await f.runner().turn(event)).status); },
+    });
+    expect(statuses).toEqual(["blocked", "blocked"]); expect(f.posts).toHaveLength(1); expect(f.calls).toHaveLength(5);
+    const redelivered = vi.fn(async () => {}); await inbox.drain(seatId, teamId, redelivered); expect(redelivered).not.toHaveBeenCalled();
+    f.hidePosts(false); await f.runner().turn(f.retry());
+    expect(f.posts).toHaveLength(1); expect((await f.store.read()).planningGoals).toHaveLength(1);
   });
   it.each(["identity", "pointer", "scope"])("refuses invalid %s model claims before they enter the public queue", async (failure) => {
     const f = await fixture(); f.patchOutput(failure === "identity" ? { productSeatId: "seat-001" } : failure === "scope" ? { ownedFiles: ["../state.json"] } : { outcomes: [{ number: 1, title: "Invalid", description: "Unknown", reason: "Unverified", currentCode: ["missing.ts"] }] });
-    await expect(f.runner().turn(startup)).rejects.toThrow(); expect((await f.current()).queue).toHaveLength(0); expect(f.posts).toHaveLength(0);
+    await expect(f.runner().turn(startup)).resolves.toMatchObject({ status: "blocked" }); expect((await f.current()).failure).not.toBeNull(); expect((await f.current()).queue).toHaveLength(0); expect(f.posts).toHaveLength(0);
   });
   it.each(["missing", "foreign", "post"])("does not publish with %s own-bot capability/evidence", async (problem) => {
     const f = await fixture({ noChat: problem === "missing" }); await f.runner().turn(startup); if (problem === "foreign") f.foreignBot(); if (problem === "post") f.badPost();
-    await expect(f.runner().turn(await f.vet())).rejects.toThrow(); expect((await f.store.read()).planningGoals).toHaveLength(0);
+    await expect(f.runner().turn(await f.vet())).resolves.toMatchObject({ status: "blocked" }); expect((await f.current()).failure).not.toBeNull(); expect((await f.store.read()).planningGoals).toHaveLength(0);
     expect(f.requests.filter((request) => request.method !== "GET")).toHaveLength(problem === "post" ? 1 : 0);
   });
   it("preserves persona decoration and verifies its complete frozen proposal during GET recovery", async () => {
