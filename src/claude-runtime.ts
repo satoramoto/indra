@@ -106,14 +106,14 @@ export class ClaudeRuntime implements AgentRuntime {
       const transcript = () => claudeTranscript(id);
       const response = await runHeaded({
         label: "Claude", cwd: this.cwd, files, validate: resultValidator(schema), launch: { command: "claude", args, env },
-        started: async () => { const path = await transcript(); started = !!path; return path; }, facts: evidence, onUsage: usageReporter(evidence, options.onUsage), timeoutMs: Math.min(options.timeoutMs ?? this.timeoutMs, this.timeoutMs), signal: options.signal,
+        started: async () => { const path = await transcript(); started = !!path; return path; }, facts: evidence, requireFinalUsage: options.requireFinalUsage, onUsage: usageReporter(evidence, options.onUsage), timeoutMs: Math.min(options.timeoutMs ?? this.timeoutMs, this.timeoutMs), signal: options.signal,
       });
-      await readLog(await transcript(), evidence);
+      if (!evidence.logObserved) await readLog(await transcript(), evidence);
       const facts = evidence.finish("succeeded");
       return { sessionId: evidence.sessionId, response, usage: facts.usage, startedAt: facts.startedAt, finishedAt: facts.finishedAt, facts };
     } catch (error) {
-      if (started) await readLog(await claudeTranscript(id), evidence);
-      else evidence.sessionId = undefined;
+      if (started && !evidence.logObserved) await readLog(await claudeTranscript(id), evidence);
+      else if (!started) evidence.sessionId = undefined;
       const recorded = recordedError(error, evidence);
       if (error instanceof HeadedStartError) recorded.cause = error;
       throw recorded;

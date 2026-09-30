@@ -253,15 +253,16 @@ describe("Codex invocation facts", () => {
 
 
 describe("live Codex budget accounting", () => {
-  it("publishes monotonic invocation deltas before completion, including resumed baselines", async () => {
+  it("fails closed on a counter reset even when a later report catches up", async () => {
     const onUsage = vi.fn();
-    const run = new CodexRuntime("/workspace").message("Continue", "/schema.json", id, { previousSessionUsage: { inputTokens: 60, outputTokens: 4 }, onUsage });
+    const run = failure(new CodexRuntime("/workspace").message("Continue", "/schema.json", id, { previousSessionUsage: { inputTokens: 60, outputTokens: 4 }, onUsage }));
+    await vi.waitFor(() => expect(child.input).toBe("Continue"));
     child.stdout.write(usage + "\n");
     expect(onUsage).toHaveBeenLastCalledWith({ inputTokens: 40, outputTokens: 5 });
     child.stdout.write(usage.replace('"input_tokens":100', '"input_tokens":80') + "\n");
-    expect(onUsage).toHaveBeenCalledTimes(1);
-    child.close(answer + usage);
-    await run;
+    await vi.waitFor(() => expect(child.kill).toHaveBeenCalledWith("SIGTERM"));
+    child.close(answer + usage.replace('"input_tokens":100', '"input_tokens":150'));
+    expect((await run).facts.usageComplete).not.toBe(true);
   });
 
   it("cancels safely when a usage observer throws", async () => {
@@ -288,7 +289,7 @@ describe("live Codex budget accounting", () => {
       await vi.waitFor(() => expect(child.input).toBe("Task"));
       child.stdout.write(started);
       await mkdir(join(home, "sessions"));
-      await writeFile(join(home, "sessions", "rollout-current.jsonl"), [
+      await writeFile(join(home, "sessions", `rollout-${id}.jsonl`), [
         { type: "session_meta", payload: { id, cwd: await realpath(home) } },
         { type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { input_tokens: 100, cached_input_tokens: 40, output_tokens: 9 } } } },
       ].map((value) => JSON.stringify(value)).join("\n") + "\n");
@@ -301,4 +302,24 @@ describe("live Codex budget accounting", () => {
       expect(onUsage).toHaveBeenCalledTimes(calls);
     } finally { controller.abort(); child.close("", null); await rm(home, { recursive: true, force: true }); }
   });
+});
+
+
+it("skips resumed historical log prefixes and keeps the stdout terminal snapshot authoritative", async () => {
+  const { mkdtemp, mkdir, writeFile, appendFile, rm, realpath } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os"); const { join } = await import("node:path");
+  const home = await realpath(await mkdtemp(join(tmpdir(), "indra-resume-prefix-")));
+  await mkdir(join(home, "sessions")); const log = join(home, "sessions", `rollout-${id}.jsonl`);
+  const count = (input: number) => JSON.stringify({ type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { input_tokens: input, output_tokens: 4 } } } }) + "\n";
+  await writeFile(log, JSON.stringify({ type: "session_meta", payload: { id, cwd: home } }) + "\n" + count(100) + count(40) + count(60));
+  const onUsage = vi.fn();
+  try {
+    const run = new CodexRuntime(home, 60_000, undefined, home, undefined, false).message("Continue", "/schema.json", id, { onUsage, previousSessionUsage: { inputTokens: 60, outputTokens: 4 } });
+    await vi.waitFor(() => expect(child.input).toBe("Continue"));
+    await appendFile(log, count(80));
+    await vi.waitFor(() => expect(onUsage).toHaveBeenCalledWith(expect.objectContaining({ inputTokens: 20 })));
+    child.close(answer + usage);
+    const result = await run;
+    expect(result.facts).toMatchObject({ usageComplete: true, usage: { inputTokens: 40, outputTokens: 5 } });
+  } finally { child.close("", null); await rm(home, { recursive: true, force: true }); }
 });

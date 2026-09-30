@@ -141,7 +141,7 @@ export async function prepareTaskFiles(cwd: string): Promise<TaskFiles> {
 
 /** The task file: the step's prompt, then where and in what shape to write the result. */
 export function taskDocument(prompt: string, schema: object, files: TaskFiles): string {
-  return `${prompt.trimEnd()}\n\n---\n\n## When you are done\n\nWrite your final result as one JSON document to \`${files.resultRel}\` (absolute path: \`${files.result}\`). It must match this JSON Schema:\n\n\`\`\`json\n${JSON.stringify(schema, null, 2)}\n\`\`\`\n\nWrite that file once, as your very last action, after all other work is finished. Indra reads and validates it, then ends this session. Do not stage, commit or delete anything under \`${TASK_DIR}/\`; it is git-ignored and Indra removes it.\n`;
+  return `${prompt.trimEnd()}\n\n---\n\n## When you are done\n\nWrite your final result as one JSON document to \`${files.resultRel}\` (absolute path: \`${files.result}\`). It must match this JSON Schema:\n\n\`\`\`json\n${JSON.stringify(schema, null, 2)}\n\`\`\`\n\nWrite that file once, as your very last action, after all other work is finished. Indra reads and validates it, waits for the provider to finish the turn, then ends this session. After writing the file, finish your turn with a brief confirmation and do no further work. Do not stage, commit or delete anything under \`${TASK_DIR}/\`; it is git-ignored and Indra removes it.\n`;
 }
 
 /** The first message typed into the interactive CLI. */
@@ -167,6 +167,7 @@ export interface HeadedSpec {
   started(): Promise<string | undefined>;
   /** Incremental log accounting, using the same collector as final evidence. */
   facts?: RuntimeFacts;
+  requireFinalUsage?: boolean;
   onUsage?: () => void;
   timeoutMs: number;
   signal?: AbortSignal;
@@ -230,11 +231,14 @@ export async function runHeaded(spec: HeadedSpec): Promise<unknown> {
       if (tail) { await tail.read().catch(() => undefined); spec.onUsage?.(); }
       const text = await readFile(files.result, "utf8").catch(() => undefined);
       // A file that stopped changing between two polls is complete; one that fails then is a real answer, not a partial write.
-      if (text !== undefined && (text === previous || !running)) return parsed(text, spec);
+      if (text !== undefined && (text === previous || !running)) {
+        const result = parsed(text, spec);
+        if (!spec.requireFinalUsage || spec.facts?.finish("succeeded").usageComplete === true) return result;
+      }
       previous = text;
       if (!running) {
         if (spawnError) throw new RuntimeStop(spawnError.code === "ENOENT" ? `${label} executable not found; install it and sign in before selecting it for a seat.` : `${label} process failed; diagnostics withheld.`);
-        throw new RuntimeStop(`${label} session ended without writing its result file.`);
+        throw new RuntimeStop(text !== undefined && spec.requireFinalUsage ? `${label} session ended without complete terminal usage.` : `${label} session ended without writing its result file.`);
       }
       if (Date.now() - startedAt >= spec.timeoutMs) throw new RuntimeStop(`${label} run timed out after ${minutes(spec.timeoutMs)}.`, "timed-out");
       if (!seenStart) {
@@ -257,6 +261,7 @@ export async function runHeaded(spec: HeadedSpec): Promise<unknown> {
       const escalate = setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* already exited */ } }, headedTiming.killGraceMs);
       await exited; clearTimeout(escalate);
     }
+    await tail?.read().catch(() => undefined);
     process.removeListener("SIGINT", ignoreInterrupt);
     if (marker) await rm(marker, { force: true }).catch(() => undefined);
     resetTerminal();
