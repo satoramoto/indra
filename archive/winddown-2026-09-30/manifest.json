@@ -1,0 +1,50 @@
+{
+  "purpose": "Unfinished scratch source preserved at project wind-down; not reviewed, tested, integrated, or production-ready.",
+  "files": [
+    {
+      "originalPath": "/private/tmp/indra-wiring-check/src/ceremony.ts",
+      "snapshotPath": "archive/winddown-2026-09-30/indra-wiring-check/src/ceremony.ts",
+      "sha256": "0a6d9b5b82e3b0c3a5b45e999f4884378fba20553aafc3258036d27a807f3e86"
+    },
+    {
+      "originalPath": "/private/tmp/indra-wiring-check/src/planning-bridge.ts",
+      "snapshotPath": "archive/winddown-2026-09-30/indra-wiring-check/src/planning-bridge.ts",
+      "sha256": "a85ff587cf2efcad150dac3e110f114f0c6cac3a52d7f2eea994a913e43ad698"
+    },
+    {
+      "originalPath": "/private/tmp/indra-wiring-check/tests/ceremony-flow.test.ts",
+      "snapshotPath": "archive/winddown-2026-09-30/indra-wiring-check/tests/ceremony-flow.test.ts",
+      "sha256": "1aa76d3f92312fab30a1b3397195c737e3475b5cdfd6f73453850137bf08bfaa"
+    },
+    {
+      "originalPath": "/private/tmp/indra-release-baseline-mjzl45ex/tests/self-update.test.ts",
+      "snapshotPath": "archive/winddown-2026-09-30/indra-release-baseline-mjzl45ex/tests/self-update.test.ts",
+      "sha256": "bf133f3159726f42b88da2ae09de80a73a8fc38dd63a4a0ecec3437b12f48bf6"
+    },
+    {
+      "originalPath": "/private/tmp/indra-opentui-proof/fixture.mjs",
+      "snapshotPath": "archive/winddown-2026-09-30/indra-opentui-proof/fixture.mjs",
+      "sha256": "e448db09bf23b6d2273f38b1e9650ff4e75b2cbfa9cd53e5419ab91aba1d0877"
+    },
+    {
+      "originalPath": "/private/tmp/indra-opentui-proof/fixture.tsx",
+      "snapshotPath": "archive/winddown-2026-09-30/indra-opentui-proof/fixture.tsx",
+      "sha256": "67bf70670e74f0ed9bd7f50461e002c2d7dab4ddb057dd8ef20fc0609f3a9b1f"
+    },
+    {
+      "originalPath": "/private/tmp/indra-opentui-proof/build.mjs",
+      "snapshotPath": "archive/winddown-2026-09-30/indra-opentui-proof/build.mjs",
+      "sha256": "ef56be5d9848657eecac8262c05c039ea7cb8798e1fbf172f5a3a61183c36a6d"
+    },
+    {
+      "originalPath": "/private/tmp/indra-opentui-proof/package.json",
+      "snapshotPath": "archive/winddown-2026-09-30/indra-opentui-proof/package.json",
+      "sha256": "132532b74120ccc414665a7eb9b85e27297e7fcacb75a8c53855fca515b48a1e"
+    },
+    {
+      "originalPath": "/private/tmp/indra-opentui-proof/package-lock.json",
+      "snapshotPath": "archive/winddown-2026-09-30/indra-opentui-proof/package-lock.json",
+      "sha256": "01bd203e74bf71fea137a2b72b25aeb8d798bb292fa161dce081a8e7ac15b379"
+    }
+  ]
+}
