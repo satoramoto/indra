@@ -6,7 +6,8 @@ import type { CeremonyWriteReadiness } from "./ceremony-ports.js";
 import { requireTeamHome, type PlanningStore } from "./planning.js";
 import { processShell, type SeatTaskRecord } from "./developer-seat.js";
 import { seatRecordName } from "./developer-maintenance.js";
-import { retroPath, SprintGitHub, type RetroArchive, type RetroPr, type RetroReview } from "./sprint.js";
+import { retroPath, SprintGitHub, releaseAttemptsName, type ReleaseAttempts, type RetroArchive, type RetroPr, type RetroReview } from "./sprint.js";
+import { goalRuntimeFilename, validateGoalReport, type GoalRuntimeRecord } from "./goal-contract.js";
 import { draftSprintRetro, renderSprintRetro, RetroGenerationError, type RetroGeneration, type RetroInput, type RetroPriorAttempt, type SprintRetroDraft } from "./sprint-retro.js";
 import { readImplementationFacts } from "./implementation-facts.js";
 import { loadSeatEngines, SeatRuntime } from "./seat-runtime.js";
@@ -142,7 +143,7 @@ export class RetroPublication {
       const record = await this.load(context);
       if (!record.frozen) {
         const failures = record.attempts.length;
-        if (failures) {
+        if (failures && context.goal.workflowModel !== "goals-v1") {
           const last = record.attempts.at(-1)!;
           const retryAt = Date.parse(last.finishedAt ?? last.startedAt) + retroRetryDelayMs(failures);
           if (!(Date.now() >= retryAt)) return pending(`Chick's retrospective draft failed or was interrupted ${failures} time(s); the next attempt starts after ${new Date(Number.isFinite(retryAt) ? retryAt : Date.now()).toISOString()}.`);
@@ -158,7 +159,7 @@ export class RetroPublication {
           if (error instanceof RetroGenerationError) { attempt.generation = error.generation; attempt.errorKind = error.kind; }
           else attempt.errorKind = "draft-error";
           await this.save(context, record);
-          return pending("Chick's retrospective draft failed or was interrupted; it will be retried with backoff.");
+          return pending(context.goal.workflowModel === "goals-v1" ? "Chick's retrospective draft failed or was interrupted; deliver a retry event after resolving the failure." : "Chick's retrospective draft failed or was interrupted; it will be retried with backoff.");
         }
         if (draft.snapshot.goalId !== context.goal.id || draft.snapshot.leadSeatId !== context.goal.seatId || draft.markdown !== await renderSprintRetro(draft.snapshot, draft.narrative, draft.generation)) {
           Object.assign(attempt, { finishedAt: new Date().toISOString(), errorKind: "unverified-content", generation: draft.generation });
@@ -233,12 +234,39 @@ export class RetroPublication {
 }
 
 /** Read only persisted evidence. Missing attempt coverage and unrecorded wall time stay explicitly unknown. */
-export async function recordedRetroInput(context: CeremonyContext, retroAttempts: RetroPriorAttempt[] = []): Promise<RetroInput> {
+export async function recordedRetroInput(context: CeremonyContext, retroAttempts: RetroPriorAttempt[] = [], github = new SprintGitHub(processShell, context.store.runtimeDir)): Promise<RetroInput> {
   const { goal, store } = context;
   const record = await store.readRuntimeFile<BridgeCeremonyRecord>(ceremonyRuntimeName(goal.id));
   const facts: RetroInput["facts"] = structuredClone(record?.facts ?? { seats: [], sessions: [], reviews: [], rounds: [], failures: [] });
   const missing: string[] = [];
   if (!record) missing.push("Chick's historical ceremony runtime record is unavailable.");
+  if (goal.workflowModel === "goals-v1") {
+    const release = goal.ceremony?.history.find((entry) => entry.stage === "release");
+    const delivered = release?.evidence.kind === "implementation" ? release.evidence.goalDelivery : undefined;
+    const report = validateGoalReport(delivered);
+    const runtime = await store.readRuntimeFile<GoalRuntimeRecord>(goalRuntimeFilename(goal.id));
+    if (runtime && (runtime.goalId !== goal.id || runtime.teamId !== goal.teamId)) throw new Error("Goal runtime evidence belongs to another goal.");
+    const project = requireTeamHome(await store.read(), goal.teamId).github;
+    const lanePrs = [];
+    for (const proof of report.lanePrs) {
+      const source = await github.prRetrospective(project, goal.id, proof.url, proof.headSha);
+      for (const key of ["decisions", "followUps"] as const) {
+        if (source[key] === null) missing.push(`${proof.laneId}: the merged PR has no ${key === "decisions" ? "Decisions" : "Follow-ups"} section.`);
+        else if (source[key]!.length > 1800) { source[key] = `${source[key]!.slice(0, 1800)} [truncated for archive]`; missing.push(`${proof.laneId}: a long PR section was truncated for the archive.`); }
+      }
+      lanePrs.push(source);
+      const lane = runtime?.lanes.find((lane) => lane.id === proof.laneId && lane.headSha === proof.headSha && lane.mergedSha === proof.mergedSha);
+      if (lane && [lane.fixRounds, lane.conflictRounds].every((count) => Number.isSafeInteger(count) && count >= 0)) {
+        facts.rounds.push({ outcomeId: lane.id, fix: lane.fixRounds, conflict: lane.conflictRounds });
+        facts.reviews.push({ outcomeId: lane.id, prUrl: proof.url, findings: lane.findings.map((finding) => `${finding.path}:${finding.line}: ${finding.reason}`) });
+      } else missing.push(`${proof.laneId}: complete shared lane round and finding records are unavailable.`);
+    }
+    for (const seatId of new Set([goal.seatId, report.seatId])) if (!facts.seats.some((seat) => seat.seatId === seatId)) facts.seats.push({ seatId, wallTimeMs: null });
+    missing.push("The public goal record does not contain Developer invocation timings or token counters; these remain unknown. Lane findings are the latest recorded verdict, not a complete history of earlier reviews.");
+    const releaseAttempts = await store.readRuntimeFile<ReleaseAttempts>(releaseAttemptsName(goal.id));
+    if (!releaseAttempts) missing.push("Integration conflict and merge-attempt history is unavailable.");
+    return { goal, facts, cutoffAt: new Date().toISOString(), missing, retroAttempts, lanePrs, releaseAttempts };
+  }
   const names = await readdir(store.runtimeDir);
   for (const assignment of goal.assignments ?? []) {
     const name = seatRecordName(assignment.seatId, goal.id, assignment.outcomeId);

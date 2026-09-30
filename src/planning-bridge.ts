@@ -3,14 +3,17 @@ import { withFileLock } from "./state-commit.js";
 import { advanceCeremony, closeCeremony, closeRevertedRelease, type CeremonyStage, type HumanApproval, type ImplementationEvidence, type PublishedRetroEvidence, type RunningReleaseEvidence } from "./ceremony.js";
 import type { CeremonyRuntimeRecord } from "./ceremony-ports.js";
 import { randomUUID } from "node:crypto";
-import type { AgentRuntime } from "./codex-runtime.js";
+import type { AgentRuntime, WriteAccess } from "./codex-runtime.js";
 import type { RuntimeSessionFacts } from "./runtime-facts.js";
 import { schemaPathOf } from "./reload.js";
 import { CLARIFY_TIMEOUT_MS, DRAFT_TIMEOUT_MS, planningId } from "./codex-runtime.js";
 import { PlanningStore, developerSeats, missingTeamMessage, requireTeamHome, teamProject, validateOutcomeSeats, type MergeKind, type PlanningDocument, type PlanningGoal, type RuntimeRecord, type SprintIntegration } from "./planning.js";
 import { processShell, type Shell } from "./developer-seat.js";
-import { SprintGitHub, sprintBranch } from "./sprint.js";
+import { SprintGitHub, sprintBranch, releaseAttemptsName, type ReleaseAttempts } from "./sprint.js";
 import { PROPOSE_EMOJI, APPROVE_EMOJI, rootMessage, proposalMessage, approvalMessage, outcomeLines, sprintSummary, integrationMessage, revertMessage, prompt, type Seat } from "./planning-text.js";
+import { goalRuntimeFilename, productRuntimeFilename, teamRuntimeFilename, ownedFilesOverlap, validateGoalBrief, validateGoalReport, validateProductProposal, type GoalBrief, type GoalRuntimeRecord, type ProductProposal, type ProductRuntimeRecord, type SchedulerRuntimeRecord, type WorkflowEvent } from "./goal-contract.js";
+import { validateWorkflowEvent, workflowDigest, type WorkflowConsumer } from "./remodel-events.js";
+import { redactSecrets } from "./redact.js";
 
 export interface Post { id: string; user_id: string; channel_id: string; root_id: string; message: string; create_at: number; props?: { indra_delivery_id?: string } }
 export interface Reaction { user_id: string; post_id: string; emoji_name: string; create_at: number }
@@ -40,6 +43,11 @@ interface BridgeRecord extends Omit<RuntimeRecord, "pending" | "mergePosts"> {
   turn?: { inputKey: string; since: number; drafting: boolean; startedAt: string; run?: Awaited<ReturnType<AgentRuntime["message"]>>; draft?: NonNullable<PlanningGoal["proposal"]>; failure?: { finishedAt: string; facts?: BridgeSessionFacts } };
 }
 interface StartIntent { goal: PlanningGoal; since: number }
+interface SchedulerWorkRecord {
+  events: WorkflowEvent[]; handledEventIds: string[]; failure: SchedulerRuntimeRecord["failure"];
+}
+const schedulerWorkName = (teamId: string, key: string) => `scheduler-work-${teamId}-${key}`;
+const workflowFailure = (error: unknown): NonNullable<SchedulerRuntimeRecord["failure"]> => ({ at: new Date().toISOString(), message: error instanceof Error ? redactSecrets(error.message).slice(0, 1000) : "Scheduler work failed; retry the retained event.", retryable: true });
 /** Release/retro adapters return pending until they have verified external evidence. */
 export type CeremonyProgress<T> = { status: "pending"; reason: string } | { status: "complete"; evidence: T };
 export interface CeremonyContext {
@@ -59,6 +67,11 @@ export interface CeremonyAdapters {
     /** Called only from a verified human checkmark on an adapter post or the owner's M command. */
     merge?(context: CeremonyContext, approval?: HumanApproval): Promise<string>;
   };
+}
+export interface SchedulerServices {
+  runtimeFor?(cwd: string, write?: WriteAccess): AgentRuntime;
+  /** Tests may replace external reads, but the production default resolves the state-derived managed project. */
+  projectContext?(github: string): Promise<{ cwd: string; mission: string; retros: GoalBrief["retros"] }>;
 }
 /** The producer contract is shared by successful results and AgentRunError.facts. */
 export type BridgeSessionFacts = RuntimeSessionFacts;
@@ -119,14 +132,247 @@ const reviewing = (goal: PlanningGoal) => goal.stage === "awaiting-review" || go
 const stageOf = (goal: PlanningGoal): CeremonyStage => goal.ceremony?.stage ?? (goal.stage === "approved" ? "implement" : goal.stage === "clarifying" ? "planning" : "proposal");
 const canDraft = (goal: PlanningGoal) => !goal.ceremony?.closure && !goal.proposal && ["planning", "proposal"].includes(stageOf(goal));
 const canClarify = (goal: PlanningGoal, metadata: BridgeRecord) => stageOf(goal) === "planning" || (canDraft(goal) && !!metadata.proposalRequest);
+const integrationNotice = (goal: PlanningGoal, url: string) => goal.workflowModel === "goals-v1" ? `**Integration for ${goal.id}: ${url}**\nThe sprint targets main. A fresh current-head bot review, passing CI and enforced server policy are required; merge then proceeds automatically. Release waits for the verified running build.` : integrationMessage(goal, url, ownerOmissions(goal));
+const revertNotice = (goal: PlanningGoal, url: string) => goal.workflowModel === "goals-v1" ? `**Rollback for ${goal.id}: ${url}**\nThe revert targets main and uses the same current-head bot review, CI and protected automatic merge gate.` : revertMessage(goal, url);
 
 /** One process serializes each seat. Poll cursors, handled posts and handled reactions survive restart. */
 export class PlanningBridge {
   private readonly busy = new Map<string, Promise<void>>();
   private readonly github: SprintGitHub;
   /** `shell` runs gh and git for the sprint's integration branch, PR, merge and rollback. */
-  constructor(private readonly store: PlanningStore, private readonly chat: PlanningChat, private readonly runtime: AgentRuntime, private readonly maxQueue = 20, private readonly shell: Shell = processShell, private readonly adapters: CeremonyAdapters = {}) {
+  constructor(private readonly store: PlanningStore, private readonly chat: PlanningChat, private readonly runtime: AgentRuntime, private readonly maxQueue = 20, private readonly shell: Shell = processShell, private readonly adapters: CeremonyAdapters = {}, private readonly scheduler: SchedulerServices = {}) {
     this.github = new SprintGitHub(shell, store.runtimeDir);
+  }
+
+  /** Compatibility entry point; production runs dispatch and slow consumers independently. */
+  async turn(input: WorkflowEvent): Promise<{ record: SchedulerRuntimeRecord; events: WorkflowEvent[] }> {
+    const event = validateWorkflowEvent(input);
+    await this.dispatch(event);
+    for (const consumer of await this.consumers(event.teamId)) await consumer.turn(event);
+    return await this.dispatch({ kind: "startup", teamId: event.teamId, at: new Date().toISOString() });
+  }
+
+  /** Sole TeamRuntime writer. No Developer lock wait or model invocation belongs in this short consumer. */
+  async dispatch(input: WorkflowEvent): Promise<{ record: SchedulerRuntimeRecord; events: WorkflowEvent[] }> {
+    const event = validateWorkflowEvent(input);
+    return await this.store.withGoalLock("workflow-scheduler", async () => {
+      const state = await this.store.read();
+      const team = (state.teams as { id: string; workflowModel?: string }[]).find((team) => team.id === event.teamId);
+      if (!team || team.workflowModel !== "goals-v1") throw new Error("Finite scheduling requires an explicitly enabled goals-v1 team.");
+      const record = await this.store.readRuntimeFile<SchedulerRuntimeRecord>(teamRuntimeFilename(team.id)) ?? {
+        version: 1, teamId: team.id, events: [], handledEventIds: [], redirects: [], activeDispatches: [], approvedQueue: [], failure: null, updatedAt: event.at,
+      };
+      const emit = (next: WorkflowEvent) => { const valid = validateWorkflowEvent(next); if (valid.kind !== "startup" && !record.events.some((old) => old.kind !== "startup" && old.id === valid.id)) record.events.push(valid); };
+      if (event.kind !== "startup" && record.handledEventIds.includes(event.id)) return { record, events: record.events };
+      if (event.kind !== "startup" && event.kind !== "redirect") emit(event);
+      record.failure = null;
+      try {
+        const goals = (state.planningGoals ?? []).filter((goal) => goal.teamId === team.id && goal.workflowModel === "goals-v1");
+        for (const key of ["vetting", ...goals.map((goal) => goal.id)]) {
+          const work = await this.store.readRuntimeFile<SchedulerWorkRecord>(schedulerWorkName(team.id, key));
+          for (const next of work?.events ?? []) emit(next);
+          if (work?.failure) record.failure ??= work.failure;
+        }
+        // Socket payloads and local events wake GET reconciliation; neither proves a human identity.
+        for (const goal of goals.filter((goal) => !goal.ceremony?.closure)) {
+          await this.productApproval(goal);
+          const posts = await this.chat.since(goal.mattermost.channelId, Date.parse(goal.createdAt) - 5000);
+          for (const post of posts.filter((post) => post.root_id === goal.mattermost.rootPostId && post.channel_id === goal.mattermost.channelId && post.message.trim())) {
+            if (record.redirects.some((redirect) => redirect.postId === post.id) || !await this.human(state, goal, post.user_id)) continue;
+            const redirect = { postId: post.id, userId: post.user_id, at: new Date(post.create_at).toISOString(), message: post.message };
+            record.redirects.push(redirect);
+            emit({ kind: "redirect", id: `redirect:${team.id}:${post.id}`, teamId: team.id, at: redirect.at, goalId: null, redirect });
+          }
+        }
+        await this.schedule(team.id, record, emit);
+        if (event.kind !== "startup") record.handledEventIds.push(event.id);
+      } catch (error) { record.failure = workflowFailure(error); }
+      record.updatedAt = new Date().toISOString(); await this.store.saveRuntime(teamRuntimeFilename(team.id), record);
+      return { record: structuredClone(record), events: structuredClone(record.events) };
+    });
+  }
+
+  /** Each slow consumer has its own receipt and journal; the host owns and awaits all their finite turns. */
+  async consumers(teamId: string): Promise<WorkflowConsumer[]> {
+    const goals = (await this.store.read()).planningGoals?.filter((goal) => goal.teamId === teamId && goal.workflowModel === "goals-v1" && goal.goalAssignment) ?? [];
+    return [
+      { consumer: `scheduler-vetting-${teamId}`, turn: async (event) => await this.vet(event) },
+      ...goals.map((goal) => ({ consumer: `scheduler-release-${goal.id}`, turn: async (event: WorkflowEvent) => await this.progress(goal.id, event) })),
+    ];
+  }
+
+  private async work(teamId: string, key: string, action: (record: SchedulerWorkRecord, emit: (event: WorkflowEvent) => void) => Promise<void>): Promise<WorkflowEvent[]> {
+    const name = schedulerWorkName(teamId, key);
+    const record = await this.store.readRuntimeFile<SchedulerWorkRecord>(name) ?? { events: [], handledEventIds: [], failure: null };
+    const before = workflowDigest(record);
+    const emit = (event: WorkflowEvent) => { const next = validateWorkflowEvent(event); if (next.kind !== "startup" && !record.events.some((old) => old.kind !== "startup" && old.id === next.id)) record.events.push(next); };
+    const previous = record.failure; record.failure = null;
+    try { await action(record, emit); } catch (error) { record.failure = workflowFailure(error); }
+    if (previous?.message === record.failure?.message) record.failure = previous;
+    await this.store.saveRuntime(name, record);
+    const events = [...record.events]; const digest = workflowDigest(record);
+    // An unchanged failure/outbox never generates another self-wakeup.
+    if (digest !== before) events.push({ kind: "queue-changed", id: `scheduler-work:${name}:${digest}`, teamId, at: "1970-01-01T00:00:00.000Z" });
+    return events;
+  }
+
+  private async vet(event: WorkflowEvent): Promise<WorkflowEvent[]> {
+    return await this.store.withGoalLock(`workflow-vetting-${event.teamId}`, async () => await this.work(event.teamId, "vetting", async (work, emit) => {
+      const record = await this.store.readRuntimeFile<SchedulerRuntimeRecord>(teamRuntimeFilename(event.teamId));
+      if (record) await this.vetNext(event.teamId, { ...record, events: [...record.events, ...work.events] }, emit);
+    }));
+  }
+
+  private async progress(goalId: string, event: WorkflowEvent): Promise<WorkflowEvent[]> {
+    if ("goalId" in event && event.goalId && event.goalId !== goalId) return [];
+    const snapshot = (await this.store.read()).planningGoals?.find((goal) => goal.id === goalId && goal.teamId === event.teamId);
+    if (snapshot?.ceremony?.stage === "implement" && !snapshot.ceremony.closure && event.kind !== "developer-report") {
+      const reported = await this.store.readRuntimeFile<GoalRuntimeRecord>(goalRuntimeFilename(goalId));
+      const team = await this.store.readRuntimeFile<SchedulerRuntimeRecord>(teamRuntimeFilename(event.teamId));
+      // The Developer owns this goal for its whole finite turn. Without a report there is nothing to release.
+      if (!reported?.report && !team?.events.some((item) => item.kind === "developer-report" && item.goalId === goalId)) return [];
+    }
+    return await this.store.withGoalLock(goalId, async () => await this.work(event.teamId, goalId, async (work, emit) => {
+      const goal = (await this.store.read()).planningGoals?.find((goal) => goal.id === goalId && goal.teamId === event.teamId && goal.workflowModel === "goals-v1" && goal.goalAssignment);
+      if (!goal) return;
+      if (goal.ceremony?.closure) { emit({ kind: "goal-closed", id: `closed:${goal.id}`, teamId: goal.teamId, goalId: goal.id, at: goal.ceremony.closure.closedAt }); return; }
+      const record = await this.store.readRuntimeFile<SchedulerRuntimeRecord>(teamRuntimeFilename(event.teamId));
+      for (const pending of [...record?.events ?? [], event].filter((item): item is Extract<WorkflowEvent, { kind: "developer-report" }> => item.kind === "developer-report" && item.goalId === goal.id)) {
+        if (work.handledEventIds.includes(pending.id)) continue;
+        await this.acceptReport(pending); work.handledEventIds.push(pending.id);
+      }
+      let current = (await this.store.read()).planningGoals!.find((item) => item.id === goal.id)!;
+      const runtime = await this.store.readRuntimeFile<GoalRuntimeRecord>(goalRuntimeFilename(goal.id));
+      if (current.ceremony?.stage === "implement" && runtime?.report) await this.acceptReport({ kind: "developer-report", id: `report:${workflowDigest(runtime.report)}`, teamId: goal.teamId, goalId: goal.id, seatId: runtime.report.seatId, report: runtime.report, at: runtime.updatedAt });
+      current = (await this.store.read()).planningGoals!.find((item) => item.id === goal.id)!;
+      const metadata = await this.metadata(goal.id);
+      if (metadata.pending) await this.deliver(current, metadata);
+      await this.recoverMilestonePosts(current, metadata);
+      await this.announceStages(current, metadata);
+      if (current.ceremony?.stage === "release" && current.integration?.status === "collecting") await this.openIntegration(current, metadata);
+      current = (await this.store.read()).planningGoals!.find((item) => item.id === goal.id)!;
+      const pr = current.integration?.status === "pr-open" ? current.integration.prUrl : current.integration?.status === "merged" ? current.integration.revertPrUrl : undefined;
+      if (pr) {
+        const scope = await this.github.integrationScope(this.project(await this.store.read(), current), current.id, current.ownedFiles!, pr, current.integration?.revertPrUrl === pr);
+        const attempts = await this.store.readRuntimeFile<ReleaseAttempts>(releaseAttemptsName(goal.id));
+        const retained = [...attempts?.corrections ?? []].reverse().find((item) => item.status === "blocked");
+        const correctionScope = scope.conflicting ? scope : event.kind === "retry" && retained ? retained : undefined;
+        if (correctionScope) {
+          const { headSha, baseSha } = correctionScope;
+          if (scope.conflicting && attempts && !attempts.conflicts.some((item) => item.prUrl === pr && item.headSha === scope.headSha && item.baseSha === scope.baseSha)) {
+            attempts.conflicts.push({ prUrl: pr, headSha: scope.headSha, baseSha: scope.baseSha, at: new Date().toISOString() });
+            await this.store.saveRuntime(releaseAttemptsName(goal.id), attempts);
+          }
+          if (!attempts || !this.scheduler.runtimeFor) throw new Error(`Integration ${pr} conflicts with main; the finite correction runtime or release journal is unavailable.`);
+          const prior = [...attempts.corrections ?? []].reverse().find((item) => item.headSha === headSha && item.baseSha === baseSha);
+          if (prior?.status === "blocked" && event.kind !== "retry") throw new Error(`Integration ${pr} needs an owner decision or an explicit retry event for its recorded conflict.`);
+          const correction: NonNullable<ReleaseAttempts["corrections"]>[number] = { headSha, baseSha, startedAt: new Date().toISOString(), status: "running", decisions: [] };
+          (attempts.corrections ??= []).push(correction); await this.store.saveRuntime(releaseAttemptsName(goal.id), attempts);
+          try {
+            const fixed = await this.github.resolveIntegration(this.project(await this.store.read(), current), current.id, current.ownedFiles!, pr, headSha, baseSha, async (cwd, sharedGitDir) => {
+              const run = await this.scheduler.runtimeFor!(cwd, { extraDirs: [sharedGitDir] }).message(`Resolve the retained integration merge for ${current.id}. HEAD is ${headSha}; MERGE_HEAD is main at ${baseSha}. Preserve existing partial corrections and notes. Read AGENTS.md. Owned files: ${JSON.stringify(current.ownedFiles)}. Resolve only mechanical conflicts inside that scope. Preserve main's unrelated changes. Do not commit, push, rebase, change refs, create a PR, merge on GitHub, or edit other files. Run the relevant permitted checks after correction. Stop every process you start before returning. If the correction requires an architectural choice or any unowned file, stop and put the blocker in openQuestions. Return brief JSON: reply, summary, decisions (including checks with actual exit codes), openQuestions.`, briefSchema, undefined);
+              await this.recordRun(current, run); const result = brief(run.response);
+              return { decisions: result.decisions, blocked: result.openQuestions };
+            }, current.integration?.revertPrUrl === pr);
+            correction.status = "pushed"; correction.resultSha = fixed.headSha; correction.decisions = fixed.decisions;
+          } catch (error) { correction.status = "blocked"; throw error; }
+          finally { correction.finishedAt = new Date().toISOString(); await this.store.saveRuntime(releaseAttemptsName(goal.id), attempts); }
+          // The new head is reviewed immediately below; its CI arrives at the event boundary.
+        }
+        const inspected = await this.github.inspectMerge(pr);
+        if (inspected.state === "OPEN" && !inspected.reviewed) await this.github.reviewIntegration(this.project(await this.store.read(), current), current.id, pr, inspected.headSha, async (cwd) => {
+          const reviewer = this.scheduler.runtimeFor?.(cwd) ?? this.runtime;
+          const run = await reviewer.message(`Fresh read-only review of ${pr} at ${inspected.headSha}. Read AGENTS.md and the diff against origin/main. You did not author it. Flag only its blocking review list, never style. Return summary and findings with path, line and reason. Do not write, commit, push, merge or post; the host posts your verdict.`, schemaPathOf(import.meta.url, "retro-review.json"), undefined, { purpose: "review" });
+          await this.recordRun(current, run); return run.response;
+        });
+        const result = await this.mergeGate(current.id, undefined, metadata);
+        if (!result.merged && !result.recorded) work.failure = { at: new Date().toISOString(), message: result.message, retryable: true };
+        else if (result.merged) {
+          await this.postIntent(current, metadata, `workflow-merge:${pr}`, result.message);
+          const merged = await this.github.inspectMerge(pr);
+          if (merged.state !== "MERGED" || !merged.mergedSha) throw new Error("The merge event is waiting for verified GitHub evidence.");
+          emit({ kind: "merge", id: `integration-merged:${pr}:${merged.headSha}`, teamId: event.teamId, goalId: current.id, laneId: null, prUrl: pr, headSha: merged.headSha, mergedSha: merged.mergedSha, at: new Date().toISOString() });
+        }
+      }
+      // Recover the update notification if the process died after committing a merge to state.
+      const committed = (await this.store.read()).planningGoals!.find((item) => item.id === current.id)!;
+      const landedUrl = committed.integration?.status === "reverted" ? committed.integration.revertPrUrl : committed.integration?.status === "merged" ? committed.integration.prUrl : undefined;
+      if (landedUrl) {
+        const landed = await this.github.inspectMerge(landedUrl);
+        if (landed.state === "MERGED" && landed.mergedSha && landed.reviewed && landed.checksPassed) emit({ kind: "merge", id: `integration-merged:${landedUrl}:${landed.headSha}`, teamId: event.teamId, goalId: current.id, laneId: null, prUrl: landedUrl, headSha: landed.headSha, mergedSha: landed.mergedSha, at: committed.updatedAt });
+      }
+      await this.ceremonyProgress(goal.id);
+      const finished = (await this.store.read()).planningGoals!.find((item) => item.id === goal.id)!;
+      if (finished.ceremony?.closure) emit({ kind: "goal-closed", id: `closed:${goal.id}`, teamId: event.teamId, goalId: goal.id, at: finished.ceremony.closure.closedAt });
+    }));
+  }
+
+  private async acceptReport(event: Extract<WorkflowEvent, { kind: "developer-report" }>): Promise<void> {
+    const report = validateGoalReport(event.report); const state = await this.store.read();
+    const goal = state.planningGoals?.find((goal) => goal.id === event.goalId && goal.teamId === event.teamId);
+    if (!goal || goal.workflowModel !== "goals-v1" || goal.ceremony?.closure || !goal.goalAssignment || goal.goalAssignment.seatId !== report.seatId || report.goalId !== goal.id || report.teamId !== goal.teamId) throw new Error("Report does not belong to an active assigned goal.");
+    if (goal.ceremony?.stage !== "implement") return;
+    await this.github.verifyGoalReport(this.project(state, goal), goal.ownedFiles!, report, goal.integration!.baseSha);
+    await this.store.update((state) => {
+      const current = state.planningGoals!.find((item) => item.id === goal.id)!;
+      if (current.ceremony?.stage !== "implement" || current.ceremony.closure) return;
+      current.goalAssignment!.status = "reported"; current.goalAssignment!.updatedAt = event.at;
+      current.ceremony = advanceCeremony(current, { to: "release", at: new Date().toISOString(), evidence: { kind: "implementation", outcomes: [], goalDelivery: report } });
+      current.updatedAt = new Date().toISOString();
+    }, `Verify whole-goal delivery ${goal.id}`);
+  }
+
+  private async schedule(teamId: string, record: SchedulerRuntimeRecord, emit: (event: WorkflowEvent) => void): Promise<void> {
+    let state = await this.store.read(); const home = requireTeamHome(state, teamId);
+    const queue = (state.planningGoals ?? []).filter((goal) => goal.teamId === teamId && goal.workflowModel === "goals-v1" && goal.stage === "approved" && !goal.ceremony?.closure && !goal.goalAssignment).sort((a, b) => a.goalProposal!.rank - b.goalProposal!.rank || a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+    record.approvedQueue = [];
+    for (const goal of queue) {
+      state = await this.store.read();
+      const held = (state.planningGoals ?? []).filter((other) => other.id !== goal.id && !other.ceremony?.closure && teamProject(state, other.teamId)?.toLowerCase() === home.github.toLowerCase() && (other.workflowModel !== "goals-v1" || other.goalAssignment));
+      const blocked = held.filter((other) => !other.ownedFiles || ownedFilesOverlap(goal.ownedFiles!, other.ownedFiles));
+      const busy = new Set((state.planningGoals ?? []).filter((other) => !other.ceremony?.closure && other.goalAssignment && ["assigned", "running", "failed"].includes(other.goalAssignment.status)).map((other) => other.goalAssignment!.seatId));
+      const seat = developerSeats(state, teamId).find((seat) => !busy.has(seat.id));
+      if (blocked.length || !seat) { record.approvedQueue.push({ goalId: goal.id, rank: goal.goalProposal!.rank, ownedFiles: goal.ownedFiles!, blockedByGoalIds: blocked.map((other) => other.id) }); continue; }
+      const context = await (this.scheduler.projectContext?.(home.github) ?? this.github.projectContext(home.github));
+      const baseSha = await this.github.ensureBranch(home.github, goal.id); const at = new Date().toISOString();
+      const brief = validateGoalBrief({ version: 1, goalId: goal.id, teamId, seatId: seat.id, header: { repo: home.github, baseBranch: "main", baseSha, branch: sprintBranch(goal.id), prTarget: "main" },
+        outcomes: goal.goalProposal!.outcomes, ownedFiles: goal.ownedFiles!, exclusions: held.filter((other) => other.ownedFiles).map((other) => ({ files: other.ownedFiles!, owner: `${other.goalAssignment?.seatId ?? other.seatId} / ${other.id}`, reason: "Another open goal owns this scope until closure." })),
+        swarm: "Split the goal into a contract only when needed and file-disjoint lanes; each lead may swarm independent single-file workers. Stop and report any needed unowned file.", retros: context.retros.slice(0, 3), redirects: record.redirects,
+        reportFormat: "Return GoalReport: lane PR URLs, immutable head/merge SHAs, reviewer and CI, exact commands and exit codes, decisions, follow-ups and needed-but-unowned files." });
+      const initial: GoalRuntimeRecord = { version: 1, goalId: goal.id, teamId, assignment: { seatId: seat.id, status: "assigned", updatedAt: at }, brief, plan: null, lanes: [], report: null, events: [], handledEventIds: [], redirects: [...record.redirects], failure: null, updatedAt: at };
+      // Assignment is the ownership handoff. No Scheduler write touches this record after it succeeds.
+      await this.store.saveRuntime(goalRuntimeFilename(goal.id), initial);
+      await this.store.assignGoal(goal.id, seat.id, { branch: sprintBranch(goal.id), baseSha, status: "collecting" }, at);
+    }
+    state = await this.store.read(); record.activeDispatches = [];
+    for (const goal of (state.planningGoals ?? []).filter((goal) => goal.teamId === teamId && goal.workflowModel === "goals-v1" && goal.goalAssignment && !goal.ceremony?.closure)) {
+      const runtime = await this.store.readRuntimeFile<GoalRuntimeRecord>(goalRuntimeFilename(goal.id));
+      if (!runtime?.brief) throw new Error(`Assigned goal ${goal.id} has no durable brief; dispatch is blocked.`);
+      const brief = validateGoalBrief(runtime.brief);
+      record.activeDispatches.push({ goalId: goal.id, seatId: goal.goalAssignment!.seatId, status: goal.ceremony?.stage === "retro" ? "retro" : goal.ceremony?.stage === "release" ? "releasing" : goal.goalAssignment!.status === "failed" ? "running" : goal.goalAssignment!.status, assignedAt: runtime.assignment?.updatedAt ?? goal.goalAssignment!.updatedAt, brief });
+      if (goal.ceremony?.stage === "implement") emit({ kind: "approval", id: `dispatch:${goal.id}`, goalId: goal.id, teamId, at: goal.ceremony.history.find((entry) => entry.stage === "implement")!.enteredAt! });
+    }
+  }
+
+  private async vetNext(teamId: string, record: SchedulerRuntimeRecord, emit: (event: WorkflowEvent) => void): Promise<void> {
+    const product = await this.store.readRuntimeFile<ProductRuntimeRecord>(productRuntimeFilename(teamId));
+    const candidate = product?.queue.find((entry) => entry.status === "proposed" && !entry.vetting)?.proposal;
+    if (!candidate) return;
+    const source = validateProductProposal(candidate); const sourceHash = workflowDigest(source);
+    if (record.events.some((event) => event.kind === "proposal-vetted" && event.id.startsWith(`proposal-vetted:${source.proposalId}:${sourceHash}:`))) return;
+    const state = await this.store.read(); const home = requireTeamHome(state, teamId);
+    const team = (state.teams as { id: string; seats: { id: string; roles: string[] }[] }[]).find((team) => team.id === teamId)!;
+    if (product!.teamId !== teamId || product!.seatId !== source.productSeatId || !team.seats.some((seat) => seat.id === source.productSeatId && seat.roles.includes("Product"))) throw new Error("Vetting candidate does not belong to this team's Product seat.");
+    const lead = team.seats.find((seat) => seat.roles.includes("Team Lead"))!;
+    const context = await (this.scheduler.projectContext?.(home.github) ?? this.github.projectContext(home.github));
+    const run = await (this.scheduler.runtimeFor?.(context.cwd) ?? this.runtime).message(`Technically vet this Product candidate against the project code, mission and retros. Keep all fields exactly unchanged except ownedFiles, which must include every required file. This is scope vetting, not human approval. Do not implement or post. Return the complete ProductProposal JSON.\nMission:\n${context.mission}\nRetros:\n${JSON.stringify(context.retros)}\nCandidate:\n${JSON.stringify(source)}`, schemaPathOf(import.meta.url, "product-proposal.json"), undefined);
+    const corrected = validateProductProposal(run.response);
+    if (JSON.stringify({ ...corrected, ownedFiles: source.ownedFiles }) !== JSON.stringify(source)) throw new Error("Technical vetting changed the candidate beyond its owned-file scope.");
+    const latest = await this.store.readRuntimeFile<ProductRuntimeRecord>(productRuntimeFilename(teamId));
+    if (!latest?.queue.some((entry) => workflowDigest(validateProductProposal(entry.proposal)) === sourceHash)) return;
+    const at = new Date().toISOString();
+    emit({ kind: "proposal-vetted", id: `proposal-vetted:${source.proposalId}:${sourceHash}:${workflowDigest(corrected)}`, teamId, goalId: source.goalId, at,
+      vetting: { proposalId: source.proposalId, leadSeatId: lead.id, ownedFiles: corrected.ownedFiles, notes: ["Scope reviewed against the project and mission; human proposal approval is still required."], at } });
   }
 
   /** The team creation lock covers the reservation, remote post and state commit. */
@@ -259,8 +505,8 @@ export class PlanningBridge {
       const key = `stage:${goal.id}:${entry.stage}`;
       // Stages recorded by legacy migration happened before the ceremony and were never announced; don't announce them late.
       if (entry.stage !== "planning" && entry.enteredAt !== null) {
-        const detail = entry.stage === "proposal" ? "Chick is preparing the draft for the owner's plan approval."
-          : entry.stage === "implement" ? approvalMessage(goal, seats)
+        const detail = entry.stage === "proposal" ? goal.workflowModel === "goals-v1" ? "Product's scoped proposal is waiting for a person's approval." : "Chick is preparing the draft for the owner's plan approval."
+          : entry.stage === "implement" ? goal.workflowModel === "goals-v1" ? "The owner approved this goal and its file scope. It is eligible for an idle Developer." : approvalMessage(goal, seats)
           : entry.stage === "release" ? "Implementation is frozen. The integration PR merges after current-head bot approval and green CI; running build verification completes this stage."
           : "The released build is verified running. Chick's retrospective must be published and archived before this goal closes.";
         await this.postIntent(goal, metadata, key, `**Stage: ${entry.stage}**\n${detail}`, entry.enteredAt ? Date.parse(entry.enteredAt) : Date.parse(goal.createdAt));
@@ -291,8 +537,8 @@ export class PlanningBridge {
 
   private async recoverMilestonePosts(goal: PlanningGoal, metadata: BridgeRecord): Promise<void> {
     const integration = goal.integration;
-    if (integration?.prUrl) await this.postIntent(goal, metadata, `integration-pr:${goal.id}`, integrationMessage(goal, integration.prUrl, ownerOmissions(goal)), Date.parse(goal.createdAt), "integration");
-    if (integration?.revertPrUrl) await this.postIntent(goal, metadata, `revert-pr:${goal.id}`, revertMessage(goal, integration.revertPrUrl), Date.parse(goal.createdAt), "revert");
+    if (integration?.prUrl) await this.postIntent(goal, metadata, `integration-pr:${goal.id}`, integrationNotice(goal, integration.prUrl), Date.parse(goal.createdAt), "integration");
+    if (integration?.revertPrUrl) await this.postIntent(goal, metadata, `revert-pr:${goal.id}`, revertNotice(goal, integration.revertPrUrl), Date.parse(goal.createdAt), "revert");
   }
 
   private context(goal: PlanningGoal): CeremonyContext {
@@ -532,12 +778,17 @@ export class PlanningBridge {
     goal = await this.beginRelease(goal, metadata, owner);
     const state = await this.store.read();
     const github = this.project(state, goal);
-    const prUrl = await this.github.openPr(github, goal.integration!.branch, `Sprint ${goal.id}: ${goal.goal}`.slice(0, 200), sprintSummary(goal, teamSeats(state, goal.teamId), ownerOmissions(goal)));
+    const release = goal.ceremony?.history.find((entry) => entry.stage === "release");
+    const report = release?.evidence.kind === "implementation" ? release.evidence.goalDelivery : undefined;
+    if (goal.workflowModel === "goals-v1" && !report) throw new Error("Integration requires the verified whole-goal report.");
+    if (goal.workflowModel === "goals-v1" && !await this.store.readRuntimeFile(releaseAttemptsName(goal.id))) await this.store.saveRuntime(releaseAttemptsName(goal.id), { version: 1, goalId: goal.id, startedAt: new Date().toISOString(), conflicts: [], merges: [] } satisfies ReleaseAttempts);
+    const body = report ? [goal.goal, `Sprint: ${report.sprintBranch} at ${report.headSha}`, "## Lane PRs", ...report.lanePrs.map((lane) => `- ${lane.laneId}: ${lane.url} (${lane.headSha}, merged ${lane.mergedSha})`), "## Validation", ...report.checks.map((check) => `- ${check.command}: exit ${check.exitCode}`), "## Decisions", ...report.decisions.map((decision) => `- ${decision}`), "## Follow-ups", ...report.followUps.map((item) => `- ${item}`)].join("\n\n") : sprintSummary(goal, teamSeats(state, goal.teamId), ownerOmissions(goal));
+    const prUrl = await this.github.openPr(github, goal.integration!.branch, `Sprint ${goal.id}: ${goal.goal}`.slice(0, 200), body);
     await this.store.update((doc) => {
       const found = doc.planningGoals!.find((item) => item.id === goal.id)!;
       if (found.integration?.status === "collecting") { found.integration = { ...found.integration, status: "pr-open", prUrl }; found.updatedAt = new Date().toISOString(); }
     }, `Open integration PR for goal ${goal.id}`);
-    metadata.pending = { inputPostId: `integration-pr:${goal.id}`, since: Date.now(), message: integrationMessage(goal, prUrl, ownerOmissions(goal)), mergePost: "integration" };
+    metadata.pending = { inputPostId: `integration-pr:${goal.id}`, since: Date.now(), message: integrationNotice(goal, prUrl), mergePost: "integration" };
     await this.store.saveRuntime(goal.id, metadata);
     await this.deliver(goal, metadata);
     return prUrl;
@@ -594,7 +845,12 @@ export class PlanningBridge {
     if (target === "revert" && integration.status === "reverted") return { message: `Sprint ${id} is already rolled back (${integration.revertPrUrl}).`, merged: false, post: true };
     const prUrl = target === "integration" && integration.status === "pr-open" ? integration.prUrl : target === "revert" && integration.status === "merged" ? integration.revertPrUrl : undefined;
     if (!target || !prUrl) return { message: `Nothing to merge for sprint ${id}: it is ${integration.status}${integration.status === "collecting" ? " and has no integration PR yet" : ""}.`, merged: false, post: false };
-    const result = await this.github.merge(prUrl);
+    const result = await this.github.merge(prUrl, goal.workflowModel !== "goals-v1" ? undefined : async (headSha) => {
+      const attempts = await this.store.readRuntimeFile<ReleaseAttempts>(releaseAttemptsName(goal.id));
+      if (!attempts) throw new Error("Release attempt journal is missing; merge is blocked until evidence can be reconciled.");
+      attempts.merges.push({ prUrl, headSha, at: new Date().toISOString() });
+      await this.store.saveRuntime(releaseAttemptsName(goal.id), attempts);
+    });
     if (!result.merged) {
       delete metadata.mergeIntent;
       await this.store.saveRuntime(id, metadata);
@@ -648,7 +904,7 @@ export class PlanningBridge {
         const found = doc.planningGoals!.find((item) => item.id === id)!;
         if (found.integration?.status === "merged" && !found.integration.revertPrUrl) { found.integration = { ...found.integration, revertPrUrl: prUrl }; found.updatedAt = new Date().toISOString(); }
       }, `Open revert PR for sprint ${id}`);
-      metadata.pending = { inputPostId: `revert-pr:${id}`, since: Date.now(), message: revertMessage(goal, prUrl), mergePost: "revert" };
+      metadata.pending = { inputPostId: `revert-pr:${id}`, since: Date.now(), message: revertNotice(goal, prUrl), mergePost: "revert" };
       await this.store.saveRuntime(id, metadata);
       await this.deliver(goal, metadata);
       return `Opened the revert PR for sprint ${id}: ${prUrl}`;
@@ -946,8 +1202,7 @@ export class PlanningBridge {
   /** A non-bot Mattermost user who is neither this bridge's account nor Chick's seat. */
   private async human(state: PlanningDocument, goal: PlanningGoal, userId: string): Promise<boolean> {
     const team = (state.teams as { id: string; seats: { id: string; externalIdentities?: { mattermost?: { userId?: string } } }[] }[]).find((item) => item.id === goal.teamId);
-    const chick = team?.seats.find((seat) => seat.id === goal.seatId)?.externalIdentities?.mattermost?.userId;
-    if (userId === (await this.chat.ownUserId()) || userId === chick) return false;
+    if (userId === (await this.chat.ownUserId()) || team?.seats.some((seat) => seat.externalIdentities?.mattermost?.userId === userId)) return false;
     return !(await this.chat.isBot(userId));
   }
 
