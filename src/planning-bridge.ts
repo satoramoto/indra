@@ -176,7 +176,8 @@ export class PlanningBridge {
           if (work?.failure) record.failure ??= work.failure;
         }
         // Socket payloads and local events wake GET reconciliation; neither proves a human identity.
-        for (const goal of goals.filter((goal) => !goal.ceremony?.closure)) {
+        const open = goals.filter((goal) => !goal.ceremony?.closure);
+        for (const goal of open) {
           await this.productApproval(goal);
           const posts = await this.chat.since(goal.mattermost.channelId, Date.parse(goal.createdAt) - 5000);
           for (const post of posts.filter((post) => post.root_id === goal.mattermost.rootPostId && post.channel_id === goal.mattermost.channelId && post.message.trim())) {
@@ -186,6 +187,9 @@ export class PlanningBridge {
             emit({ kind: "redirect", id: `redirect:${team.id}:${post.id}`, teamId: team.id, at: redirect.at, goalId: null, redirect });
           }
         }
+        // Keep only redirects an open goal's scan can still re-read (deduplication) or a new brief can still carry.
+        const since = Math.min(...open.map((goal) => Date.parse(goal.createdAt) - 5000));
+        record.redirects = record.redirects.filter((redirect) => Date.parse(redirect.at) >= since);
         await this.schedule(team.id, record, emit);
         if (event.kind !== "startup") record.handledEventIds.push(event.id);
       } catch (error) { record.failure = workflowFailure(error); }
@@ -337,11 +341,13 @@ export class PlanningBridge {
       if (blocked.length || !seat) { record.approvedQueue.push({ goalId: goal.id, rank: goal.goalProposal!.rank, ownedFiles: goal.ownedFiles!, blockedByGoalIds: blocked.map((other) => other.id) }); continue; }
       const context = await (this.scheduler.projectContext?.(home.github) ?? this.github.projectContext(home.github));
       const baseSha = await this.github.ensureBranch(home.github, goal.id); const at = new Date().toISOString();
+      // A brief carries only direction given while this goal was open, including replies in its own proposal thread.
+      const redirects = record.redirects.filter((redirect) => Date.parse(redirect.at) >= Date.parse(goal.createdAt));
       const brief = validateGoalBrief({ version: 1, goalId: goal.id, teamId, seatId: seat.id, header: { repo: home.github, baseBranch: "main", baseSha, branch: sprintBranch(goal.id), prTarget: "main" },
         outcomes: goal.goalProposal!.outcomes, ownedFiles: goal.ownedFiles!, exclusions: held.filter((other) => other.ownedFiles).map((other) => ({ files: other.ownedFiles!, owner: `${other.goalAssignment?.seatId ?? other.seatId} / ${other.id}`, reason: "Another open goal owns this scope until closure." })),
-        swarm: "Split the goal into a contract only when needed and file-disjoint lanes; each lead may swarm independent single-file workers. Stop and report any needed unowned file.", retros: context.retros.slice(0, 3), redirects: record.redirects,
+        swarm: "Split the goal into a contract only when needed and file-disjoint lanes; each lead may swarm independent single-file workers. Stop and report any needed unowned file.", retros: context.retros.slice(0, 3), redirects,
         reportFormat: "Return GoalReport: lane PR URLs, immutable head/merge SHAs, reviewer and CI, exact commands and exit codes, decisions, follow-ups and needed-but-unowned files." });
-      const initial: GoalRuntimeRecord = { version: 1, goalId: goal.id, teamId, assignment: { seatId: seat.id, status: "assigned", updatedAt: at }, brief, plan: null, lanes: [], report: null, events: [], handledEventIds: [], redirects: [...record.redirects], failure: null, updatedAt: at };
+      const initial: GoalRuntimeRecord = { version: 1, goalId: goal.id, teamId, assignment: { seatId: seat.id, status: "assigned", updatedAt: at }, brief, plan: null, lanes: [], report: null, events: [], handledEventIds: [], redirects: [...redirects], failure: null, updatedAt: at };
       // Assignment is the ownership handoff. No Scheduler write touches this record after it succeeds.
       await this.store.saveRuntime(goalRuntimeFilename(goal.id), initial);
       await this.store.assignGoal(goal.id, seat.id, { branch: sprintBranch(goal.id), baseSha, status: "collecting" }, at);
