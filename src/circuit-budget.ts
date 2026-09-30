@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { AgentResult, AgentRuntime, MessageOptions } from "./codex-runtime.js";
 import type { Shell, ShellResult } from "./command-shell.js";
 import { listProcesses, type OwnedProcess, type ProcessLister } from "./process-tree.js";
-import type { TokenUsage } from "./runtime-facts.js";
+import type { RuntimeSessionFacts, TokenUsage } from "./runtime-facts.js";
 import { withFileLock } from "./state-commit.js";
 
 export interface CircuitPolicy {
@@ -22,7 +22,7 @@ export const DEFAULT_CIRCUIT_POLICY: Readonly<CircuitPolicy> = Object.freeze({
   maxRetries: 10, maxPhaseRetries: 3, maxModelConcurrency: 4,
 });
 export class CircuitOpenError extends Error {
-  constructor(readonly scopeId: string, readonly reason: string) {
+  constructor(readonly scopeId: string, readonly reason: string, readonly facts?: RuntimeSessionFacts) {
     super(`Circuit open for ${scopeId}: ${reason}. An explicit owner budget grant is required.`);
     this.name = "CircuitOpenError";
   }
@@ -293,6 +293,26 @@ export class CircuitBudget {
   protectShell(shell: Shell, context: CircuitContext): Shell { return protectShell(this, shell, context); }
 }
 
+/** Preserve only bounded accounting evidence when a circuit stop replaces a provider result/error. */
+function recordedFacts(value: unknown): RuntimeSessionFacts | undefined {
+  if (!object(value) || !object(value.facts)) return;
+  const facts = value.facts;
+  if (typeof facts.invocationId !== "string" || !facts.invocationId || !["codex", "claude"].includes(String(facts.engine))
+    || typeof facts.startedAt !== "string" || !Number.isFinite(Date.parse(facts.startedAt))
+    || typeof facts.finishedAt !== "string" || !Number.isFinite(Date.parse(facts.finishedAt))
+    || !["succeeded", "failed", "interrupted", "timed-out"].includes(String(facts.status))) return;
+  const counters = (input: unknown): TokenUsage | undefined => !object(input) ? undefined : Object.fromEntries(
+    ["inputTokens", "uncachedInputTokens", "cachedInputTokens", "cacheWriteInputTokens", "outputTokens", "reasoningOutputTokens"]
+      .flatMap((key) => nonnegative(input[key]) ? [[key, input[key]]] : []));
+  return {
+    invocationId: facts.invocationId, engine: facts.engine as RuntimeSessionFacts["engine"],
+    ...(typeof facts.sessionId === "string" ? { sessionId: facts.sessionId } : {}),
+    startedAt: facts.startedAt, finishedAt: facts.finishedAt, status: facts.status as RuntimeSessionFacts["status"],
+    usage: counters(facts.usage), cumulativeUsage: counters(facts.cumulativeUsage),
+    ...(typeof facts.usageComplete === "boolean" ? { usageComplete: facts.usageComplete } : {}),
+  };
+}
+
 type ObservedOptions = MessageOptions & { onUsage?: (usage: TokenUsage) => void };
 type BoundedShell = { run(command: string, args: string[], cwd: string, options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<ShellResult> };
 
@@ -347,6 +367,9 @@ async function protectedRun<T>(budget: CircuitBudget, kind: "model" | "command",
       try { await budget.stop("budget accounting unavailable"); } catch (error) { failure = accountingError(error); }
     }
     try { await budget.finish(reservation.id, finalUsageKnown); } catch (error) { stop(error); }
+  }
+  if (failure instanceof CircuitOpenError && kind === "model") {
+    throw new CircuitOpenError(failure.scopeId, failure.reason, recordedFacts(executionError) ?? recordedFacts(value));
   }
   if (failure) throw failure;
   if (executionError) throw executionError;
