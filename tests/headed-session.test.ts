@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -267,4 +267,71 @@ describe("the pane during a headed run", () => {
       expect(await readHeadedMarker(file, () => false)).toBeUndefined();
     } finally { await rm(`${dir}.runtime`, { recursive: true, force: true }); }
   });
+});
+
+
+it.each(["codex", "claude"] as const)("enforces live usage callbacks in headed %s and cleans task files", async (engine) => {
+  const child = new Headed(); vi.mocked(spawn).mockReturnValue(child as unknown as ReturnType<typeof spawn>);
+  const onUsage = vi.fn(() => { throw new Error("budget reached"); });
+  const home = join(dir, "harness", "seat-004", "codex");
+  const runtime = engine === "codex" ? new CodexRuntime(dir, 60_000, { extraDirs: [] }, home, undefined, true) : new ClaudeRuntime(dir, 60_000, { extraDirs: [] }, undefined, true);
+  const run = failure(runtime.message("Build", schema, undefined, { onUsage }));
+  await launched();
+  if (engine === "claude") {
+    const args = call()[1]; const id = args[args.indexOf("--session-id") + 1];
+    await transcript(id, [{ type: "assistant", sessionId: id, message: { id: "msg-budget", usage: { input_tokens: 5, cache_read_input_tokens: 10, cache_creation_input_tokens: 20, output_tokens: 7 } } }]);
+  } else {
+    await mkdir(join(home, "sessions"), { recursive: true });
+    await writeFile(join(home, "sessions", "rollout-budget.jsonl"), [
+      { type: "session_meta", payload: { id: "budget-session", cwd: dir } },
+      { type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { input_tokens: 35, output_tokens: 7 } } } },
+    ].map((value) => JSON.stringify(value)).join("\n") + "\n");
+  }
+  const error = await run;
+  expect(onUsage).toHaveBeenCalledWith(expect.objectContaining({ inputTokens: 35, outputTokens: 7 }));
+  expect(error.facts.usage).toMatchObject({ inputTokens: 35, outputTokens: 7 });
+  expect(child.kill).toHaveBeenCalled();
+  expect((await readdir(join(dir, ".indra"))).filter((file) => /^(task|result)-/.test(file))).toEqual([]);
+});
+
+
+it.each(["codex", "claude"] as const)("keeps headed %s visible until its terminal usage receipt follows the result file", async (engine) => {
+  const child = new Headed(); vi.mocked(spawn).mockReturnValue(child as unknown as ReturnType<typeof spawn>);
+  const home = join(dir, "harness", "seat-004", "codex");
+  const runtime = engine === "codex" ? new CodexRuntime(dir, 60_000, { extraDirs: [] }, home, undefined, true) : new ClaudeRuntime(dir, 60_000, { extraDirs: [] }, undefined, true);
+  let finished = false;
+  const run = runtime.message("Build", schema, undefined, { requireFinalUsage: true, onUsage: () => {} });
+  void run.then(() => { finished = true; });
+  await launched();
+  let log: string; let ending: object[];
+  if (engine === "codex") {
+    await mkdir(join(home, "sessions"), { recursive: true }); log = join(home, "sessions", "rollout-terminal.jsonl");
+    await writeFile(log, [
+      { type: "session_meta", payload: { id: "terminal-session", cwd: dir } },
+      { type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { input_tokens: 35, output_tokens: 7 } } } },
+    ].map((value) => JSON.stringify(value)).join("\n") + "\n");
+    ending = [{ type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { input_tokens: 37, output_tokens: 10 } } } }, { type: "event_msg", payload: { type: "task_complete" } }];
+  } else {
+    const args = call()[1]; const id = args[args.indexOf("--session-id") + 1];
+    await transcript(id, [{ type: "assistant", sessionId: id, message: { id: "tool", stop_reason: "tool_use", usage: { input_tokens: 35, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 7 } } }]);
+    log = join(config, "projects", "-tmp-project", `${id}.jsonl`);
+    ending = [{ type: "assistant", sessionId: id, message: { id: "final", stop_reason: "end_turn", usage: { input_tokens: 2, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 3 } } }, { type: "system", subtype: "turn_duration", sessionId: id }];
+  }
+  await writeFile(resultFile(await taskFile()), JSON.stringify({ summary: "Done" }));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(finished).toBe(false); expect(child.kill).not.toHaveBeenCalled();
+  await appendFile(log, ending.map((value) => JSON.stringify(value)).join("\n") + "\n");
+  expect((await run).facts).toMatchObject({ usageComplete: true, usage: { inputTokens: 37, outputTokens: 10 } });
+  expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+});
+
+it("does not mistake a headed result file and stale counters for terminal usage", async () => {
+  const child = new Headed(); vi.mocked(spawn).mockReturnValue(child as unknown as ReturnType<typeof spawn>);
+  const run = failure(new ClaudeRuntime(dir, 200, { extraDirs: [] }, undefined, true).message("Build", schema, undefined, { requireFinalUsage: true, onUsage: () => {} }));
+  await launched();
+  const args = call()[1]; const id = args[args.indexOf("--session-id") + 1];
+  await transcript(id, [{ type: "assistant", sessionId: id, message: { id: "tool", stop_reason: "tool_use", usage: { input_tokens: 35, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 7 } } }]);
+  await writeFile(resultFile(await taskFile()), JSON.stringify({ summary: "Done" }));
+  const error = await run;
+  expect(error.facts.status).toBe("timed-out"); expect(error.facts.usageComplete).not.toBe(true);
 });

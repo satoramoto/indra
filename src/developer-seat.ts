@@ -1,3 +1,5 @@
+import { isCircuitOpen } from "./circuit-budget.js";
+import { circuitRuntime, circuitShell, withCircuitScope } from "./circuit-scope.js";
 import { SprintGitHub } from "./sprint.js";
 import { DeveloperGoal } from "./developer-goal.js";
 import type { WorkflowEvent, GoalReport } from "./goal-contract.js";
@@ -102,7 +104,7 @@ export class DeveloperSeat {
     private readonly shell: Shell,
     private readonly runtimeFor: RuntimeFactory,
     private readonly log: (line: string) => void = () => {},
-  ) {}
+  ) { this.shell = circuitShell(shell); }
 
   /** Finite goals-v1 entry point. No assignment means no model, Git, chat or legacy work. */
   async turn(event: WorkflowEvent): Promise<{ events: WorkflowEvent[]; report: GoalReport | null }> {
@@ -266,6 +268,9 @@ export class DeveloperSeat {
   }
 
   private async work(goal: PlanningGoal, record: SeatTaskRecord, resuming = false): Promise<void> {
+    return withCircuitScope(this.store.runtimeDir, goal.id, "implement", () => this.workInScope(goal, record, resuming));
+  }
+  private async workInScope(goal: PlanningGoal, record: SeatTaskRecord, resuming: boolean): Promise<void> {
     const outcome = this.outcome(goal, record.outcomeId);
     const base = baseBranch(goal);
     let finalized = false;
@@ -314,7 +319,8 @@ export class DeveloperSeat {
             await this.event(record, { kind: "ci", result: "started", headSha: checkedHead });
             let checks: ShellResult;
             try { checks = await this.shell.run("gh", ["pr", "checks", record.prUrl!, "--watch"], record.worktree); }
-            catch {
+            catch (error) {
+              if (isCircuitOpen(error)) throw error;
               await this.event(record, { kind: "ci", result: "failed", headSha: checkedHead });
               throw new SeatError("CI observation failed.");
             }
@@ -346,7 +352,7 @@ export class DeveloperSeat {
       }
     } catch (error) {
       if (finalized) { this.log(`Merged ${goal.id}/${record.outcomeId}; could not finish post-merge housekeeping.`); return; }
-      const reason = error instanceof SeatError || error instanceof ProjectCheckoutError ? error.message : "unexpected error";
+      const reason = isCircuitOpen(error) || error instanceof SeatError || error instanceof ProjectCheckoutError ? error.message : "unexpected error";
       this.log(`Assignment ${goal.id}/${record.outcomeId} failed at ${record.step}: ${reason}`);
       await this.fail(goal, record.outcomeId, `${record.step}: ${reason}`.slice(0, 200), record);
     }
@@ -398,10 +404,12 @@ export class DeveloperSeat {
 
   private async codex(role: SeatTaskRecord["sessions"][number]["role"], record: SeatTaskRecord, write: WriteAccess | undefined, prompt: string, schema: string): Promise<AgentResult> {
     let run: AgentResult;
+    const reviewHead = role === "reviewer" ? (await this.sh("git", ["rev-parse", "HEAD"], record.worktree)).stdout.trim() : "";
     // Every session is new: no session id is ever passed, so the reviewer never shares the builder's context.
-    try { run = await this.runtimeFor(record.worktree, write).message(prompt, schema, undefined, { purpose: role === "developer" ? "build" : role === "reviewer" ? "review" : "fix" }); }
+    try { run = await circuitRuntime(this.runtimeFor(record.worktree, write), this.store.runtimeDir, record.goalId, "implement", `legacy:${record.outcomeId}:${role}:${reviewHead}`, role !== "developer" && role !== "reviewer").message(prompt, schema, undefined, { purpose: role === "developer" ? "build" : role === "reviewer" ? "review" : "fix" }); }
     catch (error) {
       if (error instanceof AgentRunError) await this.event(record, { kind: "session", role, session: error.facts }, `session:${error.facts.invocationId}`);
+      if (isCircuitOpen(error)) throw error;
       this.log(`Agent ${role} session error.`); throw new SeatError(sessionFailureNote(role, error));
     }
     if (run.facts) await this.event(record, { kind: "session", role, session: run.facts }, `session:${run.facts.invocationId}`);

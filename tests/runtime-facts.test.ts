@@ -184,3 +184,12 @@ describe("invocation facts", () => {
     expect(facts.finish("succeeded").usage).toEqual({ uncachedInputTokens: 10, outputTokens: 3 });
   });
 });
+
+it.each(["sidechain", "delegation"])("does not claim complete Claude usage after unaccounted %s work", (kind) => {
+  const facts = new RuntimeFacts("claude");
+  if (kind === "sidechain") facts.observeLog({ type: "assistant", isSidechain: true, message: { id: "child", usage: { input_tokens: 200, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 20 } } });
+  else facts.observeLog({ type: "assistant", message: { id: "delegate", stop_reason: "tool_use", content: [{ type: "tool_use", name: "Agent" }], usage: { input_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 2 } } });
+  facts.observeLog({ type: "assistant", message: { id: "final", stop_reason: "end_turn", usage: { input_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 2 } } });
+  facts.observeLog({ type: "system", subtype: "turn_duration" });
+  expect(facts.finish("succeeded").usageComplete).not.toBe(true);
+});

@@ -54,7 +54,7 @@ export class LiveUsageTail {
   compactedAt?: string;
   /** A compaction marker came after the last window, so the next, smaller window is not a second compaction. */
   private marked = false;
-  constructor(readonly path: string, readonly engine: RuntimeEngine, private readonly now = () => Date.now()) { this.facts = new RuntimeFacts(engine); }
+  constructor(readonly path: string, readonly engine: RuntimeEngine, private readonly now = () => Date.now(), facts?: RuntimeFacts) { this.facts = facts ?? new RuntimeFacts(engine); }
 
   /** The session handle the log names (`claude:<id>`, or a bare Codex ID), once a line has named it. */
   get sessionId(): string | undefined { return this.facts.sessionId; }
@@ -72,6 +72,12 @@ export class LiveUsageTail {
     if (!this.marked && this.context !== undefined && context < this.context / 2) this.compactedAt = at();
     this.marked = false;
     this.context = context;
+  }
+
+  /** Resume accounting starts after the existing log prefix, which belongs to earlier invocations. */
+  async seekEnd(): Promise<void> {
+    const file = await open(this.path, "r");
+    try { this.offset = (await file.stat()).size; this.pending = Buffer.alloc(0); } finally { await file.close(); }
   }
 
   async read(): Promise<TokenUsage | undefined> {

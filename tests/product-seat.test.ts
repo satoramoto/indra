@@ -1,4 +1,8 @@
+import { accountedFailure } from "./circuit-fixture.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+// These integration cases exercise durable accounting plus real Git/process supervision.
+vi.setConfig({ testTimeout: 20_000 });
 import { copyFile, mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { main } from "../src/cli.js";
@@ -65,11 +69,12 @@ async function fixture(options: { decorate?: boolean; noChat?: boolean; fallback
   let failCall = 0; let outputPatch: Partial<ProductProposal> = {};
   let inspect: ((cwd: string, prompt: string) => Promise<void>) | undefined;
   const runtime: AgentRuntime = { message: async (prompt, schema, session, messageOptions) => {
+    messageOptions?.onUsage?.({ inputTokens: 8, outputTokens: 2 });
     calls.push({ prompt, schema, session, purpose: messageOptions?.purpose });
-    if (calls.length === failCall) throw new Error("Interrupted model turn");
+    if (calls.length === failCall) throw accountedFailure("Interrupted model turn");
     const identity = JSON.parse(/^Proposal identity: (.+)$/m.exec(prompt)![1]) as Pick<ProductProposal, "goalId" | "proposalId" | "rank" | "productSeatId">;
     const response: ProductProposal = { version: 1, ...identity, mission: "docs/mission.md", summary: `Reliable build improvement ${identity.rank}`, outcomes: [{ number: 1, title: "Verify delivery", description: "Improve the existing delivery evidence with a regression", reason: "The mission needs reliable autonomous delivery", currentCode: ["src/work.ts"] }], ownedFiles: ["src/**", "tests/**"], risks: ["Existing callers need compatibility"], rationale: `Use mission and retros, turn ${calls.length}`, basedOnRetros: ["goal-d", "goal-c", "goal-b"], ...outputPatch };
-    return { sessionId: `product-session-${calls.length}`, response, usage: { tokens: 10 }, startedAt: at, finishedAt: at };
+    return { sessionId: `product-session-${calls.length}`, response, usage: { inputTokens: 8, outputTokens: 2 }, startedAt: at, finishedAt: at };
   } };
   const seat = (await loadProductSeat(store, seatId))!;
   const runner = () => new ProductSeat({ store, seat, runtime, runtimeFor: options.fallback ? undefined : (cwd, write) => { contexts.push({ cwd, write }); return { message: async (...args) => { await inspect?.(cwd, args[0]); return runtime.message(...args); } }; }, chat: options.noChat ? undefined : chat, shell });
@@ -400,4 +405,16 @@ describe("finite Product seat with real store and own-bot delivery", () => {
     const f = await fixture({ fallback: true }); await f.runner().turn({ ...startup, teamId: "another-team" }); expect(f.calls).toHaveLength(0);
     expect(await f.runner().turn(startup)).toMatchObject({ status: "blocked" }); expect(f.contexts).toHaveLength(0); expect(f.calls).toHaveLength(0); expect((await f.current()).failure?.message).toContain("runtimeFor");
   });
+});
+
+
+it("stops Product on a token trip and refuses ordinary retry after recreation", async () => {
+  const f = await fixture();
+  await writeFile(join(f.store.runtimeDir, "circuit-policy.json"), JSON.stringify({ maxTokens: 1 }));
+  await f.runner().turn({ kind: "startup", teamId, at });
+  expect((await f.current()).failure).toMatchObject({ retryable: false, message: expect.stringContaining("Circuit open") });
+  expect(f.calls).toHaveLength(1);
+  await f.runner().turn(f.retry());
+  expect(f.calls).toHaveLength(1);
+  expect((await f.current()).failure!.retryable).toBe(false);
 });

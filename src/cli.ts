@@ -1,6 +1,9 @@
 /// <reference types="vite/client" />
 import { createInterface } from "node:readline/promises";
 import { randomUUID } from "node:crypto";
+import { userInfo } from "node:os";
+import { circuitShell } from "./circuit-scope.js";
+import { CircuitBudget, CircuitOpenError, type CircuitGrant } from "./circuit-budget.js";
 import { dirname, join, resolve } from "node:path";
 import { readToken } from "./credential.js";
 import { Inventory, InventoryError, type Seat, type Team } from "./domain.js";
@@ -71,7 +74,7 @@ export async function createPlanningBridge(store: PlanningStore, chat: PlanningC
       const reader = new module.LocalReleaseActivationReader(store.checkout, { appDir: defaultAppDir, runtimeDir: store.runtimeDir });
       supplied = { ...supplied, release: { poll: async ({ goal }) => {
         if (!goal.integration?.prUrl) return { status: "pending", reason: "Waiting for the integration PR." };
-        const mergeVerification = await new SprintGitHub(processShell, store.runtimeDir).mergeVerification(goal.integration.prUrl).catch(() => undefined);
+        const mergeVerification = await new SprintGitHub(circuitShell(processShell), store.runtimeDir).mergeVerification(goal.integration.prUrl).catch((error) => { if (error instanceof CircuitOpenError) throw error; return undefined; });
         if (!mergeVerification) return { status: "pending", reason: "The merged integration's current-head bot review and CI are not verified." };
         const result = await reader.read(goal.integration);
         if (result.status !== "running") return { status: "pending", reason: result.reason };
@@ -234,6 +237,13 @@ const GOAL_ACTIONS = ["approve", "propose", "integrate", "merge", "rollback"] as
 type GoalAction = typeof GOAL_ACTIONS[number];
 const isGoalAction = (action: string | undefined): action is GoalAction => (GOAL_ACTIONS as readonly (string | undefined)[]).includes(action);
 
+/** Preserve the circuit/caller stop signal as well as the lifetime of the owning host. */
+export function withRuntimeSignal(runtime: AgentRuntime, signal: AbortSignal): AgentRuntime {
+  return { message: (prompt, schema, sessionId, options) => runtime.message(prompt, schema, sessionId, {
+    ...options, signal: options?.signal ? AbortSignal.any([signal, options.signal]) : signal,
+  }) };
+}
+
 /** All model and posting paths use the seat from state, local engine selection and optional Indra profiles. */
 async function seatServices(store: PlanningStore, username: string, seatId?: string) {
   const state = await store.read();
@@ -252,9 +262,9 @@ async function seatServices(store: PlanningStore, username: string, seatId?: str
   };
 }
 
-type Options = { mode: "help" } | { mode: "seat"; seatId: string; checkout: string; readyNonce?: string } | { mode: "state"; checkout: string; once: boolean } | { mode: "ui"; checkout: string } | { mode: "mattermost"; slug: string } | { mode: "mattermost"; checkout: string; once: boolean } | { mode: "planning"; action: "start" | "serve" | "host" | "status" | "retry" | GoalAction; checkout: string; goal?: string; seatId?: string; participants: string[]; readyNonce?: string };
+type Options = { mode: "help" } | { mode: "seat"; seatId: string; checkout: string; readyNonce?: string } | { mode: "state"; checkout: string; once: boolean } | { mode: "ui"; checkout: string } | { mode: "mattermost"; slug: string } | { mode: "mattermost"; checkout: string; once: boolean } | { mode: "planning"; action: "start" | "serve" | "host" | "status" | "retry" | "budget" | "budget-grant" | GoalAction; grant?: Omit<CircuitGrant, "owner">; checkout: string; goal?: string; seatId?: string; participants: string[]; readyNonce?: string };
 
-const usage = "Usage: npm start -- [--state PATH] [--once] | --ui [--state PATH] | --mattermost [--state PATH] [--once] | --mattermost --team SLUG | planning start --goal TEXT [--participant SEAT_ID] [--state PATH] | planning propose|approve|integrate|merge|rollback --goal GOAL_ID [--state PATH] | planning retry (--goal GOAL_ID | --seat PRODUCT_SEAT_ID) [--state PATH] | planning serve|host|status [--state PATH] | seat run --seat SEAT_ID [--state PATH]\nPlanning serves only Chick's Yahaha thread, in the team's home channel and project from state. Reply in the thread to clarify; react :memo: on Chick's goal post to request a draft, and :white_check_mark: on the proposal post to approve it.\nEach approved goal is a sprint on branch sprint/GOAL_ID; its seats' PRs target that branch, and one integration PR takes it into main. The ceremony is planning -> proposal -> implement -> release -> retro, followed by closure. Draft failures stay in proposal. integrate explicitly authorizes a partial release and records omitted outcomes once no seat is active. merge merges the applicable integration, revert or retro PR once its gates pass; it does not complete release. Release waits for the new build to run, and closure waits for the retro thread post and archival merge. rollback opens a PR on main reverting the merged sprint.";
+const usage = "Usage: npm start -- [--state PATH] [--once] | --ui [--state PATH] | --mattermost [--state PATH] [--once] | --mattermost --team SLUG | planning start --goal TEXT [--participant SEAT_ID] [--state PATH] | planning propose|approve|integrate|merge|rollback --goal GOAL_ID [--state PATH] | planning retry (--goal GOAL_ID | --seat PRODUCT_SEAT_ID) [--state PATH] | planning budget (--goal GOAL_ID | --seat PRODUCT_SEAT_ID) [--state PATH] | planning budget-grant (--goal GOAL_ID | --seat PRODUCT_SEAT_ID) [--tokens N] [--execution-ms N] [--retries N] [--phase-retries PHASE=N] --reason TEXT [--state PATH] | planning serve|host|status [--state PATH] | seat run --seat SEAT_ID [--state PATH]\nPlanning serves only Chick's Yahaha thread, in the team's home channel and project from state. Reply in the thread to clarify; react :memo: on Chick's goal post to request a draft, and :white_check_mark: on the proposal post to approve it.\nEach approved goal is a sprint on branch sprint/GOAL_ID; its seats' PRs target that branch, and one integration PR takes it into main. The ceremony is planning -> proposal -> implement -> release -> retro, followed by closure. Draft failures stay in proposal. integrate explicitly authorizes a partial release and records omitted outcomes once no seat is active. merge merges the applicable integration, revert or retro PR once its gates pass; it does not complete release. Release waits for the new build to run, and closure waits for the retro thread post and archival merge. rollback opens a PR on main reverting the merged sprint.";
 
 export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_REPO): Options {
   if (args.length === 1 && (args[0] === "--help" || args[0] === "-h")) return { mode: "help" };
@@ -275,22 +285,40 @@ export function parseOptions(args: string[], stateEnv = process.env.INDRA_STATE_
   }
   if (args[0] === "planning") {
     const action = args[1];
-    if (action !== "start" && action !== "serve" && action !== "host" && action !== "status" && action !== "retry" && !isGoalAction(action)) throw new StateDataError(usage);
+    if (action !== "start" && action !== "serve" && action !== "host" && action !== "status" && action !== "retry" && action !== "budget" && action !== "budget-grant" && !isGoalAction(action)) throw new StateDataError(usage);
     let checkout: string | undefined; let goal: string | undefined; let seatId: string | undefined; let readyNonce: string | undefined;
     const participants: string[] = [];
+    const grant: Partial<Omit<CircuitGrant, "owner">> = {};
+    const targeted = action === "retry" || action === "budget" || action === "budget-grant";
+    const amount = (value: string): number => {
+      if (!/^[1-9][0-9]*$/.test(value) || !Number.isSafeInteger(Number(value))) throw new StateDataError("Budget increments must be positive finite safe integers.");
+      return Number(value);
+    };
     for (let index = 2; index < args.length; index++) {
       const key = args[index]; const value = args[++index];
       if (!value || value.startsWith("--")) throw new StateDataError(usage);
       if (key === "--state" && !checkout) checkout = value;
       else if (key === "--goal" && !goal) goal = value;
-      else if (key === "--seat" && action === "retry" && !seatId) seatId = value;
+      else if (key === "--seat" && targeted && !seatId) seatId = value;
+      else if (action === "budget-grant" && ["--tokens", "--execution-ms", "--retries"].includes(key)) {
+        const field = key === "--tokens" ? "tokens" : key === "--execution-ms" ? "executionMs" : "retries";
+        if (grant[field] !== undefined) throw new StateDataError(usage);
+        grant[field] = amount(value);
+      }
+      else if (action === "budget-grant" && key === "--phase-retries") {
+        const match = /^([a-zA-Z0-9][a-zA-Z0-9:_.\/-]{0,255})=([0-9]+)$/.exec(value);
+        if (!match || ["constructor", "prototype", "__proto__"].includes(match[1]) || Object.hasOwn(grant.phaseRetries ?? {}, match[1])) throw new StateDataError("Use --phase-retries PHASE=COUNT with a unique phase and positive count.");
+        (grant.phaseRetries ??= {})[match[1]] = amount(match[2]);
+      }
+      else if (action === "budget-grant" && key === "--reason" && grant.reason === undefined && value.trim()) grant.reason = value.trim();
       else if (key === "--participant" && action === "start") participants.push(value);
       else if (key === "--ready-nonce" && !readyNonce && action === "serve" && /^[a-f0-9-]{36}$/.test(value)) readyNonce = value;
       else throw new StateDataError(usage);
     }
-    if (action === "retry" ? !!goal === !!seatId : (action === "start" || isGoalAction(action)) !== !!goal) throw new StateDataError(usage);
+    if (targeted ? !!goal === !!seatId : (action === "start" || isGoalAction(action)) !== !!goal) throw new StateDataError(usage);
+    if (action === "budget-grant" && (!grant.reason || ![grant.tokens, grant.executionMs, grant.retries, ...Object.values(grant.phaseRetries ?? {})].some((value) => value !== undefined))) throw new StateDataError("A budget grant requires --reason and at least one positive allowance.");
     const projectRoot = appRootOf(import.meta.url);
-    return { mode: "planning", action, checkout: resolve(checkout || stateEnv || resolve(projectRoot, "..", "indra-state")), goal, participants, ...(seatId ? { seatId } : {}), ...(readyNonce ? { readyNonce } : {}) };
+    return { mode: "planning", action, checkout: resolve(checkout || stateEnv || resolve(projectRoot, "..", "indra-state")), goal, participants, ...(action === "budget-grant" ? { grant: grant as Omit<CircuitGrant, "owner"> } : {}), ...(seatId ? { seatId } : {}), ...(readyNonce ? { readyNonce } : {}) };
   }
   let mattermost = false;
   let checkout: string | undefined;
@@ -470,15 +498,37 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         return 0;
       }
       const store = createPlanningStore(options.checkout);
+      if (options.action === "budget" || options.action === "budget-grant") {
+        let scopeId: string;
+        if (options.seatId) {
+          const product = await loadProductSeat(store, options.seatId);
+          if (!product) throw new StateDataError("A seat budget requires a configured goals-v1 Product seat.");
+          scopeId = `product-${product.teamId}-${product.id}`;
+        } else {
+          const goal = (await store.read()).planningGoals?.find((goal) => goal.id === options.goal);
+          if (!goal || goal.workflowModel !== "goals-v1") throw new StateDataError("A budget requires an existing goals-v1 goal.");
+          scopeId = goal.id;
+        }
+        const budget = new CircuitBudget({ runtimeDir: store.runtimeDir, scopeId });
+        if (options.action === "budget-grant" && process.env.INDRA_SEAT_PANE === "1") throw new StateDataError("Budget grants belong to the owner terminal, not a hosted agent seat.");
+        try {
+          const ledger = options.action === "budget" ? await budget.status() : await budget.grant({ ...options.grant!, owner: userInfo().username });
+          console.log(JSON.stringify(ledger, null, 2));
+          if (options.action === "budget-grant") console.log("Recorded a finite owner allowance. Usage and history are preserved; no retry was queued.");
+        } catch (error) { throw new StateDataError(error instanceof Error ? error.message : "Circuit operation failed."); }
+        return 0;
+      }
       if (options.action === "retry") {
         if (options.seatId) {
           const product = await loadProductSeat(store, options.seatId);
           if (!product) throw new StateDataError("A seat retry requires a configured goals-v1 Product seat.");
+          await new CircuitBudget({ runtimeDir: store.runtimeDir, scopeId: `product-${product.teamId}-${product.id}` }).assertAvailable();
           await new WorkflowInbox(store.runtimeDir).publish({ kind: "product-retry", id: `owner-product-retry:${product.id}:${randomUUID()}`, teamId: product.teamId, seatId: product.id, at: new Date().toISOString(), reason: "Owner requested Product recovery after resolving the recorded blocker." });
           console.log(`Queued one finite Product retry for ${product.id}; no goal or proposal approval is created.`); return 0;
         }
         const goal = (await store.read()).planningGoals?.find((goal) => goal.id === options.goal);
         if (!goal || goal.workflowModel !== "goals-v1" || goal.ceremony?.closure) throw new StateDataError("A retry requires an open goals-v1 goal.");
+        await new CircuitBudget({ runtimeDir: store.runtimeDir, scopeId: goal.id }).assertAvailable();
         await new WorkflowInbox(store.runtimeDir).publish({ kind: "retry", id: `owner-retry:${goal.id}:${randomUUID()}`, teamId: goal.teamId, goalId: goal.id, at: new Date().toISOString(), reason: "Owner requested reconciliation after resolving the recorded blocker." });
         console.log(`Queued a finite retry for ${goal.id}; approval, scope and merge gates still apply.`); return 0;
       }
@@ -544,7 +594,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       if (team) {
         const home = requireTeamHome(state, team.id); const github = await workflowDelivery(store);
         const inbox = new WorkflowInbox(store.runtimeDir); const signals = hostSignals();
-        const bounded = (runtime: AgentRuntime): AgentRuntime => ({ message: (prompt, schema, sessionId, messageOptions) => runtime.message(prompt, schema, sessionId, { ...messageOptions, signal: signals.signal }) });
+        const bounded = (runtime: AgentRuntime): AgentRuntime => withRuntimeSignal(runtime, signals.signal);
         const freshBridge = () => createPlanningBridge(store, chat, bounded(services.runtime(process.cwd())), ceremonyModules, (cwd: string, write?: WriteAccess) => bounded(services.runtime(cwd, undefined, write)));
         try { await runWorkflowHost({ store, teamId: team.id, consumer: `scheduler-${team.id}`, signal: signals.signal,
           mattermost: { server: SERVER, token, channelId: home.channelId }, github,
@@ -599,7 +649,8 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       rl.close();
     }
   } catch (error) {
-    if (error instanceof StateDataError) console.error(`State error: ${error.message}`);
+    if (error instanceof CircuitOpenError) console.error(error.message);
+    else if (error instanceof StateDataError) console.error(`State error: ${error.message}`);
     else if (error instanceof InventoryError) console.error(`Connection/error: ${error.message}`);
     else if (error instanceof MattermostAccessError) console.error(`Mattermost access: ${error.message}`);
     else if (error instanceof Error && error.name !== "AbortError") console.error("Connection/error: The inventory could not complete.");
