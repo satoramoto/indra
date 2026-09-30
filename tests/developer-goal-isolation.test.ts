@@ -65,7 +65,7 @@ class Lanes implements DeveloperLaneServices {
   }
   async review(lane: GoalLane, _brief: GoalBrief, journal: LaneJournal, observation: LaneObservation, persist: () => Promise<void>) {
     journal.review = { id: `review-${lane.id}`, headSha: observation.headSha, findings: [], body: "Reviewed exact head", posted: true, verdict: "APPROVE", comments: [] };
-    this.remote.get(lane.id)!.reviewed = true; await persist();
+    Object.assign(this.remote.get(lane.id)!, { reviewed: true, reviewer: "independent-agent" }); await persist();
   }
   async fix(): Promise<void> { throw new LaneError("A repair needs an explicit retry in this fixture."); }
   async merge(url: string) {
@@ -201,6 +201,7 @@ describe("independent Developer lane failure isolation", () => {
     f.services.remote.get("a")!.ci = "passed";
     const completed = await f.runner().turn(await f.ci("a", "ci-a"));
     expect(completed.report?.lanePrs).toHaveLength(2); expect(f.services.finishCalls).toBe(1);
+    expect(completed.report!.lanePrs.map((lane) => lane.reviewer)).toEqual(["independent-agent", "independent-agent"]);
     expect((await f.store.read()).planningGoals![0].goalAssignment?.status).toBe("reported");
     expect(f.services.builds).toEqual([{ lane: "a", attempt: 0 }, { lane: "b", attempt: 0 }, { lane: "a", attempt: 1 }, { lane: "a", attempt: 2 }]);
   });
