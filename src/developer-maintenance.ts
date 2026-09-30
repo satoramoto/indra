@@ -102,7 +102,7 @@ export async function maintainDeveloperSeat(store: PlanningStore, seatId: string
   let handled = false;
   const state = await store.read();
   for (const goal of state.planningGoals ?? []) {
-    if (goal.stage !== "approved") continue;
+    if (goal.workflowModel === "goals-v1" || goal.ceremony?.closure || goal.stage !== "approved") continue;
     const github = teamProject(state, goal.teamId);
     if (!github || !/^[\w.-]+\/[\w.-]+$/.test(github)) continue;
     for (const assignment of goal.assignments ?? []) {

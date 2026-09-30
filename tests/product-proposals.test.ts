@@ -1,10 +1,17 @@
 import { expect, it } from "vitest";
-import { PRODUCT_QUEUE_CAP, proposeGoals } from "../src/product-proposals.js";
-import { assertProductQueueCapacity, type ProductRuntimeRecord } from "../src/goal-contract.js";
-import type { PlanningStore } from "../src/planning.js";
-it("keeps Product's queue boundary while its no-op stub performs no I/O", async () => {
+import { PRODUCT_QUEUE_CAP, productProposalDigest, productProposalMessage } from "../src/product-proposals.js";
+import { assertProductQueueCapacity, type ProductRuntimeRecord, type ProductProposal } from "../src/goal-contract.js";
+it("keeps strict canonical proposal digests and complete human approval text", () => {
   expect(PRODUCT_QUEUE_CAP).toBe(5);
-  expect(await proposeGoals({ store: {} as PlanningStore, teamId: "team-one", productSeatId: "seat-002" }, { kind: "startup", teamId: "team-one", at: "2026-09-01T00:00:00Z" })).toEqual({ status: "disabled", proposals: [] });
+  const proposal: ProductProposal = { version: 1, goalId: "goal-example", proposalId: "proposal-example", productSeatId: "seat-002", rank: 1, mission: "docs/mission.md", summary: "Improve recovery", outcomes: [{ number: 1, title: "Preserve delivery", description: "Recover the same post after a lost acknowledgment", reason: "The mission requires autonomous recovery", currentCode: ["src/product-seat.ts"] }], ownedFiles: ["src/product-*.ts", "tests/product-*.test.ts"], risks: ["Uncertain delivery must remain blocked"], rationale: "Prevent duplicate proposals", basedOnRetros: ["goal-earlier"] };
+  const digest = productProposalDigest(proposal);
+  expect(digest).toMatch(/^[0-9a-f]{64}$/);
+  expect(productProposalDigest(Object.fromEntries(Object.entries(proposal).reverse()))).toBe(digest);
+  expect(productProposalDigest({ ...proposal, ownedFiles: ["src/**"] })).not.toBe(digest);
+  expect(() => productProposalDigest({ ...proposal, autoApprove: true })).toThrow();
+  const message = productProposalMessage(proposal);
+  for (const value of [proposal.summary, proposal.rationale, ...proposal.ownedFiles, ...proposal.risks, proposal.outcomes[0].reason, proposal.outcomes[0].currentCode[0], proposal.proposalId, proposal.goalId]) expect(message).toContain(value);
+  expect(message).toContain("React ✅");
 });
 
 it("caps all unpublished and published unapproved proposals together without double counting", () => {

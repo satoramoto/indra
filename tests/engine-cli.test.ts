@@ -10,6 +10,8 @@ import { SprintGitHub } from "../src/sprint.js";
 import { PlanningStore } from "../src/planning.js";
 import { loadSeatPersonas, type SeatPersona } from "../src/seat-persona.js";
 import { runWorkflowHost, type WorkflowHostOptions } from "../src/remodel-events.js";
+import { ProductSeat } from "../src/product-seat.js";
+import * as projectCheckouts from "../src/project-checkout.js";
 import * as op from "../src/op-env.js";
 import type { WorkflowEvent } from "../src/goal-contract.js";
 
@@ -105,6 +107,28 @@ const configure = (value: unknown) => writeFile(join(`${checkout}.runtime`, "sea
 const planning = (action: string) => main(["planning", action, ...(action === "serve" ? [] : ["--goal", "goal-1"]), "--state", checkout]);
 
 describe("goals-v1 production event wiring", () => {
+  it.each(["codex", "claude"])("adapts Product's %s runtime factory without confusing write capability and timeout", async (engine) => {
+    const state = await new PlanningStore(checkout).read();
+    const team = state.teams[0] as { workflowModel?: string; project?: { github: string }; seats: { id: string; roles: string[] }[] };
+    team.workflowModel = "goals-v1"; team.project = { github: "test/product-project" }; team.seats.find((seat) => seat.id === "seat-dev")!.roles = ["Product"];
+    await configure({ "seat-dev": engine });
+    const project = join(`${checkout}.runtime`, "projects", "test-product-project");
+    const clone = vi.spyOn(projectCheckouts, "ensureProjectCheckout").mockResolvedValue(project);
+    const write: WriteAccess = { extraDirs: ["/shared.git"] }; const options = { timeoutMs: 2345 };
+    vi.spyOn(ProductSeat.prototype, "turn").mockImplementation(async function (this: ProductSeat, event) {
+      expect(event).toMatchObject({ kind: "startup", teamId: "team-001" });
+      await this.services.runtime.message("Default read-only runtime.", "product-schema", undefined, options);
+      await this.services.runtimeFor!(project).message("Explicit read-only runtime.", "product-schema", undefined, options);
+      await this.services.runtimeFor!(project, write).message("Factory capability probe.", "product-schema", undefined, options);
+      return { status: "idle", proposalIds: [] };
+    });
+    expect(await main(["seat", "run", "--seat", "seat-dev", "--state", checkout])).toBe(0);
+    expect(clone).toHaveBeenCalledExactlyOnceWith(processShell, `${checkout}.runtime`, "test/product-project");
+    expect(fakes.calls).toHaveLength(3);
+    expect(fakes.calls.map((call) => call.write)).toEqual([undefined, undefined, write]);
+    for (const call of fakes.calls) expect(call).toMatchObject({ engine, cwd: project, timeout: undefined, options, session: undefined });
+    expect(fakes.hosts[0]).toMatchObject({ teamId: "team-001", consumer: "seat-dev" });
+  });
   it("omits event ingress for an entirely historical UI and joins every enabled host on abort", async () => {
     const store = new PlanningStore(checkout); const onEvent = vi.fn(async () => {});
     expect(uiWorkflowEvents(store, [])).toBeUndefined(); expect(fakes.hosts).toEqual([]);

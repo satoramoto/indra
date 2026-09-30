@@ -350,7 +350,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
               const fresh = await loadProductSeat(store, product.id); if (!fresh) throw new Error("The Product seat is no longer configured.");
               const project = requireTeamHome(await store.read(), product.teamId).github;
               const cwd = await ensureProjectCheckout(processShell, store.runtimeDir, project);
-              const productServices = { store, seat: fresh, runtime: services.runtime(cwd), runtimeFor: services.runtime, chat };
+              const productServices = { store, seat: fresh, runtime: services.runtime(cwd), runtimeFor: (cwd: string, write?: WriteAccess) => services.runtime(cwd, undefined, write), chat };
               const result = await withFileLock(turnLockFile(options.checkout, { kind: "seat", seatId: product.id }), () => new ProductSeat(productServices).turn(event), 24 * 60 * 60_000);
               if (result.status === "disabled") throw new Error("The goals-v1 Product service is unavailable in this build. Install the Product lane before starting this seat.");
               const record = await store.readRuntimeFile<ProductRuntimeRecord>(productRuntimeFilename(product.teamId));
