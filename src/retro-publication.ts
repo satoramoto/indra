@@ -6,7 +6,7 @@ import type { CeremonyWriteReadiness } from "./ceremony-ports.js";
 import { requireTeamHome, type PlanningStore } from "./planning.js";
 import { processShell, type SeatTaskRecord } from "./developer-seat.js";
 import { seatRecordName } from "./developer-maintenance.js";
-import { retroPath, SprintGitHub, releaseAttemptsName, type ReleaseAttempts, type RetroArchive, type RetroPr, type RetroReview } from "./sprint.js";
+import { retroPath, SprintGitHub, releaseAttemptsName, type ReleaseAttempts, type RetroArchive, type RetroPr, type RetroReview, type RetroRejection } from "./sprint.js";
 import { goalRuntimeFilename, validateGoalReport, type GoalRuntimeRecord, type WorkflowFailure } from "./goal-contract.js";
 import { draftSprintRetro, renderSprintRetro, RetroGenerationError, type RetroGeneration, type RetroInput, type RetroPriorAttempt, type SprintRetroDraft } from "./sprint-retro.js";
 import { readImplementationFacts } from "./implementation-facts.js";
@@ -20,6 +20,7 @@ import { opCredential } from "./service-account.js";
 import { schemaPathOf } from "./reload.js";
 import { redactSecrets } from "./redact.js";
 import { validateWorkflowEvent } from "./remodel-events.js";
+import { mattermostPostUrl } from "./hub-format.js";
 
 /** The store still checks the companion schema before writing any ceremony state. */
 export const ceremonyReadiness: CeremonyWriteReadiness = { version: 1, consumers: { planning: 1, developer: 1, release: 1, retro: 1, tui: 1 } };
@@ -41,9 +42,16 @@ export interface RetroPublicationRecord {
   gate?: { headSha: string; postId: string; announcedAt: string };
   authorization?: { headSha: string; prUrl: string; postId: string; approval: HumanApproval };
   review?: { headSha: string; result: RetroReview };
+  /** Superseded publications are append-only snapshots, including their successful generation and delivered evidence. */
+  revisions?: RetroPublicationRevision[];
+  correction?: { revision: number; retry: { id: string; at: string }; notice?: { message: string; postId?: string }; resultHeadSha?: string };
   verifiedAt?: string;
   /** Final completion timing, recorded before returning closure proof; the bridge journals closedAt from state. */
   stageTimings?: { stage: CeremonyStage; enteredAt: string | null; throughAt: string | null; elapsedMs: number | null }[];
+}
+export interface RetroPublicationRevision extends Pick<RetroPublicationRecord, "attempts" | "gate" | "review" | "authorization" | "correction"> {
+  frozen: NonNullable<RetroPublicationRecord["frozen"]>; postIds: string[]; prUrl: string;
+  headSha: string; rejection: RetroRejection; supersededAt: string;
 }
 /** `prior` lists the earlier failed or aborted attempts, oldest first, for the retro phase facts. */
 export type RetroDraft = (context: CeremonyContext, prior: RetroPriorAttempt[]) => Promise<SprintRetroDraft>;
@@ -63,11 +71,12 @@ function draftFailure(record: RetroPublicationRecord): WorkflowFailure {
   const last = record.attempts.at(-1)!;
   return { at: last.finishedAt ?? last.startedAt, message: `Chick's retrospective draft for ${record.goalId} failed or was interrupted (attempt ${record.attempts.length}); run planning retry --goal ${record.goalId} after resolving the failure.`, retryable: true };
 }
-function freshDraftRetry(context: CeremonyContext, record: RetroPublicationRecord): { id: string; at: string } | undefined {
+function freshDraftRetry(context: CeremonyContext, record: RetroPublicationRecord, after?: string): { id: string; at: string } | undefined {
   if (context.event?.kind !== "retry") return;
   const event = validateWorkflowEvent(context.event);
   if (event.kind !== "retry" || event.goalId !== context.goal.id || event.teamId !== context.goal.teamId || !event.id.trim()
-    || record.attempts.some((attempt) => attempt.retry?.id === event.id)) return;
+    || [...record.revisions?.flatMap((revision) => revision.attempts) ?? [], ...record.attempts].some((attempt) => attempt.retry?.id === event.id)
+    || (after && !(Date.parse(event.at) > Date.parse(after)))) return;
   const last = record.attempts.at(-1);
   if (last && !(Date.parse(event.at) > Date.parse(last.finishedAt ?? last.startedAt))) return;
   return { id: event.id, at: event.at };
@@ -104,14 +113,19 @@ export class RetroPublication {
     return this.services.formatPost ? await this.services.formatPost(context, message) : message;
   }
 
-  private async verifyPosts(context: CeremonyContext, record: RetroPublicationRecord): Promise<void> {
+  private async verifyPosts(context: CeremonyContext, record: Pick<RetroPublicationRecord, "frozen" | "postIds" | "correction">): Promise<void> {
     const { frozen, postIds } = record;
     if (!frozen || !postIds?.length || postIds.length !== frozen.parts.length || new Set(postIds).size !== postIds.length) throw new Error("Retrospective fragments are incomplete.");
     const { ownUserId, posts } = await this.services.thread(context);
-    for (const [index, id] of postIds.entries()) {
+    const messages = postIds.map((id, index) => ({ id, message: frozen.parts[index] }));
+    if (record.correction) {
+      if (!record.correction.notice?.postId) throw new Error("Correction notice delivery is incomplete.");
+      messages.push({ id: record.correction.notice.postId, message: record.correction.notice.message });
+    }
+    for (const { id, message } of messages) {
       const post = posts.find((item) => item.id === id);
       if (!ownUserId || !post || post.delete_at || post.user_id !== ownUserId || post.channel_id !== context.goal.mattermost.channelId
-        || post.root_id !== context.goal.mattermost.rootPostId || post.message !== await this.formatPost(context, frozen.parts[index])) throw new Error("Retrospective fragment delivery or content is unverified.");
+        || post.root_id !== context.goal.mattermost.rootPostId || post.message !== await this.formatPost(context, message)) throw new Error("Retrospective fragment delivery or content is unverified.");
     }
   }
 
@@ -140,8 +154,9 @@ export class RetroPublication {
     if (goal.mattermost.channelId !== home.channelId) throw new Error("Retrospective thread is outside the team's home.");
     const record = await store.readRuntimeFile<RetroPublicationRecord>(retroRuntimeName(goal.id)) ?? { version: 1, goalId: goal.id, github: home.github, attempts: [] };
     if (record.version !== 1 || record.goalId !== goal.id || record.github !== home.github) throw new Error("Retrospective journal does not match the team's configured project.");
-    if (record.frozen) {
-      const frozen = record.frozen;
+    for (const publication of [...record.revisions ?? [], record]) {
+      if (!publication.frozen) continue;
+      const frozen = publication.frozen;
       // Version 1 drafts were frozen before phase reflections, with the persona attribution inside the archive.
       // They are verified against their own frozen bytes and cannot be re-rendered by the current renderer.
       const legacy = (frozen.draft.snapshot as { version: number }).version === 1;
@@ -158,100 +173,153 @@ export class RetroPublication {
     await context.store.saveRuntime(retroRuntimeName(context.goal.id), record);
   }
 
+  private async advance(context: CeremonyContext, record: RetroPublicationRecord, reserved = false): Promise<CeremonyProgress<PublishedRetroEvidence>> {
+    if (!record.frozen) {
+      const failures = record.attempts.length;
+      const finite = context.goal.workflowModel === "goals-v1" || !!record.correction;
+      const retry = finite ? freshDraftRetry(context, record) : undefined;
+      if (failures && finite && !retry && !reserved) {
+        record.failure = draftFailure(record); await this.save(context, record);
+        return pending(record.failure.message, record.failure);
+      }
+      if (failures && !finite) {
+        const last = record.attempts.at(-1)!;
+        const retryAt = Date.parse(last.finishedAt ?? last.startedAt) + retroRetryDelayMs(failures);
+        if (!(Date.now() >= retryAt)) return pending(`Chick's retrospective draft failed or was interrupted ${failures} time(s); the next attempt starts after ${new Date(Number.isFinite(retryAt) ? retryAt : Date.now()).toISOString()}.`);
+      }
+      if (record.correction) {
+        const previous = record.revisions![record.correction.revision];
+        const proof = await this.archive.inspectRetroPr(record.github, context.goal.id, previous.frozen.markdown, previous.prUrl);
+        if (proof.state !== "OPEN" || proof.headSha !== previous.headSha || JSON.stringify(proof.rejection) !== JSON.stringify(previous.rejection)) throw new Error("The rejected publication changed before correction drafting.");
+        await this.verifyPosts(context, previous);
+      }
+      // The final attempt of each frozen revision succeeded; only real failures precede it.
+      const prior = priorRetroAttempts([...record.revisions?.flatMap((revision) => revision.attempts.slice(0, -1)) ?? [], ...record.attempts.slice(0, reserved ? -1 : undefined)]);
+      if (!reserved) record.attempts.push({ startedAt: new Date().toISOString(), ...(retry ? { retry } : {}) });
+      await this.save(context, record);
+      const attempt = record.attempts.at(-1)!;
+      let draft: SprintRetroDraft;
+      try { draft = await this.draft(context, prior); }
+      catch (error) {
+        attempt.finishedAt = new Date().toISOString();
+        if (error instanceof RetroGenerationError) { attempt.generation = error.generation; attempt.errorKind = error.kind; }
+        else attempt.errorKind = "draft-error";
+        if (finite) record.failure = draftFailure(record);
+        await this.save(context, record);
+        return pending(record.failure?.message ?? "Chick's retrospective draft failed or was interrupted; it will be retried with backoff.", record.failure);
+      }
+      if (draft.snapshot.goalId !== context.goal.id || draft.snapshot.leadSeatId !== context.goal.seatId || draft.markdown !== await renderSprintRetro(draft.snapshot, draft.narrative, draft.generation)
+        || (record.correction && draft.markdown === record.revisions![record.correction.revision].frozen.markdown)) {
+        Object.assign(attempt, { finishedAt: new Date().toISOString(), errorKind: "unverified-content", generation: draft.generation });
+        if (finite) record.failure = draftFailure(record);
+        await this.save(context, record);
+        throw new Error("Retrospective content was not rendered from this goal's recorded facts.");
+      }
+      const messages = parts(draft.markdown);
+      // The Chick chat adds its persona attribution to each thread post; verifyPosts expects exactly that.
+      // The archive keeps the frozen parts only, so no attribution lines appear between fragments.
+      const markdown = archiveOf(messages);
+      attempt.finishedAt = new Date().toISOString();
+      attempt.generation = draft.generation;
+      record.frozen = { draft, parts: messages, markdown, sha256: digest(markdown) };
+      delete record.failure;
+      await this.save(context, record);
+    }
+    const frozen = record.frozen;
+    const postIds: string[] = [];
+    for (const [index, message] of frozen.parts.entries()) postIds.push(await context.post(`retro-content:${frozen.sha256}:${index}`, message));
+    record.postIds = postIds;
+    if (record.correction) {
+      const previous = record.revisions![record.correction.revision];
+      if (!record.correction.notice) {
+        const team = ((await context.store.read()).teams as { id: string; slug?: string }[]).find((team) => team.id === context.goal.teamId);
+        const links = previous.postIds.flatMap((id) => { const url = mattermostPostUrl(team?.slug, id); return url ? [`[earlier thread part](${url})`] : []; });
+        record.correction.notice = { message: `**Corrected retrospective: ${context.goal.id}**\nThis publication supersedes the [earlier frozen retrospective](https://github.com/${record.github}/blob/${previous.headSha}/${retroPath(context.goal.id)}) (${previous.frozen.sha256}) after review ${previous.rejection.reviewId} requested corrections.${links.length ? ` Earlier posts: ${links.join(", ")}.` : ""} Historical posts remain unchanged. The corrected archive still requires a fresh current-head review and passing CI.` };
+        await this.save(context, record);
+      }
+      record.correction.notice.postId = await context.post(`retro-correction:${previous.frozen.sha256}:${frozen.sha256}`, record.correction.notice.message);
+    }
+    await this.save(context, record);
+    await this.verifyPosts(context, record);
+    if (record.correction) {
+      const previous = record.revisions![record.correction.revision];
+      try {
+        if (!this.archive.correctRetroPr) throw new Error("The archive correction adapter is unavailable.");
+        record.correction.resultHeadSha = await this.archive.correctRetroPr(record.github, context.goal.id, previous.frozen.markdown, frozen.markdown, previous.prUrl, previous.rejection);
+        record.prUrl = previous.prUrl;
+        delete record.failure;
+      } catch {
+        record.failure = { at: record.correction.retry.at, message: `The corrected retrospective for ${context.goal.id} is frozen; its guarded archive update needs reconciliation. Preserve both revisions and resolve the PR head or publication problem.`, retryable: true };
+        await this.save(context, record); return pending(record.failure.message, record.failure);
+      }
+    } else record.prUrl = await this.archive.ensureRetroPr(record.github, context.goal.id, frozen.markdown);
+    await this.save(context, record);
+    let pr = await this.archive.inspectRetroPr(record.github, context.goal.id, frozen.markdown, record.prUrl);
+    if (pr.url !== record.prUrl) return pending("The inspected archival PR does not match this publication.");
+    if (record.correction && pr.headSha !== record.correction.resultHeadSha) {
+      record.failure = { at: record.correction.retry.at, message: `The corrected retrospective head for ${context.goal.id} changed after its guarded update; reconcile the PR before publication can finish.`, retryable: true };
+      await this.save(context, record); return pending(record.failure.message, record.failure);
+    }
+    if (pr.state === "CLOSED") return pending("The retrospective PR is closed without merging; the owner must resolve it before the goal can close.");
+    if (pr.state === "OPEN") {
+      const announcedAt = record.gate?.headSha === pr.headSha ? record.gate.announcedAt : new Date().toISOString();
+      // Save the start of the announcement before delivery; a reaction received during a lost response is fresh.
+      if (record.gate?.headSha !== pr.headSha) {
+        record.gate = { headSha: pr.headSha, postId: "", announcedAt };
+        await this.save(context, record);
+      }
+      const postId = await context.post(`retro-merge:${pr.headSha}`, `**Retrospective archive: ${context.goal.id}**\n${pr.url}\n\nOnly \`${retroPath(context.goal.id)}\` may change. A fresh review and passing CI are required. It merges automatically once the current head is approved and CI passes. Suggested process changes remain proposals for the owner.`, "retro");
+      record.gate = { headSha: pr.headSha, postId, announcedAt };
+      await this.save(context, record);
+      if (!pr.reviewed && !pr.rejection) {
+        await this.review(context, record, pr);
+        pr = await this.archive.inspectRetroPr(record.github, context.goal.id, frozen.markdown, record.prUrl);
+      }
+      if (pr.state === "OPEN" && pr.rejection) {
+        record.failure = { at: pr.rejection.submittedAt, message: `The retrospective archive for ${context.goal.id} was rejected by satori-miyamoto on its current head (review ${pr.rejection.reviewId}); resolve the findings and run planning retry --goal ${context.goal.id} to publish a corrected revision.`, retryable: true };
+        const retry = freshDraftRetry(context, record, pr.rejection.submittedAt);
+        if (!retry || !this.archive.correctRetroPr) { await this.save(context, record); return pending(record.failure.message, record.failure); }
+        await this.verifyPosts(context, record);
+        const revision: RetroPublicationRevision = structuredClone({ frozen, attempts: record.attempts, postIds, prUrl: pr.url, headSha: pr.headSha, rejection: pr.rejection,
+          supersededAt: retry.at, gate: record.gate, review: record.review, authorization: record.authorization, correction: record.correction });
+        (record.revisions ??= []).push(revision);
+        record.correction = { revision: record.revisions.length - 1, retry };
+        record.attempts = [{ startedAt: new Date().toISOString(), retry }];
+        delete record.frozen; delete record.postIds; delete record.gate; delete record.review; delete record.authorization; delete record.verifiedAt; delete record.stageTimings;
+        // The intent, immutable source revision and consumed retry are one write before any correction model work.
+        await this.save(context, record);
+        return await this.advance(context, record, true);
+      }
+      delete record.failure;
+      await this.save(context, record);
+      if (pr.state === "OPEN" && pr.reviewed && pr.checksPassed) {
+        await this.verifyPosts(context, record);
+        const merge = await this.archive.mergeRetroPr(record.github, context.goal.id, frozen.markdown, pr.url, pr.headSha);
+        pr = await this.archive.inspectRetroPr(record.github, context.goal.id, frozen.markdown, record.prUrl);
+        if (!merge.merged && pr.state !== "MERGED") return pending(merge.reason);
+      }
+      if (pr.state !== "MERGED") return pending(!pr.reviewed ? "The retrospective archive needs a fresh review on its current head." : !pr.checksPassed ? "The retrospective archive is waiting for passing CI." : "The archival merge is pending verification.");
+    }
+    if (!pr.reviewed || !pr.checksPassed || !pr.mergedSha) return pending("The archival merge still needs current-head review and passing CI.");
+    await this.verifyPosts(context, record);
+    record.verifiedAt ??= new Date().toISOString();
+    record.stageTimings = context.goal.ceremony!.history.map((entry, index, history) => {
+      const throughAt = index + 1 < history.length ? history[index + 1].enteredAt : record.verifiedAt!;
+      return { stage: entry.stage, enteredAt: entry.enteredAt, throughAt, elapsedMs: entry.enteredAt === null || throughAt === null ? null : Date.parse(throughAt) - Date.parse(entry.enteredAt) };
+    });
+    await this.save(context, record);
+    return { status: "complete", evidence: { kind: "retro-published", path: retroPath(context.goal.id), prUrl: pr.url, baseBranch: "main", mergedSha: pr.mergedSha,
+      postId: postIds.at(-1)!, publishedAt: record.verifiedAt, factsOnly: true, suggestions: "owner-proposals-only" } };
+  }
+
   async poll(context: CeremonyContext): Promise<CeremonyProgress<PublishedRetroEvidence>> {
     let retained: RetroPublicationRecord | undefined;
     try {
-      const record = await this.load(context);
-      retained = record;
-      if (!record.frozen) {
-        const failures = record.attempts.length;
-        const finite = context.goal.workflowModel === "goals-v1";
-        const retry = finite ? freshDraftRetry(context, record) : undefined;
-        if (failures && finite && !retry) {
-          record.failure = draftFailure(record); await this.save(context, record);
-          return pending(record.failure.message, record.failure);
-        }
-        if (failures && !finite) {
-          const last = record.attempts.at(-1)!;
-          const retryAt = Date.parse(last.finishedAt ?? last.startedAt) + retroRetryDelayMs(failures);
-          if (!(Date.now() >= retryAt)) return pending(`Chick's retrospective draft failed or was interrupted ${failures} time(s); the next attempt starts after ${new Date(Number.isFinite(retryAt) ? retryAt : Date.now()).toISOString()}.`);
-        }
-        const prior = priorRetroAttempts(record.attempts);
-        record.attempts.push({ startedAt: new Date().toISOString(), ...(retry ? { retry } : {}) });
-        await this.save(context, record);
-        const attempt = record.attempts.at(-1)!;
-        let draft: SprintRetroDraft;
-        try { draft = await this.draft(context, prior); }
-        catch (error) {
-          attempt.finishedAt = new Date().toISOString();
-          if (error instanceof RetroGenerationError) { attempt.generation = error.generation; attempt.errorKind = error.kind; }
-          else attempt.errorKind = "draft-error";
-          if (finite) record.failure = draftFailure(record);
-          await this.save(context, record);
-          return pending(record.failure?.message ?? "Chick's retrospective draft failed or was interrupted; it will be retried with backoff.", record.failure);
-        }
-        if (draft.snapshot.goalId !== context.goal.id || draft.snapshot.leadSeatId !== context.goal.seatId || draft.markdown !== await renderSprintRetro(draft.snapshot, draft.narrative, draft.generation)) {
-          Object.assign(attempt, { finishedAt: new Date().toISOString(), errorKind: "unverified-content", generation: draft.generation });
-          if (finite) record.failure = draftFailure(record);
-          await this.save(context, record);
-          throw new Error("Retrospective content was not rendered from this goal's recorded facts.");
-        }
-        const messages = parts(draft.markdown);
-        // The Chick chat adds its persona attribution to each thread post; verifyPosts expects exactly that.
-        // The archive keeps the frozen parts only, so no attribution lines appear between fragments.
-        const markdown = archiveOf(messages);
-        attempt.finishedAt = new Date().toISOString();
-        attempt.generation = draft.generation;
-        record.frozen = { draft, parts: messages, markdown, sha256: digest(markdown) };
-        delete record.failure;
-        await this.save(context, record);
-      }
-      const frozen = record.frozen;
-      const postIds: string[] = [];
-      for (const [index, message] of frozen.parts.entries()) postIds.push(await context.post(`retro-content:${frozen.sha256}:${index}`, message));
-      record.postIds = postIds;
-      await this.save(context, record);
-      await this.verifyPosts(context, record);
-      record.prUrl = await this.archive.ensureRetroPr(record.github, context.goal.id, frozen.markdown);
-      await this.save(context, record);
-      let pr = await this.archive.inspectRetroPr(record.github, context.goal.id, frozen.markdown, record.prUrl);
-      if (pr.url !== record.prUrl) return pending("The inspected archival PR does not match this publication.");
-      if (pr.state === "CLOSED") return pending("The retrospective PR is closed without merging; the owner must resolve it before the goal can close.");
-      if (pr.state === "OPEN") {
-        const announcedAt = record.gate?.headSha === pr.headSha ? record.gate.announcedAt : new Date().toISOString();
-        // Save the start of the announcement before delivery; a reaction received during a lost response is fresh.
-        if (record.gate?.headSha !== pr.headSha) {
-          record.gate = { headSha: pr.headSha, postId: "", announcedAt };
-          await this.save(context, record);
-        }
-        const postId = await context.post(`retro-merge:${pr.headSha}`, `**Retrospective archive: ${context.goal.id}**\n${pr.url}\n\nOnly \`${retroPath(context.goal.id)}\` may change. A fresh review and passing CI are required. It merges automatically once the current head is approved and CI passes. Suggested process changes remain proposals for the owner.`, "retro");
-        record.gate = { headSha: pr.headSha, postId, announcedAt };
-        await this.save(context, record);
-        if (!pr.reviewed) {
-          await this.review(context, record, pr);
-          pr = await this.archive.inspectRetroPr(record.github, context.goal.id, frozen.markdown, record.prUrl);
-        }
-        if (pr.state === "OPEN" && pr.reviewed && pr.checksPassed) {
-          await this.verifyPosts(context, record);
-          const merge = await this.archive.mergeRetroPr(record.github, context.goal.id, frozen.markdown, pr.url, pr.headSha);
-          pr = await this.archive.inspectRetroPr(record.github, context.goal.id, frozen.markdown, record.prUrl);
-          if (!merge.merged && pr.state !== "MERGED") return pending(merge.reason);
-        }
-        if (pr.state !== "MERGED") return pending(!pr.reviewed ? "The retrospective archive needs a fresh review on its current head." : !pr.checksPassed ? "The retrospective archive is waiting for passing CI." : "The archival merge is pending verification.");
-      }
-      if (!pr.reviewed || !pr.checksPassed || !pr.mergedSha) return pending("The archival merge still needs current-head review and passing CI.");
-      await this.verifyPosts(context, record);
-      record.verifiedAt ??= new Date().toISOString();
-      record.stageTimings = context.goal.ceremony!.history.map((entry, index, history) => {
-        const throughAt = index + 1 < history.length ? history[index + 1].enteredAt : record.verifiedAt!;
-        return { stage: entry.stage, enteredAt: entry.enteredAt, throughAt, elapsedMs: entry.enteredAt === null || throughAt === null ? null : Date.parse(throughAt) - Date.parse(entry.enteredAt) };
-      });
-      await this.save(context, record);
-      return { status: "complete", evidence: { kind: "retro-published", path: retroPath(context.goal.id), prUrl: pr.url, baseBranch: "main", mergedSha: pr.mergedSha,
-        postId: postIds.at(-1)!, publishedAt: record.verifiedAt, factsOnly: true, suggestions: "owner-proposals-only" } };
+      const record = await this.load(context); retained = record;
+      return await this.advance(context, record);
     } catch {
       const record = retained;
-      if (context.goal.workflowModel === "goals-v1" && record && !record.frozen && record.attempts.length) {
+      if (record && (context.goal.workflowModel === "goals-v1" || record.correction) && !record.frozen && record.attempts.length) {
         record.failure = draftFailure(record);
         // A lost reservation acknowledgement still blocks replay. A later turn recovers from the retained attempt.
         try { await this.save(context, record); } catch { /* Preserve the blocker even when the runtime journal is unavailable. */ }
