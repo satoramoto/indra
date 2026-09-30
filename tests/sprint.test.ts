@@ -32,7 +32,7 @@ class GitHub implements Shell {
   calls: { command: string; args: string[]; cwd: string }[] = [];
   state?: "OPEN" | "CLOSED" | "MERGED";
   checks = [{ name: "checks", bucket: "pass" }];
-  reviews: { id: number; user: { login: string }; state: string; commit_id: string; body?: string; comments?: unknown[] }[] = [];
+  reviews: { id: number; user: { login: string }; state: string; commit_id: string; body?: string; comments?: unknown[]; submitted_at?: string }[] = [];
   reviewer = "satori-miyamoto";
   loseReview = false;
   refuseReview = false;
@@ -50,6 +50,7 @@ class GitHub implements Shell {
   autoArmed = false;
   serverRejected = false;
   mutateBeforeMerge?: () => Promise<void>;
+  mutateBeforePush?: () => Promise<void>;
   constructor(readonly remote: string) {}
   head() { return git(this.remote, "rev-parse", `refs/heads/retro/${goal}`).trim(); }
   async run(command: string, args: string[], cwd: string) {
@@ -57,7 +58,9 @@ class GitHub implements Shell {
     const ok = (stdout = "", code = 0) => ({ code, stdout, stderr: "" });
     if (command === "git") {
       if (args.join(" ") === "remote get-url origin") return ok(this.remoteUrl);
+      if (args.includes("push")) await this.mutateBeforePush?.();
       const result = await processShell.run(command, args, cwd);
+      if (args.includes("push") && result.code === 0 && this.state) git(this.remote, "update-ref", "refs/pull/1/head", this.head());
       if (args.includes("push") && this.losePush) { this.losePush = false; return ok("", 1); }
       return result;
     }
@@ -69,7 +72,7 @@ class GitHub implements Shell {
       if (args[0] === "api" && args[1].endsWith("/reviews") && args.includes("POST")) {
         if (this.refuseReview) return ok("", 1);
         const review = JSON.parse(await readFile(args[args.indexOf("--input") + 1], "utf8"));
-        this.reviews.push({ id: this.reviews.length + 1, user: { login: this.reviewer }, state: review.event === "APPROVE" ? "APPROVED" : "CHANGES_REQUESTED", ...review });
+        this.reviews.push({ id: this.reviews.length + 1, user: { login: this.reviewer }, state: review.event === "APPROVE" ? "APPROVED" : "CHANGES_REQUESTED", submitted_at: "2026-01-01T00:00:00.000Z", ...review });
         return ok("", this.loseReview ? 1 : 0);
       }
       throw new Error("Unexpected reviewer command");
@@ -325,6 +328,69 @@ describe("retrospective-only GitHub archival", () => {
       comments: findings ? [{ path, line: 3, side: "RIGHT", body: "Missing recorded evidence." }] : [] });
     expect((await github.inspectRetroPr("test/project", goal, content, url)).reviewed).toBe(!findings);
     expect(shell.calls.filter((call) => call.command === "env").every((call) => call.args.includes("user") || call.args.some((arg) => arg.endsWith("/reviews")))).toBe(true);
+  });
+
+  const replacement = content + "\nProduct draft history is unknown.\n";
+  async function rejectedArchive() {
+    const f = await fixture(); await f.github.ensureRetroPr("test/project", goal, content);
+    await f.github.reviewRetroPr("test/project", goal, content, url, f.shell.head(), async () => ({ summary: "Correct the unsupported count", findings: [{ path, line: 3, reason: "Missing recorded Product history." }] }));
+    const rejection = (await f.github.inspectRetroPr("test/project", goal, content, url)).rejection!;
+    expect(rejection).toEqual({ reviewId: 1, headSha: f.shell.head(), submittedAt: "2026-01-01T00:00:00.000Z" });
+    return { ...f, rejection };
+  }
+
+  it.each(["before-push", "lost-response"])("recovers a guarded correction at %s without a second commit or a replacement PR", async (boundary) => {
+    const f = await rejectedArchive(); const old = f.shell.head();
+    const apply = () => new SprintGitHub(f.shell, f.runtimeDir).correctRetroPr("test/project", goal, content, replacement, url, f.rejection);
+    if (boundary === "before-push") {
+      f.shell.mutateBeforePush = async () => { throw new Error("Process stopped before push"); };
+      await expect(apply()).rejects.toThrow(); expect(f.shell.head()).toBe(old); f.shell.mutateBeforePush = undefined;
+    } else f.shell.losePush = true;
+    const corrected = await apply(); expect(await apply()).toBe(corrected);
+    expect(git(f.remote, "rev-list", "--parents", "-n", "1", corrected).trim()).toBe(`${corrected} ${old}`);
+    expect(git(f.remote, "show", `${old}:${path}`)).toBe(content); expect(git(f.remote, "show", `${corrected}:${path}`)).toBe(replacement);
+    expect(git(f.remote, "diff", "--name-only", old, corrected).trim()).toBe(path);
+    expect(f.shell.calls.filter((call) => call.args.includes("commit"))).toHaveLength(2);
+    expect(f.shell.calls.filter((call) => call.args[1] === "create")).toHaveLength(1);
+    const pushes = f.shell.calls.filter((call) => call.args.includes("push"));
+    expect(pushes.every((call) => !call.args.some((arg) => arg.includes("force") || arg.startsWith("+")))).toBe(true);
+    expect(pushes.at(-1)!.args).toContain(`HEAD:refs/heads/retro/${goal}`);
+    expect(git(f.project, "status", "--porcelain")).toBe("");
+    expect((await processShell.run("git", ["config", "--get", "core.hooksPath"], f.project)).code).toBe(1);
+    expect((await f.github.inspectRetroPr("test/project", goal, replacement, url)).reviewed).toBe(false);
+    expect((await f.github.mergeRetroPr("test/project", goal, replacement, url, corrected)).merged).toBe(false);
+    f.shell.approve(); f.shell.checks[0].bucket = "pending";
+    expect((await f.github.mergeRetroPr("test/project", goal, replacement, url, corrected)).merged).toBe(false);
+    f.shell.checks[0].bucket = "pass"; expect((await f.github.mergeRetroPr("test/project", goal, replacement, url, corrected)).merged).toBe(true);
+  });
+
+  it.each(["advance", "rewind"])("rejects a concurrent %s at the remote advertisement instead of replacing its head", async (move) => {
+    const f = await rejectedArchive(); const old = f.shell.head(); let moved = "";
+    f.shell.mutateBeforePush = async () => {
+      f.shell.mutateBeforePush = undefined;
+      if (move === "advance") {
+        git(f.source, "fetch", "--quiet", f.remote, `retro/${goal}`); git(f.source, "checkout", "--quiet", "--detach", "FETCH_HEAD");
+        git(f.source, "commit", "--allow-empty", "-qm", "Concurrent head"); moved = git(f.source, "rev-parse", "HEAD").trim();
+        git(f.source, "push", "--quiet", f.remote, `HEAD:refs/heads/retro/${goal}`);
+      } else moved = git(f.remote, "rev-parse", `${old}^`).trim();
+      git(f.remote, "update-ref", `refs/heads/retro/${goal}`, moved); git(f.remote, "update-ref", "refs/pull/1/head", moved);
+    };
+    await expect(f.github.correctRetroPr("test/project", goal, content, replacement, url, f.rejection)).rejects.toThrow();
+    expect(f.shell.head()).toBe(moved); expect(moved).not.toBe(old);
+    await expect(new SprintGitHub(f.shell, f.runtimeDir).correctRetroPr("test/project", goal, content, replacement, url, f.rejection)).rejects.toThrow("head moved");
+  });
+
+  it.each(["stale-review", "dismissed", "foreign-reviewer", "wrong-bytes", "extra-file", "existing-hook", "configured-hooks"])("blocks a correction with %s evidence or policy", async (problem) => {
+    const f = await rejectedArchive(); const old = f.shell.head();
+    if (problem === "stale-review") f.shell.reviews[0].commit_id = "f".repeat(40);
+    if (problem === "dismissed") f.shell.reviews[0].state = "DISMISSED";
+    if (problem === "foreign-reviewer") f.shell.reviews[0].user.login = "owner";
+    if (problem === "extra-file") f.shell.extraPage = true;
+    if (problem === "existing-hook") await writeFile(join(f.project, ".git/hooks/pre-push"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    if (problem === "configured-hooks") git(f.project, "config", "core.hooksPath", "/owner/hooks");
+    await expect(f.github.correctRetroPr("test/project", goal, problem === "wrong-bytes" ? "wrong" : content, replacement, url, f.rejection)).rejects.toThrow();
+    expect(f.shell.head()).toBe(old); expect(f.shell.calls.filter((call) => call.args.includes("push"))).toHaveLength(1);
+    if (["stale-review", "dismissed", "foreign-reviewer"].includes(problem)) expect((await f.github.inspectRetroPr("test/project", goal, content, url)).rejection).toBeUndefined();
   });
 
   it("fails closed on the wrong review account or an unconfirmed verdict", async () => {

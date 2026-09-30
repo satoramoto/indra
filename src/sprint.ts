@@ -45,7 +45,10 @@ export interface RetroPr {
   url: string; state: "OPEN" | "CLOSED" | "MERGED"; headSha: string; mergedSha?: string;
   /** A fresh approval from the review account on this exact head, with no outstanding change requests. */
   reviewed: boolean; checksPassed: boolean;
+  /** Latest delivered bot verdict rejects this exact open head; historical or dismissed findings are insufficient. */
+  rejection?: RetroRejection;
 }
+export interface RetroRejection { reviewId: number; headSha: string; submittedAt: string }
 export interface RetroReview {
   summary: string;
   findings: { path: string; line: number; reason: string }[];
@@ -53,6 +56,8 @@ export interface RetroReview {
 export interface RetroArchive {
   ensureRetroPr(github: string, goalId: string, markdown: string): Promise<string>;
   inspectRetroPr(github: string, goalId: string, markdown: string, prUrl: string): Promise<RetroPr>;
+  /** Optional for historical adapters; updates the same PR from verified rejected bytes by a guarded fast-forward. */
+  correctRetroPr?(github: string, goalId: string, previous: string, markdown: string, prUrl: string, rejection: RetroRejection): Promise<string>;
   reviewRetroPr(github: string, goalId: string, markdown: string, prUrl: string, headSha: string, review: (worktree: string) => Promise<RetroReview>): Promise<void>;
   mergeRetroPr(github: string, goalId: string, markdown: string, prUrl: string, headSha: string): Promise<MergeResult>;
 }
@@ -528,15 +533,88 @@ export class SprintGitHub implements RetroArchive {
     });
   }
 
+  /** Retain the exact correction commit before pushing; replay reconciles only that commit, never arbitrary matching bytes. */
+  async correctRetroPr(github: string, goalId: string, previous: string, markdown: string, prUrl: string, rejection: RetroRejection): Promise<string> {
+    this.retroRepo(github, goalId, prUrl);
+    if (!SHA.test(rejection.headSha) || !Number.isSafeInteger(rejection.reviewId) || rejection.reviewId < 1 || !Number.isFinite(Date.parse(rejection.submittedAt))
+      || !markdown.trim() || markdown === previous) throw new SprintError("A correction needs a verified rejection and changed frozen content.");
+    const hash = (text: string) => createHash("sha256").update(text).digest("hex");
+    const identity = { version: 1, github, goalId, prUrl, rejection, previous: hash(previous), markdown: hash(markdown) };
+    const key = hash(JSON.stringify(identity)); const file = join(this.runtimeDir, `retro-correction-${goalId}-${key}.json`);
+    return await withFileLock(join(this.runtimeDir, `retro-git-${goalId}.lock`), async () => {
+      const project = await this.retroCheckout(github); const branch = retroBranch(goalId); const path = retroPath(goalId);
+      const saved = await readFile(file, "utf8").catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; return undefined; });
+      const record = saved ? JSON.parse(saved) as typeof identity & { resultSha: string | null } : { ...identity, resultSha: null as string | null };
+      if (Object.entries(identity).some(([key, value]) => JSON.stringify(record[key as keyof typeof identity]) !== JSON.stringify(value))
+        || (record.resultSha !== null && !SHA.test(record.resultSha))) throw new SprintError("Retrospective correction journal identity is unverified.");
+      const verifyCommit = async (head: string) => {
+        const parents = (await this.must("git", ["rev-list", "--parents", "-n", "1", head], project)).stdout.trim().split(" ");
+        if (JSON.stringify(parents) !== JSON.stringify([head, rejection.headSha]) || (await this.must("git", ["show", `${rejection.headSha}:${path}`], project)).stdout !== previous) throw new SprintError("Correction ancestry or superseded bytes changed.");
+        await this.retroTree(project, rejection.headSha, head, path, markdown);
+      };
+      const head = await this.retroDetails(prUrl);
+      if (record.resultSha && head.headRefOid === record.resultSha) {
+        const published = await this.inspectRetroPr(github, goalId, markdown, prUrl);
+        await verifyCommit(record.resultSha);
+        if (published.headSha !== record.resultSha || published.state === "CLOSED") throw new SprintError("The corrected archive changed or closed before reconciliation.");
+        return record.resultSha;
+      }
+      if (head.headRefOid !== rejection.headSha) throw new SprintError("The archive head moved outside this correction; preserve both revisions and reconcile it.");
+      const verifyRejected = async () => {
+        const proof = await this.inspectRetroPr(github, goalId, previous, prUrl);
+        if (proof.state !== "OPEN" || proof.headSha !== rejection.headSha || JSON.stringify(proof.rejection) !== JSON.stringify(rejection)) throw new SprintError("Correction requires the same delivered bot rejection on the open archive head.");
+      };
+      await verifyRejected();
+      // A command-local guard must not hide a configured or default repository hook.
+      const configured = await this.run("git", ["config", "--get", "core.hooksPath"], project);
+      if (configured.code !== 1) throw new SprintError("An existing hooks configuration requires owner reconciliation before archival correction.");
+      const hookPath = (await this.must("git", ["rev-parse", "--path-format=absolute", "--git-path", "hooks/pre-push"], project)).stdout.trim();
+      const hook = await lstat(hookPath).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; });
+      if (hook) throw new SprintError("An existing pre-push hook requires owner reconciliation before archival correction.");
+      const worktrees = join(this.runtimeDir, "worktrees"); await mkdir(worktrees, { recursive: true, mode: 0o700 });
+      const temp = await mkdtemp(join(worktrees, `retro-correction-${goalId}-`)); const worktree = join(temp, "checkout");
+      try {
+        await this.must("git", ["worktree", "add", "--detach", worktree, record.resultSha ?? rejection.headSha], project);
+        if (!record.resultSha) {
+          const document = join(worktree, path);
+          if (!(await lstat(document)).isFile() || await readFile(document, "utf8") !== previous) throw new SprintError("The correction checkout does not contain the expected regular document.");
+          await writeFile(document, markdown);
+          await this.must("git", ["add", "--", path], worktree);
+          await this.must("git", ["commit", "--only", "-m", `Correct retrospective for ${goalId}`, "--", path], worktree);
+          record.resultSha = (await this.must("git", ["rev-parse", "HEAD"], worktree)).stdout.trim();
+          await verifyCommit(record.resultSha);
+          const pending = `${file}.${process.pid}.tmp`; await writeFile(pending, JSON.stringify(record), { mode: 0o600 }); await rename(pending, file);
+        } else await verifyCommit(record.resultSha);
+        await verifyRejected();
+        const hooks = join(temp, "hooks"); await mkdir(hooks, { mode: 0o700 });
+        // Git supplies its advertised remote SHA to pre-push, then checks that same SHA under the remote ref lock.
+        // This is a normal non-forced push, with an extra expected-old-head condition and no shared config mutation.
+        await writeFile(join(hooks, "pre-push"), `#!/bin/sh\nread -r local_ref local_sha remote_ref remote_sha || exit 1\n[ "$local_sha" = "${record.resultSha}" ] && [ "$remote_ref" = "refs/heads/${branch}" ] && [ "$remote_sha" = "${rejection.headSha}" ] || exit 1\nif read -r extra; then exit 1; fi\n`, { mode: 0o700 });
+        try { await this.run("git", ["-c", `core.hooksPath=${hooks}`, ...GH_CREDENTIAL, "push", "origin", `HEAD:refs/heads/${branch}`], worktree); }
+        catch { /* A lost push response is reconciled against the journaled commit below. */ }
+        const after = await this.inspectRetroPr(github, goalId, markdown, prUrl);
+        if (after.headSha !== record.resultSha || after.state === "CLOSED") throw new SprintError("The correction push is unconfirmed or the archive head moved; retry reconciliation.");
+        await verifyCommit(after.headSha);
+        return after.headSha;
+      } finally {
+        // Unknown hook output or uncommitted work remains recoverable; never force-remove it.
+        const removed = await this.run("git", ["worktree", "remove", worktree], project);
+        if (removed.code === 0) await rm(temp, { recursive: true, force: true });
+      }
+    });
+  }
+
+  private async retroDetails(prUrl: string) {
+    const result = await this.run("gh", ["pr", "view", prUrl, "--json", "state,headRefName,baseRefName,headRefOid,isCrossRepository,isDraft,author,mergeCommit,reviewDecision"]);
+    if (result.code !== 0) throw new SprintError("Could not inspect the retrospective PR.");
+    try { return JSON.parse(result.stdout) as { state: RetroPr["state"]; headRefName: string; baseRefName: string; headRefOid: string; isCrossRepository: boolean; isDraft: boolean; author: { login: string }; mergeCommit?: { oid: string }; reviewDecision?: string }; }
+    catch { throw new SprintError("Invalid retrospective PR details."); }
+  }
+
   /** Check the exact PR head, every changed path, document bytes, review and CI again, even after a restart. */
   async inspectRetroPr(github: string, goalId: string, markdown: string, prUrl: string): Promise<RetroPr> {
     const endpoint = this.retroRepo(github, goalId, prUrl);
-    const read = async () => {
-      const result = await this.run("gh", ["pr", "view", prUrl, "--json", "state,headRefName,baseRefName,headRefOid,isCrossRepository,isDraft,author,mergeCommit,reviewDecision"]);
-      if (result.code !== 0) throw new SprintError("Could not inspect the retrospective PR.");
-      try { return JSON.parse(result.stdout) as { state: RetroPr["state"]; headRefName: string; baseRefName: string; headRefOid: string; isCrossRepository: boolean; isDraft: boolean; author: { login: string }; mergeCommit?: { oid: string }; reviewDecision?: string }; }
-      catch { throw new SprintError("Invalid retrospective PR details."); }
-    };
+    const read = async () => await this.retroDetails(prUrl);
     const pr = await read();
     if (pr.baseRefName !== "main" || pr.headRefName !== retroBranch(goalId) || pr.isCrossRepository !== false || !SHA.test(pr.headRefOid) || !["OPEN", "CLOSED", "MERGED"].includes(pr.state) || !pr.author?.login) throw new SprintError("Retrospective PR does not match this goal's archive branch and project.");
     const path = retroPath(goalId);
@@ -553,7 +631,7 @@ export class SprintGitHub implements RetroArchive {
       await this.must("git", ["merge-base", "--is-ancestor", pr.mergeCommit!.oid, "origin/main"], project);
       await this.retroTree(project, `${pr.mergeCommit!.oid}^`, pr.mergeCommit!.oid, path, markdown);
     }
-    const reviews = await this.retroPages<{ id: number; user: { login: string }; state: string; commit_id: string }>(`${endpoint}/reviews?per_page=100`);
+    const reviews = await this.retroPages<{ id: number; user: { login: string }; state: string; commit_id: string; submitted_at?: string }>(`${endpoint}/reviews?per_page=100`);
     const latest = new Map<string, typeof reviews[number]>();
     for (const review of reviews.sort((a, b) => a.id - b.id)) if (["APPROVED", "CHANGES_REQUESTED", "DISMISSED"].includes(review.state)) latest.set(review.user?.login, review);
     const approved = latest.get("satori-miyamoto");
@@ -566,7 +644,10 @@ export class SprintGitHub implements RetroArchive {
     } catch { /* Missing/unreadable CI is pending. */ }
     const after = await read();
     if (JSON.stringify(after) !== JSON.stringify(pr)) throw new SprintError("Retrospective PR changed during verification; retry.");
-    return { url: prUrl, state: pr.state, headSha: pr.headRefOid, mergedSha: pr.mergeCommit?.oid, reviewed: reviewed && !pr.isDraft, checksPassed };
+    const rejection = pr.state === "OPEN" && !pr.isDraft && pr.author.login !== "satori-miyamoto" && approved?.state === "CHANGES_REQUESTED" && approved.commit_id === pr.headRefOid
+      && Number.isSafeInteger(approved.id) && approved.id > 0 && approved.submitted_at && Number.isFinite(Date.parse(approved.submitted_at))
+      ? { reviewId: approved.id, headSha: pr.headRefOid, submittedAt: approved.submitted_at } : undefined;
+    return { url: prUrl, state: pr.state, headSha: pr.headRefOid, mergedSha: pr.mergeCommit?.oid, reviewed: reviewed && !pr.isDraft, checksPassed, ...(rejection ? { rejection } : {}) };
   }
 
   /** A fresh read-only reviewer sees the pinned checkout; the host posts its line comments and verdict. */
