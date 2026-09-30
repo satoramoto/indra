@@ -2,6 +2,7 @@
 import { createInterface } from "node:readline/promises";
 import { randomUUID } from "node:crypto";
 import { userInfo } from "node:os";
+import { circuitShell } from "./circuit-scope.js";
 import { CircuitBudget, CircuitOpenError, type CircuitGrant } from "./circuit-budget.js";
 import { dirname, join, resolve } from "node:path";
 import { readToken } from "./credential.js";
@@ -73,7 +74,7 @@ export async function createPlanningBridge(store: PlanningStore, chat: PlanningC
       const reader = new module.LocalReleaseActivationReader(store.checkout, { appDir: defaultAppDir, runtimeDir: store.runtimeDir });
       supplied = { ...supplied, release: { poll: async ({ goal }) => {
         if (!goal.integration?.prUrl) return { status: "pending", reason: "Waiting for the integration PR." };
-        const mergeVerification = await new SprintGitHub(processShell, store.runtimeDir).mergeVerification(goal.integration.prUrl).catch(() => undefined);
+        const mergeVerification = await new SprintGitHub(circuitShell(processShell), store.runtimeDir).mergeVerification(goal.integration.prUrl).catch((error) => { if (error instanceof CircuitOpenError) throw error; return undefined; });
         if (!mergeVerification) return { status: "pending", reason: "The merged integration's current-head bot review and CI are not verified." };
         const result = await reader.read(goal.integration);
         if (result.status !== "running") return { status: "pending", reason: result.reason };
@@ -235,6 +236,13 @@ export async function runConsistencyCheck(state: StateInventory, reader: TeamMem
 const GOAL_ACTIONS = ["approve", "propose", "integrate", "merge", "rollback"] as const;
 type GoalAction = typeof GOAL_ACTIONS[number];
 const isGoalAction = (action: string | undefined): action is GoalAction => (GOAL_ACTIONS as readonly (string | undefined)[]).includes(action);
+
+/** Preserve the circuit/caller stop signal as well as the lifetime of the owning host. */
+export function withRuntimeSignal(runtime: AgentRuntime, signal: AbortSignal): AgentRuntime {
+  return { message: (prompt, schema, sessionId, options) => runtime.message(prompt, schema, sessionId, {
+    ...options, signal: options?.signal ? AbortSignal.any([signal, options.signal]) : signal,
+  }) };
+}
 
 /** All model and posting paths use the seat from state, local engine selection and optional Indra profiles. */
 async function seatServices(store: PlanningStore, username: string, seatId?: string) {
@@ -586,7 +594,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       if (team) {
         const home = requireTeamHome(state, team.id); const github = await workflowDelivery(store);
         const inbox = new WorkflowInbox(store.runtimeDir); const signals = hostSignals();
-        const bounded = (runtime: AgentRuntime): AgentRuntime => ({ message: (prompt, schema, sessionId, messageOptions) => runtime.message(prompt, schema, sessionId, { ...messageOptions, signal: signals.signal }) });
+        const bounded = (runtime: AgentRuntime): AgentRuntime => withRuntimeSignal(runtime, signals.signal);
         const freshBridge = () => createPlanningBridge(store, chat, bounded(services.runtime(process.cwd())), ceremonyModules, (cwd: string, write?: WriteAccess) => bounded(services.runtime(cwd, undefined, write)));
         try { await runWorkflowHost({ store, teamId: team.id, consumer: `scheduler-${team.id}`, signal: signals.signal,
           mattermost: { server: SERVER, token, channelId: home.channelId }, github,
