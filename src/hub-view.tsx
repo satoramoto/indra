@@ -148,8 +148,12 @@ export function occupancy(model: TerminalUiModel, seat: StateSeat): { label: str
   const newest = newestPlanningRecord(records);
   if (model.team?.workflowModel === "goals-v1") {
     const live = model.liveUsage[seat.id];
-    return live ? { label: "running session · " + engineLabel(live.engine), color: theme.text }
-      : { label: "current session evidence unavailable", color: theme.dim };
+    if (live) return { label: "running session · " + engineLabel(live.engine), color: theme.text };
+    const host = model.live[seat.id];
+    if (seat.roles.includes("Product") && model.sessionResult.connection === "connected" && host?.process === "running" && !host.problem
+      && host.product?.runState === "idle" && host.product.failure === null && host.product.pending === null
+      && newest?.status !== "error" && !records.some((record) => record.status === "running")) return { label: "no active session", color: theme.dim };
+    return { label: "current session evidence unavailable", color: theme.dim };
   }
   if (model.sessionResult.connection !== "connected") return { label: "occupancy unknown", color: theme.wait, session: newest };
   if (newest?.status === "error" && !newest.sessionId) return { label: records.some((record) => !!record.sessionId) ? "runtime error · saved session" : "runtime record error", color: theme.bad, session: newest };
@@ -209,7 +213,7 @@ export function seatState(model: TerminalUiModel, seat: StateSeat): HubState {
   const live = model.live[seat.id];
   if (live?.problem || live?.process === "no credential" || live?.process === "no channel") return "failed";
   if (live?.goal) return live.goal.progress?.failure || live.goal.status === "failed" ? "failed" : live.goal.status === "running" ? "running" : "waiting";
-  if (live?.product) return live.product.failure ? "failed" : live.product.queue.some((item) => item.status === "posted") ? "needs" : live.product.queue.length ? "waiting" : "idle";
+  if (live?.product) return live.product.failure ? "failed" : live.product.queue.some((item) => item.status === "posted") ? "needs" : live.product.runState === "active" ? live.process === "running" ? "running" : "waiting" : live.product.queue.length ? "waiting" : "idle";
   if (live?.scheduler) return live.scheduler.failure ? "failed" : live.scheduler.activeDispatches.length ? "running" : live.scheduler.approvedQueue.length ? "waiting" : "idle";
   if (isDeveloper(seat) && live) {
     const status = live.assignment?.status;
@@ -267,6 +271,7 @@ export function seatInfo(model: TerminalUiModel, seat: StateSeat): SeatInfo {
     : processDown ? { text: processLabel(live), color: processColor[live.process] }
     : developer ? live.retry ? { text: "failed · T retry", color: theme.bad } : { text: "no assignment", color: theme.dim }
     : { text: status.label, color: status.color === theme.text ? theme.dim : status.color };
+  const postedProposal = live?.product?.queue.find((entry) => entry.status === "posted");
   const attention = state !== "needs" && state !== "failed" ? undefined
     : live?.problem ? displayText(live.problem, 300)
     : live?.goal?.progress?.failure ? displayText(live.goal.progress.failure.message)
@@ -274,6 +279,7 @@ export function seatInfo(model: TerminalUiModel, seat: StateSeat): SeatInfo {
     : live?.product?.failure ? displayText(live.product.failure.message)
     : held?.status === "failed" ? displayText(held.title, 200) + " · failed"
     : developer && live.retry ? assignmentLine(live, 200)
+    : !processDown && postedProposal ? `Proposal awaits your approval: ${displayText(postedProposal.proposal.summary, 200)}`
     : records.map(ownerAction).find(Boolean) ?? (processDown ? processLabel(live) : status.label);
   const running = model.liveUsage[seat.id];
   return {
