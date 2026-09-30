@@ -8,7 +8,7 @@ import type { Shell, ShellResult } from "../src/developer-seat.js";
 import { MattermostPlanningChat } from "../src/planning-mattermost.js";
 import { parseOptions } from "../src/cli.js";
 import type { AgentRuntime, AgentResult } from "../src/codex-runtime.js";
-import { CLARIFY_TIMEOUT_MS, DRAFT_TIMEOUT_MS } from "../src/codex-runtime.js";
+import { CLARIFY_TIMEOUT_MS, DEVELOPER_SESSION_TIMEOUT_MS, DRAFT_TIMEOUT_MS } from "../src/codex-runtime.js";
 
 import { advanceCeremony } from "../src/ceremony.js";
 import { goalRuntimeFilename, productRuntimeFilename, teamRuntimeFilename, validateProductProposal, type GoalReport, type GoalRuntimeRecord, type ProductRuntimeRecord, type SchedulerRuntimeRecord } from "../src/goal-contract.js";
@@ -915,6 +915,24 @@ describe("whole-goal queue contract", () => {
     expect(next.record.failure!.message).toContain("CI pending");
     expect(gh.calls.find((call) => call.startsWith("gh pr create"))).toContain("## Decisions");
   });
+  it("gives scheduled integration reviews the finite Developer session budget", async () => {
+    const store = await remodelStore(); const goalId = "goal-review-timeout";
+    await propose(store, goalId); await store.approveGoal(goalId, proof(goalId), at); await scheduler(store).turn(startup);
+    vi.spyOn(SprintGitHub.prototype, "verifyGoalReport").mockResolvedValue(undefined);
+    vi.spyOn(SprintGitHub.prototype, "integrationScope").mockResolvedValue({ headSha: MAIN_SHA, baseSha: MAIN_SHA, conflicting: false });
+    vi.spyOn(SprintGitHub.prototype, "reviewIntegration").mockImplementation(async (_repo, _goal, _url, _sha, review) => { await review("/fixture/reviewer"); gh.reviewed = true; });
+    vi.spyOn(SprintGitHub.prototype, "merge").mockResolvedValue({ merged: false, reason: "CI pending" });
+    const message = vi.fn<AgentRuntime["message"]>().mockResolvedValue({ sessionId: "fresh-review", startedAt: at, finishedAt: at, response: { summary: "Approved", findings: [] } });
+    const runtimeFor = vi.fn(() => ({ message }));
+    const bridge = new Bridge(store, new FakeChat(), new FakeRuntime(), 20, gh, {}, { projectContext: async () => structuredClone(context), runtimeFor });
+    const result = await bridge.turn({ kind: "developer-report", id: "review-timeout-report", goalId, teamId: "team-001", seatId: "seat-003", report: reportFor(goalId), at });
+    expect(message).toHaveBeenCalledExactlyOnceWith(expect.stringContaining(`at ${MAIN_SHA}`), expect.stringContaining("retro-review.json"), undefined, { purpose: "review", timeoutMs: DEVELOPER_SESSION_TIMEOUT_MS });
+    expect(runtimeFor).toHaveBeenCalledExactlyOnceWith("/fixture/reviewer");
+    expect(DEVELOPER_SESSION_TIMEOUT_MS).toBe(60 * 60_000);
+    expect(result.record.failure!.message).toContain("CI pending");
+    expect((await store.read()).planningGoals![0].integration?.status).toBe("pr-open");
+  });
+
   it("recovers a committed merge notification, waits for the actual running build and archived retro, then releases scope for the next goal", async () => {
     const store = await remodelStore(); const chat = new FakeChat();
     for (const id of ["goal-finish", "goal-wait"]) { await propose(store, id); await store.approveGoal(id, proof(id), at); }

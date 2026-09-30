@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import type { AgentRuntime, WriteAccess } from "./codex-runtime.js";
 import type { RuntimeSessionFacts } from "./runtime-facts.js";
 import { schemaPathOf } from "./reload.js";
-import { CLARIFY_TIMEOUT_MS, DRAFT_TIMEOUT_MS, planningId } from "./codex-runtime.js";
+import { CLARIFY_TIMEOUT_MS, DEVELOPER_SESSION_TIMEOUT_MS, DRAFT_TIMEOUT_MS, planningId } from "./codex-runtime.js";
 import { PlanningStore, developerSeats, missingTeamMessage, requireTeamHome, teamProject, validateOutcomeSeats, type MergeKind, type PlanningDocument, type PlanningGoal, type RuntimeRecord, type SprintIntegration } from "./planning.js";
 import { processShell, type Shell } from "./developer-seat.js";
 import { SprintGitHub, sprintBranch, releaseAttemptsName, type ReleaseAttempts } from "./sprint.js";
@@ -282,7 +282,7 @@ export class PlanningBridge {
         const inspected = await this.github.inspectMerge(pr);
         if (inspected.state === "OPEN" && !inspected.reviewed) await this.github.reviewIntegration(this.project(await this.store.read(), current), current.id, pr, inspected.headSha, async (cwd) => {
           const reviewer = this.scheduler.runtimeFor?.(cwd) ?? this.runtime;
-          const run = await reviewer.message(`Fresh read-only review of ${pr} at ${inspected.headSha}. Read AGENTS.md and the diff against origin/main. You did not author it. Flag only its blocking review list, never style. Return summary and findings with path, line and reason. Do not write, commit, push, merge or post; the host posts your verdict.`, schemaPathOf(import.meta.url, "retro-review.json"), undefined, { purpose: "review" });
+          const run = await reviewer.message(`Fresh read-only review of ${pr} at ${inspected.headSha}. Read AGENTS.md and the diff against origin/main. You did not author it. Flag only its blocking review list, never style. Return summary and findings with path, line and reason. Do not write, commit, push, merge or post; the host posts your verdict.`, schemaPathOf(import.meta.url, "retro-review.json"), undefined, { purpose: "review", timeoutMs: DEVELOPER_SESSION_TIMEOUT_MS });
           await this.recordRun(current, run); return run.response;
         });
         const result = await this.mergeGate(current.id, undefined, metadata);
