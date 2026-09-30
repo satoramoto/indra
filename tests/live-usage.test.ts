@@ -55,7 +55,7 @@ describe("the live context window", () => {
     await writeFile(log, count({ input_tokens: 120_000, cached_input_tokens: 100_000, output_tokens: 1_500, reasoning_output_tokens: 500, total_tokens: 121_500 }, { input_tokens: 900_000, cached_input_tokens: 700_000, output_tokens: 9_000, total_tokens: 909_000 })
       + count({ input_tokens: 180_000, cached_input_tokens: 170_000, output_tokens: 2_000, total_tokens: 182_000 }, { input_tokens: 1_080_000, cached_input_tokens: 870_000, output_tokens: 11_000, total_tokens: 1_091_000 }));
     const tail = new LiveUsageTail(log, "codex", () => Date.parse("2026-09-29T10:06:00.000Z"));
-    expect(await tail.read()).toEqual({ inputTokens: 1_080_000, cachedInputTokens: 870_000, outputTokens: 11_000 });
+    expect(await tail.read()).toEqual({ inputTokens: 1_080_000, uncachedInputTokens: 210_000, cachedInputTokens: 870_000, outputTokens: 11_000 });
     expect([tail.context, tail.compactedAt]).toEqual([182_000, undefined]);
     await appendFile(log, JSON.stringify({ timestamp: "2026-09-29T10:07:00.000Z", type: "compacted", payload: { message: "summary" } }) + "\n"
       + count({ input_tokens: 30_000, cached_input_tokens: 0, output_tokens: 800 }, { input_tokens: 1_110_000, cached_input_tokens: 870_000, output_tokens: 11_800 }));
