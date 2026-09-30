@@ -178,9 +178,18 @@ describe("whole-goal release proof", () => {
     run.mockResolvedValue({ code: 0, stdout: JSON.stringify({ state: "OPEN", headRefOid: report.headSha, body }), stderr: "" });
     await expect(github.prRetrospective("test/project", "goal-one", url, report.headSha)).rejects.toThrow("verified merged PR head");
   });
-  it.each(["owned", "unowned", "blocked", "check-failed", "push-failed", "live-owned", "live-foreign", "uninspectable", "ignored", "late-process"] as const)("preserves a real %s correction until its exact result is safely published and process-free", async (mode) => {
+  it.each(["owned", "dependencies", "unowned", "blocked", "check-failed", "push-failed", "live-owned", "live-foreign", "uninspectable", "ignored", "late-process", "late-ignored", "late-dirty", "late-untracked", "remove-failed"] as const)("preserves a real %s correction until its exact result is safely published and process-free", async (mode) => {
     const f = await fixture();
-    await writeFile(join(f.source, "change.ts"), "original\n"); await writeFile(join(f.source, ".gitignore"), ".cache\n"); git(f.source, "add", "."); git(f.source, "commit", "-qm", "Shared base");
+    await writeFile(join(f.source, "change.ts"), "original\n"); await writeFile(join(f.source, ".gitignore"), ".cache\nnode_modules/\ndist/\ncoverage/\n");
+    await mkdir(join(f.source, "vendor/fixture-dependency"), { recursive: true });
+    await writeFile(join(f.source, "vendor/fixture-dependency/package.json"), JSON.stringify({ name: "fixture-dependency", version: "1.0.0" }));
+    const packageJson = { name: "correction-fixture", version: "1.0.0", private: true, dependencies: { "fixture-dependency": "file:vendor/fixture-dependency" },
+      scripts: { build: `node -e "for (const dir of ['dist', 'coverage']) { require('fs').mkdirSync(dir, { recursive: true }); require('fs').writeFileSync(dir + '/output', 'generated'); }"` } };
+    await writeFile(join(f.source, "package.json"), JSON.stringify(packageJson));
+    await writeFile(join(f.source, "package-lock.json"), JSON.stringify({ name: packageJson.name, version: packageJson.version, lockfileVersion: 3, requires: true, packages: {
+      "": { name: packageJson.name, version: packageJson.version, dependencies: packageJson.dependencies }, "node_modules/fixture-dependency": { resolved: "vendor/fixture-dependency", link: true }, "vendor/fixture-dependency": { version: "1.0.0" },
+    } }));
+    git(f.source, "add", "."); git(f.source, "commit", "-qm", "Shared base");
     git(f.source, "checkout", "-qb", "sprint/goal-one"); await writeFile(join(f.source, "change.ts"), "goal change\n"); git(f.source, "commit", "-qam", "Goal"); const head = git(f.source, "rev-parse", "HEAD").trim();
     git(f.source, "checkout", "main"); await writeFile(join(f.source, "change.ts"), "main change\n"); git(f.source, "commit", "-qam", "Main"); const base = git(f.source, "rev-parse", "HEAD").trim();
     git(f.source, "push", f.remote, "main", "sprint/goal-one");
@@ -195,26 +204,40 @@ describe("whole-goal release proof", () => {
       }
       if (command === "git") {
         if (args.includes("push")) { pushAttempts++; if (mode === "push-failed" && !retry) return { code: 1, stdout: "", stderr: "Fixture push failed" }; }
+        if (args[0] === "worktree" && args[1] === "remove" && mode === "remove-failed" && !retry) return { code: 1, stdout: "", stderr: "Fixture cleanup refused" };
         return await processShell.run(command, args, cwd);
       }
       if (args[0] === "pr" && args[1] === "view") return { code: 0, stdout: JSON.stringify({ headRefName: "sprint/goal-one", baseRefName: "main", headRefOid: git(f.remote, "rev-parse", "sprint/goal-one").trim(), baseRefOid: base, isCrossRepository: false, mergeable: "CONFLICTING", body: "## Decisions\nOriginal decision" }), stderr: "" };
       if (args[0] === "api" && args[1].includes("/files?")) return { code: 0, stdout: JSON.stringify([[{ filename: "change.ts" }]]), stderr: "" };
       if (args[0] === "api" && args[1].includes("git/ref")) return { code: 0, stdout: git(f.remote, "rev-parse", "sprint/goal-one").trim(), stderr: "" };
-      if (args[0] === "pr" && args[1] === "edit") { published = true; expect(await readFile(args.at(-1)!, "utf8")).toContain("indra-integration-correction:"); return { code: 0, stdout: "", stderr: "" }; }
+      if (args[0] === "pr" && args[1] === "edit") {
+        published = true; expect(await readFile(args.at(-1)!, "utf8")).toContain("indra-integration-correction:");
+        if (mode === "late-ignored") await writeFile(join(isolated, ".cache"), "Unique ignored evidence\n");
+        if (mode === "late-dirty") await writeFile(join(isolated, "change.ts"), "New local work after publication\n");
+        if (mode === "late-untracked") await writeFile(join(isolated, "notes.txt"), "Unique untracked evidence\n");
+        return { code: 0, stdout: "", stderr: "" };
+      }
       throw new Error("Unexpected correction command");
     } };
     const github = new SprintGitHub(shell, f.runtimeDir); let isolated = "";
     const resolver = vi.fn(async (cwd: string, shared: string) => {
       if (retry) { expect(cwd).toBe(isolated); expect(await readFile(join(cwd, "change.ts"), "utf8")).toBe("partial correction with useful notes\n"); }
       isolated = cwd; expect(shared).toBe(await realpath(join(f.project, ".git")));
-      await writeFile(join(cwd, "change.ts"), mode === "owned" || retry ? "goal and main preserved\n" : "partial correction with useful notes\n"); resolved = true;
+      await writeFile(join(cwd, "change.ts"), mode === "owned" || mode === "dependencies" || retry ? "goal and main preserved\n" : "partial correction with useful notes\n"); resolved = true;
+      if (["dependencies", "push-failed", "ignored"].includes(mode)) {
+        const installed = await processShell.run("npm", ["ci", "--ignore-scripts", "--no-audit", "--no-fund", "--cache", join(f.root, "npm-cache")], cwd);
+        expect(installed.code, installed.stderr).toBe(0);
+        const built = await processShell.run("npm", ["run", "build"], cwd); expect(built.code, built.stderr).toBe(0);
+        expect(git(cwd, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory").trim().split("\n")).toEqual(["coverage/", "dist/", "node_modules/"]);
+      }
       if (mode === "unowned") await writeFile(join(cwd, "README.md"), "Unapproved change to preserve\n");
       if (mode === "ignored") await writeFile(join(cwd, ".cache"), "Unique ignored evidence\n");
       if (!retry && mode === "check-failed") throw new Error("Required check failed with exit 1");
       return { decisions: ["Preserved both changes"], blocked: !retry && mode === "blocked" ? ["An architectural decision is needed"] : [] };
     });
     const correction = () => github.resolveIntegration("test/project", "goal-one", ["change.ts"], url, head, base, resolver);
-    if (mode === "owned") {
+    const cleanupOnly = ["late-process", "late-ignored", "late-dirty", "late-untracked", "remove-failed"].includes(mode);
+    if (mode === "owned" || mode === "dependencies") {
       const result = await correction();
       expect(git(f.remote, "rev-list", "--parents", "-n", "1", result.headSha).trim().split(" ")).toEqual([result.headSha, head, base]);
       expect(git(f.remote, "show", `${result.headSha}:change.ts`)).toBe("goal and main preserved\n");
@@ -222,15 +245,23 @@ describe("whole-goal release proof", () => {
       expect(calls.at(-1)).toEqual(["git", "worktree", "remove", isolated]);
       expect(calls.filter((args) => args[0] === "lsof")).toHaveLength(3);
     } else {
-      const reason = mode === "unowned" ? "outside approved ownership" : mode === "blocked" ? "owner decision" : mode === "check-failed" ? "Required check failed" : mode === "push-failed" ? "Fixture push failed" : mode === "ignored" ? "ignored work" : "process";
-      await expect(correction()).rejects.toThrow(reason);
-      expect(await readFile(join(isolated, "change.ts"), "utf8")).toBe("partial correction with useful notes\n");
+      const reason = mode === "unowned" ? "outside approved ownership" : mode === "blocked" ? "owner decision" : mode === "check-failed" ? "Required check failed" : mode === "push-failed" ? "Fixture push failed" : ["ignored", "late-ignored"].includes(mode) ? "ignored work" : ["late-dirty", "late-untracked"].includes(mode) ? "uncommitted" : mode === "remove-failed" ? "Fixture cleanup refused" : "process";
+      if (cleanupOnly) {
+        const result = await correction(); expect(result.headSha).toBe(git(f.remote, "rev-parse", "sprint/goal-one").trim());
+        expect(result.decisions.at(-1)).toContain(`Retained published correction checkout at ${isolated}`); expect(result.decisions.at(-1)).toContain(reason);
+      } else await expect(correction()).rejects.toThrow(reason);
+      expect(await readFile(join(isolated, "change.ts"), "utf8")).toBe(mode === "late-dirty" ? "New local work after publication\n" : "partial correction with useful notes\n");
       if (mode === "unowned") expect(await readFile(join(isolated, "README.md"), "utf8")).toBe("Unapproved change to preserve\n");
-      if (mode === "ignored") expect(await readFile(join(isolated, ".cache"), "utf8")).toBe("Unique ignored evidence\n");
-      expect(calls.some((args) => args.includes("remove"))).toBe(false);
+      if (["ignored", "late-ignored"].includes(mode)) expect(await readFile(join(isolated, ".cache"), "utf8")).toBe("Unique ignored evidence\n");
+      if (mode === "late-untracked") expect(await readFile(join(isolated, "notes.txt"), "utf8")).toBe("Unique untracked evidence\n");
+      expect(calls.some((args) => args.includes("remove"))).toBe(mode === "remove-failed");
       const journalName = (await readdir(f.runtimeDir)).find((name) => name.startsWith("integration-recovery-") && name.endsWith(".json"))!;
       const journal = JSON.parse(await readFile(join(f.runtimeDir, journalName), "utf8"));
-      expect(journal).toMatchObject({ headSha: head, baseSha: base, checkout: isolated, github: "test/project", ownedFiles: ["change.ts"], failure: expect.stringContaining(reason) });
+      expect(journal).toMatchObject({ headSha: head, baseSha: base, checkout: isolated, github: "test/project", ownedFiles: ["change.ts"], failure: cleanupOnly ? null : expect.stringContaining(reason), ...(cleanupOnly ? { phase: "pushed", cleanup: expect.stringContaining(reason) } : {}) });
+      if (["ignored", "late-ignored"].includes(mode)) expect(journal.workspace.ignored).toContain(".cache");
+      if (["dependencies", "push-failed", "ignored"].includes(mode)) expect(journal.workspace.ignored).toEqual(expect.arrayContaining(["node_modules/", "dist/", "coverage/"]));
+      if (mode === "late-untracked") expect(journal.workspace.dirty).toContain("notes.txt");
+      if (mode === "late-dirty") expect(journal.workspace.dirty).toContain("change.ts");
       expect(await realpath(git(isolated, "rev-parse", "--git-common-dir").trim())).toBe(await realpath(join(f.project, ".git")));
       if (mode === "blocked") {
         const file = join(f.runtimeDir, journalName); const original = await readFile(file, "utf8");
@@ -239,16 +270,20 @@ describe("whole-goal release proof", () => {
         expect(resolver).toHaveBeenCalledTimes(1); expect(await readFile(join(isolated, "change.ts"), "utf8")).toBe("partial correction with useful notes\n");
         expect(git(f.source, "status", "--porcelain")).toBe(""); await writeFile(file, original);
       }
-      if (mode !== "late-process") expect(git(f.remote, "rev-parse", "sprint/goal-one").trim()).toBe(head);
-      if (!["push-failed", "late-process"].includes(mode)) expect(pushAttempts).toBe(0);
-      if (!["unowned", "ignored"].includes(mode)) {
+      if (!cleanupOnly) expect(git(f.remote, "rev-parse", "sprint/goal-one").trim()).toBe(head);
+      if (mode !== "push-failed" && !cleanupOnly) expect(pushAttempts).toBe(0);
+      if (["late-ignored", "late-dirty", "late-untracked"].includes(mode)) {
+        const result = await correction(); expect(result.headSha).toBe(journal.resultSha);
+        expect(result.decisions.at(-1)).toContain(reason); expect(resolver).toHaveBeenCalledTimes(1); expect(pushAttempts).toBe(1);
+        expect(JSON.parse(await readFile(join(f.runtimeDir, journalName), "utf8"))).toMatchObject({ phase: "pushed", failure: null, cleanup: expect.stringContaining(reason) });
+      } else if (!["unowned", "ignored"].includes(mode)) {
         const preservedHead = git(isolated, "rev-parse", "HEAD").trim(); retry = true;
         const result = await correction();
         expect(result.headSha).toBe(git(f.remote, "rev-parse", "sprint/goal-one").trim());
-        if (mode === "push-failed" || mode === "late-process") { expect(resolver).toHaveBeenCalledTimes(1); expect(result.headSha).toBe(preservedHead); }
+        if (mode === "push-failed" || cleanupOnly) { expect(resolver).toHaveBeenCalledTimes(1); expect(result.headSha).toBe(preservedHead); }
         else expect(resolver).toHaveBeenCalledTimes(2);
         expect(pushAttempts).toBe(mode === "push-failed" ? 2 : 1);
-        expect(JSON.parse(await readFile(join(f.runtimeDir, journalName), "utf8"))).toMatchObject({ phase: "cleaned", resultSha: result.headSha, failure: null });
+        expect(JSON.parse(await readFile(join(f.runtimeDir, journalName), "utf8"))).toMatchObject({ phase: "cleaned", resultSha: result.headSha, failure: null, cleanup: null });
         await expect(readFile(join(isolated, "change.ts"))).rejects.toThrow();
       }
     }
