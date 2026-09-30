@@ -16,7 +16,7 @@ Default limits:
 
 Token totals count input plus output. Cached input and reasoning output are already included in those totals and are not counted again. Live provider reports drive cancellation. Providers report asynchronously, so a call can exceed its allowance by work completed before the next report and during shutdown. Codex rollout files and Claude streams or headed transcripts supply live snapshots. An earlier complete-looking live snapshot is not a final receipt. Headed Codex waits for its `task_complete` receipt after the result file; headed Claude waits for an `end_turn` assistant message followed by `turn_duration`. These waits use the existing bounded deadline and keep the session visible. Missing terminal usage, regressing counters, interrupted accounting, or abandoned reservations fail closed with conservative charges. Claude child-agent or sidechain work is treated as unknown consumption because its main transcript does not prove an inclusive total. Limits are bounds on admitted work and observed usage, not an exact provider billing cap.
 
-Execution time is the sum of active invocation time. Concurrent lanes spend it concurrently. Waiting for external CI does not itself spend model tokens. Polling does not consume automatic repair counts. Stable repair identifiers avoid charging a replay twice.
+Execution time is the sum of active invocation time. Concurrent lanes spend it concurrently. Waiting for external CI does not itself spend model tokens. Polling does not consume automatic repair counts. Replaying a cached, finished workflow result invokes no provider and consumes no retry. Repeating an actual model invocation consumes a retry, including when its head and input are unchanged.
 
 Existing work adopts prospective accounting. The ledger explicitly labels earlier usage as unknown; a new ledger's zero recorded usage does not assert that historical work was free.
 
@@ -32,10 +32,10 @@ node --experimental-ffi dist/cli.js planning budget --seat PRODUCT_SEAT_ID --sta
 The JSON includes totals, limits, active reservations, the current trip, adoption information, and the preserved trip/grant history. Resolve the underlying failure and wait for active invocations to stop before granting additional budget. Grants are an explicit operator action. Agents must not use grants as automatic recovery; the CLI also refuses grants from a hosted agent seat.
 
 ```sh
-node --experimental-ffi dist/cli.js planning budget-grant --goal GOAL_ID --tokens 250000 --execution-ms 600000 --retries 1 --phase-retries developer:repair=1 --reason 'Fixed the failing command; allow one bounded repair' --state /path/to/indra-state
+node --experimental-ffi dist/cli.js planning budget-grant --goal GOAL_ID --tokens 250000 --execution-ms 600000 --retries 1 --phase-retries implement=1 --reason 'Fixed the failing command; allow one bounded repair' --state /path/to/indra-state
 ```
 
-Supply at least one increment and a nonempty reason. Every increment must be a positive finite safe integer. `--phase-retries PHASE=COUNT` may appear once per distinct phase; use the phase names in the ledger's retry records. `--seat PRODUCT_SEAT_ID` targets `product-TEAM_ID-SEAT_ID` instead of a goal. The local OS username records the owner.
+Supply at least one increment and a nonempty reason. Every increment must be a positive finite safe integer. `--phase-retries PHASE=COUNT` may appear once per distinct phase; use the phase names in the ledger's retry records: `implement`, `product`, `vetting`, `planning`, `proposal`, `release`, or `retro`. `--seat PRODUCT_SEAT_ID` targets `product-TEAM_ID-SEAT_ID` instead of a goal. The local OS username records the owner.
 
 Grants add allowances and preserve all totals, retry identifiers, and history. They do not reset accounting, approve a proposal, or queue a retry. A grant that leaves another resource exhausted can leave the circuit tripped. Inspect status again, then explicitly request recovery if appropriate:
 
