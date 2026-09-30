@@ -766,15 +766,15 @@ describe("whole-goal queue contract", () => {
     await copyFile(new URL("../schema/v1/state.schema.json", import.meta.url), join(base.checkout, "schema/v1/state.schema.json"));
     return new PlanningStore(base.checkout, undefined, { version: 1, consumers: { planning: 1, developer: 1, release: 1, retro: 1, tui: 1 } });
   }
-  async function propose(store: PlanningStore, id: string, ownedFiles = ["src/**"], otherTeam = false, rank = 1) {
+  async function propose(store: PlanningStore, id: string, ownedFiles = ["src/**"], otherTeam = false, rank = 1, when = at) {
     const teamId = otherTeam ? "team-other" : "team-001";
-    const goal: PlanningGoal = { workflowModel: "goals-v1", id, teamId, seatId: otherTeam ? "seat-other-lead" : "seat-001", participantSeatIds: [], goal: "Implement goal", projectRefs: [otherTeam ? "Satoramoto/Indra" : "satoramoto/indra"], stage: "clarifying", createdAt: at, updatedAt: at, mattermost: { channelId: "channel", rootPostId: `root-${id}` }, brief: { summary: "Goal", decisions: [], openQuestions: [] }, ownedFiles };
+    const goal: PlanningGoal = { workflowModel: "goals-v1", id, teamId, seatId: otherTeam ? "seat-other-lead" : "seat-001", participantSeatIds: [], goal: "Implement goal", projectRefs: [otherTeam ? "Satoramoto/Indra" : "satoramoto/indra"], stage: "clarifying", createdAt: when, updatedAt: when, mattermost: { channelId: "channel", rootPostId: `root-${id}` }, brief: { summary: "Goal", decisions: [], openQuestions: [] }, ownedFiles };
     await store.createGoal(goal);
     await store.update((state) => {
       const next = state.planningGoals!.find((item) => item.id === id)!;
       next.stage = "awaiting-review";
       next.goalProposal = { version: 1, goalId: id, proposalId: `proposal-${id}`, productSeatId: otherTeam ? "seat-other-product" : "seat-002", rank, mission: "docs/mission.md", summary: "Implement goal", outcomes: [{ number: 1, title: "Outcome", description: "Deliver it", reason: "Mission progress", currentCode: ["src/planning.ts"] }], ownedFiles, risks: [], rationale: "Useful", basedOnRetros: [] };
-      next.ceremony = advanceCeremony(next, { to: "proposal", at });
+      next.ceremony = advanceCeremony(next, { to: "proposal", at: when });
     }, "Propose fixture goal");
   }
   const proof = (id: string) => ({ kind: "approval" as const, proposalId: `proposal-${id}`, proposalPostId: `root-${id}`, approval: { source: "owner-command" as const, command: "planning approve" as const, at } });
@@ -880,6 +880,57 @@ describe("whole-goal queue contract", () => {
     const second = await scheduler(store, chat).turn(startup);
     expect(second.record.redirects).toEqual(first.record.redirects); expect(second.events.filter((event) => event.kind === "redirect")).toHaveLength(1);
   });
+
+  /** Releases and closes an assigned seat-003 goal through the real report, merge, release and retro path. */
+  async function close(store: PlanningStore, chat: FakeChat, goalId: string) {
+    vi.spyOn(SprintGitHub.prototype, "verifyGoalReport").mockResolvedValue(undefined);
+    vi.spyOn(SprintGitHub.prototype, "integrationScope").mockResolvedValue({ headSha: MAIN_SHA, baseSha: MAIN_SHA, conflicting: false });
+    vi.spyOn(SprintGitHub.prototype, "reviewIntegration").mockImplementation(async () => { gh.reviewed = true; });
+    await scheduler(store, chat).turn({ kind: "developer-report", id: `report-${goalId}`, goalId, teamId: "team-001", seatId: "seat-003", report: reportFor(goalId), at });
+    const adapters: CeremonyAdapters = {
+      release: { poll: async ({ goal }) => ({ status: "complete", evidence: { kind: "release-running", prUrl: goal.integration!.prUrl!, mergedSha: MERGE_SHA, mergeVerification: { headSha: MAIN_SHA, reviewCommitSha: MAIN_SHA, reviewer: "satori-miyamoto", checksPassed: true }, checksPassed: true, buildSha: MERGE_SHA, runningSha: MERGE_SHA, runningAt: new Date().toISOString() } }) },
+      retro: { poll: async ({ goal, post }) => ({ status: "complete", evidence: { kind: "retro-published", path: `docs/retros/${goal.id}.md`, prUrl: "https://github.com/satoramoto/indra/pull/900", baseBranch: "main", mergedSha: "c".repeat(40), postId: await post("frozen-retro", "Verified frozen retro"), publishedAt: new Date().toISOString(), factsOnly: true, suggestions: "owner-proposals-only" } }) },
+    };
+    const closed = await scheduler(store, chat, new FakeRuntime(), adapters).turn(startup);
+    expect(closed.record.failure).toBeNull(); expect((await store.read()).planningGoals!.find((goal) => goal.id === goalId)!.ceremony!.closure).toBeDefined();
+    return closed;
+  }
+  const reply = (chat: FakeChat, id: string, goalId: string, createAt: number, message: string) => chat.posts.push({ id, user_id: "ryan", channel_id: "channel", root_id: `root-${goalId}`, message, create_at: createAt });
+
+  it("briefs a later goal only with redirects posted since its proposal, leaving out a closed goal's direction", async () => {
+    const store = await remodelStore(); const chat = new FakeChat();
+    await propose(store, "goal-old", ["src/**"], false, 1, "2026-08-31T23:00:00Z"); await store.approveGoal("goal-old", proof("goal-old"), at);
+    // The old redirect is within the later goal's 5 s re-read window, so only the brief filter can leave it out.
+    reply(chat, "old-redirect", "goal-old", Date.parse(at) - 1000, "Direction for the old goal");
+    const first = await scheduler(store, chat).turn(startup);
+    expect(first.record.redirects.map((item) => item.postId)).toEqual(["old-redirect"]);
+    await propose(store, "goal-new", ["src/**"], false, 1); await store.approveGoal("goal-new", proof("goal-new"), at);
+    reply(chat, "new-redirect", "goal-new", Date.parse(at) + 1000, "Direction for the new goal");
+    const queued = await scheduler(store, chat).turn(startup);
+    expect(queued.record.approvedQueue.map((item) => item.goalId)).toEqual(["goal-new"]);
+    expect(queued.record.redirects.map((item) => item.postId)).toEqual(["old-redirect", "new-redirect"]);
+    const closed = await close(store, chat, "goal-old");
+    expect((await store.read()).planningGoals!.find((goal) => goal.id === "goal-new")!.goalAssignment).toBeDefined();
+    const later = (await store.readRuntimeFile<GoalRuntimeRecord>(goalRuntimeFilename("goal-new")))!;
+    const kept = closed.record.redirects.filter((item) => item.postId === "new-redirect");
+    expect(kept.map((item) => item.message)).toEqual(["Direction for the new goal"]);
+    expect(later.brief!.redirects).toEqual(kept); expect(later.redirects).toEqual(kept);
+  }, 30_000);
+
+  it("prunes a redirect from the team record once every goal that could re-read it has closed, without emitting it again", async () => {
+    const store = await remodelStore(); const chat = new FakeChat();
+    await propose(store, "goal-done"); await store.approveGoal("goal-done", proof("goal-done"), at);
+    reply(chat, "done-redirect", "goal-done", Date.parse(at) + 1000, "Keep the current behaviour");
+    const redirectEvents = (events: SchedulerRuntimeRecord["events"]) => events.filter((event) => event.kind === "redirect" && event.redirect.postId === "done-redirect");
+    const first = await scheduler(store, chat).turn(startup); const second = await scheduler(store, chat).turn(startup);
+    expect(second.record.redirects.map((item) => item.postId)).toEqual(["done-redirect"]); expect(redirectEvents(second.events)).toHaveLength(1);
+    expect(second.record.redirects).toEqual(first.record.redirects);
+    const closed = await close(store, chat, "goal-done");
+    expect(closed.record.redirects).toEqual([]);
+    const after = await scheduler(store, chat).turn(startup);
+    expect(after.record.redirects).toEqual([]); expect(redirectEvents(after.events)).toHaveLength(1);
+    expect((await store.readRuntimeFile<SchedulerRuntimeRecord>(teamRuntimeFilename("team-001")))!.redirects).toEqual([]);
+  }, 30_000);
 
   it("emits revision-bound vetting without approving, posting or competing with the Product queue writer", async () => {
     const store = await remodelStore(); await propose(store, "goal-vet");
