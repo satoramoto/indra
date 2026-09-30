@@ -128,6 +128,30 @@ describe("sprint checked commands", () => {
   });
 });
 
+describe("unattended sprint revert", () => {
+  it("reverts a real commit with a failing signer while preserving owner identity and configuration", async () => {
+    const f = await fixture();
+    await writeFile(join(f.source, "README.md"), "Changed project\n");
+    git(f.source, "commit", "-qam", "Change to revert");
+    const merged = git(f.source, "rev-parse", "HEAD").trim();
+    git(f.source, "push", "--quiet", f.remote, "main");
+    git(f.project, "config", "commit.gpgsign", "true");
+    git(f.project, "config", "gpg.program", "/usr/bin/false");
+    git(f.project, "config", "gpg.format", "openpgp");
+    const config = await readFile(join(f.project, ".git/config"), "utf8");
+    const identity = git(f.source, "log", "-1", "--format=%an <%ae>|%cn <%ce>");
+    const shell: Shell = { run: async (command, args, cwd) => {
+      if (command === "gh") return { code: 0, stdout: args[0] === "pr" && args[1] === "create" ? url : "", stderr: "" };
+      return f.shell.run(command, args, cwd);
+    } };
+    expect(await new SprintGitHub(shell, f.runtimeDir).revertPr("test/project", goal, merged, "Revert", "Revert approved change")).toBe(url);
+    expect(git(f.remote, "show", `revert/${goal}:README.md`)).toBe("Project\n");
+    expect(git(f.remote, "log", "-1", "--format=%an <%ae>|%cn <%ce>", `revert/${goal}`)).toBe(identity);
+    expect(git(f.remote, "cat-file", "commit", `revert/${goal}`)).not.toContain("gpgsig");
+    expect(await readFile(join(f.project, ".git/config"), "utf8")).toBe(config);
+  });
+});
+
 describe("whole-goal release proof", () => {
   const report: GoalReport = { version: 1, goalId: "goal-one", teamId: "team-one", seatId: "seat-one", sprintBranch: "sprint/goal-one", headSha: "a".repeat(40),
     lanePrs: [{ laneId: "lane-one", url, headSha: "c".repeat(40), mergedSha: "d".repeat(40), reviewer: "satori-miyamoto", ci: "passed" }],
@@ -320,6 +344,27 @@ describe("retrospective-only GitHub archival", () => {
     expect(rejection).toEqual({ reviewId: local ? expect.stringMatching(/^agent:[a-f0-9]{64}$/) : 1, headSha: f.shell.head(), submittedAt: local ? expect.any(String) : "2026-01-01T00:00:00.000Z" });
     return { ...f, rejection };
   }
+
+  it("archives and corrects the frozen report without invoking the owner's configured signer", async () => {
+    const f = await fixture();
+    git(f.project, "config", "commit.gpgsign", "true");
+    git(f.project, "config", "gpg.program", "/usr/bin/false");
+    git(f.project, "config", "gpg.format", "openpgp");
+    const config = await readFile(join(f.project, ".git/config"), "utf8");
+    const identity = git(f.project, "log", "-1", "--format=%an <%ae>|%cn <%ce>");
+    expect(() => git(f.project, "commit", "--allow-empty", "-qm", "Would require signing")).toThrow();
+    await f.github.ensureRetroPr("test/project", goal, content);
+    const old = f.shell.head();
+    await f.github.reviewRetroPr("test/project", goal, content, url, old, async () => ({ summary: "Correct the count", findings: [{ path, line: 3, reason: "Unsupported count." }] }));
+    const rejection = (await f.github.inspectRetroPr("test/project", goal, content, url)).rejection!;
+    const corrected = await f.github.correctRetroPr("test/project", goal, content, replacement, url, rejection);
+    expect(git(f.remote, "show", `${corrected}:${path}`)).toBe(replacement);
+    for (const head of [old, corrected]) {
+      expect(git(f.remote, "log", "-1", "--format=%an <%ae>|%cn <%ce>", head)).toBe(identity);
+      expect(git(f.remote, "cat-file", "commit", head)).not.toContain("gpgsig");
+    }
+    expect(await readFile(join(f.project, ".git/config"), "utf8")).toBe(config);
+  });
 
   it.each(["before-push", "lost-response"])("recovers a guarded correction at %s without a second commit or a replacement PR", async (boundary) => {
     const f = await rejectedArchive(); const old = f.shell.head();

@@ -91,6 +91,24 @@ describe("state sync", () => {
     expect(pushes.every((line) => !/--force|--mirror|(^| )-f( |$)| \+/.test(line))).toBe(true);
   });
 
+  it("rebases local state commits with an unavailable owner signer without changing its configuration", async () => {
+    const { checkout, remote, store, merge, localWrite } = await fixture();
+    await merge(renameLead("Chick Corea"), "Remote change");
+    await localWrite("goal-one");
+    const before = head(checkout);
+    const identity = git(checkout, "log", "-1", "--format=%an <%ae>|%cn <%ce>");
+    git(checkout, "config", "commit.gpgsign", "true");
+    git(checkout, "config", "gpg.program", "/usr/bin/false");
+    git(checkout, "config", "gpg.format", "openpgp");
+    const config = await readFile(join(checkout, ".git/config"), "utf8");
+    expect(await store.sync()).toMatchObject({ outcome: "synced", changed: true });
+    expect(head(checkout)).not.toBe(before);
+    expect(head(remote, "main")).toBe(head(checkout));
+    expect(git(checkout, "log", "-1", "--format=%an <%ae>|%cn <%ce>")).toBe(identity);
+    expect(git(checkout, "cat-file", "commit", "HEAD")).not.toContain("gpgsig");
+    expect(await readFile(join(checkout, ".git/config"), "utf8")).toBe(config);
+  });
+
   it("aborts a conflicting rebase and leaves the checkout and the remote exactly as they were", async () => {
     const { checkout, remote, store, merge } = await fixture();
     await merge((doc) => { (doc as { planningGoals: PlanningGoal[] }).planningGoals = [goal("goal-remote")]; }, "Add goal-remote");

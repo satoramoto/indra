@@ -728,7 +728,7 @@ describe("sprint integration", () => {
     expect(result).toContain("https://github.com/satoramoto/indra/pull/102");
     const worktree = join(store.runtimeDir, "worktrees", `revert-${goal.id}`);
     expect(gh.calls).toContain(`git worktree add --no-track -b revert/${goal.id} ${worktree} origin/main`);
-    expect(gh.calls).toContain(`git revert --no-edit ${MERGE_SHA}`);
+    expect(gh.calls).toContain(`git revert --no-gpg-sign --no-edit ${MERGE_SHA}`);
     expect(gh.calls).toContain(`git -c credential.helper= -c credential.helper=!gh auth git-credential push origin HEAD:refs/heads/revert/${goal.id}`);
     expect(gh.calls.find((line) => line.includes(`--head revert/${goal.id}`) && line.startsWith("gh pr create"))).toContain("--base main");
     expect(await sprintOf(store)).toMatchObject({ status: "merged", revertPrUrl: "https://github.com/satoramoto/indra/pull/102" });
