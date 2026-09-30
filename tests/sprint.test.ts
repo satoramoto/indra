@@ -1,10 +1,11 @@
-import { mkdtemp, mkdir, readFile, writeFile, symlink, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile, symlink, rm, realpath, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SprintError, SprintGitHub, retroPath } from "../src/sprint.js";
 import { processShell, type Shell } from "../src/command-shell.js";
 import { git } from "./state-checkout.js";
+import type { GoalReport } from "../src/goal-contract.js";
 
 const roots: string[] = [];
 vi.setConfig({ testTimeout: 30_000 });
@@ -140,6 +141,133 @@ describe("sprint checked commands", () => {
     const github = new SprintGitHub({ run }, "/managed/state.runtime");
     await expect(github.openPr("test/project", "sprint/goal-test", "Title", "Body")).rejects.toBe(error);
     expect(run).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("whole-goal release proof", () => {
+  const report: GoalReport = { version: 1, goalId: "goal-one", teamId: "team-one", seatId: "seat-one", sprintBranch: "sprint/goal-one", headSha: "a".repeat(40),
+    lanePrs: [{ laneId: "lane-one", url, headSha: "c".repeat(40), mergedSha: "d".repeat(40), reviewer: "satori-miyamoto", ci: "passed" }],
+    checks: [{ command: "npm run typecheck", exitCode: 0 }], decisions: [], followUps: [], neededButUnowned: [] };
+  it("checks actual branch head, merged lane verdict/CI/base/ancestry and both sides of renamed files", async () => {
+    const f = await fixture();
+    let remoteHead = report.headSha; let laneFiles = [{ filename: "src/new.ts", previous_filename: "src/old.ts" }]; let ancestor = true;
+    const run = vi.fn<Shell["run"]>(async (command, args) => {
+      if (command === "git" && args[0] === "diff") return { code: 0, stdout: "src/new.ts\0", stderr: "" };
+      if (command === "git" && args[0] === "merge-base") return { code: ancestor ? 0 : 1, stdout: "", stderr: "" };
+      if (command === "gh" && args[0] === "pr") return { code: 0, stdout: JSON.stringify({ baseRefName: "sprint/goal-one", isCrossRepository: false }), stderr: "" };
+      if (command === "gh" && args[1]?.includes("/files?")) return { code: 0, stdout: JSON.stringify([laneFiles]), stderr: "" };
+      if (command === "gh" && args[1]?.includes("git/ref")) return { code: 0, stdout: remoteHead, stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    });
+    const github = new SprintGitHub({ run }, f.runtimeDir);
+    const inspect = vi.spyOn(github, "inspectMerge").mockResolvedValue({ url, state: "MERGED", headSha: report.lanePrs[0].headSha, mergedSha: report.lanePrs[0].mergedSha, reviewed: true, checksPassed: true });
+    await expect(github.verifyGoalReport("test/project", ["src/**"], report, "b".repeat(40))).resolves.toBeUndefined();
+    remoteHead = "e".repeat(40); await expect(github.verifyGoalReport("test/project", ["src/**"], report, "b".repeat(40))).rejects.toThrow("sprint head"); remoteHead = report.headSha;
+    inspect.mockResolvedValueOnce({ url, state: "MERGED", headSha: report.lanePrs[0].headSha, mergedSha: report.lanePrs[0].mergedSha, reviewed: false, checksPassed: true });
+    await expect(github.verifyGoalReport("test/project", ["src/**"], report, "b".repeat(40))).rejects.toThrow("not supported");
+    ancestor = false; await expect(github.verifyGoalReport("test/project", ["src/**"], report, "b".repeat(40))).rejects.toThrow("merge-base"); ancestor = true;
+    laneFiles = [{ filename: "src/new.ts", previous_filename: "private/old.ts" }]; await expect(github.verifyGoalReport("test/project", ["src/**"], report, "b".repeat(40))).rejects.toThrow("ownership");
+    await expect(github.verifyGoalReport("test/project", ["src/**"], { ...report, checks: [{ command: "check", exitCode: 1 }] }, "b".repeat(40))).rejects.toThrow("successful checks");
+  });
+  it("reads actual merged PR sections and rejects stale or unmerged retrospective sources", async () => {
+    const body = "## Decisions\nKept the boundary\n\n## Follow-ups\nAdd the next feature\n\n## Validation\nchecks passed";
+    const run = vi.fn<Shell["run"]>().mockResolvedValue({ code: 0, stdout: JSON.stringify({ state: "MERGED", headRefOid: report.headSha, body }), stderr: "" });
+    const github = new SprintGitHub({ run }, "/fixture.runtime");
+    expect(await github.prRetrospective("test/project", "goal-one", url, report.headSha)).toEqual({ url, headSha: report.headSha, decisions: "Kept the boundary", followUps: "Add the next feature" });
+    await expect(github.prRetrospective("test/project", "goal-one", url, "f".repeat(40))).rejects.toThrow("verified merged PR head");
+    run.mockResolvedValue({ code: 0, stdout: JSON.stringify({ state: "OPEN", headRefOid: report.headSha, body }), stderr: "" });
+    await expect(github.prRetrospective("test/project", "goal-one", url, report.headSha)).rejects.toThrow("verified merged PR head");
+  });
+  it.each(["owned", "unowned", "blocked", "check-failed", "push-failed", "live-owned", "live-foreign", "uninspectable", "ignored", "late-process"] as const)("preserves a real %s correction until its exact result is safely published and process-free", async (mode) => {
+    const f = await fixture();
+    await writeFile(join(f.source, "change.ts"), "original\n"); await writeFile(join(f.source, ".gitignore"), ".cache\n"); git(f.source, "add", "."); git(f.source, "commit", "-qm", "Shared base");
+    git(f.source, "checkout", "-qb", "sprint/goal-one"); await writeFile(join(f.source, "change.ts"), "goal change\n"); git(f.source, "commit", "-qam", "Goal"); const head = git(f.source, "rev-parse", "HEAD").trim();
+    git(f.source, "checkout", "main"); await writeFile(join(f.source, "change.ts"), "main change\n"); git(f.source, "commit", "-qam", "Main"); const base = git(f.source, "rev-parse", "HEAD").trim();
+    git(f.source, "push", f.remote, "main", "sprint/goal-one");
+    const calls: string[][] = []; let resolved = false; let published = false; let retry = false; let pushAttempts = 0;
+    const shell: Shell = { run: async (command, args, cwd) => {
+      calls.push([command, ...args]);
+      if (command === "lsof") {
+        expect(args).toEqual(["-nP", "-F", "p", "+D", expect.stringContaining("integration-fix-goal-one-")]);
+        if (!retry && ((resolved && mode.startsWith("live-")) || (published && mode === "late-process"))) return { code: 0, stdout: mode === "live-foreign" ? "p99999\n" : "p12345\n", stderr: "" };
+        if (resolved && !retry && mode === "uninspectable") return { code: 1, stdout: "", stderr: "Inspection permission denied" };
+        return { code: 1, stdout: "", stderr: "" };
+      }
+      if (command === "git") {
+        if (args.includes("push")) { pushAttempts++; if (mode === "push-failed" && !retry) return { code: 1, stdout: "", stderr: "Fixture push failed" }; }
+        return await processShell.run(command, args, cwd);
+      }
+      if (args[0] === "pr" && args[1] === "view") return { code: 0, stdout: JSON.stringify({ headRefName: "sprint/goal-one", baseRefName: "main", headRefOid: git(f.remote, "rev-parse", "sprint/goal-one").trim(), baseRefOid: base, isCrossRepository: false, mergeable: "CONFLICTING", body: "## Decisions\nOriginal decision" }), stderr: "" };
+      if (args[0] === "api" && args[1].includes("/files?")) return { code: 0, stdout: JSON.stringify([[{ filename: "change.ts" }]]), stderr: "" };
+      if (args[0] === "api" && args[1].includes("git/ref")) return { code: 0, stdout: git(f.remote, "rev-parse", "sprint/goal-one").trim(), stderr: "" };
+      if (args[0] === "pr" && args[1] === "edit") { published = true; expect(await readFile(args.at(-1)!, "utf8")).toContain("indra-integration-correction:"); return { code: 0, stdout: "", stderr: "" }; }
+      throw new Error("Unexpected correction command");
+    } };
+    const github = new SprintGitHub(shell, f.runtimeDir); let isolated = "";
+    const resolver = vi.fn(async (cwd: string, shared: string) => {
+      if (retry) { expect(cwd).toBe(isolated); expect(await readFile(join(cwd, "change.ts"), "utf8")).toBe("partial correction with useful notes\n"); }
+      isolated = cwd; expect(shared).toBe(await realpath(join(f.project, ".git")));
+      await writeFile(join(cwd, "change.ts"), mode === "owned" || retry ? "goal and main preserved\n" : "partial correction with useful notes\n"); resolved = true;
+      if (mode === "unowned") await writeFile(join(cwd, "README.md"), "Unapproved change to preserve\n");
+      if (mode === "ignored") await writeFile(join(cwd, ".cache"), "Unique ignored evidence\n");
+      if (!retry && mode === "check-failed") throw new Error("Required check failed with exit 1");
+      return { decisions: ["Preserved both changes"], blocked: !retry && mode === "blocked" ? ["An architectural decision is needed"] : [] };
+    });
+    const correction = () => github.resolveIntegration("test/project", "goal-one", ["change.ts"], url, head, base, resolver);
+    if (mode === "owned") {
+      const result = await correction();
+      expect(git(f.remote, "rev-list", "--parents", "-n", "1", result.headSha).trim().split(" ")).toEqual([result.headSha, head, base]);
+      expect(git(f.remote, "show", `${result.headSha}:change.ts`)).toBe("goal and main preserved\n");
+      await expect(readFile(join(isolated, "change.ts"))).rejects.toThrow();
+      expect(calls.at(-1)).toEqual(["git", "worktree", "remove", isolated]);
+      expect(calls.filter((args) => args[0] === "lsof")).toHaveLength(3);
+    } else {
+      const reason = mode === "unowned" ? "outside approved ownership" : mode === "blocked" ? "owner decision" : mode === "check-failed" ? "Required check failed" : mode === "push-failed" ? "Fixture push failed" : mode === "ignored" ? "ignored work" : "process";
+      await expect(correction()).rejects.toThrow(reason);
+      expect(await readFile(join(isolated, "change.ts"), "utf8")).toBe("partial correction with useful notes\n");
+      if (mode === "unowned") expect(await readFile(join(isolated, "README.md"), "utf8")).toBe("Unapproved change to preserve\n");
+      if (mode === "ignored") expect(await readFile(join(isolated, ".cache"), "utf8")).toBe("Unique ignored evidence\n");
+      expect(calls.some((args) => args.includes("remove"))).toBe(false);
+      const journalName = (await readdir(f.runtimeDir)).find((name) => name.startsWith("integration-recovery-") && name.endsWith(".json"))!;
+      const journal = JSON.parse(await readFile(join(f.runtimeDir, journalName), "utf8"));
+      expect(journal).toMatchObject({ headSha: head, baseSha: base, checkout: isolated, github: "test/project", ownedFiles: ["change.ts"], failure: expect.stringContaining(reason) });
+      expect(await realpath(git(isolated, "rev-parse", "--git-common-dir").trim())).toBe(await realpath(join(f.project, ".git")));
+      if (mode === "blocked") {
+        const file = join(f.runtimeDir, journalName); const original = await readFile(file, "utf8");
+        await writeFile(file, JSON.stringify({ ...journal, checkout: f.source }));
+        await expect(correction()).rejects.toThrow("recovery identity is uncertain");
+        expect(resolver).toHaveBeenCalledTimes(1); expect(await readFile(join(isolated, "change.ts"), "utf8")).toBe("partial correction with useful notes\n");
+        expect(git(f.source, "status", "--porcelain")).toBe(""); await writeFile(file, original);
+      }
+      if (mode !== "late-process") expect(git(f.remote, "rev-parse", "sprint/goal-one").trim()).toBe(head);
+      if (!["push-failed", "late-process"].includes(mode)) expect(pushAttempts).toBe(0);
+      if (!["unowned", "ignored"].includes(mode)) {
+        const preservedHead = git(isolated, "rev-parse", "HEAD").trim(); retry = true;
+        const result = await correction();
+        expect(result.headSha).toBe(git(f.remote, "rev-parse", "sprint/goal-one").trim());
+        if (mode === "push-failed" || mode === "late-process") { expect(resolver).toHaveBeenCalledTimes(1); expect(result.headSha).toBe(preservedHead); }
+        else expect(resolver).toHaveBeenCalledTimes(2);
+        expect(pushAttempts).toBe(mode === "push-failed" ? 2 : 1);
+        expect(JSON.parse(await readFile(join(f.runtimeDir, journalName), "utf8"))).toMatchObject({ phase: "cleaned", resultSha: result.headSha, failure: null });
+        await expect(readFile(join(isolated, "change.ts"))).rejects.toThrow();
+      }
+    }
+    expect(calls.some((args) => args.includes("rebase") || args.includes("--force") || args[0] === "kill")).toBe(false);
+  });
+  it("posts the fresh integration review on its exact head and reconciles a lost delivery without rerunning the reviewer", async () => {
+    const f = await fixture(); await f.github.ensureRetroPr("test/project", goal, content);
+    f.shell.loseReview = true;
+    const review = vi.fn(async (cwd: string) => {
+      expect(git(cwd, "rev-parse", "HEAD").trim()).toBe(f.shell.head());
+      return { summary: "Blocking defect", findings: [{ path, line: 1, reason: "Incorrect result" }] };
+    });
+    await f.github.reviewIntegration("test/project", goal, url, f.shell.head(), review);
+    await f.github.reviewIntegration("test/project", goal, url, f.shell.head(), review);
+    expect(review).toHaveBeenCalledTimes(1);
+    expect(f.shell.reviews).toHaveLength(1);
+    expect(f.shell.reviews[0]).toMatchObject({ state: "CHANGES_REQUESTED", commit_id: f.shell.head(), comments: [{ path, line: 1, side: "RIGHT", body: "Incorrect result" }] });
+    expect(f.shell.reviews[0].body).toContain("indra-integration-review:");
+    expect(f.shell.calls.some((call) => call.args.includes("merge"))).toBe(false);
   });
 });
 

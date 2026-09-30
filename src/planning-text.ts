@@ -20,6 +20,7 @@ export function proposalMessage(goal: PlanningGoal, seats: Map<string, string>):
   return `**Draft proposal ${draft.id} — awaiting review**\n${draft.summary}\n${draft.outcomes.map((item) => `- **${item.title}** → ${seatLabel(seats, item.seatId)}: ${item.description}`).join("\n")}\n\nRecorded in indra-state as ${goal.id}. No work has been approved or executed. To approve it, a person reacts :${APPROVE_EMOJI}: on this post.`;
 }
 export function approvalMessage(goal: PlanningGoal, seats: Map<string, string>): string {
+  if (goal.workflowModel === "goals-v1") return `**Proposal ${goal.goalProposal?.proposalId ?? goal.id} approved**\n${goal.goal}\n\nThe whole goal is queued for one idle Developer with disjoint owned files. Integration, release and retro proceed automatically with current-head bot approval and green CI; no further human approval is required.`;
   const titles = new Map(goal.proposal!.outcomes.map((item) => [item.id, item.title]));
   return `**Proposal ${goal.proposal!.id} approved**\n${(goal.assignments ?? []).map((item) => `- ${titles.get(item.outcomeId) ?? item.outcomeId} → ${seatLabel(seats, item.seatId)}`).join("\n")}\n\nRecorded in indra-state as ${goal.id}. Each outcome is queued for its Developer seat.${goal.integration ? ` Their PRs target \`${goal.integration.branch}\`; once every outcome merges, Chick opens one PR from it into main.` : ""}`;
 }
@@ -42,10 +43,10 @@ export function sprintSummary(goal: PlanningGoal, seats: Map<string, string>, om
 }
 export function integrationMessage(goal: PlanningGoal, prUrl: string, omissions: ImplementationEvidence["omissions"]): string {
   const partial = omissions?.length ? `\n\n**Owner-authorized omissions**\n${omissions.map((item) => `- ${item.outcomeId}: ${item.reason}`).join("\n")}` : "";
-  return `**Sprint ${goal.id} is ready: ${prUrl}**\nThis PR takes \`${sprintBranch(goal.id)}\` into main. To merge the sprint once its CI is green, a person reacts :${APPROVE_EMOJI}: on this post (or the owner presses M in Chick's detail).${partial}`;
+  return `**Sprint ${goal.id} is ready: ${prUrl}**\nThis PR takes \`${sprintBranch(goal.id)}\` into main. The sprint merges automatically after a fresh satori-miyamoto approval on the current head and green CI. Release then verifies the running build; the retro is posted and archived through the same review and CI gate.${partial}`;
 }
 export function revertMessage(goal: PlanningGoal, prUrl: string): string {
-  return `**Rollback of sprint ${goal.id}: ${prUrl}**\nThis PR on main reverts the sprint's merge commit ${goal.integration!.mergedSha!.slice(0, 7)}. To merge the revert once its CI is green, a person reacts :${APPROVE_EMOJI}: on this post (or the owner presses M in Chick's detail).`;
+  return `**Rollback of sprint ${goal.id}: ${prUrl}**\nThis PR on main reverts the sprint's merge commit ${goal.integration!.mergedSha!.slice(0, 7)}. The revert merges automatically after a fresh satori-miyamoto approval on the current head and green CI.`;
 }
 /** Chick's prompts are contracts: the outcome and its acceptance, what Indra does next, the constraints and the schema. */
 export function prompt(goal: PlanningGoal, input: string, drafting: boolean, developers: Seat[]): string {

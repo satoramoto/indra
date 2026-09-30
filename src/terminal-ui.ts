@@ -8,6 +8,7 @@ import type { RollbackPlan, UpdateResult } from "./self-update.js";
 import type { SessionSnapshot, SprintLoop } from "./session-snapshot.js";
 import type { LiveUsage, LiveUsagePort } from "./live-usage.js";
 import type { TokenUsage } from "./runtime-facts.js";
+import type { WorkflowEvent } from "./goal-contract.js";
 import { sumUsage } from "./hub-format.js";
 import { MAX_SCROLLBACK } from "./session-mirror.js";
 
@@ -84,18 +85,17 @@ export const GOAL_INPUT_LIMIT = 8000;
 export interface UiInput { value: string }
 /**
  * A goal whose proposal the owner is requesting (`P`) or approving (`A`) from the terminal, or whose sprint the owner
- * integrates (`I`), merges (`M`: release, revert or retro) or rolls back (`V`).
+ * integrates (`I`) or rolls back (`V`).
  */
 export interface UiApproval {
-  action: "approve" | "propose" | "integrate" | "merge" | "revert";
+  action: "approve" | "propose" | "integrate" | "revert";
   goalId: string; goal: string;
-  mergeKind?: "release" | "revert" | "retro";
   prUrl?: string;
   /** An approval cannot silently approve a replaced proposal. */
   updatedAt?: string;
 }
 /** `revert` in the UI (V) is `planning rollback`; `rollback` alone is the self-update rollback (R). */
-const sprintActions: Record<string, SprintAction> = { integrate: "integrate", merge: "merge", revert: "rollback" };
+const sprintActions: Record<string, SprintAction> = { integrate: "integrate", revert: "rollback" };
 /** A rollback (`R`) from the running build's short SHA to the previous build's. */
 export interface UiRollback { action: "rollback"; from: string; to: string }
 export interface UiRetry extends AssignmentRetry { action: "retry" }
@@ -164,7 +164,7 @@ export class TerminalUiModel {
   private approving?: UiApproval;
   /** The proposal request the owner confirmed, until `proposeConfirmed` runs it. */
   private proposing?: UiApproval;
-  /** The sprint action (`I`, `M` or `V`) the owner confirmed, until `sprintConfirmed` runs it. */
+  /** The sprint action (`I` or `V`) the owner confirmed, until `sprintConfirmed` runs it. */
   private sprinting?: UiApproval;
   private ceremonyPending = false;
   private starting = false;
@@ -189,6 +189,60 @@ export class TerminalUiModel {
   private busy = 0;
   /** Settles when the update in progress (install, build, switch and restarts) ends. */
   private updateRun?: Promise<void>;
+  workflowError?: string;
+  workflowSuspended = false;
+  private updateQueued = false;
+  private upgradeQueued = false;
+  private eventRun?: Promise<void>;
+  private pendingEvents = new Map<string, WorkflowEvent>();
+  private pendingMerges = new Map<string, Extract<WorkflowEvent, { kind: "merge" }>>();
+
+  private workflowBusy(): boolean { return this.workflowSuspended || !!this.driving || !!this.input || !!this.confirm || this.busy > 0 || this.updating || this.syncing; }
+
+  /** Event acknowledgements retain pending work even while input, an action or attachment owns the UI. */
+  async workflowEvent(event: WorkflowEvent): Promise<void> {
+    const key = event.kind === "queue-changed" ? `${event.teamId}:${event.id.split(":")[0]}` : event.kind === "startup" ? `startup:${event.teamId}` : event.id;
+    this.pendingEvents.set(key, event);
+    await this.flushWorkflowEvents();
+  }
+
+  async flushWorkflowEvents(): Promise<void> {
+    if (this.eventRun) return this.eventRun;
+    if (this.workflowBusy() || (!this.pendingEvents.size && !this.updateQueued && !this.upgradeQueued)) return;
+    this.eventRun = (async () => {
+      do {
+        const events = [...this.pendingEvents.values()]; this.pendingEvents.clear();
+        if (events.length) this.upgradeQueued = true;
+        await this.refresh();
+        for (const event of events) if (event.kind === "merge" && event.laneId === null) this.pendingMerges.set(event.id, event);
+        for (const [id, event] of this.pendingMerges) {
+          const session = this.sessionResult.sessions.find((session) => session.teamId === event.teamId && session.id === event.goalId);
+          const integration = session?.loop?.integration;
+          if (!integration) continue; // A state event may arrive after the merge event.
+          const release = event.prUrl === integration.prUrl && integration.status === "merged" && event.mergedSha === integration.mergedSha;
+          const revert = event.prUrl === integration.revertPrUrl && integration.status === "reverted";
+          if (release || revert) { this.pendingMerges.delete(id); this.updateQueued = true; }
+          else if (event.prUrl !== integration.prUrl && event.prUrl !== integration.revertPrUrl) this.pendingMerges.delete(id);
+        }
+        // Build/running receipts only observe readiness. Calling check() here would write another receipt forever.
+        await this.checkBuild();
+        if (this.workflowBusy()) break;
+        const upgrade = this.upgradeQueued; this.upgradeQueued = false;
+        if (this.updateQueued) await this.updateCode();
+        else if (upgrade && !this.reloadWanted && !this.updateResult?.installFailed && this.processes?.upgrade) {
+          await this.exclusive(async () => {
+            const { problems } = await this.processes!.upgrade!();
+            if (problems.length) this.notice = "Could not restart after an update: " + problems.join("; ");
+            await this.refresh();
+          });
+        }
+      } while (this.pendingEvents.size && !this.workflowBusy());
+    })();
+    try { await this.eventRun; } finally { this.eventRun = undefined; this.bump(); }
+  }
+
+  async settleWorkflow(): Promise<void> { await this.eventRun; await this.updateRun; }
+
 
   constructor(private readonly state: StateInventory, private readonly sessions: SessionReadPort, private readonly processes?: SeatProcessPort, private readonly goals?: GoalStarter, private readonly stateSync?: StateSyncPort, private readonly update?: UpdatePort) {}
 
@@ -206,7 +260,7 @@ export class TerminalUiModel {
       return;
     }
     this.busy++;
-    try { await work(); } finally { this.busy--; }
+    try { await work(); } finally { this.busy--; this.bump(); }
   }
 
   /** Syncs the state checkout first, then hosts the processes, so they start from the remote's state; then checks for new code. */
@@ -230,7 +284,10 @@ export class TerminalUiModel {
    */
   async updateCode(): Promise<void> {
     const update = this.update;
-    if (!update || this.updating || this.busy) return;
+    if (!update) return;
+    this.updateQueued = true;
+    if (this.workflowBusy()) return;
+    this.updateQueued = false;
     await this.exclusive(async () => {
       try {
         await this.loadUpdateSettings();
@@ -338,7 +395,7 @@ export class TerminalUiModel {
 
   /** A reload is due and nothing is in flight: no typing, confirmation, state sync, update or action. */
   readyToReload(): boolean {
-    return this.reloadWanted && !!this.update?.canReload && !this.updateResult?.installFailed && !this.input && !this.confirm && !this.syncing && !this.updating && this.busy === 0;
+    return this.reloadWanted && !!this.update?.canReload && !this.updateResult?.installFailed && !this.driving && !this.input && !this.confirm && !this.syncing && !this.updating && this.busy === 0;
   }
 
   view(): UiView { return { page: this.page, ...(this.teamId ? { teamId: this.teamId } : {}), ...(this.seatId ? { seatId: this.seatId } : {}) }; }
@@ -480,6 +537,7 @@ export class TerminalUiModel {
   newGoalBlocked(submitting = false): string | undefined {
     if (!this.goals || !this.team) return "Planning goals cannot be started from this screen.";
     if (this.stateError || !this.sessionsReadable) return "Cannot start a planning goal: current goal state is unavailable; refresh first.";
+    if (this.team.workflowModel === "goals-v1") return "Product proposes this team’s goals; approve its published proposal or reply to redirect.";
     const missing = missingTeamHome(this.team);
     if (missing.length) return "Cannot start a planning goal: " + missingTeamMessage(this.team.displayName, missing);
     const open = this.openGoals();
@@ -502,8 +560,6 @@ export class TerminalUiModel {
     // Reverting a released sprint remains possible in history, independently of closure.
     if (action === "revert") return this.goals.sprint && integration?.status === "merged" && !integration.revertPrUrl
       && (stage === "release" || stage === "retro") ? { ...target, prUrl: integration.prUrl } : undefined;
-    if (action === "merge" && this.goals.sprint && integration?.status === "merged" && integration.revertPrUrl
-      && (stage === "release" || stage === "retro")) return { ...target, mergeKind: "revert", prUrl: integration.revertPrUrl };
     if (loop.closedAt) return undefined;
     if (action === "propose") return (stage === "planning" || stage === "proposal") && session.stage === "clarifying" ? target : undefined;
     if (action === "approve") return stage === "proposal" && session.stage === "awaiting-review" ? { ...target, updatedAt: session.updatedAt } : undefined;
@@ -511,10 +567,6 @@ export class TerminalUiModel {
     if (action === "integrate") return (stage === "implement" || stage === "release") && integration?.status === "collecting"
       && loop.tickets.some((ticket) => ticket.status === "merged")
       && !loop.tickets.some((ticket) => ticket.status === "building" || ticket.status === "in review") ? target : undefined;
-    if (action === "merge") {
-      if (stage === "release" && integration?.status === "pr-open" && integration.prUrl) return { ...target, mergeKind: "release", prUrl: integration.prUrl };
-      if (stage === "retro" && loop.retro?.status === "pending" && loop.retro.prUrl) return { ...target, mergeKind: "retro", prUrl: loop.retro.prUrl };
-    }
     return undefined;
   }
 
@@ -529,10 +581,10 @@ export class TerminalUiModel {
   ceremonyKeys(): string[] {
     if (this.page !== "seat") return [];
     const keys: string[] = [];
-    for (const [action, label] of [["propose", "P propose"], ["approve", "A approve"], ["integrate", "I integrate"], ["merge", "M merge"], ["revert", "V revert"]] as const) {
+    for (const [action, label] of [["propose", "P propose"], ["approve", "A approve"], ["integrate", "I integrate"], ["revert", "V revert"]] as const) {
       const session = this.actionGoal(action);
       const target = session && this.operation(session, action);
-      if (target) keys.push(label + (target.mergeKind ? " " + target.mergeKind : ""));
+      if (target) keys.push(label);
     }
     return keys;
   }
@@ -554,7 +606,7 @@ export class TerminalUiModel {
           this.notice = `Not run: ${target.action} for ${target.goalId} changed or is no longer available. Review the refreshed ceremony and confirm again.`;
           return;
         }
-        this.notice = `Running ${target.action}${target.mergeKind ? " " + target.mergeKind : ""} for ${target.goalId}…`;
+        this.notice = `Running ${target.action} for ${target.goalId}…`;
         this.bump();
         try { this.notice = await run(); }
         catch (error) { this.notice = failure + (error instanceof Error ? error.message : String(error)); }
@@ -584,7 +636,7 @@ export class TerminalUiModel {
   get seat(): StateSeat | undefined { return this.team?.seats.find((seat) => seat.id === this.seatId); }
 
   sessionsFor(seatId: string): TerminalSession[] {
-    return this.sessionResult.sessions.filter((session) => session.teamId === this.teamId && session.seatId === seatId);
+    return this.sessionResult.sessions.filter((session) => session.teamId === this.teamId && (session.seatId === seatId || session.goalOwnerSeatId === seatId));
   }
 
   /** Team history includes every planning sprint, independent of which seat currently holds work. */
@@ -596,7 +648,7 @@ export class TerminalUiModel {
 
   selectedSession(): TerminalSession | undefined { return currentSession(this.seat ? this.sessionsFor(this.seat.id) : []); }
   attachTarget(): string | undefined {
-    const bridge = this.sessionResult.connection === "connected" ? this.selectedSession()?.attach : undefined;
+    const bridge = this.seat?.roles.includes("Team Lead") && this.sessionResult.connection === "connected" ? this.selectedSession()?.attach : undefined;
     // A Developer seat's runner has its own verified tmux session.
     const attach = bridge ?? (this.seat ? this.live[this.seat.id]?.attach : undefined);
     return attach?.kind === "tmux" ? attach.target : undefined;
@@ -739,7 +791,7 @@ export class TerminalUiModel {
     if (!port) return false;
     const next: Record<string, LiveUsage> = {};
     await Promise.all((this.team?.seats ?? []).map(async (seat) => {
-      const hosted = seat.roles.includes("Team Lead") ? { kind: "bridge" as const } : seat.roles.includes("Developer") ? { kind: "seat" as const, seatId: seat.id } : undefined;
+      const hosted = seat.roles.includes("Team Lead") ? { kind: "bridge" as const } : seat.roles.some((role) => role === "Developer" || role === "Product") ? { kind: "seat" as const, seatId: seat.id } : undefined;
       const found = hosted ? await port.read(hosted).catch(() => undefined) : undefined;
       if (found) next[seat.id] = found;
     }));
@@ -858,12 +910,12 @@ export class TerminalUiModel {
       else if (!this.goals) this.notice = "Proposals cannot be requested from this screen.";
       else if (!target) this.notice = "No goal is being clarified for this seat.";
       else this.confirm = this.operation(target, "propose");
-    } else if (text === "I" || text === "M" || text === "V") {
-      const action = text === "I" ? "integrate" : text === "M" ? "merge" : "revert";
+    } else if (text === "I" || text === "V") {
+      const action = text === "I" ? "integrate" : "revert";
       const target = this.actionGoal(action);
       if (this.page !== "seat" || !this.seat?.roles.includes("Team Lead")) this.notice = "Open Chick's seat to " + action + " a sprint.";
       else if (!this.goals?.sprint) this.notice = "Sprints cannot be managed from this screen.";
-      else if (!target) this.notice = text === "I" ? "Integration unavailable: a sprint needs merged work and no outcome building or in review." : text === "M" ? "No sprint has an eligible release, revert or retro PR open for this seat." : "No merged sprint to roll back for this seat.";
+      else if (!target) this.notice = text === "I" ? "Integration unavailable: a sprint needs merged work and no outcome building or in review." : "No merged sprint to roll back for this seat.";
       else this.confirm = this.operation(target, action);
     } else if (input === "n") {
       const blocked = this.newGoalBlocked();
@@ -896,5 +948,50 @@ export class TerminalUiModel {
     }
     this.revision++;
     return "none";
+  }
+}
+
+export type WorkflowEventSource = (onEvent: (event: WorkflowEvent) => Promise<void>, signal: AbortSignal) => Promise<void>;
+
+/** Owns the host lifetime separately from finite UI turns. The source is subscribed before startup reconciliation. */
+export class TerminalUiWorkflow {
+  private readonly controller = new AbortController();
+  private sourceRun?: Promise<void>;
+  private startRun?: Promise<void>;
+  private ready = false;
+  private active = true;
+  private attached = false;
+  constructor(private readonly model: TerminalUiModel, private readonly source?: WorkflowEventSource, private readonly idle: () => void = () => {}) { model.workflowSuspended = true; }
+  start(): Promise<void> {
+    if (this.startRun) return this.startRun;
+    this.startRun = (async () => {
+      if (this.source) this.sourceRun = Promise.resolve().then(() => this.source!((event) => this.model.workflowEvent(event), this.controller.signal)).then(() => {
+        if (!this.controller.signal.aborted) throw new Error("Event host stopped.");
+      }).catch(() => {
+        if (!this.controller.signal.aborted) {
+          this.fail("Workflow event host failed; restart Indra to reconcile retained events.");
+        }
+      });
+      await this.model.start();
+      this.ready = !this.controller.signal.aborted;
+      await this.wake();
+    })();
+    return this.startRun;
+  }
+  private fail(message: string): void {
+    this.ready = false; this.controller.abort(); this.model.workflowSuspended = true;
+    this.model.workflowError = message; this.model.revision++; this.model.changed?.();
+  }
+  async setAttached(attached: boolean): Promise<void> { this.attached = attached; await this.wake(); }
+  async wake(): Promise<void> {
+    this.model.workflowSuspended = !this.active || !this.ready || this.attached;
+    if (this.model.workflowSuspended) return;
+    try { await this.model.flushWorkflowEvents(); }
+    catch { this.fail("Workflow reconciliation failed; restart Indra to reconcile retained events."); return; }
+    if (this.active && !this.attached && this.model.readyToReload()) this.idle();
+  }
+  async stop(): Promise<void> {
+    this.active = false; this.model.workflowSuspended = true; this.controller.abort();
+    await Promise.allSettled([this.sourceRun, this.startRun, this.model.settleWorkflow()]);
   }
 }

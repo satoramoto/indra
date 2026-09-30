@@ -3,7 +3,7 @@ import type { ScrollBoxRenderable } from "@opentui/core";
 import { createSignal } from "solid-js";
 import { describe, expect, it, vi } from "vitest";
 import { StateInventory, type StateSnapshot } from "../src/state-domain.js";
-import { GOAL_INPUT_LIMIT, TerminalUiModel, sessionSprint, type SessionReadResult, type StateSyncPort, type TerminalSession, type UpdatePort } from "../src/terminal-ui.js";
+import { GOAL_INPUT_LIMIT, TerminalUiModel, TerminalUiWorkflow, sessionSprint, type SessionReadResult, type StateSyncPort, type TerminalSession, type UpdatePort } from "../src/terminal-ui.js";
 import type { UpdateResult } from "../src/self-update.js";
 import type { StateSyncResult } from "../src/state-commit.js";
 import { TerminalApp } from "../src/terminal-ui-solid.js";
@@ -86,7 +86,7 @@ describe("terminal UI", () => {
     try {
       await setup.renderOnce();
       expect(setup.captureCharFrame()).toContain("Re-queued goal-retry/outcome-1 for seat-002.");
-      expect(visibleIn(await scrollFrames(setup, "detail-scroll"), "assignment Retry failed work · queued")).toBe(true);
+      expect(visibleIn(await scrollFrames(setup, "detail-scroll"), "historical Retry failed work · queued")).toBe(true);
     } finally { setup.renderer.destroy(); }
     model.key("t", "T");
     expect(model.confirm).toBeUndefined();
@@ -364,7 +364,7 @@ describe("terminal UI", () => {
       await detail.renderOnce();
       const frame = detail.captureCharFrame();
       const frames = [frame, ...await scrollFrames(detail, "detail-scroll")];
-      for (const text of ["process running (seat runner)", "assignment Second · in-review"]) expect(visibleIn(frames, text), text).toBe(true);
+      for (const text of ["process running (seat runner)", "historical Second · in-review"]) expect(visibleIn(frames, text), text).toBe(true);
     } finally { detail.renderer.destroy(); }
   });
 
@@ -450,11 +450,13 @@ describe("terminal UI", () => {
     model.input = { value: "half a goal" };
     calls.length = 0;
     await model.updateCode();
+    expect(calls).toEqual([]);
+    expect(model.reloadWanted).toBe(false);
+    expect(model.readyToReload()).toBe(false);
+    model.key("escape");
+    await model.flushWorkflowEvents();
     expect(calls).toEqual(["check"]);
     expect(model.reloadWanted).toBe(true);
-    expect(model.readyToReload()).toBe(false);
-    expect(model.updateLine()?.text).toBe("Indra abc1234 · update pending · reloads when idle");
-    model.key("escape");
     expect(model.readyToReload()).toBe(true);
     expect(model.view()).toEqual({ page: "seat", teamId: "team-001", seatId: "seat-003" });
   });
@@ -484,8 +486,10 @@ describe("terminal UI", () => {
     expect(model.reloadWanted).toBe(false);
     expect(model.updateLine()).toEqual({ ok: false, text: "Indra abc1234 · blocked: dependency install failed: npm ci failed: ENOSPC · retrying on the next check" });
 
-    // The next check installs and builds: the new build is live, then held actions run again.
+    // Typing is preserved while blocked. At the next idle boundary the retry may install and build.
+    const draft = model.input; model.input = undefined;
     const retry = model.updateCode();
+    model.input = draft;
     const again = model.control("restart");
     await new Promise((done) => setTimeout(done, 20));
     expect(calls).toEqual(["check", "check"]);
@@ -713,7 +717,7 @@ describe("terminal UI", () => {
     } finally { setup.renderer.destroy(); }
   });
 
-  it("opens, merges and rolls back a sprint with I, M and V, each after a y/n confirmation", async () => {
+  it("opens and rolls back a sprint with I and V, while M never offers a merge", async () => {
     const calls: string[] = [];
     let sprint: TerminalSession["sprint"] = "collecting";
     const goals: GoalStarter = { start: async () => "unused", approve: async () => "unused", propose: async () => "unused", sprint: async (action, goalId) => { calls.push(`${action} ${goalId}`); return `ran ${action}`; } };
@@ -728,7 +732,7 @@ describe("terminal UI", () => {
     model.key("down");
     model.key("return");
     expect(model.key("m", "M")).toBe("none");
-    expect(model.notice).toContain("No sprint has an eligible release, revert or retro PR open");
+    expect(model.confirm).toBeUndefined();
     model.key("i", "I");
     expect(model.confirm).toEqual({ action: "integrate", goalId: "goal-1", goal: "Plan the next cycle" });
     const [revision] = createSignal(model.revision);
@@ -750,8 +754,8 @@ describe("terminal UI", () => {
     sprint = "pr-open";
     await model.refresh();
     model.key("m", "M");
-    expect(model.confirm).toEqual({ action: "merge", goalId: "goal-1", goal: "Plan the next cycle", mergeKind: "release", prUrl });
-    expect(model.key("y", "y")).toBe("sprint");
+    expect(model.confirm).toBeUndefined();
+    expect(model.key("y", "y")).toBe("none");
     await model.sprintConfirmed();
     sprint = "merged";
     await model.refresh();
@@ -763,11 +767,11 @@ describe("terminal UI", () => {
     sprint = "revert-open";
     await model.refresh();
     model.key("m", "M");
-    expect(model.confirm).toMatchObject({ action: "merge", mergeKind: "revert", prUrl: "https://github.com/example/indra/pull/81" });
-    expect(model.key("y", "y")).toBe("sprint");
+    expect(model.confirm).toBeUndefined();
+    expect(model.key("y", "y")).toBe("none");
     await model.sprintConfirmed();
-    expect(calls).toEqual(["integrate goal-1", "merge goal-1", "rollback goal-1", "merge goal-1"]);
-    expect(model.notice).toBe("ran merge");
+    expect(calls).toEqual(["integrate goal-1", "rollback goal-1"]);
+    expect(model.ceremonyKeys()).toEqual([]);
   });
 
   it("requests Chick's proposal for the newest clarifying goal with P and a y/n confirmation", async () => {
@@ -946,15 +950,15 @@ describe("persisted ceremony and allowed actions", () => {
     const working = ceremonySession("implement");
     working.loop!.tickets.push({ id: "other", title: "Still reviewing", seatId: "seat-003", status: "in review" });
     await check(working, []);
-    await check(ceremonySession("release"), ["M merge release"]);
+    await check(ceremonySession("release"), []);
     const updating = ceremonySession("release"); updating.loop!.integration!.status = "merged";
     updating.loop!.build = { status: "unavailable", reason: "Build failed." };
     await check(updating, ["V revert"]);
     await check(ceremonySession("retro"), ["V revert"]);
     const publishing = ceremonySession("retro"); publishing.loop!.retro!.prUrl = "https://github.com/example/indra/pull/201";
-    await check(publishing, ["M merge retro", "V revert"]);
+    await check(publishing, ["V revert"]);
     publishing.loop!.integration!.revertPrUrl = "https://github.com/example/indra/pull/202";
-    await check(publishing, ["M merge revert"]);
+    await check(publishing, []);
     await check(closeSession(ceremonySession("retro")), ["V revert"]);
     const legacy = ceremonySession("release"); delete legacy.loop!.ceremony;
     await check(legacy, []);
@@ -1089,21 +1093,20 @@ describe("persisted ceremony and allowed actions", () => {
     expect(fixture.model.notice).toContain("confirm again");
   });
 
-  it("does not redirect a release confirmation to a revert or a replacement retro PR", async () => {
-    const fixture = await ceremonyHarness([ceremonySession("release")]);
-    fixture.model.key("m", "M"); expect(fixture.model.key("y", "y")).toBe("sprint");
-    const reverted = ceremonySession("release"); reverted.loop!.integration!.status = "merged";
-    reverted.loop!.integration!.revertPrUrl = "https://github.com/example/indra/pull/202";
-    fixture.sessions([reverted]); await fixture.model.sprintConfirmed();
-    expect(fixture.goals.sprint).not.toHaveBeenCalled();
-    expect(fixture.model.notice).toContain("confirm again");
+  it("never offers M or a second A for release, revert or retro", async () => {
+    const release = ceremonySession("release");
+    const revert = ceremonySession("release"); revert.loop!.integration!.status = "merged"; revert.loop!.integration!.revertPrUrl = "https://github.com/example/indra/pull/202";
     const retro = ceremonySession("retro"); retro.loop!.retro!.prUrl = "https://github.com/example/indra/pull/201";
-    fixture.sessions([retro]); await fixture.model.refresh();
-    fixture.model.key("m", "M"); expect(fixture.model.key("y", "y")).toBe("sprint");
-    retro.loop!.retro!.prUrl = "https://github.com/example/indra/pull/203";
-    fixture.sessions([retro]); await fixture.model.sprintConfirmed();
-    expect(fixture.goals.sprint).not.toHaveBeenCalled();
-    expect(fixture.model.ceremonyKeys()).toContain("M merge retro");
+    const fixture = await ceremonyHarness([]);
+    for (const session of [release, revert, retro]) {
+      fixture.sessions([session]); await fixture.model.refresh();
+      for (const key of ["M", "A"]) {
+        fixture.model.key(key.toLowerCase(), key); expect(fixture.model.confirm).toBeUndefined();
+        expect(fixture.model.key("y", "y")).toBe("none");
+        await fixture.model.sprintConfirmed(); await fixture.model.approveConfirmed();
+      }
+    }
+    expect(fixture.goals.sprint).not.toHaveBeenCalled(); expect(fixture.goals.approve).not.toHaveBeenCalled();
   });
 
   it("refuses actions when the current state cannot be read", async () => {
@@ -1117,18 +1120,18 @@ describe("persisted ceremony and allowed actions", () => {
   });
 
   it("refreshes after backend refusal and dispatches an in-flight confirmation only once", async () => {
-    const fixture = await ceremonyHarness([ceremonySession("release")]);
+    const fixture = await ceremonyHarness([ceremonySession("implement")]);
     let reject = (_error: Error) => {};
     vi.mocked(fixture.goals.sprint!).mockImplementation(() => new Promise((_resolve, fail) => { reject = fail; }));
-    fixture.model.key("m", "M"); fixture.model.key("y", "y");
+    fixture.model.key("i", "I"); fixture.model.key("y", "y");
     const pending = fixture.model.sprintConfirmed();
     await vi.waitFor(() => expect(fixture.goals.sprint).toHaveBeenCalledOnce());
-    fixture.model.key("m", "M"); expect(fixture.model.confirm).toBeUndefined();
+    fixture.model.key("i", "I"); expect(fixture.model.confirm).toBeUndefined();
     await fixture.model.sprintConfirmed();
     const changed = ceremonySession("release"); changed.loop!.integration!.status = "merged";
-    fixture.sessions([changed]); reject(new Error("The merge target changed; confirm again."));
+    fixture.sessions([changed]); reject(new Error("The integration target changed; confirm again."));
     await pending;
-    expect(fixture.model.notice).toContain("Could not merge sprint goal-ceremony: The merge target changed");
+    expect(fixture.model.notice).toContain("Could not integrate sprint goal-ceremony: The integration target changed");
     expect(fixture.model.ceremonyKeys()).toEqual(["V revert"]);
     expect(fixture.goals.sprint).toHaveBeenCalledOnce();
   });
@@ -1160,25 +1163,25 @@ describe("persisted ceremony and allowed actions", () => {
     } finally { setup.renderer.destroy(); }
   });
 
-  it("names the retro PR in M's confirmation, then drops the closed sprint from the list while its records keep the evidence", async () => {
+  it("observes automatic retro closure and retains the recorded release and archive evidence", async () => {
     const retro = ceremonySession("retro"); retro.loop!.retro!.prUrl = "https://github.com/example/indra/pull/201";
     const fixture = await ceremonyHarness([retro]);
     const closed = closeSession(retro);
     // Today's live process failure must not erase the recorded released build.
     closed.loop!.build = { status: "unavailable", reason: "Current process evidence is unavailable." };
-    vi.mocked(fixture.goals.sprint!).mockImplementation(async () => { fixture.sessions([closed]); return "Retro published; goal closed."; });
     fixture.model.key("m", "M");
     const [revision, setRevision] = createSignal(fixture.model.revision);
     const setup = await testRender(() => <TerminalApp model={fixture.model} revision={revision} onKey={() => {}} />, { width: 100, height: 32 });
     try {
       await setup.renderOnce();
       const before = setup.captureCharFrame();
-      expect(compactFrame(before)).toContain(compactFrame("Merge the retro publication PR into main for sprint goal-ceremony"));
-      expect(before).toContain(retro.loop!.retro!.prUrl);
+      expect(before).not.toContain("y merge");
+      expect(fixture.model.confirm).toBeUndefined();
       expect(fixture.goals.sprint).not.toHaveBeenCalled();
-      expect(fixture.model.key("y", "y")).toBe("sprint");
-      await fixture.model.sprintConfirmed();
-      expect(fixture.goals.sprint).toHaveBeenCalledExactlyOnceWith("merge", "goal-ceremony");
+      expect(fixture.model.key("y", "y")).toBe("none");
+      fixture.sessions([closed]);
+      await fixture.model.workflowEvent({ kind: "goal-closed", id: "closed", goalId: closed.id, teamId: closed.teamId, at: "2026-01-06T00:00:00Z" });
+      expect(fixture.goals.sprint).not.toHaveBeenCalled();
       expect(fixture.model.newGoalBlocked()).toBeUndefined();
       setRevision(fixture.model.revision); await setup.renderOnce();
       // Closed means finished (#59): the sprint card leaves the list.
@@ -1276,7 +1279,7 @@ describe("visible sprint loop", () => {
     ["running", "Running build contains the integration commit."],
     ["reload-pending", "Pending reload:"], ["update-pending", "Update pending:"],
     ["unavailable", "Build evidence unavailable; release is not confirmed."],
-    ["revert-open", "Revert PR open; awaiting human merge confirmation."],
+    ["revert-open", "Revert PR open; awaiting bot review and green CI."],
     ["reverted", "Reverted on main; running revert build is unverified."],
   ])("renders %s build evidence explicitly", async (status, message) => {
     const fixture = harness(); fixture.state(homed);
@@ -1303,5 +1306,153 @@ describe("visible sprint loop", () => {
       expect(frame).toContain(`${label} session: ${sessionId}`);
       if (engine !== "codex") expect(frame).not.toContain("Codex");
     } finally { setup.renderer.destroy(); }
+  });
+});
+
+describe("event-driven UI lifetime", () => {
+  const at = "2026-09-29T12:00:00Z";
+  const queue = (source: string, suffix: string): import("../src/goal-contract.js").WorkflowEvent => ({ kind: "queue-changed", teamId: "team-001", id: `${source}:team-001:${suffix}`, at });
+  function deferred<T = void>() { let resolve!: (value: T) => void; let reject!: (reason: unknown) => void; const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
+  async function setup(options: { legacy?: boolean; close?: Promise<void> } = {}) {
+    type Event = import("../src/goal-contract.js").WorkflowEvent;
+    let send!: (event: Event) => Promise<void>;
+    let signal!: AbortSignal;
+    const calls: string[] = [];
+    const sourceExit = deferred();
+    let sessions: TerminalSession[] = [];
+    let pending = true;
+    let current = { id: "current", sha: "a".repeat(40), builtAt: at };
+    const check = vi.fn(async (): Promise<UpdateResult> => { calls.push("check"); return { outcome: "up-to-date", message: "Current build", at }; });
+    const upgrade = vi.fn(async () => { calls.push("upgrade"); return { pending: pending ? ["seat-003"] : [], problems: [] }; });
+    const read = vi.fn(async (): Promise<SessionReadResult> => ({ connection: "connected", sessions }));
+    const processes: SeatProcessPort = { ensureAll: async () => { calls.push("ensure"); return []; }, read: async () => ({ "seat-003": { process: "running", ...(pending ? { updatePending: true } : {}) } }), stop: async () => {}, restart: async () => {}, upgrade };
+    const state = structuredClone(homed);
+    if (!options.legacy) { state.teams[0].workflowModel = "goals-v1"; state.teams[0].seats[1].roles = ["Product"]; }
+    const model = new TerminalUiModel(new StateInventory({ read: async () => state }), { readSessions: read }, processes, undefined, undefined,
+      { running: current, canReload: true, check, current: async () => current });
+    const reload = vi.fn();
+    const host = new TerminalUiWorkflow(model, options.legacy ? undefined : async (onEvent, abort) => {
+      calls.push("subscribe"); send = onEvent; signal = abort;
+      await onEvent({ kind: "startup", teamId: "team-001", at });
+      await Promise.race([sourceExit.promise, new Promise<void>((done) => { if (abort.aborted) done(); else abort.addEventListener("abort", () => done(), { once: true }); })]);
+      if (options.close) await options.close;
+      calls.push("host-closed");
+    }, reload);
+    await host.start();
+    return { model, host, check, upgrade, read, reload, calls, processes, send: (event: Event) => send(event), signal: () => signal,
+      sessions: (value: TerminalSession[]) => { sessions = value; }, current: () => { current = { ...current, id: "new", sha: "b".repeat(40) }; }, idle: () => { pending = false; }, fail: () => sourceExit.reject(new Error("Host connection lost")) };
+  }
+
+  it("subscribes before startup hosting, reconciles once, and observes build receipts without writing update receipts", async () => {
+    const f = await setup();
+    try {
+      expect(f.calls.slice(0, 4)).toEqual(["subscribe", "ensure", "check", "upgrade"]);
+      expect(f.check).toHaveBeenCalledTimes(1);
+      for (const event of [queue("build", "first"), queue("running", "first"), queue("state", "first")]) await f.send(event);
+      expect(f.check).toHaveBeenCalledTimes(1);
+      expect(f.upgrade).toHaveBeenCalledTimes(4);
+      expect(f.model.workflowError).toBeUndefined();
+      // The UI already runs this build, but an older busy seat was deferred at startup.
+      f.idle();
+      await f.send(queue("scheduler-idle", "completed-turn"));
+      expect(f.upgrade).toHaveBeenCalledTimes(5);
+      expect(f.model.live["seat-003"].updatePending).toBeUndefined();
+      expect(f.check).toHaveBeenCalledTimes(1);
+    } finally { await f.host.stop(); }
+  });
+
+  it("retains legacy startup/update behavior when no new-model event capability is supplied", async () => {
+    const f = await setup({ legacy: true });
+    try {
+      expect(f.calls).toEqual(["ensure", "check", "upgrade"]);
+      expect(f.model.workflowError).toBeUndefined();
+      await f.model.updateCode(); expect(f.check).toHaveBeenCalledTimes(2);
+    } finally { await f.host.stop(); }
+  });
+
+  it.each(["input", "confirm", "drive"] as const)("coalesces receipts while %s owns the UI, then safely reloads the retained build", async (busy) => {
+    const f = await setup();
+    try {
+      if (busy === "input") f.model.input = { value: "preserve my text" };
+      else if (busy === "confirm") f.model.confirm = { action: "rollback", from: "a", to: "b" };
+      else f.model.driving = { seatId: "seat-003", state: "on" };
+      const reads = f.read.mock.calls.length;
+      f.current();
+      for (const event of [queue("build", "one"), queue("build", "two"), queue("running", "one")]) await f.send(event);
+      expect(f.read).toHaveBeenCalledTimes(reads); expect(f.reload).not.toHaveBeenCalled();
+      f.model.input = undefined; f.model.confirm = undefined; f.model.driving = undefined;
+      await f.host.wake();
+      expect(f.read).toHaveBeenCalledTimes(reads + 1);
+      expect(f.model.reloadWanted).toBe(true); expect(f.reload).toHaveBeenCalledTimes(1);
+      expect(f.check).toHaveBeenCalledTimes(1);
+    } finally { await f.host.stop(); }
+  });
+
+  it("retains event work while an owned process action is in flight", async () => {
+    const f = await setup();
+    try {
+      const entered = deferred(); const finish = deferred();
+      f.processes.restart = async () => { entered.resolve(); await finish.promise; };
+      f.model.restore({ page: "seat", teamId: "team-001", seatId: "seat-003" });
+      const action = f.model.control("restart"); await entered.promise;
+      const reads = f.read.mock.calls.length;
+      await f.send(queue("state", "during-action")); await f.send(queue("state", "latest"));
+      expect(f.read).toHaveBeenCalledTimes(reads); expect(f.upgrade).toHaveBeenCalledTimes(1);
+      finish.resolve(); await action; await f.host.wake();
+      expect(f.upgrade).toHaveBeenCalledTimes(2); expect(f.check).toHaveBeenCalledTimes(1);
+    } finally { await f.host.stop(); }
+  });
+
+  it("preserves an upgrade event when typing starts during its asynchronous refresh", async () => {
+    const f = await setup();
+    try {
+      const reached = deferred(); const finish = deferred();
+      f.read.mockImplementationOnce(async () => { reached.resolve(); await finish.promise; return { connection: "connected", sessions: [] }; });
+      const turn = f.send({ kind: "seat-idle", teamId: "team-001", seatId: "seat-003", id: "late-idle", at });
+      await reached.promise; f.model.input = { value: "in flight" }; finish.resolve(); await turn;
+      expect(f.upgrade).toHaveBeenCalledTimes(1);
+      f.model.input = undefined; f.idle(); await f.host.wake();
+      expect(f.upgrade).toHaveBeenCalledTimes(2); expect(f.model.live["seat-003"].updatePending).toBeUndefined();
+    } finally { await f.host.stop(); }
+  });
+
+  it("updates only matching integration/revert merges and retains an integration event until state catches up", async () => {
+    const f = await setup();
+    try {
+      const session = ceremonySession("release"); session.workflowModel = "goals-v1";
+      const event: Extract<import("../src/goal-contract.js").WorkflowEvent, { kind: "merge" }> = { kind: "merge", id: "integration", teamId: session.teamId, goalId: session.id, laneId: null, prUrl: session.loop!.integration!.prUrl!, headSha: "c".repeat(40), mergedSha: "d".repeat(40), at };
+      f.sessions([session]);
+      await f.send({ ...event, id: "lane", laneId: "implementation" });
+      await f.send({ ...event, id: "retro", prUrl: "https://github.com/example/indra/pull/900" });
+      await f.send(event); expect(f.check).toHaveBeenCalledTimes(1);
+      session.loop!.integration!.status = "merged"; session.loop!.integration!.mergedSha = event.mergedSha;
+      await f.send(queue("state", "caught-up")); expect(f.check).toHaveBeenCalledTimes(2);
+      session.loop!.integration!.status = "reverted"; session.loop!.integration!.revertPrUrl = "https://github.com/example/indra/pull/901";
+      await f.send({ ...event, id: "revert", prUrl: session.loop!.integration!.revertPrUrl });
+      expect(f.check).toHaveBeenCalledTimes(3);
+      expect(f.model.readyToReload()).toBe(false);
+    } finally { await f.host.stop(); }
+  });
+
+  it("surfaces a deferred reconciliation failure instead of rejecting a detached key-handler wake", async () => {
+    const f = await setup();
+    try {
+      f.model.input = { value: "editing" }; await f.send(queue("scheduler-idle", "pending"));
+      f.processes.upgrade = async () => { throw new Error("State unavailable"); };
+      f.model.input = undefined; await f.host.wake();
+      expect(f.model.workflowError).toContain("reconciliation failed"); expect(f.signal().aborted).toBe(true);
+    } finally { await f.host.stop(); }
+  });
+
+  it("awaits host shutdown on exit and surfaces an unexpected host failure", async () => {
+    const closed = deferred(); const f = await setup({ close: closed.promise });
+    const stopped = vi.fn(); const stopping = f.host.stop().then(stopped);
+    await Promise.resolve(); expect(f.signal().aborted).toBe(true); expect(stopped).not.toHaveBeenCalled();
+    closed.resolve(); await stopping; expect(stopped).toHaveBeenCalledTimes(1); expect(f.calls.at(-1)).toBe("host-closed");
+    const failed = await setup();
+    try {
+      failed.fail(); await new Promise<void>((done) => setImmediate(done));
+      expect(failed.signal().aborted).toBe(true); expect(failed.model.workflowError).toContain("event host failed");
+    } finally { await failed.host.stop(); }
   });
 });

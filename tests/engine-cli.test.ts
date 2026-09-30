@@ -5,10 +5,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentRuntime, MessageOptions, WriteAccess } from "../src/codex-runtime.js";
 import type { CeremonyAdapters, PlanningChat } from "../src/planning-bridge.js";
 import { processShell, type RuntimeFactory } from "../src/developer-seat.js";
-import { createPlanningBridge, createPlanningStore, main } from "../src/cli.js";
+import { createPlanningBridge, createPlanningStore, developerEventTurn, main, uiWorkflowEvents, workflowDelivery } from "../src/cli.js";
 import { SprintGitHub } from "../src/sprint.js";
 import { PlanningStore } from "../src/planning.js";
 import { loadSeatPersonas, type SeatPersona } from "../src/seat-persona.js";
+import { runWorkflowHost, type WorkflowHostOptions } from "../src/remodel-events.js";
+import { ProductSeat } from "../src/product-seat.js";
+import * as projectCheckouts from "../src/project-checkout.js";
+import * as op from "../src/op-env.js";
+import type { WorkflowEvent } from "../src/goal-contract.js";
 
 const fakes = vi.hoisted(() => ({
   calls: [] as { engine: string; cwd: string; timeout?: number; write?: WriteAccess; home?: string; roles?: readonly string[]; prompt: string; schema: string; session?: string; options?: MessageOptions }[],
@@ -18,6 +23,7 @@ const fakes = vi.hoisted(() => ({
   token: vi.fn(async () => "test-bot-token"),
   request: vi.fn(async () => ({ goal: { id: "goal-1" }, alreadyRequested: false })),
   resume: undefined as string | undefined,
+  hosts: [] as WorkflowHostOptions[],
 }));
 function fakeRuntime(engine: string) {
   return class implements AgentRuntime {
@@ -35,6 +41,7 @@ vi.mock("../src/codex-runtime.js", async (original) => ({ ...await original<type
 vi.mock("../src/claude-runtime.js", async (original) => ({ ...await original<typeof import("../src/claude-runtime.js")>(), ClaudeRuntime: fakeRuntime("claude") }));
 vi.mock("../src/seat-persona.js", async (original) => ({ ...await original<typeof import("../src/seat-persona.js")>(), loadSeatPersonas: vi.fn(async () => ({})) }));
 vi.mock("../src/service-account.js", () => ({ opCredential: vi.fn(async () => ({})), stageServiceToken: vi.fn() }));
+vi.mock("../src/remodel-events.js", async (original) => ({ ...await original<typeof import("../src/remodel-events.js")>(), runWorkflowHost: vi.fn(async (options: WorkflowHostOptions) => { fakes.hosts.push(options); await options.turn({ kind: "startup", teamId: options.teamId, at: "2026-09-01T00:00:00Z" }); await options.onReady?.(); }) }));
 vi.mock("../src/self-update.js", async (original) => ({ ...await original<typeof import("../src/self-update.js")>(), recordRunningBuild: vi.fn(), SelfUpdater: vi.fn() }));
 vi.mock("../src/state-commit.js", async (original) => ({ ...await original<typeof import("../src/state-commit.js")>(), withFileLock: async (_path: string, run: () => Promise<unknown>) => run() }));
 vi.mock("../src/planning-mattermost.js", async (original) => ({
@@ -64,6 +71,8 @@ vi.mock("../src/planning-bridge.js", () => ({
     async merge() { await this.exercise("merge"); return "Merged"; }
     async rollback() { await this.exercise("rollback"); return "Reverted"; }
     async poll() { await this.exercise("serve"); throw new Error("End fake server loop"); }
+    async dispatch(event: WorkflowEvent) { fakes.actions.push(`scheduler-${event.kind}`); return { record: { failure: null }, events: [] }; }
+    async consumers() { return []; }
   },
 }));
 vi.mock("../src/developer-seat.js", async (original) => ({
@@ -85,6 +94,7 @@ let checkout: string;
 beforeEach(async () => {
   checkout = join(await mkdtemp(join(tmpdir(), "indra-engine-cli-")), "state"); await mkdir(`${checkout}.runtime`);
   fakes.calls.length = 0; fakes.posts.length = 0; fakes.actions.length = 0; fakes.adapters.length = 0; fakes.resume = undefined; fakes.token.mockClear(); fakes.request.mockClear();
+  fakes.hosts.length = 0;
   vi.mocked(loadSeatPersonas).mockResolvedValue({});
   vi.spyOn(console, "log").mockImplementation(() => {}); vi.spyOn(console, "error").mockImplementation(() => {});
   vi.spyOn(PlanningStore.prototype, "read").mockResolvedValue({ $schema: "schema", schemaVersion: 1, sprints: [], teams: [{ id: "team-001", slug: "yahaha", externalIdentities: { mattermost: { teamId: "team", homeChannelId: "home" } }, seats: [
@@ -95,6 +105,72 @@ beforeEach(async () => {
 afterEach(async () => { vi.restoreAllMocks(); await rm(join(checkout, ".."), { recursive: true, force: true }); });
 const configure = (value: unknown) => writeFile(join(`${checkout}.runtime`, "seat-engines.json"), JSON.stringify(value));
 const planning = (action: string) => main(["planning", action, ...(action === "serve" ? [] : ["--goal", "goal-1"]), "--state", checkout]);
+
+describe("goals-v1 production event wiring", () => {
+  it.each(["codex", "claude"])("adapts Product's %s runtime factory without confusing write capability and timeout", async (engine) => {
+    const state = await new PlanningStore(checkout).read();
+    const team = state.teams[0] as { workflowModel?: string; project?: { github: string }; seats: { id: string; roles: string[] }[] };
+    team.workflowModel = "goals-v1"; team.project = { github: "test/product-project" }; team.seats.find((seat) => seat.id === "seat-dev")!.roles = ["Product"];
+    await configure({ "seat-dev": engine });
+    const project = join(`${checkout}.runtime`, "projects", "test-product-project");
+    const clone = vi.spyOn(projectCheckouts, "ensureProjectCheckout").mockResolvedValue(project);
+    const write: WriteAccess = { extraDirs: ["/shared.git"] }; const options = { timeoutMs: 2345 };
+    vi.spyOn(ProductSeat.prototype, "turn").mockImplementation(async function (this: ProductSeat, event) {
+      expect(event).toMatchObject({ kind: "startup", teamId: "team-001" });
+      await this.services.runtime.message("Default read-only runtime.", "product-schema", undefined, options);
+      await this.services.runtimeFor!(project).message("Explicit read-only runtime.", "product-schema", undefined, options);
+      await this.services.runtimeFor!(project, write).message("Factory capability probe.", "product-schema", undefined, options);
+      return { status: "idle", proposalIds: [] };
+    });
+    expect(await main(["seat", "run", "--seat", "seat-dev", "--state", checkout])).toBe(0);
+    expect(clone).toHaveBeenCalledExactlyOnceWith(processShell, `${checkout}.runtime`, "test/product-project");
+    expect(fakes.calls).toHaveLength(3);
+    expect(fakes.calls.map((call) => call.write)).toEqual([undefined, undefined, write]);
+    for (const call of fakes.calls) expect(call).toMatchObject({ engine, cwd: project, timeout: undefined, options, session: undefined });
+    expect(fakes.hosts[0]).toMatchObject({ teamId: "team-001", consumer: "seat-dev" });
+  });
+  it("omits event ingress for an entirely historical UI and joins every enabled host on abort", async () => {
+    const store = new PlanningStore(checkout); const onEvent = vi.fn(async () => {});
+    expect(uiWorkflowEvents(store, [])).toBeUndefined(); expect(fakes.hosts).toEqual([]);
+    const stopped: string[] = [];
+    vi.mocked(runWorkflowHost).mockImplementationOnce(async (options) => {
+      fakes.hosts.push(options); await new Promise<void>((done) => options.signal!.addEventListener("abort", () => { stopped.push(options.teamId); done(); }, { once: true }));
+    }).mockImplementationOnce(async (options) => {
+      fakes.hosts.push(options); await new Promise<void>((done) => options.signal!.addEventListener("abort", () => { stopped.push(options.teamId); done(); }, { once: true }));
+    });
+    const controller = new AbortController(); let ended = false;
+    const run = uiWorkflowEvents(store, ["team-001", "team-other"])!(onEvent, controller.signal).then(() => { ended = true; });
+    expect(fakes.hosts.map((host) => host.consumer)).toEqual(["ui-team-001", "ui-team-other"]); expect(ended).toBe(false);
+    controller.abort(); await run; expect(stopped).toEqual(["team-001", "team-other"]); expect(ended).toBe(true);
+  });
+  it("uses the finite Developer capability and fails honestly when that lane is unavailable", async () => {
+    const event: WorkflowEvent = { kind: "startup", teamId: "team-001", at: "2026-09-01T00:00:00Z" };
+    const tick = vi.fn(async () => "idle"); await expect(developerEventTurn({ tick }, event)).rejects.toThrow("unavailable"); expect(tick).not.toHaveBeenCalled();
+    const turn = vi.fn(async () => ({ events: [], report: null })); expect(await developerEventTurn({ turn, tick }, event)).toEqual({ events: [], report: null });
+    expect(turn).toHaveBeenCalledExactlyOnceWith(event); expect(tick).not.toHaveBeenCalled();
+  });
+  it("requires an explicit non-secret delivery configuration and reads the secret through op only at startup", async () => {
+    const store = new PlanningStore(checkout); const read = vi.spyOn(op, "opRead").mockResolvedValue("fixture-secret");
+    await expect(workflowDelivery(store)).rejects.toThrow("Configure workflow-delivery.json"); expect(read).not.toHaveBeenCalled();
+    await store.saveRuntime("workflow-delivery", { version: 1, port: 9781, secretRef: "op://fixture/webhook/secret" });
+    expect(await workflowDelivery(store)).toEqual({ port: 9781, secret: "fixture-secret" }); expect(read).toHaveBeenCalledExactlyOnceWith("op://fixture/webhook/secret", {});
+    await store.saveRuntime("workflow-delivery", { version: 1, port: 9781, secret: "never-configure-a-raw-secret" });
+    await expect(workflowDelivery(store)).rejects.toThrow("Configure workflow-delivery.json"); expect(read).toHaveBeenCalledTimes(1);
+  });
+  it("routes enabled planning serve through external ingress and a finite startup turn instead of the legacy poll", async () => {
+    const state = await new PlanningStore(checkout).read(); const team = state.teams[0] as { workflowModel?: string; project?: { github: string } }; team.workflowModel = "goals-v1"; team.project = { github: "test/project" };
+    vi.mocked(PlanningStore.prototype.read).mockResolvedValue(state);
+    await new PlanningStore(checkout).saveRuntime("workflow-delivery", { version: 1, port: 9781, secretRef: "op://fixture/webhook/secret" });
+    vi.spyOn(op, "opRead").mockResolvedValue("fixture-webhook-secret");
+    expect(await planning("serve")).toBe(0);
+    expect(fakes.actions).toEqual(["scheduler-startup"]);
+    expect(fakes.hosts).toHaveLength(1);
+    expect(fakes.hosts[0]).toMatchObject({ teamId: "team-001", consumer: "scheduler-team-001", mattermost: { channelId: "home", token: "test-bot-token" }, github: { port: 9781, secret: "fixture-webhook-secret" } });
+    expect(fakes.hosts[0].consumers).toBeTypeOf("function"); expect(fakes.hosts[0].activity).toBeTypeOf("function");
+    expect(fakes.calls).toEqual([]);
+    expect(runWorkflowHost).toHaveBeenCalled();
+  });
+});
 
 describe("every CLI runtime/chat construction path", () => {
   it.each(["start", "serve", "approve", "integrate", "merge", "rollback"])("routes planning %s through Chick's state ID and both decorators", async (action) => {

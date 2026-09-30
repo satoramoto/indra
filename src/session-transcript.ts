@@ -12,9 +12,12 @@
  */
 import { lstat, open, readdir, readFile, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { engineHome, seatHarnessDir } from "./harness-home.js";
 import { sanitizePaneText } from "./pane-tail.js";
+import { PlanningStore } from "./planning.js";
+import { headedMarkerFile, readHeadedMarker } from "./headed-session.js";
+import { TmuxHost } from "./tmux-host.js";
 
 export type TranscriptEngine = "claude" | "codex";
 export type TranscriptKind = "user" | "assistant" | "thinking" | "tool" | "result" | "error";
@@ -258,9 +261,11 @@ async function seatTask(runtimeDir: string, seatId: string): Promise<{ worktree?
 /** Finds the log of a seat's current engine session in the checkout's runtime directory and the engines' homes. */
 export class TranscriptLocator {
   readonly runtimeDir: string;
+  private readonly store: PlanningStore;
   private readonly found = new Map<string, string>();
-  constructor(checkout: string, private readonly env: NodeJS.ProcessEnv = process.env, private readonly home = homedir()) {
+  constructor(private readonly checkout: string, private readonly env: NodeJS.ProcessEnv = process.env, private readonly home = homedir()) {
     this.runtimeDir = `${resolve(checkout)}.runtime`;
+    this.store = new PlanningStore(checkout);
   }
 
   /** Where Claude keeps `projects/`: the seat's harness home, then the configured and default Claude homes. */
@@ -320,15 +325,32 @@ export class TranscriptLocator {
     return found;
   }
 
+  /** The current finite run's exact log, bound to this seat's verified host and live headed process. */
+  private async headed(seatId: string): Promise<TranscriptLocation | undefined> {
+    const host = new TmuxHost(this.checkout, undefined, undefined, undefined, { kind: "seat", seatId });
+    const record = await host.verifiedRecord().catch(() => undefined);
+    if (!record) return undefined;
+    const marker = await readHeadedMarker(headedMarkerFile(this.checkout, record.readyNonce));
+    if (!marker?.log || !await isFile(marker.log)) return undefined;
+    const name = basename(marker.log);
+    const id = marker.engine === "claude" ? name.slice(0, -6) : /-([0-9a-f-]{36})\.jsonl$/i.exec(name)?.[1];
+    return id && UUID.test(id) ? { engine: marker.engine, sessionId: id, path: marker.log } : undefined;
+  }
+
   /**
-   * The seat's current session log: the newest of the recorded session's log and, for a Developer seat, the newest
-   * log of its active work. `recordedHandle` is Chick's recorded planning session for a Team Lead seat.
+   * Finite seats require the verified current run. Historical seats retain their recorded/active-work fallback.
+   * `recordedHandle` is Chick's recorded planning session for a Team Lead seat.
    */
   async locate(seat: TranscriptSeat, recordedHandle?: string): Promise<TranscriptLocation | undefined> {
     if (!/^[a-z][a-z0-9-]+$/.test(seat.id)) return undefined;
-    const candidates: TranscriptLocation[] = [];
+    if (seat.roles.includes("Product")) return this.headed(seat.id);
     const lead = seat.roles.includes("Team Lead");
-    const task = lead ? undefined : await seatTask(this.runtimeDir, seat.id);
+    const state = await this.store.read().catch(() => undefined);
+    const team = (state?.teams as { workflowModel?: string; seats: { id: string }[] }[] | undefined)?.find((team) => team.seats.some((item) => item.id === seat.id));
+    if (!lead && team?.workflowModel === "goals-v1") return this.headed(seat.id);
+    if (!lead && !team) return undefined;
+    const task = !lead ? await seatTask(this.runtimeDir, seat.id) : undefined;
+    const candidates: TranscriptLocation[] = [];
     const recorded = await this.recorded(seat.id, lead ? recordedHandle : task?.sessionId ?? recordedHandle);
     if (recorded) candidates.push(recorded);
     candidates.push(...await this.live(seat.id, task?.worktree));

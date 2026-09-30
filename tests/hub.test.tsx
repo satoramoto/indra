@@ -311,7 +311,7 @@ describe("the hub on the owner's screen", () => {
           "harness Codex · model gpt-6-sol · effort medium", "tokens work 300k · out 50k · cache 1M · ctx 250k/300k · includes the run in progress",
           // George Duke's last hour: 400k at 50 minutes ago and 850k at 20 (the 90-minute session is outside the window).
           "burn ⢠⠀⢸⠀ last hour",
-          `assignment ${titles[0]} · in-review`, "pr ⎇ satoramoto/indra#103 · ● CI pending · 3 sessions · 47m on this task",
+          `historical ${titles[0]} · in-review`, "pr ⎇ satoramoto/indra#103 · ● CI pending · 3 sessions · 47m on this task",
           "steps ■ build → ■ review → ─ fix skipped → ◧ ci → □ merge", "latest Opened PR 103; review requested",
           "SPRINTS", "planning → proposal → [implement] → release → retro", "tickets 1/4 tickets merged", "SEATS", ...names],
         "lead-seat": ["LIVE · Chick Corea · progress · click or i to drive", "Chick Corea @chickcorea · Team Lead · idle", "process running (planning bridge)", "harness Claude · model claude-opus-5-5 · effort max",
@@ -575,6 +575,41 @@ describe("per-cell polish", () => {
       expect(frame.split("\n").length - 1).toBe(HUB_GRID.rows);
       const scroll = setup.renderer.root.findDescendantById("team-scroll") as ScrollBoxRenderable;
       expect(scroll.scrollHeight, frame).toBeLessThanOrEqual(scroll.height);
+    } finally { setup.renderer.destroy(); }
+  });
+});
+
+describe("three-role goal hub", () => {
+  it("renders whole-goal lanes, scheduler overlap and ranked Product proposals in their actual seat views", async () => {
+    const { projectGoalRuntime } = await import("../src/goal-contract.js");
+    const state = structuredClone(snapshot); state.teams[0].workflowModel = "goals-v1"; state.teams[0].seats[1].roles = ["Product"];
+    const proposal: import("../src/goal-contract.js").ProductProposal = { version: 1, goalId: "goal-next", proposalId: "proposal-next", productSeatId: "seat-002", rank: 1, mission: "docs/mission.md", summary: "First ranked improvement", outcomes: [{ number: 1, title: "Improve", description: "Improve reliability", reason: "Mission", currentCode: ["src/work.ts"] }], ownedFiles: ["src/work.ts"], risks: [], rationale: "Useful improvement", basedOnRetros: [] };
+    const brief: import("../src/goal-contract.js").GoalBrief = { version: 1, goalId: "goal-owned", teamId: "team-001", seatId: "seat-003", header: { repo: "satoramoto/indra", baseBranch: "main", baseSha: "a".repeat(40), branch: "sprint/goal-owned", prTarget: "main" }, outcomes: proposal.outcomes, ownedFiles: ["src/work.ts"], exclusions: [], swarm: "One file per worker", retros: [], redirects: [], reportFormat: "Report evidence" };
+    const progress = projectGoalRuntime({ version: 1, goalId: "goal-owned", teamId: "team-001", assignment: { seatId: "seat-003", status: "running", updatedAt: ago(1) }, brief, plan: null, report: null, failure: null, events: [], handledEventIds: [], redirects: [], updatedAt: ago(1), lanes: [{ id: "lane-work", branch: "codex/goal-work", ownedFiles: ["src/work.ts"], dependsOn: [], status: "reviewing", prUrl: "https://github.com/satoramoto/indra/pull/123", headSha: "b".repeat(40), mergedSha: null, reviewer: "satori-miyamoto", review: "pending", ci: "passed", findings: [], fixRounds: 0, conflictRounds: 0, decisions: ["Keep the scope"], followUps: ["Measure latency later"], updatedAt: ago(1) }] });
+    const facts: Record<string, SeatLive> = {
+      "seat-001": { process: "running", scheduler: { version: 1, teamId: "team-001", approvedQueue: [{ goalId: "goal-waiting", rank: 2, ownedFiles: ["src/work.ts"], blockedByGoalIds: ["goal-owned"] }], activeDispatches: [{ goalId: "goal-owned", seatId: "seat-003", status: "running", assignedAt: ago(2), brief }], events: [], handledEventIds: [], redirects: [], failure: null, updatedAt: ago(1) }, attach: { kind: "tmux", target: "indra:chick" } },
+      "seat-002": { process: "running", attach: { kind: "tmux", target: "indra:product" }, product: { version: 1, teamId: "team-001", seatId: "seat-002", queue: [{ proposal: { ...proposal, goalId: "goal-second", proposalId: "proposal-second", summary: "Second ranked improvement", rank: 2 }, status: "proposed", vetting: null, rootPostId: null, proposalPostId: null }, { proposal, status: "posted", vetting: null, rootPostId: "root", proposalPostId: "root" }], events: [], handledEventIds: [], pending: null, failure: null, updatedAt: ago(1) } },
+      "seat-003": { process: "running", attach: { kind: "tmux", target: "indra:developer" }, goal: { goalId: "goal-owned", title: "Deliver one goal", status: "running", ownedFiles: ["src/work.ts"], progress }, assignment: { title: "Obsolete outcome queue", status: "running" } },
+    };
+    const session: TerminalSession = { ...hubSession(), id: "goal-owned", goal: "Deliver one goal", workflowModel: "goals-v1", goalOwnerSeatId: "seat-003", engine: "unknown", sessionId: undefined, loop: { stage: "implement", workflowModel: "goals-v1", tickets: [], goal: facts["seat-003"].goal, ceremony: { version: 1, stage: "implement", history: [] } } };
+    const model = new TerminalUiModel(new StateInventory({ read: async () => state }), { readSessions: async () => ({ connection: "connected", sessions: [session] }) }, { ensureAll: async () => [], read: async () => facts, stop: async () => {}, restart: async () => {} });
+    await model.refresh(); const [revision, setRevision] = createSignal(model.revision);
+    model.restore({ page: "seat", teamId: "team-001", seatId: "seat-001" });
+    const setup = await testRender(() => <TerminalApp model={model} revision={revision} onKey={() => {}} />, { width: 140, height: 54 });
+    const text = async () => { await setup.renderOnce(); const scroll = setup.renderer.root.findDescendantById("detail-scroll") as ScrollBoxRenderable; const frames: string[] = []; for (let top = 0; top < scroll.scrollHeight; top += 10) { scroll.scrollTo(top); await setup.renderOnce(); frames.push(setup.captureCharFrame()); } return frames.join("\n"); };
+    try {
+      let frame = await text(); expect(frame).toContain("Scheduler · approved queue and active goals"); expect(frame).toContain("goal-waiting"); expect(frame).toContain("overlap blocked by goal-owned"); expect(frame).toContain("seat-003 · running");
+      model.seatId = "seat-002"; setRevision((n) => n + 1); frame = await text();
+      expect(frame).toContain("Product · ranked proposed queue"); expect(frame).toContain("awaiting owner approval");
+      expect(frame.indexOf("1. First ranked improvement")).toBeLessThan(frame.indexOf("2. Second ranked improvement"));
+      expect(frame).toContain("Product runner"); expect(model.attachTarget()).toBe("indra:product");
+      expect(model.sessionsFor("seat-002")).toEqual([]);
+      delete facts["seat-002"].product; await model.refresh(); setRevision((n) => n + 1); frame = await text();
+      expect(frame).toContain("Product queue unavailable."); expect(frame).toContain("current session evidence unavailable");
+      model.seatId = "seat-003"; setRevision((n) => n + 1); frame = await text();
+      expect(frame).toContain("Deliver one goal"); expect(frame).toContain("lane-work"); expect(frame).toContain("#123"); expect(frame).toContain("CI passed");
+      expect(frame).toContain("Keep the scope"); expect(frame).toContain("Measure latency later"); expect(frame).not.toContain("Obsolete outcome queue");
+      expect(model.attachTarget()).toBe("indra:developer"); expect(model.sessionsFor("seat-003").map((item) => item.id)).toEqual(["goal-owned"]);
     } finally { setup.renderer.destroy(); }
   });
 });

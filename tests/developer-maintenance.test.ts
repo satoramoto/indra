@@ -48,6 +48,15 @@ async function fixture(status: PlanningAssignment["status"] = "failed") {
 }
 
 describe("developer maintenance", () => {
+  it.each(["whole-goal", "closed"])("does not reconcile or retire %s historical assignment records", async (kind) => {
+    const f = await fixture(); const state = await f.store.read();
+    if (kind === "whole-goal") state.planningGoals![0].workflowModel = "goals-v1";
+    else state.planningGoals![0].ceremony = { closure: {} } as NonNullable<typeof state.planningGoals>[number]["ceremony"];
+    vi.spyOn(f.store, "read").mockResolvedValue(state);
+    const update = vi.spyOn(f.store, "update"); const save = vi.spyOn(f.store, "saveRuntime");
+    expect(await f.maintain()).toBe(false); expect(f.run).not.toHaveBeenCalled(); expect(update).not.toHaveBeenCalled(); expect(save).not.toHaveBeenCalled();
+  });
+
   it("copies round and review evidence before retiring archives, and keeps attempt intervals after checkout removal", async () => {
     const { store, record, maintain, archive } = await fixture("merged");
     const facts = new ImplementationRecorder(store, "seat-002", "goal-abc", "outcome-1");
