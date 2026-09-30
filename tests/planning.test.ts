@@ -957,6 +957,41 @@ describe("whole-goal queue contract", () => {
     expect(chat.reacted).toEqual([]); expect(chat.posts.some((post) => post.message.includes("a person reacts"))).toBe(false);
     expect(closed.events.some((event) => event.kind === "goal-closed")).toBe(true);
   });
+  it("projects retained retro failures for the Team Lead, passes retry identity and clears failures during ordinary publication waits", async () => {
+    const store = await remodelStore(); const chat = new FakeChat(); const goalId = "goal-retro-retry";
+    await propose(store, goalId); await store.approveGoal(goalId, proof(goalId), at); await scheduler(store, chat).turn(startup);
+    vi.spyOn(SprintGitHub.prototype, "verifyGoalReport").mockResolvedValue(undefined);
+    vi.spyOn(SprintGitHub.prototype, "integrationScope").mockResolvedValue({ headSha: MAIN_SHA, baseSha: MAIN_SHA, conflicting: false });
+    vi.spyOn(SprintGitHub.prototype, "reviewIntegration").mockImplementation(async () => { gh.reviewed = true; });
+    const releaseWait = await scheduler(store, chat).turn({ kind: "developer-report", id: "retro-retry-report", goalId, teamId: "team-001", seatId: "seat-003", report: reportFor(goalId), at });
+    expect(releaseWait.record.failure).toBeNull(); // Missing running-build evidence is an ordinary pending state.
+    const failure = { at, message: `Chick's retrospective draft failed; run planning retry --goal ${goalId}.`, retryable: true };
+    const poll = vi.fn<NonNullable<CeremonyAdapters["retro"]>["poll"]>().mockResolvedValue({ status: "pending", reason: failure.message, failure });
+    const adapters: CeremonyAdapters = {
+      release: { poll: async ({ goal }) => ({ status: "complete", evidence: { kind: "release-running", prUrl: goal.integration!.prUrl!, mergedSha: MERGE_SHA, mergeVerification: { headSha: MAIN_SHA, reviewCommitSha: MAIN_SHA, reviewer: "satori-miyamoto", checksPassed: true }, checksPassed: true, buildSha: MERGE_SHA, runningSha: MERGE_SHA, runningAt: new Date().toISOString() } }) },
+      retro: { poll },
+    };
+    const failed = await scheduler(store, chat, new FakeRuntime(), adapters).turn(startup);
+    expect(failed.record.failure).toEqual(failure);
+    expect(await store.readRuntimeFile(`scheduler-work-team-001-${goalId}`)).toMatchObject({ failure });
+    expect(await store.readRuntimeFile(goalId)).toMatchObject({ waiting: { stage: "retro", reason: failure.message } });
+    const restarted = scheduler(store, chat, new FakeRuntime(), adapters);
+    const consumer = (await restarted.consumers("team-001")).find((item) => item.consumer === `scheduler-release-${goalId}`)!;
+    expect((await consumer.turn(startup)).filter((event) => event.kind === "queue-changed")).toEqual([]); // A stable blocker does not wake itself again.
+    expect((await restarted.dispatch(startup)).record.failure).toEqual(failure);
+    const retry = { kind: "retry" as const, id: "retry-retro-once", teamId: "team-001", goalId, at: new Date().toISOString(), reason: "Draft failure resolved" };
+    poll.mockResolvedValue({ status: "pending", reason: "The frozen retrospective is waiting for passing CI." });
+    const waiting = await scheduler(store, chat, new FakeRuntime(), adapters).turn(retry);
+    expect(poll.mock.calls.at(-1)![0].event).toEqual(retry);
+    expect(waiting.record.failure).toBeNull();
+    expect(await store.readRuntimeFile(`scheduler-work-team-001-${goalId}`)).toMatchObject({ failure: null });
+    poll.mockResolvedValue({ status: "pending", reason: "Retrospective thread delivery is pending." });
+    expect((await scheduler(store, chat, new FakeRuntime(), adapters).turn(startup)).record.failure).toBeNull();
+    poll.mockImplementation(async ({ goal, post }) => ({ status: "complete", evidence: { kind: "retro-published", path: `docs/retros/${goal.id}.md`, prUrl: "https://github.com/satoramoto/indra/pull/900", baseBranch: "main", mergedSha: "c".repeat(40), postId: await post("frozen-retro", "Verified frozen retro"), publishedAt: new Date().toISOString(), factsOnly: true, suggestions: "owner-proposals-only" } }));
+    const closed = await scheduler(store, chat, new FakeRuntime(), adapters).turn({ kind: "queue-changed", id: "archive-wakeup", teamId: "team-001", at: new Date().toISOString() });
+    expect(closed.record.failure).toBeNull(); expect((await store.read()).planningGoals![0].ceremony!.closure?.evidence.kind).toBe("retro-published");
+  });
+
   it("keeps multiple approved goals unassigned and dispatches only disjoint scopes to idle Developers", async () => {
     const store = await remodelStore();
     for (const [id, scope] of [["goal-first", "src/**"], ["goal-overlap", "src/future.ts"], ["goal-tests", "tests/**"]]) { await propose(store, id, [scope]); await store.approveGoal(id, proof(id), at); }
