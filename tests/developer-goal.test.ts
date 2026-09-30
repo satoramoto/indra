@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { DeveloperSeat, type Shell } from "../src/developer-seat.js";
 import { DeveloperGoal, developerGoalJournalName } from "../src/developer-goal.js";
 import { changedPaths, type LaneJournal } from "../src/developer-lanes.js";
@@ -31,12 +32,18 @@ class LocalGitHub implements Shell {
   prs = new Map<string, Pull>(); calls: { command: string; args: string[]; cwd: string }[] = [];
   ci = "pending"; failLog = "tests/a.test.ts: expected 2, got 1"; mergeBlocker: string | undefined;
   tamperBase = false; tamperHead = false; loseCreate = false;
+  localChecks: "typecheck" | "tests" | null = null; keepLocalFailure = false;
   constructor(readonly project: string) {}
   async run(command: string, args: string[], cwd: string) {
     this.calls.push({ command, args, cwd });
     const ok = (stdout = "", code = 0) => ({ code, stdout, stderr: "" });
     if (command === "ps") return ok();
-    if (command === "npm" || (command === "env" && args[0] === "NODE_OPTIONS=--experimental-ffi")) return ok("fixture checks completed");
+    if (command === "npm" || (command === "env" && args[0] === "NODE_OPTIONS=--experimental-ffi")) {
+      // Exercise production check handling with real failing/passing subprocesses and the agents' actual source edits.
+      if (this.localChecks && command === "npm" && args.join(" ") === "run typecheck") return processShell.run(process.execPath, [fileURLToPath(new URL("../node_modules/typescript/bin/tsc", import.meta.url)), "--noEmit", "--skipLibCheck", "src/a.ts"], cwd);
+      if (this.localChecks && command === "env") return processShell.run(process.execPath, ["--test", ...args.slice(4)], cwd);
+      return ok("fixture checks completed");
+    }
     if (command === "git") {
       if (args.join(" ") === "remote get-url origin") return ok(`https://github.com/${repo}.git`);
       return processShell.run(command, ["-c", "commit.gpgsign=false", ...args], cwd);
@@ -130,15 +137,15 @@ async function fixture(lanes = 1) {
     if (role === "lead-plan") response = { workers: (workerFiles ?? [`src/${file}.ts`]).map((path) => ({ file: path, task: "Implement source" })), decisions: planDecisions, followUps: planFollowUps };
     if (role === "worker") {
       const path = /Own exactly ([^ ]+)\. Task:/.exec(prompt)![1]; await workerHook?.(path);
-      response = { ...summary, decisions: workerDecisions, followUps: workerFollowUps, content: `export const ${second ? "other" : "value"} = 2;\n` };
+      response = { ...summary, decisions: workerDecisions, followUps: workerFollowUps, content: shell.localChecks === "typecheck" ? 'export const value: number = "broken";\n' : `export const ${second ? "other" : "value"} = 2;\n` };
     }
     if (role === "lead") {
       if (failLead) { failLead = false; await writeFile(join(cwd, `src/${file}.ts`), "export const value = 7;\n"); throw new Error("Interrupted lead"); }
-      await writeFile(join(cwd, `tests/${file}.test.ts`), "// regression coverage fixture\n");
+      await writeFile(join(cwd, `tests/${file}.test.ts`), shell.localChecks ? 'import { strict as assert } from "node:assert";\nimport test from "node:test";\nimport { value } from "../src/a.ts";\ntest("value is recovered", () => assert.equal(value, 3));\n' : "// regression coverage fixture\n");
     }
     if (role === "fix") {
       fixDrafts.push(await readFile(join(cwd, `src/${file}.ts`), "utf8"));
-      await writeFile(join(cwd, `src/${file}.ts`), "export const value = 3;\n");
+      await writeFile(join(cwd, `src/${file}.ts`), shell.keepLocalFailure ? (shell.localChecks === "typecheck" ? 'export const value: number = "still broken";\n' : "export const value = 4;\n") : "export const value = 3;\n");
       if (failFix) { failFix = false; throw new Error("Interrupted fix"); }
       shell.ci = "pass";
     }
@@ -172,6 +179,72 @@ describe("finite production Developer goal orchestration", () => {
     expect(replay.report).toEqual(done.report); expect(f.calls).toHaveLength(before);
     expect(f.shell.calls.some((call) => call.command === "ps")).toBe(true);
     expect(f.shell.calls.filter((call) => call.command === "git" && call.args.slice(0, 2).join(" ") === "worktree remove").every((call) => !call.args.includes("--force"))).toBe(true);
+  });
+  it.each(["typecheck", "tests"] as const)("repairs an actual initial %s failure once, validates the changed head and reports without owner retry", async (check) => {
+    const f = await fixture(); f.shell.localChecks = check;
+    const done = await f.runner().turn(event());
+    expect((await f.current())!.failure).toBeNull(); expect(done.report).not.toBeNull();
+    expect(f.calls.map((call) => call.role)).toEqual(["planner", "lead-plan", "worker", "lead", "fix", "reviewer"]);
+    const journal = (await f.store.readRuntimeFile<{ lanes: Record<string, LaneJournal> }>(developerGoalJournalName(goalId)))!.lanes.code;
+    const failed = journal.checks.filter((item) => item.exitCode !== 0); expect(failed).toHaveLength(1);
+    expect(failed[0].diagnostic).toContain(check === "typecheck" ? "TS2322" : "2 !== 3");
+    expect(f.calls.find((call) => call.role === "fix")!.prompt).toContain(`${failed[0].command} exited ${failed[0].exitCode}:\n${failed[0].diagnostic}`);
+    expect(f.calls.find((call) => call.role === "fix")!.prompt).toContain("fails without the fix");
+    expect(journal.fixAttempts!.map((attempt) => attempt.status)).toEqual(["complete"]);
+    expect((await f.current())!.lanes[0].fixRounds).toBe(1);
+    expect(failed[0].headSha).not.toBe(done.report!.lanePrs[0].headSha);
+    expect(done.report!.checks.map((item) => item.exitCode)).toEqual([0, 0, 0]);
+    expect(f.shell.prs.size).toBe(1); expect([...f.shell.prs.values()][0].merged).toBe(true);
+    const replay = await f.runner().turn({ kind: "approval", id: "local-check-replay", teamId: "team-one", goalId, at });
+    expect(replay.report).toEqual(done.report); expect(f.calls.filter((call) => call.role === "fix")).toHaveLength(1);
+  });
+  it("recovers a published automatic fix after its journal write without duplicating the fix or PR", async () => {
+    const f = await fixture(); f.shell.localChecks = "tests";
+    const save = f.store.saveRuntime.bind(f.store); let interrupted = false;
+    const saves = vi.spyOn(f.store, "saveRuntime").mockImplementation(async (name, value) => {
+      await save(name, value);
+      if (!interrupted && name === developerGoalJournalName(goalId) && (value as { lanes: Record<string, LaneJournal> }).lanes.code?.prUrl) {
+        interrupted = true; throw new Error("Interrupted after published journal write");
+      }
+    });
+    await expect(f.runner().turn(event())).rejects.toThrow("Interrupted after published journal write"); saves.mockRestore();
+    expect((await f.current())!.lanes[0].prUrl).toBeNull(); expect(f.shell.prs.size).toBe(1);
+    const done = await f.runner().turn(event());
+    expect((await f.current())!.failure).toBeNull(); expect(done.report?.lanePrs[0].url).toBe([...f.shell.prs.keys()][0]);
+    expect(f.calls.filter((call) => call.role === "fix")).toHaveLength(1); expect(f.shell.prs.size).toBe(1);
+  });
+  it("bounds persistent local failure across event replay and restart after the fix journal was saved", async () => {
+    const f = await fixture(); f.shell.localChecks = "tests"; f.shell.keepLocalFailure = true;
+    expect((await f.runner().turn(event())).report).toBeNull();
+    expect((await f.current())!.failure).not.toBeNull(); expect(f.shell.prs.size).toBe(0);
+    const journal = (await f.store.readRuntimeFile<{ lanes: Record<string, LaneJournal> }>(developerGoalJournalName(goalId)))!.lanes.code;
+    const failed = journal.checks.filter((item) => item.exitCode !== 0);
+    expect(failed).toHaveLength(2); expect(new Set(failed.map((item) => item.headSha)).size).toBe(2);
+    expect(journal.fixAttempts!.map((attempt) => attempt.status)).toEqual(["failed"]);
+    const before = f.calls.length; const checks = f.shell.calls.filter((call) => call.command === "env" && call.args[0] === "NODE_OPTIONS=--experimental-ffi").length;
+    await f.runner().turn(event());
+    await f.runner().turn({ kind: "approval", id: "failed-check-replay", teamId: "team-one", goalId, at });
+    expect(f.calls).toHaveLength(before);
+    // Model a crash after the fix/check journal write but before the public failure write.
+    const record = (await f.current())!; record.failure = null; await f.store.saveRuntime(goalRuntimeFilename(goalId), record);
+    expect((await f.runner().turn(event())).report).toBeNull();
+    expect((await f.current())!.failure).not.toBeNull(); expect((await f.current())!.lanes[0].fixRounds).toBe(1);
+    expect(f.calls.filter((call) => call.role === "fix")).toHaveLength(1);
+    expect(f.shell.calls.filter((call) => call.command === "env" && call.args[0] === "NODE_OPTIONS=--experimental-ffi")).toHaveLength(checks);
+    expect(f.shell.prs.size).toBe(0);
+  });
+  it.each(["dependencies", "signal", "abort"])("does not turn a %s failure into an automatic code fix", async (failure) => {
+    const f = await fixture(); const run = f.shell.run.bind(f.shell);
+    vi.spyOn(f.shell, "run").mockImplementation(async (command, args, cwd) => {
+      if (command === "npm" && args.join(" ") === (failure === "dependencies" ? "ci" : "run typecheck")) {
+        if (failure === "abort") throw Object.assign(new Error("Check aborted"), { name: "AbortError" });
+        return { code: failure === "signal" ? 130 : 1, stdout: "", stderr: "Check could not run" };
+      }
+      return run(command, args, cwd);
+    });
+    expect((await f.runner().turn(event())).report).toBeNull();
+    expect((await f.current())!.failure).not.toBeNull(); expect(f.shell.prs.size).toBe(0);
+    await f.runner().turn(event()); expect(f.calls.filter((call) => call.role === "fix")).toHaveLength(0);
   });
   it("lands a declared contract before creating dependent isolated lanes from its merged sprint base", async () => {
     const f = await fixture(2); await f.runner().turn(event());
