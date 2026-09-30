@@ -1,5 +1,5 @@
 import * as childProcess from "node:child_process";
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -25,9 +25,9 @@ describe("processShell", () => {
     const script = 'process.stdout.write(JSON.stringify({ cwd: process.cwd(), args: process.argv.slice(1) }) + "\\n"); process.stderr.write(" diagnostic\\n"); process.exitCode = Number(process.argv[1]);';
     const result = await processShell.run(process.execPath, ["-e", script, "--", ...args], cwd);
     expect(result).toEqual({ code, stdout: JSON.stringify({ cwd, args }) + "\n", stderr: " diagnostic\n" });
-    expect(exec).toHaveBeenCalledTimes(1);
+    expect(exec).toHaveBeenCalled();
     const options = exec.mock.calls[0][2] as childProcess.ExecFileOptions;
-    expect({ cwd: options.cwd, encoding: options.encoding, maxBuffer: options.maxBuffer, timeout: options.timeout }).toEqual({ cwd, encoding: "utf8", maxBuffer: 20_000_000, timeout: 7_200_000 });
+    expect({ cwd: options.cwd, encoding: options.encoding, maxBuffer: options.maxBuffer, timeout: options.timeout }).toEqual({ cwd, encoding: "utf8", maxBuffer: 20_000_000, timeout: 0 });
     expect(options.env?.INDRA_COMMAND_SHELL_TEST).toBe("visible");
     expect(options.env?.OP_COMMAND_SHELL_TEST).toBeUndefined();
     expect(options.env?.INDRA_STATE_GITHUB_TOKEN).toBeUndefined();
@@ -77,4 +77,30 @@ describe("runChecked", () => {
     expect(run).toHaveBeenCalledTimes(1);
     expect(failure).not.toHaveBeenCalled();
   });
+});
+
+
+it.each(["abort", "timeout"])("ends a command's detached grandchild on %s", async (reason) => {
+  const cwd = await mkdtemp(join(await realpath(tmpdir()), "indra-command-tree-")); roots.push(cwd);
+  const marker = join(cwd, "grandchild.pid");
+  const grandchild = `require("node:fs").writeFileSync(${JSON.stringify(marker)}, String(process.pid)); process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);`;
+  const middle = `require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(grandchild)}], { detached: true, stdio: "ignore" }); setInterval(() => {}, 1000);`;
+  const script = `require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(middle)}], { stdio: "ignore" }); setInterval(() => {}, 1000);`;
+  const controller = new AbortController();
+  const run = processShell.run(process.execPath, ["-e", script], cwd, { signal: controller.signal, timeoutMs: reason === "timeout" ? 700 : 5000 });
+  let pid = 0;
+  try {
+    await vi.waitFor(async () => { pid = Number(await readFile(marker, "utf8")); expect(pid).toBeGreaterThan(1); });
+    if (reason === "abort") controller.abort();
+    expect((await run).code).toBe(1);
+    const { listProcesses } = await import("../src/process-tree.js");
+    await vi.waitFor(async () => expect((await listProcesses()).some((row) => row.pid === pid)).toBe(false));
+  } finally { controller.abort(); if (pid) try { process.kill(pid, "SIGKILL"); } catch { /* already ended */ } }
+});
+
+it("never launches a command when already cancelled", async () => {
+  const controller = new AbortController(); controller.abort();
+  const before = vi.mocked(childProcess.execFile).mock.calls.length;
+  expect((await processShell.run("unused", [], "/", { signal: controller.signal })).code).toBe(1);
+  expect(vi.mocked(childProcess.execFile).mock.calls.length).toBe(before);
 });

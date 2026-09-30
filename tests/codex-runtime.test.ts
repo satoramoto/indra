@@ -189,7 +189,7 @@ describe("Codex invocation facts", () => {
     }
   }, 10_000);
 
-  it.skipIf(process.platform === "win32")("escalates for the owned Codex process group even after the launcher closes", async () => {
+  it.skipIf(process.platform === "win32")("cleans escalation after tracked Codex descendants have ended", async () => {
     vi.useFakeTimers();
     Object.assign(child, { pid: 12345 });
     const kill = vi.spyOn(process, "kill").mockReturnValue(true);
@@ -197,7 +197,8 @@ describe("Codex invocation facts", () => {
     const run = failure(new CodexRuntime("/workspace").message("Task", "/schema.json", undefined, { signal: controller.signal }));
     controller.abort(); child.close("", null); await run;
     await vi.advanceTimersByTimeAsync(1000);
-    expect(kill).toHaveBeenCalledWith(-12345, "SIGKILL");
+    expect(kill).not.toHaveBeenCalledWith(-12345, "SIGKILL");
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("continues enforcing the stdout limit during cancellation", async () => {
@@ -247,5 +248,55 @@ describe("Codex invocation facts", () => {
     child.close(started + usage);
     const error = await run;
     expect(error.message).toContain("no session id or final response"); expect(error.facts.usage?.inputTokens).toBe(100);
+  });
+});
+
+
+describe("live Codex budget accounting", () => {
+  it("publishes monotonic invocation deltas before completion, including resumed baselines", async () => {
+    const onUsage = vi.fn();
+    const run = new CodexRuntime("/workspace").message("Continue", "/schema.json", id, { previousSessionUsage: { inputTokens: 60, outputTokens: 4 }, onUsage });
+    child.stdout.write(usage + "\n");
+    expect(onUsage).toHaveBeenLastCalledWith({ inputTokens: 40, outputTokens: 5 });
+    child.stdout.write(usage.replace('"input_tokens":100', '"input_tokens":80') + "\n");
+    expect(onUsage).toHaveBeenCalledTimes(1);
+    child.close(answer + usage);
+    await run;
+  });
+
+  it("cancels safely when a usage observer throws", async () => {
+    const run = failure(new CodexRuntime("/workspace").message("Task", "/schema.json", undefined, { onUsage: () => { throw new Error("private observer diagnostic"); } }));
+    child.stdout.write(started + usage + "\n");
+    await vi.waitFor(() => expect(child.kill).toHaveBeenCalledWith("SIGTERM"));
+    child.close("", null);
+    const error = await run;
+    expect(error.message).toBe("Codex usage callback failed.");
+    expect(error.facts.usage?.inputTokens).toBe(100);
+  });
+
+  it.each([false, true])("tails exact-session rollout while headless (resumed=%s), before turn.completed", async (resumed) => {
+    const { mkdtemp, mkdir, writeFile, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const home = await mkdtemp(join(tmpdir(), "indra-live-codex-"));
+    const onUsage = vi.fn(); const controller = new AbortController();
+    try {
+      const run = failure(new CodexRuntime(home, 60_000, undefined, home, undefined, false).message("Task", "/schema.json", resumed ? id : undefined,
+        { signal: controller.signal, onUsage, ...(resumed ? { previousSessionUsage: { inputTokens: 60, outputTokens: 4 } } : {}) }));
+      await vi.waitFor(() => expect(child.input).toBe("Task"));
+      child.stdout.write(started);
+      await mkdir(join(home, "sessions"));
+      await writeFile(join(home, "sessions", "rollout-current.jsonl"), [
+        { type: "session_meta", payload: { id, cwd: home } },
+        { type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { input_tokens: 100, cached_input_tokens: 40, output_tokens: 9 } } } },
+      ].map((value) => JSON.stringify(value)).join("\n") + "\n");
+      await vi.waitFor(() => expect(onUsage).toHaveBeenCalled(), { timeout: 2000 });
+      expect(onUsage.mock.lastCall?.[0]).toMatchObject({ inputTokens: resumed ? 40 : 100, outputTokens: resumed ? 5 : 9 });
+      controller.abort(); child.close("", null);
+      expect((await run).facts.status).toBe("interrupted");
+      const calls = onUsage.mock.calls.length;
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(onUsage).toHaveBeenCalledTimes(calls);
+    } finally { await rm(home, { recursive: true, force: true }); }
   });
 });

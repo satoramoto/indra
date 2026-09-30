@@ -172,23 +172,25 @@ describe("Claude runtime", () => {
     await launched(); controller.abort(); await check;
   });
 
-  it.skipIf(process.platform === "win32")("escalates for the owned process group even after its parent has exited", async () => {
+  it.skipIf(process.platform === "win32")("cleans escalation timers after tracked descendants have ended", async () => {
     vi.useFakeTimers();
     Object.assign(child, { pid: 12345 });
     const kill = vi.spyOn(process, "kill").mockReturnValue(true);
     const controller = new AbortController();
     const run = new ClaudeRuntime(dir).message("Task", schema, undefined, { signal: controller.signal }); const check = expect(run).rejects.toThrow("cancelled");
     await launched(); controller.abort();
+    await vi.advanceTimersByTimeAsync(0);
     expect(kill).toHaveBeenCalledWith(-12345, "SIGTERM");
     child.emit("close", 0); await check;
     await vi.advanceTimersByTimeAsync(1000);
-    expect(kill).toHaveBeenCalledWith(-12345, "SIGKILL");
+    expect(kill).not.toHaveBeenCalledWith(-12345, "SIGKILL");
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it.each(["stdout", "stderr"] as const)("bounds %s without logging a truncated secret", async (stream) => {
     const run = new ClaudeRuntime(dir).message("Task", schema); const check = expect(run).rejects.toThrow(`${stream} exceeded the output limit`);
     await launched(); child[stream].write("x".repeat((stream === "stdout" ? CLAUDE_OUTPUT_LIMIT : CLAUDE_STDERR_LIMIT) + 1));
-    expect(child.kill).toHaveBeenCalledWith("SIGTERM"); child.emit("close", null); await check;
+    await vi.waitFor(() => expect(child.kill).toHaveBeenCalledWith("SIGTERM")); child.emit("close", null); await check;
   });
 
   it("rejects an unreadable or malformed schema before starting a model", async () => {
@@ -308,4 +310,18 @@ describe("Claude invocation facts", () => {
     expect(invalid.facts).toMatchObject({ engine: "claude", status: "failed" });
     expect(JSON.stringify(invalid)).not.toContain("private schema text"); expect(spawn).not.toHaveBeenCalled();
   });
+});
+
+
+it("publishes Claude stream usage before the result and terminates on observer failure", async () => {
+  const onUsage = vi.fn(() => { throw new Error("private observer diagnostic"); });
+  const run = failure(new ClaudeRuntime(dir).message("Task", schema, undefined, { onUsage }));
+  await launched();
+  child.stdout.write(JSON.stringify({ type: "stream_event", session_id: id, parent_tool_use_id: null, event: { type: "message_start", message: { id: "budget-message", usage: { input_tokens: 32, cache_creation_input_tokens: 8, cache_read_input_tokens: 12 } } } }) + "\n");
+  expect(onUsage).toHaveBeenLastCalledWith({ inputTokens: 52, uncachedInputTokens: 32, cachedInputTokens: 12, cacheWriteInputTokens: 8 });
+  await vi.waitFor(() => expect(child.kill).toHaveBeenCalledWith("SIGTERM"));
+  child.close("", null);
+  const error = await run;
+  expect(error.message).toBe("Claude usage callback failed.");
+  expect(error.facts.usage?.inputTokens).toBe(52);
 });

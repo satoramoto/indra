@@ -54,7 +54,7 @@ export class LiveUsageTail {
   compactedAt?: string;
   /** A compaction marker came after the last window, so the next, smaller window is not a second compaction. */
   private marked = false;
-  constructor(readonly path: string, readonly engine: RuntimeEngine, private readonly now = () => Date.now()) { this.facts = new RuntimeFacts(engine); }
+  constructor(readonly path: string, readonly engine: RuntimeEngine, private readonly now = () => Date.now(), facts?: RuntimeFacts) { this.facts = facts ?? new RuntimeFacts(engine); }
 
   /** The session handle the log names (`claude:<id>`, or a bare Codex ID), once a line has named it. */
   get sessionId(): string | undefined { return this.facts.sessionId; }
