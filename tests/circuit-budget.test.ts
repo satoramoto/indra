@@ -279,3 +279,29 @@ it("caches only this live process identity while rechecking foreign reservations
     expect((await own.status()).trip?.reason).toContain("owner exited");
   } finally { list.mockRestore(); }
 });
+
+
+it("keeps a transient mid-command accounting failure closed after process inspection recovers", async () => {
+  const { options } = await fixture();
+  let reads = 0; let failed = false;
+  const budget = new CircuitBudget({ ...options, processes: async () => {
+    reads++;
+    if (reads === 2) { failed = true; throw new Error("Transient process inspection failure"); }
+    return [row];
+  } });
+  const shell: Shell = { run: async (_command, _args, _cwd, options) => new Promise((_resolve, reject) => {
+    options?.signal?.addEventListener("abort", () => reject(options.signal?.reason), { once: true });
+  }) };
+  await expect(protectShell(budget, shell, { phase: "implement" }).run("fixture", [], "/")).rejects.toBeInstanceOf(CircuitOpenError);
+  expect(failed).toBe(true);
+  const status = await budget.status();
+  expect(status.reservations).toEqual({}); expect(status.trip?.reason).toBe("budget accounting unavailable");
+  await expect(new CircuitBudget(options).assertAvailable()).rejects.toBeInstanceOf(CircuitOpenError);
+});
+
+it("can persist an accounting stop even while foreign-owner inspection is unavailable", async () => {
+  const { options, budget } = await fixture(); await budget.begin("command", { phase: "implement" });
+  const unavailable = new CircuitBudget({ ...options, processes: async () => { throw new Error("ps remains unavailable"); } });
+  await unavailable.stop("budget accounting unavailable");
+  await expect(budget.assertAvailable()).rejects.toBeInstanceOf(CircuitOpenError);
+});

@@ -170,7 +170,7 @@ export class CircuitBudget {
       throw new CircuitOpenError(this.scopeId, "ledger persistence failed");
     } finally { await unlink(temporary).catch(() => undefined); }
   }
-  private async transaction<T>(work: (ledger: CircuitLedger) => T | Promise<T>, recovery = false): Promise<T> {
+  private async transaction<T>(work: (ledger: CircuitLedger) => T | Promise<T>, recovery = false, inspectOwners = true): Promise<T> {
     await mkdir(this.options.runtimeDir, { recursive: true, mode: 0o700 });
     return withFileLock(`${this.path}.lock`, async () => {
       let ledger: CircuitLedger;
@@ -179,7 +179,7 @@ export class CircuitBudget {
       try { await readFile(`${this.path}.tripped`); this.trip(ledger, "ledger persistence failed"); }
       catch (error) { if (!missing(error)) throw error; }
       this.account(ledger);
-      await this.reap(ledger);
+      if (inspectOwners) await this.reap(ledger);
       let result: T | undefined; let failure: unknown;
       try { result = await work(ledger); } catch (error) { failure = error; }
       await this.persist(ledger);
@@ -194,7 +194,7 @@ export class CircuitBudget {
   /** Persist a workflow accounting failure so ordinary retry cannot reopen it. Reasons are controlled host messages. */
   stop(reason: string): Promise<void> {
     if (!reason.trim() || reason.length > 500) throw new Error("A circuit stop requires a bounded reason.");
-    return this.transaction((ledger) => { this.trip(ledger, reason); });
+    return this.transaction((ledger) => { this.trip(ledger, reason); }, false, false);
   }
 
   /** Charge actual automatic repair starts only; polling and ordinary planned calls do not consume this counter. */
@@ -341,6 +341,11 @@ async function protectedRun<T>(budget: CircuitBudget, kind: "model" | "command",
     clearInterval(poll); options.signal?.removeEventListener("abort", forwardAbort);
     await queued;
     await polling;
+    // A transient read/process-inspection failure must not reopen when final cleanup succeeds.
+    // Persist before releasing this reservation; stop() does not depend on the failing inspection.
+    if (failure) {
+      try { await budget.stop("budget accounting unavailable"); } catch (error) { failure = accountingError(error); }
+    }
     try { await budget.finish(reservation.id, finalUsageKnown); } catch (error) { stop(error); }
   }
   if (failure) throw failure;
