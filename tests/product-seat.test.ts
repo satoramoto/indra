@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { main } from "../src/cli.js";
 import { WorkflowInbox, runWorkflowHost } from "../src/remodel-events.js";
@@ -8,10 +8,11 @@ import { productJournalFilename, productProposalDigest, type ProductChat } from 
 import { productRuntimeFilename, type ProductProposal, type ProductRuntimeRecord, type WorkflowEvent } from "../src/goal-contract.js";
 import { PlanningStore } from "../src/planning.js";
 import { MattermostPlanningChat } from "../src/planning-mattermost.js";
-import { processShell, type Shell } from "../src/command-shell.js";
+import { processShell, type Shell, type ShellResult } from "../src/command-shell.js";
 import type { AgentRuntime, WriteAccess } from "../src/codex-runtime.js";
 import { loadSeatPersonas, withPersonaChat } from "../src/seat-persona.js";
 import type { Post } from "../src/planning-bridge.js";
+import type { ProductSourceRevision } from "../src/product-source-snapshot.js";
 import { stateCheckout, git } from "./state-checkout.js";
 
 vi.setConfig({ testTimeout: 20_000 });
@@ -22,7 +23,7 @@ const at = "2026-09-01T00:00:00Z";
 const startup: WorkflowEvent = { kind: "startup", teamId, at };
 const ready = { version: 1 as const, consumers: { planning: 1 as const, developer: 1 as const, release: 1 as const, retro: 1 as const, tui: 1 as const } };
 
-async function fixture(options: { decorate?: boolean; noChat?: boolean; fallback?: boolean } = {}) {
+async function fixture(options: { decorate?: boolean; noChat?: boolean; fallback?: boolean; liveness?: (path: string) => ShellResult } = {}) {
   const state = { $schema: "./schema/v1/state.schema.json", schemaVersion: 1, teams: [{ id: teamId, slug: "fixture", displayName: "Fixture", workflowModel: "goals-v1", project: { github }, externalIdentities: { mattermost: { teamId: "mm-team", homeChannelId: "home" } }, seats: [
     { id: "seat-001", displayName: "Chick Corea", roles: ["Team Lead"], externalIdentities: { mattermost: { userId: "lead-user", username: "chickcorea" } } },
     { id: seatId, displayName: "George Duke", roles: ["Product"], externalIdentities: { mattermost: { userId: "product-user", username: "georgeduke" } } },
@@ -31,15 +32,16 @@ async function fixture(options: { decorate?: boolean; noChat?: boolean; fallback
   const checkout = await stateCheckout("indra-product-", state); roots.push(checkout, `${checkout}.runtime`);
   const store = new PlanningStore(checkout, undefined, ready);
   await mkdir(join(checkout, "schema/v1"), { recursive: true }); await copyFile(new URL("../schema/v1/state.schema.json", import.meta.url), join(checkout, "schema/v1/state.schema.json"));
-  const project = join(store.runtimeDir, "projects", github); const remote = join(store.runtimeDir, "fixture-remote.git");
+  let project = join(store.runtimeDir, "projects", github); const remote = join(store.runtimeDir, "fixture-remote.git");
   await mkdir(join(project, "docs/retros"), { recursive: true }); await mkdir(join(project, "src"));
   await writeFile(join(project, "docs/mission.md"), "Ship reliable continuous builds, without doing Product's own implementation.\n");
   await writeFile(join(project, "src/work.ts"), "export const work = 1;\n");
   for (const letter of ["a", "b", "c", "d"]) await writeFile(join(project, `docs/retros/goal-${letter}.md`), `Retro ${letter}: preserve the evidence before reporting.\n`);
   git(project, "init", "--quiet", "--initial-branch=main"); git(project, "add", "."); git(project, "commit", "--quiet", "-m", "Project mission and retros");
   git(project, "init", "--bare", "--quiet", remote); git(project, "remote", "add", "origin", remote); git(project, "push", "--quiet", "origin", "main");
+  project = await realpath(project);
   const commands: { command: string; args: string[]; cwd: string }[] = [];
-  const shell: Shell = { run: async (command, args, cwd) => { commands.push({ command, args, cwd }); if (command === "git" && args.join(" ") === "remote get-url origin") return { code: 0, stdout: `https://github.com/${github}.git`, stderr: "" }; return processShell.run(command, args, cwd); } };
+  const shell: Shell = { run: async (command, args, cwd) => { commands.push({ command, args, cwd }); if (command === "lsof" && options.liveness) return options.liveness(args.at(-1)!); if (command === "git" && args.join(" ") === "remote get-url origin") return { code: 0, stdout: `https://github.com/${github}.git`, stderr: "" }; return processShell.run(command, args, cwd); } };
   const posts: Post[] = []; const requests: { path: string; method: string; body?: Record<string, unknown> }[] = [];
   let losePost = false; let hidePosts = false; let foreignBot = false; let badPost = false;
   const request: typeof fetch = async (input, init) => {
@@ -61,6 +63,7 @@ async function fixture(options: { decorate?: boolean; noChat?: boolean; fallback
   const calls: { prompt: string; schema: string; session?: string; purpose?: string }[] = [];
   const contexts: { cwd: string; write?: WriteAccess }[] = [];
   let failCall = 0; let outputPatch: Partial<ProductProposal> = {};
+  let inspect: ((cwd: string, prompt: string) => Promise<void>) | undefined;
   const runtime: AgentRuntime = { message: async (prompt, schema, session, messageOptions) => {
     calls.push({ prompt, schema, session, purpose: messageOptions?.purpose });
     if (calls.length === failCall) throw new Error("Interrupted model turn");
@@ -69,7 +72,7 @@ async function fixture(options: { decorate?: boolean; noChat?: boolean; fallback
     return { sessionId: `product-session-${calls.length}`, response, usage: { tokens: 10 }, startedAt: at, finishedAt: at };
   } };
   const seat = (await loadProductSeat(store, seatId))!;
-  const runner = () => new ProductSeat({ store, seat, runtime, runtimeFor: options.fallback ? undefined : (cwd, write) => { contexts.push({ cwd, write }); return runtime; }, chat: options.noChat ? undefined : chat, shell });
+  const runner = () => new ProductSeat({ store, seat, runtime, runtimeFor: options.fallback ? undefined : (cwd, write) => { contexts.push({ cwd, write }); return { message: async (...args) => { await inspect?.(cwd, args[0]); return runtime.message(...args); } }; }, chat: options.noChat ? undefined : chat, shell });
   const current = async () => (await store.readRuntimeFile<ProductRuntimeRecord>(productRuntimeFilename(teamId)))!;
   const vet = async (index = 0, ownedFiles = ["src/work.ts", "tests/work.test.ts"]): Promise<Extract<WorkflowEvent, { kind: "proposal-vetted" }>> => {
     const proposal = (await current()).queue[index].proposal; const corrected = { ...proposal, ownedFiles };
@@ -86,8 +89,22 @@ async function fixture(options: { decorate?: boolean; noChat?: boolean; fallback
   };
   let retries = 0;
   const retry = (): WorkflowEvent => ({ kind: "product-retry", id: `retry-${++retries}`, seatId, teamId, reason: "Explicit recovery", at });
-  return { store, project, commands, requests, posts, calls, contexts, runner, current, vet, approve, redirect, retry,
+  const advanceMain = async (content: string) => {
+    const author = join(store.runtimeDir, "fixture-author");
+    if (!await stat(author).catch(() => undefined)) git(project, "clone", "--quiet", "--branch", "main", remote, author);
+    await writeFile(join(author, "src/work.ts"), content);
+    await writeFile(join(author, "src/new-source.ts"), "export const added = true;\n");
+    git(author, "add", "."); git(author, "commit", "--quiet", "-m", "Advance source remotely"); git(author, "push", "--quiet", "origin", "main");
+    return git(author, "rev-parse", "HEAD").trim();
+  };
+  return { store, project, commands, requests, posts, calls, contexts, runner, current, vet, approve, redirect, retry, advanceMain,
+    inspectRuntime: (probe: typeof inspect) => { inspect = probe; },
     failModel: (after = 0) => { failCall = calls.length + after + 1; }, patchOutput: (patch: Partial<ProductProposal>) => { outputPatch = patch; }, losePost: () => { losePost = true; }, hidePosts: (value: boolean) => { hidePosts = value; }, foreignBot: () => { foreignBot = true; }, badPost: () => { badPost = true; } };
+}
+
+interface SourceJournal {
+  active: { runId: string } | null;
+  runs: Record<string, { status: string; prompt: string; goalId: string; proposalId: string; source?: ProductSourceRevision }>;
 }
 
 describe("finite Product seat with real store and own-bot delivery", () => {
@@ -96,12 +113,123 @@ describe("finite Product seat with real store and own-bot delivery", () => {
     expect(await f.runner().turn(startup)).toMatchObject({ status: "proposed", proposalIds: expect.any(Array) });
     const record = await f.current(); expect(record.queue).toHaveLength(5); expect(record.queue.map((entry) => entry.proposal.rank)).toEqual([1, 2, 3, 4, 5]);
     expect(f.calls).toHaveLength(5); expect(f.calls.every((call) => call.session === undefined && call.schema.endsWith("product-proposal.json"))).toBe(true);
-    expect(f.contexts).toEqual([{ cwd: f.project, write: undefined }]);
+    expect(f.contexts).toHaveLength(5); expect(new Set(f.contexts.map(({ cwd }) => cwd)).size).toBe(5);
+    expect(f.contexts.every(({ cwd, write }) => cwd.startsWith(`${f.project}.product-snapshots/`) && write === undefined)).toBe(true);
     expect(f.calls[0].prompt).toContain("Ship reliable continuous builds"); expect(f.calls[0].prompt).toContain("goal-d:"); expect(f.calls[0].prompt).not.toContain("goal-a:");
-    expect(f.commands.every((call) => call.cwd === f.project)).toBe(true);
+    expect(f.commands.every((call) => call.cwd === f.project || call.cwd === join(f.store.runtimeDir, "projects", github) || f.contexts.some(({ cwd }) => cwd === call.cwd))).toBe(true);
     expect(f.requests.filter((request) => request.method !== "GET")).toHaveLength(0);
     expect(await readFile(join(f.store.checkout, "state.json"), "utf8")).toBe(before);
     expect((await f.store.readRuntimeFile<{ runs: Record<string, { sessionId: string }> }>(productJournalFilename(teamId)))!.runs).toBeDefined();
+  });
+
+  it("runs ordinary file reads at fetched main while preserving the old, dirty shared checkout", async () => {
+    const f = await fixture(); const oldHead = git(f.project, "rev-parse", "HEAD");
+    const head = await f.advanceMain("export const work = 2;\n");
+    await writeFile(join(f.project, "src/work.ts"), "Unfinished shared work\n");
+    await writeFile(join(f.project, "untracked-note.txt"), "Keep my notes\n");
+    const status = git(f.project, "status", "--porcelain", "--untracked-files=all", "--ignored");
+    const observed: string[] = [];
+    f.inspectRuntime(async (cwd, prompt) => {
+      expect(cwd).not.toBe(f.project); expect(git(cwd, "rev-parse", "HEAD").trim()).toBe(head);
+      expect(prompt).toContain(`Base: origin/main at ${head}`);
+      observed.push(await readFile(join(cwd, "src/work.ts"), "utf8"));
+      expect(await readFile(join(cwd, "src/new-source.ts"), "utf8")).toBe("export const added = true;\n");
+    });
+    expect(await f.runner().turn(startup)).toMatchObject({ status: "proposed" });
+    expect(observed).toEqual(Array(5).fill("export const work = 2;\n"));
+    expect(git(f.project, "rev-parse", "HEAD")).toBe(oldHead);
+    expect(git(f.project, "status", "--porcelain", "--untracked-files=all", "--ignored")).toBe(status);
+    expect(await readFile(join(f.project, "src/work.ts"), "utf8")).toBe("Unfinished shared work\n");
+    expect(await readFile(join(f.project, "untracked-note.txt"), "utf8")).toBe("Keep my notes\n");
+    expect(f.commands.some(({ args }) => args.includes("reset") || args.includes("checkout"))).toBe(false);
+    const journal = (await f.store.readRuntimeFile<SourceJournal>(productJournalFilename(teamId)))!;
+    expect(Object.values(journal.runs).every((run) => run.source?.sha === head)).toBe(true);
+    expect(f.contexts.every(({ write }) => write === undefined)).toBe(true);
+  });
+  it("resumes a prepared run at its saved base after main advances without changing its identity or accepted drafts", async () => {
+    const f = await fixture(); const base = git(f.project, "rev-parse", "HEAD").trim();
+    const save = f.store.saveRuntime.bind(f.store); let stopped = false;
+    const persistence = vi.spyOn(f.store, "saveRuntime").mockImplementation(async (name, value) => {
+      if (stopped) throw new Error("Product host stopped after preparation");
+      await save(name, value);
+      if (name === productJournalFilename(teamId)) {
+        const journal = value as SourceJournal; const run = journal.active?.runId ? journal.runs[journal.active.runId] : undefined;
+        if (f.calls.length === 2 && run?.status === "prepared" && run.source?.snapshots.length === 1) {
+          stopped = true; throw new Error("Product host stopped after preparation");
+        }
+      }
+    });
+    await expect(f.runner().turn(startup)).rejects.toThrow("Product host stopped after preparation"); persistence.mockRestore();
+    const before = (await f.store.readRuntimeFile<SourceJournal>(productJournalFilename(teamId)))!;
+    const runId = before.active!.runId; const reserved = before.runs[runId];
+    const accepted = structuredClone((await f.current()).queue); expect(accepted).toHaveLength(2);
+    const nextHead = await f.advanceMain("export const work = 3;\n"); const observed: string[] = [];
+    f.inspectRuntime(async (cwd, prompt) => {
+      const expected = observed.length ? nextHead : base;
+      expect(git(cwd, "rev-parse", "HEAD").trim()).toBe(expected);
+      expect(prompt).toContain(`Base: origin/main at ${expected}`);
+      if (!observed.length) expect(prompt).toBe(reserved.prompt);
+      observed.push(await readFile(join(cwd, "src/work.ts"), "utf8"));
+    });
+    expect(await f.runner().turn(startup)).toMatchObject({ status: "proposed" });
+    expect(observed).toEqual(["export const work = 1;\n", "export const work = 3;\n", "export const work = 3;\n"]);
+    const after = (await f.store.readRuntimeFile<SourceJournal>(productJournalFilename(teamId)))!;
+    expect(after.runs[runId]).toMatchObject({ status: "complete", prompt: reserved.prompt, goalId: reserved.goalId, proposalId: reserved.proposalId, source: { sha: base } });
+    expect(after.runs[runId].source!.snapshots[0].id).toBe(reserved.source!.snapshots[0].id);
+    expect((await f.current()).queue.slice(0, 2)).toEqual(accepted); expect((await f.current()).queue).toHaveLength(5);
+    await f.runner().turn(startup); expect(f.calls).toHaveLength(5);
+  });
+  it.each(["prepared", "failed", "started", "legacy"] as const)("retries a %s run in a fresh copy of its original source and preserves earlier work", async (recovery) => {
+    const f = await fixture(); f.failModel(2); await f.runner().turn(startup);
+    const accepted = structuredClone((await f.current()).queue);
+    const before = (await f.store.readRuntimeFile<SourceJournal>(productJournalFilename(teamId)))!;
+    const runId = before.active!.runId; const reserved = structuredClone(before.runs[runId]);
+    const base = reserved.source!.sha; const failedCopy = f.contexts[2].cwd;
+    await writeFile(join(failedCopy, "recovery-note.txt"), "Preserve interrupted work\n");
+    if (recovery === "started" || recovery === "prepared") before.runs[runId].status = recovery;
+    if (recovery === "legacy") delete before.runs[runId].source;
+    await f.store.saveRuntime(productJournalFilename(teamId), before);
+    const nextHead = await f.advanceMain("export const work = 4;\n"); const observed: string[] = [];
+    f.inspectRuntime(async (cwd, prompt) => {
+      expect(cwd).not.toBe(failedCopy);
+      expect(git(cwd, "rev-parse", "HEAD").trim()).toBe(observed.length ? nextHead : base);
+      if (!observed.length) expect(prompt).toBe(reserved.prompt);
+      observed.push(await readFile(join(cwd, "src/work.ts"), "utf8"));
+    });
+    const retry = f.retry(); expect(await f.runner().turn(retry)).toMatchObject({ status: "proposed" });
+    expect(observed).toEqual(["export const work = 1;\n", "export const work = 4;\n", "export const work = 4;\n"]);
+    const after = (await f.store.readRuntimeFile<SourceJournal>(productJournalFilename(teamId)))!;
+    expect(after.runs[runId]).toMatchObject({ status: "complete", prompt: reserved.prompt, goalId: reserved.goalId, proposalId: reserved.proposalId, source: { sha: base } });
+    if (recovery !== "legacy") expect(after.runs[runId].source!.snapshots[0]).toMatchObject({ id: reserved.source!.snapshots[0].id, status: "preserved" });
+    expect(await readFile(join(failedCopy, "recovery-note.txt"), "utf8")).toBe("Preserve interrupted work\n");
+    expect((await f.current()).queue.slice(0, 2)).toEqual(accepted); expect((await f.current()).queue).toHaveLength(5);
+    await f.runner().turn(retry); await f.runner().turn(startup); expect(f.calls).toHaveLength(6);
+  });
+  it("retires only completed clean unused source copies and retains ignored evidence or live usage", async () => {
+    let busy = "";
+    // Control the process observation boundary; all ownership, Git and filesystem operations are real.
+    const f = await fixture({ liveness: (path) => path === busy ? { code: 0, stdout: "p12345\n", stderr: "" } : { code: 1, stdout: "", stderr: "" } });
+    f.inspectRuntime(async (cwd) => {
+      if (f.calls.length === 0) {
+        await mkdir(join(cwd, ".indra")); await writeFile(join(cwd, ".indra/.gitignore"), "*\n");
+        await writeFile(join(cwd, ".indra/result.json"), "{\"retained\":true}\n");
+      }
+      if (f.calls.length === 1) busy = cwd;
+    });
+    expect(await f.runner().turn(startup)).toMatchObject({ status: "proposed" });
+    expect(await readFile(join(f.contexts[0].cwd, ".indra/result.json"), "utf8")).toBe("{\"retained\":true}\n");
+    expect(await stat(f.contexts[1].cwd)).toBeDefined();
+    const journal = (await f.store.readRuntimeFile<SourceJournal>(productJournalFilename(teamId)))!;
+    expect(Object.values(journal.runs).map((run) => run.source!.snapshots[0].status)).toEqual(["ready", "ready", "removed", "removed", "removed"]);
+    for (const { cwd } of f.contexts.slice(2)) expect(await stat(cwd).catch(() => undefined)).toBeUndefined();
+    expect(f.commands.some(({ args }) => args.includes("--force"))).toBe(false);
+  });
+  it("preserves complete snapshots when process observation is uncertain", async () => {
+    const f = await fixture({ liveness: () => ({ code: 1, stdout: "", stderr: "Observation was incomplete" }) });
+    expect(await f.runner().turn(startup)).toMatchObject({ status: "proposed" });
+    for (const { cwd } of f.contexts) expect(await stat(cwd)).toBeDefined();
+    expect(f.commands.some(({ args }) => args[0] === "worktree" && args[1] === "remove")).toBe(false);
+    expect((await f.current()).failure).toBeNull();
   });
   it("settles its own outbox and duplicate starts without another model run, then publishes a vetted revision", async () => {
     const f = await fixture(); await f.runner().turn(startup);
@@ -268,8 +396,8 @@ describe("finite Product seat with real store and own-bot delivery", () => {
     const f = await fixture({ decorate: true }); await f.runner().turn(startup); await f.runner().turn(await f.vet());
     expect(f.posts[0].message).toMatch(/^Keeping a steady groove\.\n\n## Proposed goal:/); expect((await f.store.read()).planningGoals).toHaveLength(1);
   });
-  it("supports the project-bound fallback runtime and ignores unrelated events", async () => {
+  it("refuses an unbound fallback runtime and ignores unrelated events", async () => {
     const f = await fixture({ fallback: true }); await f.runner().turn({ ...startup, teamId: "another-team" }); expect(f.calls).toHaveLength(0);
-    await f.runner().turn(startup); expect(f.contexts).toHaveLength(0); expect(f.calls).toHaveLength(5); expect(f.calls.every((call) => call.session === undefined && call.purpose === "product-proposal")).toBe(true);
+    expect(await f.runner().turn(startup)).toMatchObject({ status: "blocked" }); expect(f.contexts).toHaveLength(0); expect(f.calls).toHaveLength(0); expect((await f.current()).failure?.message).toContain("runtimeFor");
   });
 });
