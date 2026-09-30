@@ -8,6 +8,11 @@ import type { CeremonyWriteReadiness } from "../src/ceremony-ports.js";
 import type { AgentRuntime, AgentResult } from "../src/codex-runtime.js";
 import type { Shell } from "../src/developer-seat.js";
 import { stateCheckout } from "./state-checkout.js";
+import { accountedFailure } from "./circuit-fixture.js";
+import { CircuitBudget, CircuitOpenError } from "../src/circuit-budget.js";
+
+// These integration cases persist multiple real Git commits and durable circuit records.
+vi.setConfig({ testTimeout: 30_000 });
 
 const ready: CeremonyWriteReadiness = { version: 1, consumers: { planning: 1, developer: 1, release: 1, retro: 1, tui: 1 } };
 const mainSha = "a".repeat(40);
@@ -38,9 +43,9 @@ class Runtime implements AgentRuntime {
   failDraft = false;
   async message(_prompt: string, schema: string, session?: string): Promise<AgentResult> {
     this.calls++;
-    if (schema.endsWith("proposal.json") && this.failDraft) throw new Error("Draft failed");
+    if (schema.endsWith("proposal.json") && this.failDraft) throw accountedFailure("Draft failed");
     const now = new Date().toISOString();
-    return { sessionId: session ?? "session-1", startedAt: now, finishedAt: now, usage: { input_tokens: 7, output_tokens: 3 }, response: schema.endsWith("proposal.json")
+    return { sessionId: session ?? "session-1", startedAt: now, finishedAt: now, usage: { inputTokens: 7, outputTokens: 3 }, response: schema.endsWith("proposal.json")
       ? { summary: "Proposal", outcomes: [{ title: "Build", description: "Implement src/example.ts and test it", seatId: "seat-dev" }], risks: [], openQuestions: [] }
       : { reply: "What is the desired result?", summary: "Goal", decisions: [], openQuestions: ["Desired result?"] } };
   }
@@ -455,7 +460,7 @@ describe("failure boundaries", () => {
       const run = await message(prompt, schema, session);
       // A fresh session's cumulative usage is its own usage, so nothing is double-counted or dropped.
       const facts = { invocationId: `call-${++invocation}`, engine: "codex" as const, sessionId: `session-${invocation}`, startedAt: run.startedAt, finishedAt: run.finishedAt,
-        status: "succeeded" as const, usage: { inputTokens: 7, outputTokens: 3 }, cumulativeUsage: { inputTokens: 7, outputTokens: 3 } };
+        status: "succeeded" as const, usageComplete: true, usage: { inputTokens: 7, outputTokens: 3 }, cumulativeUsage: { inputTokens: 7, outputTokens: 3 } };
       return { ...run, sessionId: `session-${invocation}`, facts };
     } };
     const active = new PlanningBridge(store, chat, completed, 20, new GitHub());
@@ -545,7 +550,12 @@ describe("owner-authorized partial release", () => {
     const failure = Object.assign(new Error("Unrestricted provider diagnostic"), { facts });
     const failing = { message: vi.fn(async () => { throw failure; }) };
     await new PlanningBridge(store, chat, failing, 20, new GitHub()).poll();
+    const calls = runtime.calls;
     await new PlanningBridge(store, chat, runtime, 20, new GitHub()).poll();
+    expect(runtime.calls).toBe(calls);
+    const budget = new CircuitBudget({ runtimeDir: store.runtimeDir, scopeId: goal.id });
+    await expect(budget.assertAvailable()).rejects.toBeInstanceOf(CircuitOpenError);
+    expect((await budget.status()).trip?.reason).toBe("model finished without complete token usage");
     expect(failing.message).toHaveBeenCalledOnce();
     const record = await store.readRuntimeFile<BridgeCeremonyRecord>(ceremonyRuntimeName(goal.id));
     expect(record?.invocations).toEqual([{ ...facts, seatId: "seat-lead" }]);

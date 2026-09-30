@@ -44,7 +44,7 @@ class Agent implements AgentRuntime {
       const snapshot = JSON.parse(prompt.split("Recorded snapshot (JSON):\n")[1]) as RetroEvidenceSnapshot;
       response = snapshot.choices;
     }
-    return { sessionId: session ?? `session-${this.calls}`, startedAt: at, finishedAt: at, usage: { input_tokens: 10, output_tokens: 5 }, response };
+    return { sessionId: session ?? `session-${this.calls}`, startedAt: at, finishedAt: at, usage: { inputTokens: 10, outputTokens: 5 }, response };
   }
 }
 class Services implements Shell, RetroArchive {
