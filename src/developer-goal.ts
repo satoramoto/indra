@@ -2,17 +2,45 @@ import { createHash } from "node:crypto";
 import type { AgentRuntime, WriteAccess } from "./codex-runtime.js";
 import type { Shell } from "./command-shell.js";
 import { GitDeveloperLanes, LaneError, LaneValidationError, laneBrief, type DeveloperLaneServices, type LaneJournal } from "./developer-lanes.js";
-import { goalRuntimeFilename, validateGoalBrief, validateGoalReport, validateLanePlan, type GoalBrief, type GoalLane, type GoalLaneProgress, type GoalReport, type GoalRuntimeRecord, type WorkflowEvent } from "./goal-contract.js";
+import { goalRuntimeFilename, validateGoalBrief, validateGoalReport, validateLanePlan, type GoalBrief, type GoalLane, type GoalLaneProgress, type GoalReport, type GoalRuntimeRecord, type WorkflowEvent, type WorkflowFailure } from "./goal-contract.js";
 import { teamProject, type PlanningGoal, type PlanningStore } from "./planning.js";
-import type { GoalAgentSession } from "./seat-runtime.js";
+import { laneAgentSummary, type GoalAgentSession } from "./seat-runtime.js";
 import { redactSecrets } from "./redact.js";
 
+interface GoalFailures { goal: WorkflowFailure | null; lanes: Record<string, WorkflowFailure> }
 interface GoalJournal {
   version: 1; goalId: string; seatId: string; github: string;
   planning: GoalAgentSession[]; lanes: Record<string, LaneJournal>;
+  failures?: GoalFailures; consumedRetryIds?: string[];
 }
 const id = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const now = () => new Date().toISOString();
+const failureFor = (error: unknown): WorkflowFailure => ({ at: now(), retryable: true,
+  message: error instanceof LaneError ? redactSecrets(error.message) : "Developer goal turn failed; preserved journals and worktrees require an explicit retry." });
+const aggregateFailure = (failures: GoalFailures) => failures.goal ?? Object.values(failures.lanes)[0] ?? null;
+const validFailure = (value: WorkflowFailure | null) => !!value && Number.isFinite(Date.parse(value.at)) && typeof value.message === "string" && typeof value.retryable === "boolean";
+function rejectedLegacyWorker(lane: LaneJournal): boolean {
+  return !lane.built && lane.sessions.some((session) => {
+    if (session.role !== "worker" || session.status !== "complete") return false;
+    try {
+      const response = session.result?.response;
+      const summary = laneAgentSummary(response);
+      const content = (response as { content?: unknown }).content;
+      return summary.neededButUnowned.length > 0 || !(content === null || typeof content === "string");
+    } catch { return false; }
+  });
+}
+function retainedFailures(record: GoalRuntimeRecord, journal: GoalJournal): GoalFailures {
+  const failures: GoalFailures = { goal: record.failure, lanes: {} };
+  // The old runner saved only the first rejection. Attribute this known failure only from retained
+  // rejected outputs; an unbuilt sibling without that evidence still requires a goal-wide retry.
+  if (record.failure?.message !== "Worker needs unowned files or returned invalid content." || !record.plan) return failures;
+  const rejected = record.plan.lanes.filter((lane) => journal.lanes[lane.id] && rejectedLegacyWorker(journal.lanes[lane.id]));
+  if (!rejected.length || Object.values(journal.lanes).some((lane) => !lane.built && !rejected.some((item) => item.id === lane.id))) return failures;
+  failures.goal = null;
+  for (const lane of rejected) { failures.lanes[lane.id] = record.failure; record.lanes.find((item) => item.id === lane.id)!.status = "failed"; }
+  return failures;
+}
 export const developerGoalJournalName = (goalId: string) => `developer-${goalRuntimeFilename(goalId)}`;
 export function wholeGoalEligible(goal: PlanningGoal, seatId: string): boolean {
   return goal.workflowModel === "goals-v1" && goal.stage === "approved" && goal.ceremony?.stage === "implement" && !goal.ceremony.closure
@@ -82,20 +110,37 @@ export class DeveloperGoal {
         return { events: [record.events.find((item) => item.kind === "developer-report" && item.report.headSha === report.headSha) ?? reportEvent(report)], report };
       }
       if (event.kind !== "startup" && record.handledEventIds.includes(event.id)) return idle;
+      if (journal.consumedRetryIds && (!Array.isArray(journal.consumedRetryIds) || journal.consumedRetryIds.some((item) => typeof item !== "string" || !item.trim()))) throw new LaneError("Invalid saved retry identities.");
+      if (event.kind === "retry" && journal.consumedRetryIds?.includes(event.id)) return idle;
       if (record.plan) {
         developerPlan(record.plan, goal);
         if (record.plan.goalId !== goal.id || record.lanes.length !== record.plan.lanes.length || record.plan.lanes.some((lane) => !record.lanes.some((item) => item.id === lane.id && item.branch === lane.branch && JSON.stringify(item.ownedFiles) === JSON.stringify(lane.ownedFiles)))) throw new LaneError("Persisted lane progress differs from its approved plan.");
       }
+      if (journal.failures && ((journal.failures.goal !== null && !validFailure(journal.failures.goal)) || !journal.failures.lanes || typeof journal.failures.lanes !== "object" || Array.isArray(journal.failures.lanes)
+        || Object.entries(journal.failures.lanes).some(([laneId, failure]) => !record.plan?.lanes.some((lane) => lane.id === laneId) || !validFailure(failure)))) throw new LaneError("Invalid saved failure attribution.");
       if (!this.acceptEvent(event, goal, record, journal)) return idle;
       if (event.kind === "redirect") {
         if (!record.redirects.some((item) => item.postId === event.redirect.postId)) record.redirects.push(event.redirect);
       }
-      if (record.failure && event.kind !== "retry") return idle;
+      const failures = journal.failures ??= retainedFailures(record, journal);
+      record.failure = aggregateFailure(failures);
+      if (failures.goal && event.kind !== "retry") return idle;
       if (event.kind === "retry") {
+        const blocked = Object.keys(failures.lanes);
+        const retryAll = !!failures.goal || !blocked.length;
+        for (const lane of Object.values(journal.lanes)) {
+          const laneProgress = record.lanes.find((item) => item.id === lane.id);
+          if (laneProgress?.status === "merged" || (!retryAll && !blocked.includes(lane.id))) continue;
+          lane.attempt++;
+          if (laneProgress?.status === "failed") laneProgress.status = lane.prUrl ? "pr-open" : "queued";
+        }
+        failures.goal = null; failures.lanes = {};
         record.failure = null;
         // Unknown/failed session history stays retained. A retry gets fresh contexts that preserve existing draft work.
-        for (const lane of Object.values(journal.lanes)) lane.attempt++;
         for (const run of journal.planning) if (run.status === "started") run.status = "failed";
+        // Save consumption with the attempt counters, before any work. The private receipt also closes
+        // a crash between the journal write and the public event receipt.
+        (journal.consumedRetryIds ??= []).push(event.id); record.handledEventIds.push(event.id); await persist();
       }
       const workingBrief = validateGoalBrief({ ...brief, redirects: [...brief.redirects, ...record.redirects.filter((item) => !brief.redirects.some((old) => old.postId === item.postId))] });
       try {
@@ -106,7 +151,7 @@ export class DeveloperGoal {
           record.lanes = record.plan.lanes.map(progress); await persist();
         }
         const plan = record.plan;
-        const ready = plan.lanes.filter((lane) => lane.dependsOn.every((dependency) => record.lanes.find((item) => item.id === dependency)?.status === "merged") && record.lanes.find((item) => item.id === lane.id)!.status !== "merged");
+        const ready = plan.lanes.filter((lane) => !failures.lanes[lane.id] && lane.dependsOn.every((dependency) => record.lanes.find((item) => item.id === dependency)?.status === "merged") && record.lanes.find((item) => item.id === lane.id)!.status !== "merged");
         // Every ready sibling has disjoint files, its own context and checkout. No lane waits for another lane's CI.
         const results = await Promise.allSettled(ready.map(async (lane) => {
           const laneProgress = record.lanes.find((item) => item.id === lane.id)!;
@@ -183,9 +228,16 @@ export class DeveloperGoal {
           } else laneProgress.status = "pr-open";
           await persist();
         }));
-        const failed = results.find((result) => result.status === "rejected");
-        if (failed?.status === "rejected") throw failed.reason;
-        if (record.lanes.every((lane) => lane.status === "merged")) {
+        // Drain every started sibling before recording failures or releasing the goal lock. A failed
+        // lane retains its own drafts while independent published lanes remain eligible for events.
+        results.forEach((result, index) => {
+          if (result.status !== "rejected") return;
+          const lane = record.lanes.find((item) => item.id === ready[index].id)!;
+          const failure = failureFor(result.reason); failures.lanes[lane.id] = failure;
+          lane.status = "failed"; lane.updatedAt = failure.at; this.log(`Lane ${lane.id}: ${failure.message}`);
+        });
+        record.failure = aggregateFailure(failures);
+        if (!record.failure && record.lanes.every((lane) => lane.status === "merged")) {
           const complete = await this.services.finish(workingBrief, plan.lanes.map((lane) => ({ lane, journal: journal.lanes[lane.id] })));
           const report = validateGoalReport({ version: 1, goalId: goal.id, teamId: goal.teamId, seatId: this.seatId, sprintBranch: goal.integration!.branch, headSha: complete.headSha,
             lanePrs: record.lanes.map((lane) => ({ laneId: lane.id, url: lane.prUrl, headSha: lane.headSha, mergedSha: lane.mergedSha, reviewer: "satori-miyamoto", ci: "passed" })), checks: complete.checks,
@@ -194,12 +246,11 @@ export class DeveloperGoal {
           record.report = report; record.assignment = { seatId: this.seatId, status: "reported", updatedAt: now() }; emit(reportEvent(report)); await persist();
           await this.status(goal.id, "reported");
         }
-        if (event.kind !== "startup") record.handledEventIds.push(event.id);
+        if (event.kind !== "startup" && !record.handledEventIds.includes(event.id)) record.handledEventIds.push(event.id);
         await persist(); return { events: emitted, report: record.report };
       } catch (error) {
-        const message = error instanceof LaneError ? redactSecrets(error.message) : "Developer goal turn failed; preserved journals and worktrees require an explicit retry.";
-        record.failure = { at: now(), message, retryable: true }; await persist();
-        this.log(message); return { events: emitted, report: null };
+        failures.goal = failureFor(error); record.failure = aggregateFailure(failures); await persist();
+        this.log(failures.goal.message); return { events: emitted, report: null };
       }
     });
   }
