@@ -21,6 +21,8 @@ export interface RuntimeSessionFacts {
   status: RunStatus;
   /** Counters attributable to this invocation; never a resumed session's lifetime total. */
   usage?: TokenUsage;
+  /** True only after a provider terminal receipt proves the invocation's final counters. */
+  usageComplete?: boolean;
   /** Codex reports lifetime totals. Persist this as the baseline for a later resume. */
   cumulativeUsage?: TokenUsage;
 }
@@ -92,6 +94,20 @@ export class RuntimeFacts {
   private resultUsage?: TokenUsage;
   private readonly messages = new Map<string, TokenUsage>();
   private activeMessage?: string;
+  private terminalUsage = false;
+  private streamTerminal = false;
+  private endedClaudeMessage = false;
+  private invalidUsage = false;
+  logObserved = false;
+  get usageRegressed(): boolean { return this.invalidUsage; }
+  invalidateUsage(): void { this.invalidUsage = true; }
+  private codexUsage(report: TokenUsage | undefined): void {
+    if (report && ["inputTokens", "outputTokens"].some((key) => {
+      const field = key as "inputTokens" | "outputTokens";
+      return report[field] !== undefined && this.cumulative?.[field] !== undefined && report[field]! < this.cumulative[field]!;
+    })) this.invalidUsage = true;
+    this.cumulative = mergeCodexUsage(this.cumulative, report);
+  }
 
   constructor(readonly engine: RuntimeEngine, sessionId?: string, private readonly baseline?: TokenUsage) {
     this.resumed = sessionId !== undefined;
@@ -102,26 +118,38 @@ export class RuntimeFacts {
     if (!jsonObject(event)) return;
     if (this.engine === "codex") {
       if (event.type === "thread.started") this.sessionId ??= sessionHandle("codex", event.thread_id);
-      // Each report supersedes the preceding snapshot, including a provider counter reset.
-      if (event.type === "turn.completed" || event.type === "turn.failed") this.cumulative = mergeCodexUsage(this.cumulative, normalizeUsage("codex", event.usage));
+      if (event.type === "turn.started") { this.terminalUsage = false; this.streamTerminal = false; }
+      if (event.type === "turn.completed" || event.type === "turn.failed") {
+        const report = normalizeUsage("codex", event.usage);
+        this.codexUsage(report);
+        this.streamTerminal = true;
+        this.terminalUsage = report?.inputTokens !== undefined && report.outputTokens !== undefined;
+      }
       return;
     }
     // Keep top-level invocation accounting consistent with Claude's result.usage.
-    if (event.parent_tool_use_id != null) return;
+    if (event.parent_tool_use_id != null) { this.invalidUsage = true; return; }
     if ((event.type === "system" && event.subtype === "init") || event.type === "result" || event.type === "assistant" || event.type === "stream_event") {
       this.sessionId ??= sessionHandle("claude", event.session_id);
     }
-    if (event.type === "result") this.resultUsage = mergeClaudeUsage(this.resultUsage, normalizeUsage("claude", event.usage));
+    if (event.type === "result") {
+      const report = normalizeUsage("claude", event.usage);
+      this.resultUsage = mergeClaudeUsage(this.resultUsage, report);
+      this.terminalUsage = report?.inputTokens !== undefined && report.outputTokens !== undefined;
+    }
     if (event.type === "assistant" && jsonObject(event.message)) {
       // Assistant output_tokens is a message-start placeholder, not completed output.
+      this.observeClaudeDelegation(event.message);
       this.message(event.message.id, event.message.usage, false);
     }
     if (event.type === "stream_event" && jsonObject(event.event)) {
       const stream = event.event;
       if (stream.type === "message_start" && jsonObject(stream.message)) {
+        this.observeClaudeDelegation(stream.message);
         this.activeMessage = typeof stream.message.id === "string" ? stream.message.id : undefined;
         this.message(this.activeMessage, stream.message.usage, false);
-      } else if (stream.type === "message_delta") this.message(this.activeMessage, stream.usage, true);
+      } else if (stream.type === "content_block_start" && jsonObject(stream.content_block) && stream.content_block.type === "tool_use" && ["Agent", "Task"].includes(String(stream.content_block.name))) this.invalidUsage = true;
+      else if (stream.type === "message_delta") this.message(this.activeMessage, stream.usage, true);
       else if (stream.type === "message_stop") this.activeMessage = undefined;
     }
   }
@@ -133,16 +161,33 @@ export class RuntimeFacts {
    */
   observeLog(entry: unknown): void {
     if (!jsonObject(entry)) return;
+    this.logObserved = true;
     if (this.engine === "codex") {
+      // The stdout terminal snapshot is newer than any concurrently finishing rollout-tail read.
+      if (this.streamTerminal) return;
+      if (entry.type === "event_msg" && jsonObject(entry.payload) && entry.payload.type === "task_started") this.terminalUsage = false;
+      if (entry.type === "event_msg" && jsonObject(entry.payload) && entry.payload.type === "task_complete") this.terminalUsage = true;
       if (entry.type === "session_meta" && jsonObject(entry.payload)) this.sessionId ??= sessionHandle("codex", entry.payload.id);
       if (entry.type === "event_msg" && jsonObject(entry.payload) && entry.payload.type === "token_count" && jsonObject(entry.payload.info)) {
-        this.cumulative = mergeCodexUsage(this.cumulative, normalizeUsage("codex", entry.payload.info.total_token_usage));
+        this.codexUsage(normalizeUsage("codex", entry.payload.info.total_token_usage));
       }
       return;
     }
-    if (entry.isSidechain === true) return;
+    if (entry.isSidechain === true) { this.invalidUsage = true; return; }
     this.sessionId ??= sessionHandle("claude", entry.sessionId);
-    if (entry.type === "assistant" && jsonObject(entry.message)) this.message(entry.message.id, entry.message.usage, true);
+    if (entry.type === "user") { this.terminalUsage = false; this.endedClaudeMessage = false; }
+    if (entry.type === "assistant" && jsonObject(entry.message)) {
+      this.terminalUsage = false;
+      this.observeClaudeDelegation(entry.message);
+      const report = normalizeUsage("claude", entry.message.usage);
+      this.endedClaudeMessage = entry.message.stop_reason === "end_turn" && report?.inputTokens !== undefined && report.outputTokens !== undefined;
+      this.message(entry.message.id, entry.message.usage, true);
+    }
+    if (entry.type === "system" && entry.subtype === "turn_duration") this.terminalUsage = this.endedClaudeMessage;
+  }
+
+  private observeClaudeDelegation(message: Record<string, unknown>): void {
+    if (Array.isArray(message.content) && message.content.some((block) => jsonObject(block) && block.type === "tool_use" && ["Agent", "Task"].includes(String(block.name)))) this.invalidUsage = true;
   }
 
   private message(id: unknown, value: unknown, output: boolean): void {
@@ -168,7 +213,7 @@ export class RuntimeFacts {
     return {
       invocationId: this.invocationId, engine: this.engine, ...(this.sessionId ? { sessionId: this.sessionId } : {}),
       startedAt: this.startedAt, finishedAt: new Date().toISOString(), status,
-      ...(usage ? { usage } : {}), ...(this.cumulative ? { cumulativeUsage: this.cumulative } : {}),
+      ...(usage ? { usage } : {}), ...(this.terminalUsage && !this.invalidUsage && usage?.inputTokens !== undefined && usage.outputTokens !== undefined ? { usageComplete: true } : {}), ...(this.cumulative ? { cumulativeUsage: this.cumulative } : {}),
     };
   }
 }
@@ -178,6 +223,7 @@ export function usageReporter(facts: RuntimeFacts, callback?: (usage: TokenUsage
   let previous: TokenUsage = {};
   return () => {
     if (!callback) return;
+    if (facts.usageRegressed) throw new RuntimeStop("Provider token accounting became unknown; final usage cannot be verified.");
     const current = facts.finish("succeeded").usage;
     if (!current) return;
     const next = { ...previous };

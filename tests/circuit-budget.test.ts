@@ -1,10 +1,11 @@
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as processTree from "../src/process-tree.js";
 import { CircuitBudget, CircuitBusyError, CircuitOpenError, DEFAULT_CIRCUIT_POLICY, protectRuntime, protectShell, validateCircuitPolicy } from "../src/circuit-budget.js";
 import type { AgentResult, AgentRuntime, MessageOptions } from "../src/codex-runtime.js";
-import type { TokenUsage } from "../src/runtime-facts.js";
+import { AgentRunError, RuntimeFacts, type TokenUsage } from "../src/runtime-facts.js";
 import type { Shell } from "../src/command-shell.js";
 const directories: string[] = [];
 const row = { pid: process.pid, ppid: 1, pgid: process.pid, start: "verified process start" };
@@ -15,7 +16,7 @@ async function fixture(policy = {}) {
   return { options, budget: new CircuitBudget(options), runtimeDir };
 }
 afterEach(async () => { await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true }))); });
-const result = (usage?: TokenUsage): AgentResult => ({ sessionId: "session", response: {}, startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), facts: { invocationId: "invocation", engine: "codex", startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), status: "succeeded", usage } });
+const result = (usage?: TokenUsage): AgentResult => ({ sessionId: "session", response: {}, startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), facts: { invocationId: "invocation", engine: "codex", startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), status: "succeeded", usageComplete: true, usage } });
 const observed = (options?: MessageOptions) => options as MessageOptions & { onUsage?: (usage: TokenUsage) => void };
 const abortingRuntime: AgentRuntime = { message: async (_prompt, _schema, _session, options) => new Promise((_resolve, reject) => {
   options?.signal?.addEventListener("abort", () => reject(options.signal?.reason), { once: true });
@@ -75,7 +76,7 @@ describe("durable circuit budget", () => {
   });
   it("charges reported failed-run usage, and unknown usage conservatively consumes the allowance and trips", async () => {
     const { budget } = await fixture({ maxInvocationTokens: 100 });
-    await expect(protectRuntime(budget, { message: async () => { throw Object.assign(new Error("failed"), { facts: { usage: { inputTokens: 20, outputTokens: 10 } } }); } }, { phase: "build" }).message("", "")).rejects.toThrow("failed");
+    await expect(protectRuntime(budget, { message: async () => { throw Object.assign(new Error("failed"), { facts: { usageComplete: true, usage: { inputTokens: 20, outputTokens: 10 } } }); } }, { phase: "build" }).message("", "")).rejects.toThrow("failed");
     expect((await budget.status()).totals.tokens).toBe(30);
     await expect(protectRuntime(budget, { message: async () => result({ inputTokens: 10 }) }, { phase: "review" }).message("", "")).rejects.toThrow("complete token usage");
     const status = await budget.status(); expect(status.totals.tokens).toBe(130); expect(status.reservations).toEqual({});
@@ -91,7 +92,7 @@ describe("durable circuit budget", () => {
     expect(outcomes.filter((entry) => entry.status === "fulfilled")).toHaveLength(1);
     const rejected = outcomes.find((entry) => entry.status === "rejected"); expect(rejected?.reason).toBeInstanceOf(CircuitBusyError);
     const invocation = outcomes.find((entry) => entry.status === "fulfilled")!;
-    await budget.usage(invocation.value.id, { inputTokens: 1, outputTokens: 1 }); await budget.finish(invocation.value.id);
+    await budget.usage(invocation.value.id, { inputTokens: 1, outputTokens: 1 }); await budget.finish(invocation.value.id, true);
     expect((await budget.status()).trip).toBeUndefined();
   });
   it("reserves aggregate token capacity across parallel models", async () => {
@@ -154,7 +155,7 @@ describe("durable circuit budget", () => {
     const occupying = await budget.begin("model", { phase: "build" }); let started = false;
     const pending = protectRuntime(new CircuitBudget(options), { message: async () => { started = true; return result({ inputTokens: 1, outputTokens: 1 }); } }, { phase: "review" }).message("", "");
     await new Promise((resolve) => setTimeout(resolve, 30)); expect(started).toBe(false);
-    await budget.usage(occupying.id, { inputTokens: 1, outputTokens: 1 }); await budget.finish(occupying.id);
+    await budget.usage(occupying.id, { inputTokens: 1, outputTokens: 1 }); await budget.finish(occupying.id, true);
     await pending; expect(started).toBe(true); expect((await budget.status()).totals.retries).toBe(0);
   });
   it("cancels admission wait before any model starts and preserves caller usage callbacks", async () => {
@@ -166,7 +167,7 @@ describe("durable circuit budget", () => {
     const rejected = expect(pending).rejects.toThrow("owner cancelled");
     await new Promise((resolve) => setTimeout(resolve, 25)); controller.abort(new Error("owner cancelled")); await rejected;
     expect(started).toBe(false); expect(Object.keys((await budget.status()).reservations)).toEqual([occupying.id]);
-    await budget.usage(occupying.id, { inputTokens: 1, outputTokens: 1 }); await budget.finish(occupying.id);
+    await budget.usage(occupying.id, { inputTokens: 1, outputTokens: 1 }); await budget.finish(occupying.id, true);
     const reports: TokenUsage[] = [];
     await runtime.message("", "", undefined, { onUsage: (usage: TokenUsage) => reports.push(usage) } as MessageOptions);
     expect(reports).toEqual([{ inputTokens: 1, outputTokens: 1 }]);
@@ -222,4 +223,59 @@ describe("durable circuit budget", () => {
     expect((await budget.status()).totals.tokens).toBe(122);
   });
 
+});
+
+
+it.each(["codex", "claude"] as const)("charges unknown final usage after an earlier complete-looking %s live snapshot", async (engine) => {
+  const { budget } = await fixture({ maxInvocationTokens: 100 });
+  const runtime: AgentRuntime = { message: async (_prompt, _schema, _session, options) => {
+    const facts = new RuntimeFacts(engine);
+    if (engine === "codex") facts.observeLog({ type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { input_tokens: 20, output_tokens: 5 } } } });
+    else {
+      facts.observe({ type: "stream_event", event: { type: "message_start", message: { id: "m", usage: { input_tokens: 20, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } } });
+      facts.observe({ type: "stream_event", event: { type: "message_delta", usage: { output_tokens: 5 } } });
+    }
+    options?.onUsage?.(facts.finish("interrupted").usage!);
+    throw new AgentRunError("Provider interrupted during later work", facts.finish("interrupted"));
+  } };
+  await expect(protectRuntime(budget, runtime, { phase: "implement" }).message("", "")).rejects.toThrow("complete token usage");
+  const status = await budget.status();
+  expect(status.totals.tokens).toBe(100); expect(status.reservations).toEqual({}); expect(status.trip).toBeDefined();
+});
+
+it("requires terminal provenance even when a successful facts envelope has both counters", async () => {
+  const { budget } = await fixture({ maxInvocationTokens: 100 });
+  const sample = result({ inputTokens: 20, outputTokens: 5 }); delete sample.facts!.usageComplete;
+  await expect(protectRuntime(budget, { message: async () => sample }, { phase: "implement" }).message("", "")).rejects.toThrow("complete token usage");
+  expect((await budget.status()).totals.tokens).toBe(100);
+});
+
+it("persists an explicit accounting stop through retry and restart until an owner grant", async () => {
+  const { budget, options } = await fixture();
+  await budget.stop("invocation attempt accounting unavailable");
+  await expect(new CircuitBudget(options).assertAvailable()).rejects.toThrow("attempt accounting unavailable");
+  await expect(budget.chargeRetry("again", "implement")).rejects.toBeInstanceOf(CircuitOpenError);
+  const recovered = await budget.grant({ retries: 1, owner: "owner", reason: "Repaired attempt journal" });
+  expect(recovered.history.map((entry) => entry.event)).toEqual(["trip", "grant"]);
+  await budget.assertAvailable();
+});
+
+
+it("caches only this live process identity while rechecking foreign reservations", async () => {
+  const { runtimeDir } = await fixture();
+  const list = vi.spyOn(processTree, "listProcesses").mockResolvedValue([row]);
+  try {
+    const own = new CircuitBudget({ runtimeDir, scopeId: "goal-self-cache" });
+    const run = await own.begin("command", { phase: "implement" });
+    await own.status(); await own.assertAvailable(); await own.finish(run.id);
+    expect(list).toHaveBeenCalledTimes(1);
+    const another = await own.begin("command", { phase: "implement" });
+    const saved = JSON.parse(await readFile(own.path, "utf8"));
+    const foreign = { ...row, pid: process.pid + 100_000, start: "foreign owner" };
+    saved.reservations[another.id].owner = { pid: foreign.pid, start: foreign.start };
+    await writeFile(own.path, JSON.stringify(saved)); list.mockResolvedValue([row, foreign]);
+    await own.status(); await own.status(); expect(list).toHaveBeenCalledTimes(3);
+    list.mockResolvedValue([row]);
+    expect((await own.status()).trip?.reason).toContain("owner exited");
+  } finally { list.mockRestore(); }
 });

@@ -56,6 +56,17 @@ export interface CircuitBudgetOptions {
   /** Clock and process source are injectable for deterministic recovery tests. */
   now?: () => number; processes?: ProcessLister; pollMs?: number;
 }
+// This process cannot die and reuse its own PID while this module is executing. Never cache foreign owners.
+let verifiedSelf: OwnedProcess | undefined;
+let verifyingSelf: Promise<OwnedProcess> | undefined;
+async function ownIdentity(): Promise<OwnedProcess> {
+  if (verifiedSelf) return verifiedSelf;
+  return verifyingSelf ??= listProcesses().then((rows) => {
+    const owner = rows.find((row) => row.pid === process.pid);
+    if (!owner) throw new Error("Cannot verify circuit invocation process identity.");
+    return verifiedSelf = { pid: owner.pid, start: owner.start };
+  }).finally(() => { verifyingSelf = undefined; });
+}
 const positive = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
 const nonnegative = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
 const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -134,9 +145,11 @@ export class CircuitBudget {
     if (ledger.totals.tokens >= ledger.limits.tokens) this.trip(ledger, "aggregate token budget exhausted");
   }
   private async reap(ledger: CircuitLedger): Promise<void> {
-    if (!Object.keys(ledger.reservations).length) return;
-    const rows = await this.processes(); // Failure refuses work; it never guesses that an owner died.
-    for (const run of Object.values(ledger.reservations)) {
+    const candidates = Object.values(ledger.reservations).filter((run) => this.options.processes !== undefined
+      || !verifiedSelf || run.owner.pid !== verifiedSelf.pid || run.owner.start !== verifiedSelf.start);
+    if (!candidates.length) return;
+    const rows = await this.processes(); // Failure refuses work; it never guesses that a foreign owner died.
+    for (const run of candidates) {
       if (rows.some((row) => row.pid === run.owner.pid && row.start === run.owner.start)) continue;
       ledger.totals.tokens += Math.max(0, run.tokenLimit - run.tokens);
       delete ledger.reservations[run.id];
@@ -178,6 +191,11 @@ export class CircuitBudget {
 
   status(): Promise<CircuitLedger> { return this.transaction((ledger) => structuredClone(ledger)); }
   assertAvailable(): Promise<void> { return this.transaction((ledger) => this.assert(ledger)); }
+  /** Persist a workflow accounting failure so ordinary retry cannot reopen it. Reasons are controlled host messages. */
+  stop(reason: string): Promise<void> {
+    if (!reason.trim() || reason.length > 500) throw new Error("A circuit stop requires a bounded reason.");
+    return this.transaction((ledger) => { this.trip(ledger, reason); });
+  }
 
   /** Charge actual automatic repair starts only; polling and ordinary planned calls do not consume this counter. */
   chargeRetry(operationId: string, phase: string): Promise<void> {
@@ -219,7 +237,7 @@ export class CircuitBudget {
   async begin(kind: "model" | "command", context: CircuitContext, requestedTimeoutMs?: number): Promise<Reservation> {
     if (!label(context.phase) || (context.operationId !== undefined && !label(context.operationId))) throw new Error("Invocation requires a stable phase and operation identifier.");
     if (requestedTimeoutMs !== undefined && !positive(requestedTimeoutMs)) throw new Error("Invocation timeout must be finite and positive.");
-    const owner = (await this.processes()).find((row) => row.pid === process.pid);
+    const owner = this.options.processes === undefined ? await ownIdentity() : (await this.processes()).find((row) => row.pid === process.pid);
     if (!owner) throw new Error("Cannot verify circuit invocation process identity.");
     return this.transaction((ledger) => {
       this.assert(ledger);
@@ -260,11 +278,11 @@ export class CircuitBudget {
       this.account(ledger); this.assert(ledger);
     });
   }
-  finish(id: string): Promise<void> {
+  finish(id: string, finalUsageKnown = false): Promise<void> {
     return this.transaction((ledger) => {
       const run = ledger.reservations[id];
       if (!run) throw new Error("Unknown circuit invocation.");
-      if (run.kind === "model" && (run.inputTokens === undefined || run.outputTokens === undefined)) {
+      if (run.kind === "model" && (!finalUsageKnown || run.inputTokens === undefined || run.outputTokens === undefined)) {
         ledger.totals.tokens += Math.max(0, run.tokenLimit - run.tokens);
         this.trip(ledger, "model finished without complete token usage");
       }
@@ -280,7 +298,7 @@ type BoundedShell = { run(command: string, args: string[], cwd: string, options?
 
 /** One bounded lifetime, including queued durable usage updates; no fire-and-forget ledger writes. */
 async function protectedRun<T>(budget: CircuitBudget, kind: "model" | "command", context: CircuitContext,
-  options: { signal?: AbortSignal; timeoutMs?: number }, execute: (options: ObservedOptions) => Promise<T>): Promise<T> {
+  options: { signal?: AbortSignal; timeoutMs?: number }, execute: (options: ObservedOptions, finalUsageKnown: () => void) => Promise<T>): Promise<T> {
   if (options.signal?.aborted) throw options.signal.reason ?? new Error("Invocation aborted.");
   const accountingError = (error: unknown) => error instanceof CircuitOpenError ? error : new CircuitOpenError(budget.scopeId, "budget accounting unavailable");
   const admission = await budget.status().catch((error) => { throw accountingError(error); });
@@ -316,14 +334,14 @@ async function protectedRun<T>(budget: CircuitBudget, kind: "model" | "command",
     polling = budget.assertAvailable().catch(stop).finally(() => { polling = undefined; });
   }, budget.pollMs);
   poll.unref();
-  let value: T | undefined; let executionError: unknown;
-  try { value = await execute({ ...options, signal: controller.signal, timeoutMs: reservation.timeoutMs, onUsage }); }
+  let value: T | undefined; let executionError: unknown; let finalUsageKnown = false;
+  try { value = await execute({ ...options, signal: controller.signal, timeoutMs: reservation.timeoutMs, onUsage }, () => { finalUsageKnown = true; }); }
   catch (error) { executionError = error; }
   finally {
     clearInterval(poll); options.signal?.removeEventListener("abort", forwardAbort);
     await queued;
     await polling;
-    try { await budget.finish(reservation.id); } catch (error) { stop(error); }
+    try { await budget.finish(reservation.id, finalUsageKnown); } catch (error) { stop(error); }
   }
   if (failure) throw failure;
   if (executionError) throw executionError;
@@ -331,20 +349,22 @@ async function protectedRun<T>(budget: CircuitBudget, kind: "model" | "command",
 }
 export function protectRuntime(budget: CircuitBudget, runtime: AgentRuntime, context: CircuitContext): AgentRuntime {
   return { message: (prompt, schemaPath, sessionId, options: ObservedOptions = {}) =>
-    protectedRun<AgentResult>(budget, "model", context, options, async (bounded) => {
+    protectedRun<AgentResult>(budget, "model", context, options, async (bounded, complete) => {
       const report = (usage: TokenUsage) => { bounded.onUsage?.(usage); options.onUsage?.(usage); };
       try {
-        const result = await runtime.message(prompt, schemaPath, sessionId, { ...options, ...bounded, onUsage: report } as ObservedOptions);
+        const result = await runtime.message(prompt, schemaPath, sessionId, { ...options, ...bounded, onUsage: report, requireFinalUsage: true } as ObservedOptions);
         // Legacy/injected runtimes can return normalized invocation usage without a facts envelope.
         // Raw provider counters and lifetime/session envelopes are not invocation evidence.
         const fallback = object(result.usage) && (Object.hasOwn(result.usage, "inputTokens") || Object.hasOwn(result.usage, "outputTokens"))
           ? { inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens } as TokenUsage : undefined;
         const finalUsage = result.facts?.usage ?? fallback;
         if (finalUsage) report(finalUsage);
+        if (result.facts?.usageComplete === true || (!result.facts && fallback)) complete();
         return result;
       } catch (error) {
-        const facts = (error as { facts?: { usage?: TokenUsage } })?.facts;
+        const facts = (error as { facts?: { usage?: TokenUsage; usageComplete?: boolean } })?.facts;
         if (facts?.usage) report(facts.usage);
+        if (facts?.usageComplete === true) complete();
         throw error;
       }
     }) };

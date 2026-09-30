@@ -15,7 +15,7 @@ export interface AgentResult { sessionId: string; response: unknown; usage?: unk
 /** Both concrete providers always return evidence; legacy injected runtimes may omit it. */
 export interface RecordedAgentResult extends AgentResult { facts: RuntimeSessionFacts }
 /** `purpose` labels this run's live progress lines, e.g. "build", "review", "fix", "draft". */
-export interface MessageOptions { /** Cumulative usage of this invocation, delivered while it runs. */ onUsage?: (usage: TokenUsage) => void; signal?: AbortSignal; timeoutMs?: number; purpose?: string; /** Last persisted cumulativeUsage, for this same session only. */ previousSessionUsage?: TokenUsage }
+export interface MessageOptions { /** Wait for provider terminal accounting before ending a headed run. */ requireFinalUsage?: boolean; /** Cumulative usage of this invocation, delivered while it runs. */ onUsage?: (usage: TokenUsage) => void; signal?: AbortSignal; timeoutMs?: number; purpose?: string; /** Last persisted cumulativeUsage, for this same session only. */ previousSessionUsage?: TokenUsage }
 export interface AgentRuntime { message(prompt: string, schemaPath: string, sessionId?: string, options?: MessageOptions): Promise<AgentResult> }
 
 /** Short turns: Chick's clarifying replies. */
@@ -62,7 +62,7 @@ export function codexHeadedArgs(cwd: string, write: WriteAccess, message: string
 export async function codexRollout(home: string, cwds: readonly string[], since: number, sessionId?: string): Promise<string | undefined> {
   const root = join(home, "sessions");
   const files = (await readdir(root, { recursive: true }).catch(() => [] as string[]))
-    .filter((file) => /(^|\/)rollout-[^/]*\.jsonl$/.test(file)).map((file) => join(root, file));
+    .filter((file) => /(^|\/)rollout-[^/]*\.jsonl$/.test(file) && (!sessionId || file.includes(sessionId))).map((file) => join(root, file));
   const recent = (await Promise.all(files.map(async (file) => ({ file, mtime: await stat(file).then((info) => info.mtimeMs, () => 0) }))))
     .filter(({ mtime }) => mtime >= since - 5000).sort((a, b) => b.mtime - a.mtime);
   for (const { file } of recent) {
@@ -116,15 +116,15 @@ export class CodexRuntime implements AgentRuntime {
       const cwds = [resolve(this.cwd), await realpath(this.cwd).catch(() => resolve(this.cwd))];
       const response = await runHeaded({
         label: "Codex", cwd: this.cwd, files, validate: resultValidator(schema), launch: { command: "codex", args: codexHeadedArgs(this.cwd, write, firstMessage(files)), env },
-        started: async () => (rollout ??= await codexRollout(home, cwds, since)), facts: evidence, onUsage: usageReporter(evidence, options.onUsage), timeoutMs: Math.min(options.timeoutMs ?? this.timeoutMs, this.timeoutMs), signal: options.signal,
+        started: async () => (rollout ??= await codexRollout(home, cwds, since)), facts: evidence, requireFinalUsage: options.requireFinalUsage, onUsage: usageReporter(evidence, options.onUsage), timeoutMs: Math.min(options.timeoutMs ?? this.timeoutMs, this.timeoutMs), signal: options.signal,
       });
       rollout ??= await codexRollout(home, cwds, since);
-      await readLog(rollout, evidence);
+      if (!evidence.logObserved) await readLog(rollout, evidence);
       if (!evidence.sessionId) throw new RuntimeStop("Codex returned no session id or final response.");
       const facts = evidence.finish("succeeded");
       return { sessionId: evidence.sessionId, response, usage: facts.usage, startedAt: facts.startedAt, finishedAt: facts.finishedAt, facts };
     } catch (error) {
-      await readLog(rollout, evidence);
+      if (!evidence.logObserved) await readLog(rollout, evidence);
       const recorded = recordedError(error, evidence);
       if (error instanceof HeadedStartError) recorded.cause = error;
       throw recorded;
@@ -163,6 +163,12 @@ export class CodexRuntime implements AgentRuntime {
       checkPromptSize(prompt);
       const base = this.envFor(childEnv());
       const env = this.home ? { ...base, CODEX_HOME: await ensureCodexHome(this.home, this.config) } : base;
+      let liveTail: LiveUsageTail | undefined;
+      if (options.onUsage && sessionId) {
+        const cwds = [resolve(this.cwd), await realpath(this.cwd).catch(() => resolve(this.cwd))];
+        const existing = await codexRollout(env.CODEX_HOME || join(homedir(), ".codex"), cwds, 0, sessionId);
+        if (existing) { liveTail = new LiveUsageTail(existing, "codex", undefined, evidence); await liveTail.seekEnd(); }
+      }
       const sandbox = sandboxArgs(this.write);
       const args = sessionId ? ["exec", "resume", sessionId, "--json", "-c", "sandbox_mode=\"read-only\"", "-"] : ["exec", "--json", ...sandbox, "--output-schema", schemaPath, "-"];
       if (signal?.aborted) throw new RuntimeStop("Codex run cancelled.", "interrupted");
@@ -170,7 +176,7 @@ export class CodexRuntime implements AgentRuntime {
       signal?.addEventListener("abort", abort, { once: true });
       const child = spawn("codex", args, { cwd: this.cwd, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32", env });
       if (options.onUsage) {
-        const since = Date.now(); let tail: LiveUsageTail | undefined;
+        const since = Date.now(); let tail = liveTail;
         const logHome = env.CODEX_HOME || join(homedir(), ".codex");
         const cwds = realpath(this.cwd).then((canonical) => [resolve(this.cwd), canonical], () => [resolve(this.cwd)]);
         pollUsage = () => usageRead ??= (async () => {
@@ -181,7 +187,7 @@ export class CodexRuntime implements AgentRuntime {
           }
           if (tail) await tail.read().catch(() => undefined);
           reportUsage();
-        })().catch(() => { stop ??= new RuntimeStop("Codex usage callback failed."); controller.abort(); }).finally(() => { usageRead = undefined; });
+        })().catch(() => { evidence.invalidateUsage(); stop ??= new RuntimeStop("Codex usage callback failed."); controller.abort(); }).finally(() => { usageRead = undefined; });
         usageTimer = setInterval(() => { void pollUsage!(); }, 250);
         usageTimer.unref?.();
       }
@@ -213,7 +219,7 @@ export class CodexRuntime implements AgentRuntime {
         if (stdoutBytes > 10_000_000) return;
         stdoutBytes += Buffer.byteLength(part);
         if (stdoutBytes > 10_000_000) { limit("stdout"); return; }
-        try { stream.push(part); } catch { stop ??= new RuntimeStop("Codex usage callback failed."); controller.abort(); }
+        try { stream.push(part); } catch { evidence.invalidateUsage(); stop ??= new RuntimeStop("Codex usage callback failed."); controller.abort(); }
         if (!stop) progress?.push(part);
       });
       child.stderr.on("data", (part: string) => {

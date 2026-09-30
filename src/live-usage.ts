@@ -74,6 +74,12 @@ export class LiveUsageTail {
     this.context = context;
   }
 
+  /** Resume accounting starts after the existing log prefix, which belongs to earlier invocations. */
+  async seekEnd(): Promise<void> {
+    const file = await open(this.path, "r");
+    try { this.offset = (await file.stat()).size; this.pending = Buffer.alloc(0); } finally { await file.close(); }
+  }
+
   async read(): Promise<TokenUsage | undefined> {
     const file = await open(this.path, "r");
     try {
