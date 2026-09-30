@@ -11,6 +11,8 @@ import { TEAM_LEAD_CODEX_CONFIG, codexConfigForRoles } from "../src/harness-home
 import * as mattermost from "../src/planning-mattermost.js";
 import { goalRuntimeFilename, type GoalReport } from "../src/goal-contract.js";
 import { releaseAttemptsName } from "../src/sprint.js";
+import { developerGoalJournalName } from "../src/developer-goal.js";
+import type { GoalAgentSession } from "../src/seat-runtime.js";
 
 afterEach(() => { vi.useRealTimers(); });
 const at = (second: number) => `2026-01-01T00:00:${String(second).padStart(2, "0")}.000Z`;
@@ -68,6 +70,26 @@ async function fixture() {
   return { context, state, draft, archive, pr, records, deliveries, services, restart, record, owner, losePost: () => { lostPost = true; } };
 }
 
+/** A reported goals-v1 goal whose one lane PR source is stubbed; no Developer journal is recorded yet. */
+function goalsV1Retro(f: Awaited<ReturnType<typeof fixture>>) {
+  const goal = f.context.goal;
+  const report: GoalReport = { version: 1, goalId: goal.id, teamId: goal.teamId, seatId: "seat-dev", sprintBranch: "sprint/goal-one", headSha: "a".repeat(40),
+    lanePrs: [{ laneId: "lane-one", url: "https://github.com/test/project/pull/1", headSha: "a".repeat(40), mergedSha: "b".repeat(40), reviewer: "satori-miyamoto", ci: "passed" }], checks: [{ command: "typecheck", exitCode: 0 }], decisions: [], followUps: [], neededButUnowned: [] };
+  goal.workflowModel = "goals-v1"; goal.ownedFiles = ["src/**"]; goal.goalAssignment = { seatId: "seat-dev", status: "reported", updatedAt: at(3) };
+  goal.goalProposal = { version: 1, goalId: goal.id, proposalId: "proposal-one", productSeatId: "seat-product", rank: 1, mission: "docs/mission.md", summary: "Ship", outcomes: [{ number: 1, title: "Deliver", description: "Deliver the goal", reason: "Mission", currentCode: ["src/a.ts"] }], ownedFiles: goal.ownedFiles, risks: [], rationale: "Useful", basedOnRetros: [] };
+  delete goal.proposal; delete goal.assignments;
+  const approval = goal.ceremony!.history.find((entry) => entry.stage === "implement")!; if (approval.evidence.kind === "approval") approval.evidence.proposalPostId = goal.mattermost.rootPostId;
+  const release = goal.ceremony!.history.find((entry) => entry.stage === "release")!; release.evidence = { kind: "implementation", outcomes: [], goalDelivery: report };
+  const github = new SprintGitHub({ run: vi.fn() }, "/unused");
+  vi.spyOn(github, "prRetrospective").mockResolvedValue({ url: report.lanePrs[0].url, headSha: "a".repeat(40), decisions: "Decision", followUps: "Follow-up" });
+  return { goal, github };
+}
+const codexUsage = { inputTokens: 1000, uncachedInputTokens: 200, cachedInputTokens: 800, cacheWriteInputTokens: 0, outputTokens: 50, reasoningOutputTokens: 10 };
+const turn = (key: string, role: GoalAgentSession["role"], start: number, finish: number, sessionId: string): GoalAgentSession => ({ key, role, status: "complete", startedAt: at(start),
+  result: { sessionId, response: {}, startedAt: at(start), finishedAt: at(finish), facts: { invocationId: `invocation-${key}`, engine: "codex", sessionId, startedAt: at(start), finishedAt: at(finish), status: "succeeded", usage: codexUsage } } });
+const journal = (goalId: string, planning: GoalAgentSession[], lanes: Record<string, GoalAgentSession[]>, seatId = "seat-dev") =>
+  ({ version: 1, goalId, seatId, github: "test/project", planning, lanes: Object.fromEntries(Object.entries(lanes).map(([id, sessions]) => [id, { id, sessions }])) });
+
 describe("recoverable retro publication", () => {
   it("reads new-model lane PR sections and shared runtime facts without importing legacy seat records or inventing timings", async () => {
     const f = await fixture(); const goal = f.context.goal;
@@ -92,6 +114,54 @@ describe("recoverable retro publication", () => {
     expect(buildRetroSnapshot(input).seats.find((seat) => seat.seatId === "seat-dev")!.wallTimeMs).toBeNull();
     expect(read.mock.calls.every(([name]) => !name.startsWith("seat-") && !name.startsWith("implementation-"))).toBe(true);
     source.mockRejectedValueOnce(new Error("The head no longer matches")); await expect(recordedRetroInput(f.context, [], github)).rejects.toThrow("head no longer matches");
+  });
+
+  it("adds every completed Developer journal session and their interval union as the Developer seat's wall time", async () => {
+    const f = await fixture(); const { goal, github } = goalsV1Retro(f);
+    // Planning 10-20s; lane-one 15-30s overlaps planning and lane-two 25-40s; a disjoint fix at 50-55s. Union: 10-40 plus 50-55 = 35s.
+    f.records.set(developerGoalJournalName(goal.id), journal(goal.id, [turn("plan", "planner", 10, 20, "thread-plan")],
+      { "lane-two": [turn("two", "lead", 25, 40, "thread-two")], "lane-one": [turn("one", "lead", 15, 30, "thread-one"), turn("fix", "fix", 50, 55, "thread-fix")] }));
+    const input = await recordedRetroInput(f.context, [], github);
+    expect(input.facts.sessions).toEqual([
+      { seatId: "seat-dev", sessionId: "thread-plan", invocationId: "invocation-plan", startedAt: at(10), finishedAt: at(20), usage: codexUsage },
+      { seatId: "seat-dev", sessionId: "thread-one", invocationId: "invocation-one", startedAt: at(15), finishedAt: at(30), usage: codexUsage },
+      { seatId: "seat-dev", sessionId: "thread-fix", invocationId: "invocation-fix", startedAt: at(50), finishedAt: at(55), usage: codexUsage },
+      { seatId: "seat-dev", sessionId: "thread-two", invocationId: "invocation-two", startedAt: at(25), finishedAt: at(40), usage: codexUsage },
+    ]);
+    expect(input.facts.seats).toContainEqual({ seatId: "seat-dev", wallTimeMs: 35_000 });
+    expect(input.missing!.some((line) => line.includes("token counters") || line.includes("seat-dev"))).toBe(false);
+    const snapshot = buildRetroSnapshot({ ...input, cutoffAt: at(59) });
+    expect(snapshot.seats.find((seat) => seat.seatId === "seat-dev")!.wallTimeMs).toBe(35_000);
+    expect(snapshot.sessions.filter((session) => session.seatId === "seat-dev").map((session) => session.usage.inputTokens)).toEqual([1000, 1000, 1000, 1000]);
+  });
+
+  it("keeps Developer wall time unknown when a journal turn was interrupted, while recording its completed sessions", async () => {
+    const f = await fixture(); const { goal, github } = goalsV1Retro(f);
+    f.records.set(developerGoalJournalName(goal.id), journal(goal.id, [turn("plan", "planner", 10, 20, "thread-plan")],
+      { "lane-one": [{ key: "build", role: "lead", status: "started", startedAt: at(21) }], "lane-two": [{ key: "retry", role: "fix", status: "failed", startedAt: at(22) }] }));
+    const input = await recordedRetroInput(f.context, [], github);
+    expect(input.facts.sessions).toEqual([{ seatId: "seat-dev", sessionId: "thread-plan", invocationId: "invocation-plan", startedAt: at(10), finishedAt: at(20), usage: codexUsage }]);
+    expect(input.facts.seats).toContainEqual({ seatId: "seat-dev", wallTimeMs: null });
+    expect(input.missing).toEqual(expect.arrayContaining([
+      "seat-dev: a Developer lead turn in lane lane-one was interrupted or failed without recorded timing or usage; wall time remains unknown.",
+      "seat-dev: a Developer fix turn in lane lane-two was interrupted or failed without recorded timing or usage; wall time remains unknown.",
+    ]));
+    expect(input.missing!.some((line) => line.includes("public goal record"))).toBe(false);
+    expect(buildRetroSnapshot({ ...input, cutoffAt: at(59) }).seats.find((seat) => seat.seatId === "seat-dev")!.wallTimeMs).toBeNull();
+  });
+
+  it("reports the public-record gap only when the Developer journal is missing, and never reads a foreign journal", async () => {
+    const f = await fixture(); const { goal, github } = goalsV1Retro(f);
+    const absent = await recordedRetroInput(f.context, [], github);
+    expect(absent.facts.sessions).toEqual([]);
+    expect(absent.facts.seats).toContainEqual({ seatId: "seat-dev", wallTimeMs: null });
+    expect(absent.missing).toContain("The Developer goal journal is unavailable, and the public goal record does not contain Developer invocation timings or token counters; these remain unknown.");
+    f.records.set(developerGoalJournalName(goal.id), journal(goal.id, [turn("plan", "planner", 10, 20, "thread-plan")], {}, "seat-other"));
+    const foreign = await recordedRetroInput(f.context, [], github);
+    expect(foreign.facts.sessions).toEqual([]);
+    expect(foreign.facts.seats).toContainEqual({ seatId: "seat-dev", wallTimeMs: null });
+    expect(foreign.missing).toContain("seat-dev: the Developer goal journal belongs to another goal or seat or is malformed; Developer invocation timings and token counters remain unknown.");
+    expect(foreign.missing!.some((line) => line.includes("public goal record"))).toBe(false);
   });
   it("surfaces the protected merge setup blocker while retaining the open retrospective", async () => {
     const f = await fixture();

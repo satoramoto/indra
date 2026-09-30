@@ -58,6 +58,8 @@ const generation = (): RetroGeneration => ({ sessionId: "fresh-retro-session", s
 function run(snapshot = buildRetroSnapshot(input()), response: unknown = narrative(snapshot)): AgentResult {
   return { sessionId: "fresh-retro-session", startedAt: at(50), finishedAt: at(55), usage: { input_tokens: 10, cached_input_tokens: 4, output_tokens: 2 }, response };
 }
+const UNRECORDED_RELEASE = { phase: "release", evidenceId: "release-integration-conflicts", kind: "unknown", text: "Integration PR conflict and merge rounds are not recorded." };
+const RECORDING_PROPOSAL = { evidenceId: "release-integration-conflicts", kind: "owner-proposal", text: "Consider recording integration PR conflict and merge rounds.", phase: "release" };
 
 describe("bounded retro evidence and numeric accounting", () => {
   it("freezes actual lane sections and recorded integration rounds without filling missing history with zero", async () => {
@@ -69,13 +71,31 @@ describe("bounded retro evidence and numeric accounting", () => {
     expect(snapshot.phases.find((phase) => phase.phase === "release")!.facts).toEqual(expect.arrayContaining([
       expect.objectContaining({ evidenceId: "release-integration-conflicts", value: 1 }), expect.objectContaining({ evidenceId: "release-merge-rounds", value: 2 }),
     ]));
+    // Recorded rounds replace the "not recorded" reflection and the standing owner proposal.
+    expect(snapshot.choices.phaseReflections).toContainEqual({ phase: "release", evidenceId: "release-integration-conflicts", kind: "slowed", text: "The integration PR recorded 1 conflict round(s) and 2 merge attempt(s)." });
+    expect(snapshot.choices.phaseReflections).not.toContainEqual(UNRECORDED_RELEASE);
+    expect(snapshot.choices.ownerProposals.some((item) => item.evidenceId === "release-integration-conflicts")).toBe(false);
     data.lanePrs[0].decisions = "Changed after cutoff";
     const markdown = await renderSprintRetro(snapshot, narrative(snapshot), generation());
     expect(markdown).toContain("Preserved the approved boundary"); expect(markdown).not.toContain("Changed after cutoff"); expect(markdown).toContain("unknown — section absent");
     expect(markdown).toContain("Integration PR merge attempts started | 2");
     const without = buildRetroSnapshot(input());
     expect(without.phases.find((phase) => phase.phase === "release")!.facts.find((fact) => fact.evidenceId === "release-merge-rounds")!.value).toBeNull();
+    expect(without.choices.phaseReflections).toContainEqual(UNRECORDED_RELEASE);
+    expect(without.choices.ownerProposals).toContainEqual(RECORDING_PROPOSAL);
     data.releaseAttempts.goalId = "goal-wrong"; expect(() => buildRetroSnapshot(data)).toThrow("integration attempt evidence");
+  });
+  it("reports recorded zero integration conflicts as worked, without the recording proposal", async () => {
+    const data = input();
+    data.releaseAttempts = { version: 1, goalId: data.goal.id, startedAt: at(30), conflicts: [], merges: [{ prUrl: pr, headSha: "a".repeat(40), at: at(33) }] };
+    const snapshot = buildRetroSnapshot(data);
+    const recorded = { phase: "release" as const, evidenceId: "release-integration-conflicts", kind: "worked" as const, text: "The integration PR recorded no conflict rounds and 1 merge attempt(s)." };
+    expect(snapshot.choices.phaseReflections.filter((item) => item.evidenceId === "release-integration-conflicts")).toEqual([recorded]);
+    expect(snapshot.choices.ownerProposals.some((item) => item.evidenceId === "release-integration-conflicts")).toBe(false);
+    await expect(validateRetroNarrative(snapshot, narrative(snapshot))).resolves.toBeDefined();
+    // A recorded count carries code's judgment; Chick cannot flip it.
+    const flipped = narrative(snapshot); flipped.phaseReflections = flipped.phaseReflections.filter((item) => item.phase !== "release").concat({ ...recorded, kind: "slowed" });
+    await expect(validateRetroNarrative(snapshot, flipped)).rejects.toThrow("unsupported");
   });
   it("computes known tables, includes generation usage and preserves the cutoff rather than guessing closure", async () => {
     const snapshot = buildRetroSnapshot(input());
@@ -265,8 +285,9 @@ describe("fresh read-only retro generation", () => {
     expect(message).toHaveBeenCalledWith(retroPrompt(snapshot), expect.stringMatching(/schemas\/retro\.json$/), undefined, { purpose: "retro" });
     expect(message.mock.calls[0][0]).not.toContain("planning-session");
     expect(message.mock.calls[0][0]).toContain("Do not use tools");
-    expect(result.generation).toMatchObject({ wallTimeMs: 5_000, usage: { inputTokens: 10, outputTokens: 2 } });
-    expect(result.markdown).toContain("| Total |  | 3 | 310 | unknown | 64 | unknown | 62 | unknown | 372 |");
+    // Codex input includes cached reads, so the fresh session's uncached input is derived (10 - 4); cache writes and reasoning stay unreported.
+    expect(result.generation).toMatchObject({ wallTimeMs: 5_000, usage: { inputTokens: 10, uncachedInputTokens: 6, outputTokens: 2 } });
+    expect(result.markdown).toContain("| Total |  | 3 | 310 | 216 | 64 | unknown | 62 | unknown | 372 |");
     expect(result.snapshot.cutoffAt).toBe(at(50));
     await expect(access(directory)).rejects.toThrow();
   });
@@ -302,7 +323,7 @@ describe("fresh read-only retro generation", () => {
         { type: "item.completed", item: { type: "agent_message", text: JSON.stringify(narrative(snapshot)) } },
       ].map((event) => JSON.stringify(event)).join("\n") + "\n");
       child.stdout.end(); child.emit("close", 0);
-      expect((await draft).generation.usage).toMatchObject({ inputTokens: 10, outputTokens: 2 });
+      expect((await draft).generation.usage).toMatchObject({ inputTokens: 10, uncachedInputTokens: 6, outputTokens: 2 });
       // The post-run refresh keeps the Team Lead's config rather than resetting it to the Developer default.
       expect(await readFile(join(configuredHome, "config.toml"), "utf8")).toBe(TEAM_LEAD_CODEX_CONFIG);
     } finally { await rm(runtimeDir, { recursive: true, force: true }); }
@@ -417,8 +438,11 @@ describe("per-phase process reflection", () => {
       { phase: "planning", evidenceId: "planning-failures", kind: "slowed", text: "Planning recorded 1 failed clarification turn(s) out of 3." },
       { phase: "implement", evidenceId: "implement-slowest-seat", kind: "noted", text: "seat-three was the slowest seat at 50m 00s, the implement critical path." },
       { phase: "retro", evidenceId: "retro-failed-drafts", kind: "slowed", text: "The retro draft failed or was aborted 2 time(s) before this attempt (first: runtime-failed; last: timed-out)." },
+      UNRECORDED_RELEASE,
     ]));
     expect(snapshot.choices.ownerProposals).toContainEqual({ evidenceId: "retro-failed-drafts", kind: "owner-proposal", text: "Consider investigating the recorded retro draft failures.", phase: "retro" });
+    // Unrecorded integration rounds keep the recording proposal.
+    expect(snapshot.choices.ownerProposals).toContainEqual(RECORDING_PROPOSAL);
     // Measured durations carry no code judgment: code offers them only as neutral "noted" facts.
     expect(snapshot.choices.phaseReflections.filter((item) => item.evidenceId === "release-approval-to-running")).toEqual([
       { phase: "release", evidenceId: "release-approval-to-running", kind: "noted", text: "The new build was recorded running 3m 10s after the merge approval (includes CI wait, merge and build)." }]);

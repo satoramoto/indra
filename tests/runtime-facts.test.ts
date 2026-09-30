@@ -19,10 +19,13 @@ const step = { type: "assistant", parent_tool_use_id: null, session_id: id, mess
 } };
 const delta = (tokens: number) => ({ type: "stream_event", session_id: id, parent_tool_use_id: null, event: { type: "message_delta", delta: { stop_reason: null }, usage: { output_tokens: tokens } } });
 const start = { type: "stream_event", session_id: id, parent_tool_use_id: null, event: { type: "message_start", message: step.message } };
+// Rollout-shaped entries as in tests/fixtures/transcripts/codex-rollout.jsonl.
+const rolloutMeta = { timestamp: "2026-09-29T10:00:00.000Z", type: "session_meta", payload: { id: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b" } };
+const rolloutTotal = (total_token_usage: object) => ({ timestamp: "2026-09-29T10:00:10.000Z", type: "event_msg", payload: { type: "token_count", info: { total_token_usage } } });
 
 describe("normalized provider counters", () => {
   it("keeps Codex cache/reasoning subsets separate and makes Claude input totals inclusive", () => {
-    expect(normalizeUsage("codex", { input_tokens: 100, cached_input_tokens: 40, cache_write_input_tokens: 5, output_tokens: 30, reasoning_output_tokens: 20 })).toEqual({ inputTokens: 100, cachedInputTokens: 40, cacheWriteInputTokens: 5, outputTokens: 30, reasoningOutputTokens: 20 });
+    expect(normalizeUsage("codex", { input_tokens: 100, cached_input_tokens: 40, cache_write_input_tokens: 5, output_tokens: 30, reasoning_output_tokens: 20 })).toEqual({ inputTokens: 100, uncachedInputTokens: 60, cachedInputTokens: 40, cacheWriteInputTokens: 5, outputTokens: 30, reasoningOutputTokens: 20 });
     expect(normalizeUsage("claude", step.message.usage)).toEqual({ inputTokens: 52, uncachedInputTokens: 32, cachedInputTokens: 12, cacheWriteInputTokens: 8, outputTokens: 1 });
     expect(normalizeUsage("claude", { output_tokens: 30, output_tokens_details: { thinking_tokens: 20 } })).toEqual({ outputTokens: 30, reasoningOutputTokens: 20 });
   });
@@ -33,6 +36,21 @@ describe("normalized provider counters", () => {
     }
     expect(normalizeUsage("claude", { input_tokens: 7, output_tokens: 0, extra: "private diagnostic" })).toEqual({ uncachedInputTokens: 7, outputTokens: 0 });
     expect(normalizeUsage("claude", { input_tokens: Number.MAX_SAFE_INTEGER, cache_read_input_tokens: 2, cache_creation_input_tokens: 0 })).not.toHaveProperty("inputTokens");
+  });
+
+  it("derives Codex uncached input only when input and cached reads are both reported", () => {
+    const facts = new RuntimeFacts("codex");
+    facts.observeLog(rolloutMeta);
+    facts.observeLog(rolloutTotal({ input_tokens: 24763, cached_input_tokens: 24448, output_tokens: 122, reasoning_output_tokens: 0, total_tokens: 24885 }));
+    expect(facts.finish("succeeded")).toMatchObject({ sessionId: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b", usage: { inputTokens: 24763, uncachedInputTokens: 315, cachedInputTokens: 24448 } });
+    expect(normalizeUsage("codex", { input_tokens: 10 })).not.toHaveProperty("uncachedInputTokens");
+    expect(normalizeUsage("codex", { cached_input_tokens: 4 })).not.toHaveProperty("uncachedInputTokens");
+    expect(normalizeUsage("codex", { input_tokens: 3, cached_input_tokens: 4 })).toEqual({ inputTokens: 3, cachedInputTokens: 4 });
+    const stale = new RuntimeFacts("codex");
+    stale.observeLog(rolloutTotal({ input_tokens: 100, cached_input_tokens: 40 })); stale.observeLog(rolloutTotal({ input_tokens: 150 }));
+    const record = stale.finish("succeeded");
+    expect(record.cumulativeUsage).toEqual({ inputTokens: 150, cachedInputTokens: 40 });
+    expect(record.cumulativeUsage?.uncachedInputTokens).toBeUndefined();
   });
 
   it("subtracts only known monotonic counters", () => {
@@ -66,11 +84,23 @@ describe("invocation facts", () => {
     resumed.observe(update); resumed.observe(update);
     expect(resumed.finish("succeeded")).toMatchObject({ usage: { inputTokens: 237, outputTokens: 8 }, cumulativeUsage: { inputTokens: 25000, outputTokens: 130 } });
     expect(resumed.finish("succeeded").usage).not.toHaveProperty("cachedInputTokens");
+    expect(resumed.finish("succeeded").usage).not.toHaveProperty("uncachedInputTokens");
     const withoutBaseline = new RuntimeFacts("codex", previous.sessionId);
     withoutBaseline.observe(update);
     expect(withoutBaseline.finish("succeeded")).toMatchObject({ cumulativeUsage: { inputTokens: 25000, outputTokens: 130 } });
     expect(withoutBaseline.finish("succeeded")).not.toHaveProperty("usage");
     expect(resumed.invocationId).not.toBe(first.invocationId);
+  });
+
+  it("carries derived Codex uncached input into a resumed invocation's delta", () => {
+    const first = new RuntimeFacts("codex"); codex.forEach((line) => first.observe(JSON.parse(line)));
+    const previous = first.finish("succeeded");
+    expect(previous.cumulativeUsage?.uncachedInputTokens).toBe(315);
+    const resumed = new RuntimeFacts("codex", previous.sessionId, previous.cumulativeUsage);
+    resumed.observe({ type: "turn.completed", usage: { input_tokens: 25000, cached_input_tokens: 24600, output_tokens: 130 } });
+    const record = resumed.finish("succeeded");
+    expect(record.usage).toMatchObject({ inputTokens: 237, cachedInputTokens: 152, uncachedInputTokens: 85, outputTokens: 8 });
+    expect(record.cumulativeUsage?.uncachedInputTokens).toBe(400);
   });
 
   it("does not invent a delta when the provider resets a resumed session counter", () => {

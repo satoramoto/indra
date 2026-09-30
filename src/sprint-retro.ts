@@ -450,7 +450,11 @@ function phaseChoices(stages: RetroEvidenceSnapshot["stages"], phases: RetroPhas
     }
     if (name === "release") {
       if (get("release-approval-to-running") !== null) measured(name, "release-approval-to-running", `The new build was recorded running ${duration(get("release-approval-to-running"))} after the merge approval (includes CI wait, merge and build).`);
-      add(name, "release-integration-conflicts", "unknown", "Integration PR conflict and merge rounds are not recorded.");
+      // Recorded counts carry their own judgment; only a missing count is reported as not recorded.
+      const conflicts = get("release-integration-conflicts"); const merges = get("release-merge-rounds");
+      if (conflicts === null || merges === null) add(name, "release-integration-conflicts", "unknown", "Integration PR conflict and merge rounds are not recorded.");
+      else if (conflicts) add(name, "release-integration-conflicts", "slowed", `The integration PR recorded ${conflicts} conflict round(s) and ${merges} merge attempt(s).`);
+      else add(name, "release-integration-conflicts", "worked", `The integration PR recorded no conflict rounds and ${merges} merge attempt(s).`);
     }
     if (name === "retro") {
       const failed = get("retro-failed-drafts")!;
@@ -468,7 +472,7 @@ function phaseProposals(phases: RetroPhase[]): RetroProposal[] {
   if (numeric(phase("planning"), "planning-failures")) add("planning", "planning-failures", "Consider investigating the recorded clarification failures.");
   if (numeric(phase("proposal"), "proposal-draft-failures")) add("proposal", "proposal-draft-failures", "Consider investigating the recorded proposal draft failures.");
   if ((phase("implement").seats?.length ?? 0) > 1 && valueOf(phase("implement"), "implement-slowest-seat") !== null) add("implement", "implement-slowest-seat", "Consider balancing outcome size across seats in future proposals.");
-  add("release", "release-integration-conflicts", "Consider recording integration PR conflict and merge rounds.");
+  if (numeric(phase("release"), "release-integration-conflicts") === null || numeric(phase("release"), "release-merge-rounds") === null) add("release", "release-integration-conflicts", "Consider recording integration PR conflict and merge rounds.");
   if (numeric(phase("retro"), "retro-failed-drafts")) add("retro", "retro-failed-drafts", "Consider investigating the recorded retro draft failures.");
   return result;
 }

@@ -10,7 +10,8 @@ import { retroPath, SprintGitHub, releaseAttemptsName, type ReleaseAttempts, typ
 import { goalRuntimeFilename, validateGoalReport, type GoalRuntimeRecord } from "./goal-contract.js";
 import { draftSprintRetro, renderSprintRetro, RetroGenerationError, type RetroGeneration, type RetroInput, type RetroPriorAttempt, type SprintRetroDraft } from "./sprint-retro.js";
 import { readImplementationFacts } from "./implementation-facts.js";
-import { loadSeatEngines, SeatRuntime } from "./seat-runtime.js";
+import { loadSeatEngines, SeatRuntime, type GoalAgentSession } from "./seat-runtime.js";
+import { developerGoalJournalName } from "./developer-goal.js";
 import { seatHarnessDir } from "./harness-home.js";
 import { loadSeatPersonas, personaPost, withPersonaRuntime } from "./seat-persona.js";
 import { AgentRunError } from "./runtime-facts.js";
@@ -233,6 +234,39 @@ export class RetroPublication {
 
 }
 
+interface DeveloperJournalEvidence { version: number; goalId: string; seatId: string; planning: GoalAgentSession[]; lanes: Record<string, { sessions: GoalAgentSession[] }> }
+type RetroSessionFact = RetroInput["facts"]["sessions"][number];
+
+/** Developer turns persisted by runGoalAgent. Wall time is their interval union, only when every turn completed with runtime facts. */
+async function developerJournalFacts(store: PlanningStore, goalId: string, seatId: string): Promise<{ sessions: RetroSessionFact[]; wallTimeMs: number | null; missing: string[] }> {
+  const journal = await store.readRuntimeFile<DeveloperJournalEvidence>(developerGoalJournalName(goalId));
+  if (!journal) return { sessions: [], wallTimeMs: null, missing: ["The Developer goal journal is unavailable, and the public goal record does not contain Developer invocation timings or token counters; these remain unknown."] };
+  const lanes = journal.lanes && typeof journal.lanes === "object" ? Object.entries(journal.lanes).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0) : null;
+  if (journal.version !== 1 || journal.goalId !== goalId || journal.seatId !== seatId || !Array.isArray(journal.planning) || !lanes || lanes.some(([, lane]) => !Array.isArray(lane?.sessions))) {
+    return { sessions: [], wallTimeMs: null, missing: [`${seatId}: the Developer goal journal belongs to another goal or seat or is malformed; Developer invocation timings and token counters remain unknown.`] };
+  }
+  const sessions: RetroSessionFact[] = []; const missing: string[] = []; const intervals: [number, number][] = [];
+  const turns = [...journal.planning.map((turn) => ({ turn, where: "planning" })), ...lanes.flatMap(([laneId, lane]) => lane.sessions.map((turn) => ({ turn, where: `lane ${laneId}` })))];
+  for (const { turn, where } of turns) {
+    const facts = turn?.status === "complete" ? turn.result?.facts : undefined;
+    const started = Date.parse(facts?.startedAt ?? ""); const finished = Date.parse(facts?.finishedAt ?? "");
+    if (!facts || !Number.isFinite(started) || !Number.isFinite(finished) || finished < started) {
+      missing.push(`${seatId}: a Developer ${typeof turn?.role === "string" ? turn.role : "agent"} turn in ${where} ${turn?.status === "complete" ? "has no recorded runtime facts" : "was interrupted or failed without recorded timing or usage"}; wall time remains unknown.`);
+      continue;
+    }
+    sessions.push({ seatId, sessionId: facts.sessionId ?? turn.result!.sessionId ?? "unknown", invocationId: facts.invocationId, startedAt: facts.startedAt, finishedAt: facts.finishedAt, usage: facts.usage ?? null });
+    intervals.push([started, finished]);
+  }
+  if (!turns.length) missing.push(`${seatId}: the Developer goal journal records no agent turns; wall time remains unknown.`);
+  if (missing.length) return { sessions, wallTimeMs: null, missing };
+  let wallTimeMs = 0; let end = -Infinity;
+  for (const [start, finish] of intervals.sort((a, b) => a[0] - b[0])) {
+    if (finish <= end) continue;
+    wallTimeMs += finish - Math.max(start, end); end = finish;
+  }
+  return { sessions, wallTimeMs, missing };
+}
+
 /** Read only persisted evidence. Missing attempt coverage and unrecorded wall time stay explicitly unknown. */
 export async function recordedRetroInput(context: CeremonyContext, retroAttempts: RetroPriorAttempt[] = [], github = new SprintGitHub(processShell, context.store.runtimeDir)): Promise<RetroInput> {
   const { goal, store } = context;
@@ -261,8 +295,11 @@ export async function recordedRetroInput(context: CeremonyContext, retroAttempts
         facts.reviews.push({ outcomeId: lane.id, prUrl: proof.url, findings: lane.findings.map((finding) => `${finding.path}:${finding.line}: ${finding.reason}`) });
       } else missing.push(`${proof.laneId}: complete shared lane round and finding records are unavailable.`);
     }
-    for (const seatId of new Set([goal.seatId, report.seatId])) if (!facts.seats.some((seat) => seat.seatId === seatId)) facts.seats.push({ seatId, wallTimeMs: null });
-    missing.push("The public goal record does not contain Developer invocation timings or token counters; these remain unknown. Lane findings are the latest recorded verdict, not a complete history of earlier reviews.");
+    const developer = await developerJournalFacts(store, goal.id, report.seatId);
+    for (const session of developer.sessions) if (!facts.sessions.some((item) => item.seatId === session.seatId && item.sessionId === session.sessionId && item.startedAt === session.startedAt)) facts.sessions.push(session);
+    if (!facts.seats.some((seat) => seat.seatId === report.seatId)) facts.seats.push({ seatId: report.seatId, wallTimeMs: developer.wallTimeMs });
+    if (!facts.seats.some((seat) => seat.seatId === goal.seatId)) facts.seats.push({ seatId: goal.seatId, wallTimeMs: null });
+    missing.push(...developer.missing, "Lane findings are the latest recorded verdict, not a complete history of earlier reviews.");
     const releaseAttempts = await store.readRuntimeFile<ReleaseAttempts>(releaseAttemptsName(goal.id));
     if (!releaseAttempts) missing.push("Integration conflict and merge-attempt history is unavailable.");
     return { goal, facts, cutoffAt: new Date().toISOString(), missing, retroAttempts, lanePrs, releaseAttempts };
