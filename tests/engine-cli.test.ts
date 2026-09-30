@@ -6,6 +6,8 @@ import type { AgentRuntime, MessageOptions, WriteAccess } from "../src/codex-run
 import type { CeremonyAdapters, PlanningChat } from "../src/planning-bridge.js";
 import { processShell, type RuntimeFactory } from "../src/developer-seat.js";
 import { createPlanningBridge, createPlanningStore, developerEventTurn, main, parseOptions, uiWorkflowEvents, workflowDelivery } from "../src/cli.js";
+import { CircuitBudget, CircuitOpenError } from "../src/circuit-budget.js";
+import { withCircuitScope } from "../src/circuit-scope.js";
 import { SprintGitHub } from "../src/sprint.js";
 import { PlanningStore } from "../src/planning.js";
 import { loadSeatPersonas, type SeatPersona } from "../src/seat-persona.js";
@@ -324,4 +326,28 @@ describe("every CLI runtime/chat construction path", () => {
     expect(read).toHaveBeenCalledWith(context.goal.integration);
   });
 
+});
+
+
+it("bounds release merge-verification commands and propagates the circuit trip", async () => {
+  const store = new PlanningStore(checkout);
+  await writeFile(join(store.runtimeDir, "circuit-policy.json"), JSON.stringify({ maxInvocationMs: 20 }));
+  const runtime = new (fakeRuntime("codex"))("/project");
+  const read = vi.fn(async () => ({ status: "unavailable" as const, reason: "Not reached" }));
+  await createPlanningBridge(store, {} as PlanningChat, runtime, { release: { LocalReleaseActivationReader: class { read = read; } } });
+  let signal: AbortSignal | undefined;
+  vi.spyOn(processShell, "run").mockImplementation(async (_command, _args, _cwd, options) => {
+    signal = options?.signal;
+    if (!signal) throw new Error("Missing circuit signal");
+    return new Promise((_resolve, reject) => signal!.addEventListener("abort", () => reject(signal!.reason), { once: true }));
+  });
+  const adapter = fakes.adapters[0].release!;
+  const context: Parameters<typeof adapter.poll>[0] = { store, runtime, post: async () => "post", recordRun: async () => {}, recordSession: async () => {}, goal: {
+    id: "goal-release", teamId: "team-one", seatId: "seat-one", participantSeatIds: [], goal: "Goal", projectRefs: ["test/project"], stage: "approved", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    mattermost: { channelId: "home", rootPostId: "root" }, brief: { summary: "Goal", decisions: [], openQuestions: [] },
+    integration: { branch: "sprint/goal-release", baseSha: "a".repeat(40), status: "merged", prUrl: "https://github.com/test/project/pull/1", mergedSha: "a".repeat(40) },
+  } };
+  await expect(withCircuitScope(store.runtimeDir, "goal-release", "release", () => adapter.poll(context))).rejects.toBeInstanceOf(CircuitOpenError);
+  expect(signal?.aborted).toBe(true); expect(read).not.toHaveBeenCalled();
+  expect((await new CircuitBudget({ runtimeDir: store.runtimeDir, scopeId: "goal-release" }).status()).trip).toBeDefined();
 });

@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { main, parseOptions } from "../src/cli.js";
+import { main, parseOptions, withRuntimeSignal } from "../src/cli.js";
 import { CircuitBudget, CircuitOpenError } from "../src/circuit-budget.js";
 import { PlanningStore } from "../src/planning.js";
 import { WorkflowInbox } from "../src/remodel-events.js";
@@ -89,4 +89,32 @@ describe("operator budget controls", () => {
   it.each([["--goal", "missing"], ["--seat", "missing"]])("rejects unknown scope %j", async (...args) => {
     expect(await run("budget", args)).toBe(1);
   });
+});
+
+
+it.each(["host", "circuit"] as const)("preserves %s cancellation through the production runtime adapter", async (source) => {
+  const host = new AbortController(); const circuit = new AbortController();
+  let received: AbortSignal | undefined;
+  const wrapped = withRuntimeSignal({ message: async (_prompt, _schema, _session, options) => {
+    received = options?.signal;
+    return new Promise((_resolve, reject) => options?.signal?.addEventListener("abort", () => reject(new Error("stopped")), { once: true }));
+  } }, host.signal);
+  const rejected = expect(wrapped.message("fixture", "schema", undefined, { signal: circuit.signal })).rejects.toThrow("stopped");
+  (source === "host" ? host : circuit).abort();
+  await rejected; expect(received?.aborted).toBe(true);
+});
+
+
+it("delivers an actual circuit trip through the production host runtime adapter", async () => {
+  const host = new AbortController();
+  const ledger = new CircuitBudget({ runtimeDir: `${checkout}.runtime`, scopeId: "goal-adapter", policy: { maxInvocationTokens: 10 } });
+  let providerSignal: AbortSignal | undefined;
+  const runtime = withRuntimeSignal({ message: async (_prompt, _schema, _session, options) => {
+    providerSignal = options?.signal;
+    expect(options?.requireFinalUsage).toBe(true);
+    options?.onUsage?.({ inputTokens: 10, outputTokens: 1 });
+    return new Promise((_resolve, reject) => providerSignal?.addEventListener("abort", () => reject(providerSignal?.reason), { once: true }));
+  } }, host.signal);
+  await expect(ledger.protectRuntime(runtime, { phase: "vetting" }).message("fixture", "schema")).rejects.toBeInstanceOf(CircuitOpenError);
+  expect(providerSignal?.aborted).toBe(true); expect(host.signal.aborted).toBe(false);
 });

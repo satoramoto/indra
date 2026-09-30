@@ -1,6 +1,6 @@
 # Circuit breakers
 
-Indra accounts for each goal and each Product seat in its runtime directory. Model work, command execution, and automatic repair attempts share durable allowances across phases, lanes, process restarts, and retries. Accounting stays outside the state Git repository. A trip stops new work and cancels active work in that scope; ordinary retries cannot clear it.
+Indra accounts for each goal and each Product seat in its runtime directory. Model work, command execution, and automatic repair attempts share durable allowances across phases, lanes, process restarts, and retries. Accounting stays outside the state Git repository. Goal-owned project commands are bounded; shared state bookkeeping and status remain available so the host can record and display a failure. A trip stops new work and cancels active work in that scope; ordinary retries cannot clear it.
 
 Default limits:
 
@@ -14,7 +14,7 @@ Default limits:
 | Automatic repairs per scope | 10 |
 | Concurrent model invocations per scope | 4 |
 
-Token totals count input plus output. Cached input and reasoning output are already included in those totals and are not counted again. Live provider reports drive cancellation. Providers report asynchronously, so a call can exceed its allowance by work completed before the next report and during shutdown. Codex rollout files and Claude streams or headed transcripts supply live snapshots. Missing final usage, regressing counters, interrupted accounting, or abandoned reservations fail closed with conservative charges. Limits are bounds on admitted work and observed usage, not an exact provider billing cap.
+Token totals count input plus output. Cached input and reasoning output are already included in those totals and are not counted again. Live provider reports drive cancellation. Providers report asynchronously, so a call can exceed its allowance by work completed before the next report and during shutdown. Codex rollout files and Claude streams or headed transcripts supply live snapshots. An earlier complete-looking live snapshot is not a final receipt. Headed Codex waits for its `task_complete` receipt after the result file; headed Claude waits for an `end_turn` assistant message followed by `turn_duration`. These waits use the existing bounded deadline and keep the session visible. Missing terminal usage, regressing counters, interrupted accounting, or abandoned reservations fail closed with conservative charges. Claude child-agent or sidechain work is treated as unknown consumption because its main transcript does not prove an inclusive total. Limits are bounds on admitted work and observed usage, not an exact provider billing cap.
 
 Execution time is the sum of active invocation time. Concurrent lanes spend it concurrently. Waiting for external CI does not itself spend model tokens. Polling does not consume automatic repair counts. Replaying a cached, finished workflow result invokes no provider and consumes no retry. Repeating an actual model invocation consumes a retry, including when its head and input are unchanged.
 
