@@ -87,6 +87,19 @@ export class WorkflowInbox {
       }
     });
   }
+  /** UI-only completion must not reacquire a business activity lease merely to acknowledge it. */
+  async acknowledgeSchedulerIdle(consumer: string, teamId: string, input: WorkflowEvent): Promise<void> {
+    const event = validateWorkflowEvent(input); need(id(consumer) && id(teamId));
+    need(event.kind === "queue-changed" && event.id.startsWith("scheduler-idle:"));
+    if (event.teamId !== teamId) return;
+    await withFileLock(join(this.runtimeDir, `workflow-consumer-${consumer}.lock`), async () => {
+      const receipt = join(this.runtimeDir, `workflow-receipts-${consumer}.json`);
+      const handled = new Set<string>(JSON.parse(await readFile(receipt, "utf8").catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; return "[]"; })));
+      if (handled.has(event.id)) return;
+      handled.add(event.id); const tmp = `${receipt}.${process.pid}.tmp`;
+      await writeFile(tmp, JSON.stringify([...handled]), { mode: 0o600 }); await rename(tmp, receipt);
+    });
+  }
 }
 
 /** A signed GitHub delivery only wakes records in the repository from state. Services re-read GitHub proof. */
@@ -141,8 +154,20 @@ export function webhookHandler(store: PlanningStore, inbox: WorkflowInbox, secre
   };
 }
 
+export interface WorkflowConsumer {
+  consumer: string;
+  turn(event: WorkflowEvent): Promise<WorkflowEvent[]>;
+}
 export interface WorkflowHostOptions {
   store: PlanningStore; teamId: string; consumer: string; turn(event: WorkflowEvent): Promise<void>; signal?: AbortSignal;
+  /** Scheduler-only slow consumers. Each owns a receipt; their work never blocks the primary dispatch consumer. */
+  consumers?(): Promise<WorkflowConsumer[]>;
+  /** Holds the host's update-safe-point lease while any turn is active, without serializing its consumers. */
+  activity?(run: () => Promise<void>): Promise<void>;
+  /** Runs after the activity lease is released; identity binds actual completed consumer/event pairs. */
+  onIdle?(identity: string): Promise<void>;
+  /** The Scheduler idle hint is UI-only. Business consumers receipt it without running work. */
+  includeSchedulerIdle?: boolean;
   /** Only the bridge owns external ingress. The secret is read from 1Password into memory by cli.ts. */
   mattermost?: { server: string; token: string; channelId: string };
   github?: { port: number; secret: string };
@@ -155,14 +180,91 @@ export async function runWorkflowHost(options: WorkflowHostOptions): Promise<voi
   await mkdir(inbox.directory, { recursive: true, mode: 0o700 });
   const watchers: FSWatcher[] = []; let socket: WebSocket | undefined; let authenticated = Promise.resolve();
   const server = options.github ? createServer(webhookHandler(store, inbox, options.github.secret)) : undefined;
-  let queue = Promise.resolve(); let fail!: (error: Error) => void; let finish!: () => void;
+  let fail!: (error: Error) => void; let finish!: () => void; let stopping = false; let enabled = false;
   const ended = new Promise<void>((resolve, reject) => { finish = resolve; fail = reject; });
-  void ended.catch(() => {}); // A socket can fail while the finite startup turn is still finishing.
-  const drain = () => { queue = queue.then(() => inbox.drain(consumer, teamId, options.turn)); void queue.catch(() => fail(new Error("Workflow event processing failed; restart to reconcile the retained delivery."))); };
-  const wake = async (source: string, value: unknown) => { await inbox.publish({ kind: "queue-changed", id: `${source}:${teamId}:${workflowDigest(value)}`, teamId, at: "1970-01-01T00:00:00.000Z" }); };
-  const abort = () => finish(); options.signal?.addEventListener("abort", abort, { once: true });
+  void ended.catch(() => {});
+  type Task = { dirty: boolean; first: boolean; run(startup: boolean): Promise<void>; running?: Promise<void> };
+  const tasks = new Map<string, Task>(); let active: Promise<void> | undefined; let completed = new Set<string>();
+  const receipts = new Set<Promise<void>>();
+  let wakeActivity: (() => void) | undefined;
+  let ready!: () => void; const started = new Promise<void>((resolve) => { ready = resolve; });
+  const startup = (): WorkflowEvent => ({ kind: "startup", teamId, at: new Date().toISOString() });
+  const notify = () => { wakeActivity?.(); wakeActivity = undefined; };
+  const pump = () => {
+    if (active || stopping) return;
+    completed = new Set<string>();
+    const run = async () => {
+      while (true) {
+        // Arm before starting turns, so a new event can wake the pool while another consumer is deferred.
+        const changed = new Promise<void>((resolve) => { wakeActivity = resolve; });
+        for (const task of tasks.values()) {
+          if (stopping || !task.dirty || task.running) continue;
+          task.dirty = false; const first = task.first; task.first = false;
+          task.running = Promise.resolve().then(() => task.run(first)).catch(() => {
+            stopping = true; fail(new Error("Workflow event processing failed; restart to reconcile the retained delivery."));
+          }).finally(() => { task.running = undefined; notify(); });
+        }
+        if (![...tasks.values()].some((task) => task.running || (!stopping && task.dirty))) break;
+        await changed;
+      }
+    };
+    active = Promise.resolve().then(() => options.activity ? options.activity(run) : run()).then(async () => {
+      if (completed.size) await options.onIdle?.(workflowDigest([...completed].sort()));
+    }).catch(() => {
+      stopping = true; fail(new Error("Workflow activity ownership failed; restart to reconcile retained events."));
+    }).finally(() => { active = undefined; if (!stopping && [...tasks.values()].some((task) => task.dirty)) pump(); });
+  };
+  const deliver = async (key: string, event: WorkflowEvent, turn: (event: WorkflowEvent) => Promise<void>) => {
+    if (!options.includeSchedulerIdle && event.kind === "queue-changed" && event.id.startsWith("scheduler-idle:")) return;
+    await turn(event);
+    completed.add(`${key}:${event.kind === "startup" ? `startup:${event.at}` : event.id}`);
+  };
+  const refreshConsumers = async () => {
+    for (const entry of await options.consumers?.() ?? []) {
+      need(id(entry.consumer) && entry.consumer !== consumer);
+      if (!tasks.has(entry.consumer)) tasks.set(entry.consumer, { dirty: true, first: true, run: async (first) => {
+        // Resolve the public service anew, never retain an agent context between turns.
+        const turn = async (event: WorkflowEvent) => {
+          await deliver(entry.consumer, event, async (event) => {
+            const current = (await options.consumers!()).find((item) => item.consumer === entry.consumer);
+            if (current) for (const next of await current.turn(event)) await inbox.publish(next);
+          });
+        };
+        if (first) await turn(startup());
+        await inbox.drain(entry.consumer, teamId, turn);
+      } });
+    }
+    notify();
+  };
+  tasks.set(consumer, { dirty: false, first: true, run: async (first) => {
+    const turn = async (event: WorkflowEvent) => await deliver(consumer, event, async (event) => { await options.turn(event); await refreshConsumers(); });
+    if (first) await turn(startup());
+    await inbox.drain(consumer, teamId, turn);
+    if (first) { await options.onReady?.(); ready(); }
+  } });
+  const drain = () => {
+    if (stopping) return;
+    for (const task of tasks.values()) task.dirty = true;
+    notify(); if (enabled) pump();
+  };
+  const wake = async (source: string, value: unknown) => {
+    await inbox.publish({ kind: "queue-changed", id: `${source}:${teamId}:${workflowDigest(value)}`, teamId, at: "1970-01-01T00:00:00.000Z" });
+    // The receiver already knows this delivery exists. File notifications still carry other-process deliveries.
+    drain();
+  };
+  const abort = () => { stopping = true; notify(); finish(); }; options.signal?.addEventListener("abort", abort, { once: true });
   try {
-    watchers.push(watch(inbox.directory, (_event, name) => { if (name?.toString().endsWith(".json")) drain(); }));
+    watchers.push(watch(inbox.directory, (_event, name) => {
+      if (!name?.toString().endsWith(".json")) return;
+      const delivery = (async () => {
+        const bytes = await readFile(join(inbox.directory, name.toString()), "utf8"); need(bytes.length < 1_000_000);
+        const event = validateWorkflowEvent(JSON.parse(bytes));
+        if (!options.includeSchedulerIdle && event.kind === "queue-changed" && event.id.startsWith("scheduler-idle:")) {
+          await Promise.all([...tasks.keys()].map((key) => inbox.acknowledgeSchedulerIdle(key, teamId, event)));
+        } else drain();
+      })().catch(() => fail(new Error("Workflow inbox notification could not be verified."))).finally(() => { receipts.delete(delivery); });
+      receipts.add(delivery);
+    }));
     if (options.mattermost) {
       watchers.push(watch(store.checkout, (_event, name) => { if (name?.toString() === "state.json") void readFile(join(store.checkout, "state.json"), "utf8").then((bytes) => wake("state", bytes)).catch(() => fail(new Error("Workflow state delivery failed."))); }));
       // Readiness/update receipts have a distinct watch from the Scheduler's own runtime journals.
@@ -186,18 +288,19 @@ export async function runWorkflowHost(options: WorkflowHostOptions): Promise<voi
         } catch { fail(new Error("Unreadable Mattermost event.")); }
       });
       socket.addEventListener("error", () => fail(new Error("Mattermost WebSocket unavailable; restore connectivity and restart the event host.")));
-      socket.addEventListener("close", () => { if (!options.signal?.aborted) fail(new Error("Mattermost WebSocket disconnected; restart to reconcile current reactions and posts.")); });
+      socket.addEventListener("close", () => { if (!stopping) fail(new Error("Mattermost WebSocket disconnected; restart to reconcile current reactions and posts.")); });
     }
     if (server) await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(options.github!.port, "127.0.0.1", resolve); });
     await Promise.race([authenticated, ended]);
     if (options.signal?.aborted) return;
-    await options.turn({ kind: "startup", teamId, at: new Date().toISOString() });
-    await inbox.drain(consumer, teamId, options.turn); await options.onReady?.();
+    enabled = true; drain(); await Promise.race([started, ended]);
     if (options.signal?.aborted) finish();
     await ended;
   } finally {
+    stopping = true; notify();
     options.signal?.removeEventListener("abort", abort); watchers.forEach((watcher) => watcher.close()); socket?.close();
     if (server) await new Promise<void>((resolve) => server.close(() => resolve()));
-    await queue.catch(() => {});
+    await active;
+    await Promise.all(receipts);
   }
 }

@@ -23,6 +23,8 @@ import { captureOpEnvironment, opRead } from "./op-env.js";
 import { WorkflowInbox, runWorkflowHost, workflowDigest } from "./remodel-events.js";
 import { productRuntimeFilename, validateProductProposal, type GoalReport, type ProductRuntimeRecord, type WorkflowEvent } from "./goal-contract.js";
 import { DeveloperSeat, loadDeveloperSeat, processShell } from "./developer-seat.js";
+import { shellWithEnv } from "./command-shell.js";
+import { withSeatGit } from "./seat-git.js";
 import { DEVELOPER_SESSION_TIMEOUT_MS, type AgentRuntime, type WriteAccess } from "./codex-runtime.js";
 import { loadSeatEngines, SeatRuntime } from "./seat-runtime.js";
 import { seatHarnessDir } from "./harness-home.js";
@@ -38,10 +40,9 @@ import { readFile, rm, writeFile, mkdir } from "node:fs/promises";
 import type { UiView } from "./terminal-ui.js";
 import { LocalSessionReader } from "./session-snapshot.js";
 import { CliGoalStarter, Supervisor } from "./supervisor.js";
-import { TmuxPaneTail } from "./pane-tail.js";
-import { attachTmux, parseOwnedTmuxTarget } from "./tmux-attach.js";
-import { verifyOwnedSession } from "./tmux-attach-owned.js";
+import { TmuxSeatSession } from "./session-mirror.js";
 import { headedMarkerFile, useHeadedMarker } from "./headed-session.js";
+import { ownedProcesses } from "./process-tree.js";
 import { LiveUsageReader } from "./live-usage.js";
 import { LocalTranscriptSource, TranscriptLocator } from "./session-transcript.js";
 import { checkConsistency, printConsistency, type TeamMemberReader } from "./consistency.js";
@@ -93,6 +94,17 @@ export async function createPlanningBridge(store: PlanningStore, chat: PlanningC
 }
 
 /** The Developer lane can land before or after the Scheduler without an unsafe legacy fallback. */
+/** An absent source preserves the historical UI lifecycle; an enabled source owns all host lifetimes. */
+export function uiWorkflowEvents(store: PlanningStore, teamIds: string[]): ((onEvent: (event: WorkflowEvent) => Promise<void>, signal: AbortSignal) => Promise<void>) | undefined {
+  if (!teamIds.length) return undefined;
+  return async (onEvent, signal) => {
+    const controller = new AbortController(); const abort = () => controller.abort();
+    signal.addEventListener("abort", abort, { once: true }); if (signal.aborted) abort();
+    const hosts = teamIds.map((teamId) => runWorkflowHost({ store, teamId, consumer: `ui-${teamId}`, signal: controller.signal, turn: onEvent, includeSchedulerIdle: true }));
+    try { await Promise.all(hosts); } finally { abort(); signal.removeEventListener("abort", abort); await Promise.allSettled(hosts); }
+  };
+}
+
 export async function developerEventTurn(runner: object, event: WorkflowEvent): Promise<{ events: WorkflowEvent[]; report: GoalReport | null }> {
   const finite = runner as { turn?: (event: WorkflowEvent) => Promise<{ events: WorkflowEvent[]; report: GoalReport | null }> };
   if (typeof finite.turn !== "function") throw new Error("The goals-v1 Developer service is unavailable in this build. Install the Developer lane before starting this seat.");
@@ -225,7 +237,7 @@ const isGoalAction = (action: string | undefined): action is GoalAction => (GOAL
 /** All model and posting paths use the seat from state, local engine selection and optional Indra profiles. */
 async function seatServices(store: PlanningStore, username: string, seatId?: string) {
   const state = await store.read();
-  const teams = state.teams as { slug: string; seats: { id: string; roles?: string[]; externalIdentities: { mattermost: { username: string } } }[] }[];
+  const teams = state.teams as { slug: string; seats: { id: string; displayName: string; roles?: string[]; externalIdentities: { mattermost: { username: string } } }[] }[];
   const seats = teams.flatMap((team) => team.seats);
   const candidates = seatId === undefined ? teams.find((team) => team.slug === "yahaha")?.seats ?? [] : seats.filter((item) => item.id === seatId);
   const seat = candidates.find((item) => item.externalIdentities.mattermost.username === username);
@@ -236,7 +248,7 @@ async function seatServices(store: PlanningStore, username: string, seatId?: str
   const engine = Object.hasOwn(engines, seat.id) ? engines[seat.id] : "codex";
   return {
     chat: (token: string) => withPersonaChat(new MattermostPlanningChat(token, username), profile),
-    runtime: (cwd: string, timeoutMs?: number, write?: WriteAccess) => withPersonaRuntime(new SeatRuntime(engine, cwd, timeoutMs, write, undefined, seatHarnessDir(store.runtimeDir, seat.id), seat.roles), profile),
+    runtime: (cwd: string, timeoutMs?: number, write?: WriteAccess) => withPersonaRuntime(new SeatRuntime(engine, cwd, timeoutMs, write, undefined, seatHarnessDir(store.runtimeDir, seat.id), seat.roles, (env) => withSeatGit(env, { displayName: seat.displayName, username })), profile),
   };
 }
 
@@ -321,6 +333,8 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
     if (options.mode === "seat") {
       recordRunningBuild(`${options.checkout}.runtime`, import.meta.url);
       if (options.readyNonce) useHeadedMarker(headedMarkerFile(options.checkout, options.readyNonce));
+      // A hosted runner records the engine process trees it starts and ends them when its pane or process is stopped.
+      if (options.readyNonce) ownedProcesses.useRecord(`${options.checkout}.runtime`);
       try {
         const store = createPlanningStore(options.checkout);
         const product = await loadProductSeat(store, options.seatId);
@@ -351,7 +365,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
         const services = await seatServices(store, seat.username, seat.id);
         const chat = services.chat(await hostedToken(options.checkout, options.readyNonce, (tokenOptions) => readBotToken(seat.username, tokenOptions)));
         await joinTeamHome(options.checkout, options.readyNonce, store, chat, seat.username);
-        const runner = new DeveloperSeat(store, seat, chat, processShell, (cwd, write) => services.runtime(cwd, DEVELOPER_SESSION_TIMEOUT_MS, write), (line) => console.log(`[${new Date().toISOString()}] ${line}`));
+        const runner = new DeveloperSeat(store, seat, chat, shellWithEnv((env) => withSeatGit(env, seat)), (cwd, write) => services.runtime(cwd, DEVELOPER_SESSION_TIMEOUT_MS, write), (line) => console.log(`[${new Date().toISOString()}] ${line}`));
         console.log(`Developer seat ${seat.id} (@${seat.username}) running. Stop with Ctrl-C.`);
         const team = ((await store.read()).teams as WorkflowTeam[]).find((team) => team.seats.some((item) => item.id === seat.id));
         if (team?.workflowModel === "goals-v1") {
@@ -360,7 +374,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
             onReady: async () => { if (options.readyNonce) await signalReady(options.checkout, options.readyNonce); },
             turn: async (event) => {
               if ("goalId" in event && event.goalId && !(await store.read()).planningGoals?.some((goal) => goal.id === event.goalId && goal.goalAssignment?.seatId === seat.id && !goal.ceremony?.closure)) return;
-              const fresh = new DeveloperSeat(store, seat, chat, processShell, (cwd, write) => services.runtime(cwd, DEVELOPER_SESSION_TIMEOUT_MS, write), (line) => console.log(`[${new Date().toISOString()}] ${line}`));
+              const fresh = new DeveloperSeat(store, seat, chat, shellWithEnv((env) => withSeatGit(env, seat)), (cwd, write) => services.runtime(cwd, DEVELOPER_SESSION_TIMEOUT_MS, write), (line) => console.log(`[${new Date().toISOString()}] ${line}`));
               const result = await withFileLock(turnLockFile(options.checkout, { kind: "seat", seatId: seat.id }), () => developerEventTurn(fresh, event), 24 * 60 * 60_000);
               for (const next of result.events) await inbox.publish(next);
               if (result.report) await inbox.publish({ kind: "developer-report", id: `report:${workflowDigest(result.report)}`, teamId: team.id, goalId: result.report.goalId, seatId: seat.id, report: result.report, at: new Date().toISOString() });
@@ -405,14 +419,9 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       const uiOptions = {
         processes: new Supervisor(options.checkout, undefined, undefined, undefined, store, (force) => stageServiceToken(options.checkout, { force })),
         goals: new CliGoalStarter(options.checkout),
-        paneTail: new TmuxPaneTail(options.checkout),
-        // Watching a seat sets up keys, scrolling and the status line only on this checkout's verified sessions.
-        // Driving leaves the pane's input on, only for a verified session with a headed run going.
-        attach: (target, mode) => attachTmux(target, undefined, (socket, session) => verifyOwnedSession(options.checkout, socket, session), mode),
-        driveCheck: async (target) => {
-          const { socket, session } = parseOwnedTmuxTarget(target);
-          return (await verifyOwnedSession(options.checkout, socket, session))?.headed === true;
-        },
+        // The seat's live session is mirrored inside the UI from this checkout's verified panes only; driving switches
+        // a pane's input on only for a verified session with a headed run going, and only while its pane is focused.
+        session: new TmuxSeatSession(options.checkout),
         liveUsage: new LiveUsageReader(options.checkout),
         transcript: new LocalTranscriptSource(new TranscriptLocator(options.checkout)),
         launchCheck: () => checkLaunch(options.checkout, new SystemTmux(), new TmuxHost(options.checkout).socket),
@@ -428,13 +437,9 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
           rollback: () => updater.rollback(),
           rolledBack: () => updater.rolledBack(),
         },
+        updateMs: 5_000,
         view,
-        workflowEvents: workflowTeams.length ? async (onEvent: (event: WorkflowEvent) => Promise<void>, signal: AbortSignal) => {
-          const controller = new AbortController(); const abort = () => controller.abort();
-          signal.addEventListener("abort", abort, { once: true }); if (signal.aborted) abort();
-          const hosts = workflowTeams.map((team) => runWorkflowHost({ store, teamId: team.id, consumer: `ui-${team.id}`, signal: controller.signal, turn: onEvent }));
-          try { await Promise.all(hosts); } finally { abort(); signal.removeEventListener("abort", abort); await Promise.allSettled(hosts); }
-        } : undefined,
+        workflowEvents: uiWorkflowEvents(store, workflowTeams.map((team) => team.id)),
         reload: async (current: UiView) => {
           // Best effort: without the saved view the reloaded UI opens on its default page.
           await mkdir(dirname(viewFile), { recursive: true, mode: 0o700 }).then(() => writeFile(viewFile, JSON.stringify(current), { mode: 0o600 })).catch(() => undefined);
@@ -521,6 +526,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       }
       recordRunningBuild(`${options.checkout}.runtime`, import.meta.url);
       if (options.readyNonce) useHeadedMarker(headedMarkerFile(options.checkout, options.readyNonce));
+      if (options.readyNonce) ownedProcesses.useRecord(`${options.checkout}.runtime`);
       const token = await hostedToken(options.checkout, options.readyNonce, readChickToken);
       const chat = services.chat(token);
       await joinTeamHome(options.checkout, options.readyNonce, store, chat, CHICK_USERNAME);
@@ -529,12 +535,16 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       if (team) {
         const home = requireTeamHome(state, team.id); const github = await workflowDelivery(store);
         const inbox = new WorkflowInbox(store.runtimeDir); const signals = hostSignals();
+        const bounded = (runtime: AgentRuntime): AgentRuntime => ({ message: (prompt, schema, sessionId, messageOptions) => runtime.message(prompt, schema, sessionId, { ...messageOptions, signal: signals.signal }) });
+        const freshBridge = () => createPlanningBridge(store, chat, bounded(services.runtime(process.cwd())), ceremonyModules, (cwd: string, write?: WriteAccess) => bounded(services.runtime(cwd, undefined, write)));
         try { await runWorkflowHost({ store, teamId: team.id, consumer: `scheduler-${team.id}`, signal: signals.signal,
           mattermost: { server: SERVER, token, channelId: home.channelId }, github,
           onReady: async () => { if (options.readyNonce) await signalReady(options.checkout, options.readyNonce); },
+          activity: async (run) => await withFileLock(turnLockFile(options.checkout, { kind: "bridge" }), run, 24 * 60 * 60_000),
+          onIdle: async (identity) => await inbox.publish({ kind: "queue-changed", id: `scheduler-idle:${team.id}:${identity}`, teamId: team.id, at: "1970-01-01T00:00:00.000Z" }),
+          consumers: async () => await (await freshBridge()).consumers(team.id),
           turn: async (event) => {
-            const fresh = await createPlanningBridge(store, chat, services.runtime(process.cwd()), ceremonyModules, (cwd, write) => services.runtime(cwd, undefined, write));
-            const result = await withFileLock(turnLockFile(options.checkout, { kind: "bridge" }), () => fresh.turn(event), 24 * 60 * 60_000);
+            const result = await (await freshBridge()).dispatch(event);
             for (const next of result.events) await inbox.publish(next);
             if (result.record.failure) console.log(result.record.failure.message);
           },

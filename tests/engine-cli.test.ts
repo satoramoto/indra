@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentRuntime, MessageOptions, WriteAccess } from "../src/codex-runtime.js";
 import type { CeremonyAdapters, PlanningChat } from "../src/planning-bridge.js";
 import { processShell, type RuntimeFactory } from "../src/developer-seat.js";
-import { createPlanningBridge, createPlanningStore, developerEventTurn, main, workflowDelivery } from "../src/cli.js";
+import { createPlanningBridge, createPlanningStore, developerEventTurn, main, uiWorkflowEvents, workflowDelivery } from "../src/cli.js";
 import { SprintGitHub } from "../src/sprint.js";
 import { PlanningStore } from "../src/planning.js";
 import { loadSeatPersonas, type SeatPersona } from "../src/seat-persona.js";
@@ -69,7 +69,8 @@ vi.mock("../src/planning-bridge.js", () => ({
     async merge() { await this.exercise("merge"); return "Merged"; }
     async rollback() { await this.exercise("rollback"); return "Reverted"; }
     async poll() { await this.exercise("serve"); throw new Error("End fake server loop"); }
-    async turn(event: WorkflowEvent) { fakes.actions.push(`scheduler-${event.kind}`); return { record: { failure: null }, events: [] }; }
+    async dispatch(event: WorkflowEvent) { fakes.actions.push(`scheduler-${event.kind}`); return { record: { failure: null }, events: [] }; }
+    async consumers() { return []; }
   },
 }));
 vi.mock("../src/developer-seat.js", async (original) => ({
@@ -104,6 +105,20 @@ const configure = (value: unknown) => writeFile(join(`${checkout}.runtime`, "sea
 const planning = (action: string) => main(["planning", action, ...(action === "serve" ? [] : ["--goal", "goal-1"]), "--state", checkout]);
 
 describe("goals-v1 production event wiring", () => {
+  it("omits event ingress for an entirely historical UI and joins every enabled host on abort", async () => {
+    const store = new PlanningStore(checkout); const onEvent = vi.fn(async () => {});
+    expect(uiWorkflowEvents(store, [])).toBeUndefined(); expect(fakes.hosts).toEqual([]);
+    const stopped: string[] = [];
+    vi.mocked(runWorkflowHost).mockImplementationOnce(async (options) => {
+      fakes.hosts.push(options); await new Promise<void>((done) => options.signal!.addEventListener("abort", () => { stopped.push(options.teamId); done(); }, { once: true }));
+    }).mockImplementationOnce(async (options) => {
+      fakes.hosts.push(options); await new Promise<void>((done) => options.signal!.addEventListener("abort", () => { stopped.push(options.teamId); done(); }, { once: true }));
+    });
+    const controller = new AbortController(); let ended = false;
+    const run = uiWorkflowEvents(store, ["team-001", "team-other"])!(onEvent, controller.signal).then(() => { ended = true; });
+    expect(fakes.hosts.map((host) => host.consumer)).toEqual(["ui-team-001", "ui-team-other"]); expect(ended).toBe(false);
+    controller.abort(); await run; expect(stopped).toEqual(["team-001", "team-other"]); expect(ended).toBe(true);
+  });
   it("uses the finite Developer capability and fails honestly when that lane is unavailable", async () => {
     const event: WorkflowEvent = { kind: "startup", teamId: "team-001", at: "2026-09-01T00:00:00Z" };
     const tick = vi.fn(async () => "idle"); await expect(developerEventTurn({ tick }, event)).rejects.toThrow("unavailable"); expect(tick).not.toHaveBeenCalled();
@@ -127,6 +142,7 @@ describe("goals-v1 production event wiring", () => {
     expect(fakes.actions).toEqual(["scheduler-startup"]);
     expect(fakes.hosts).toHaveLength(1);
     expect(fakes.hosts[0]).toMatchObject({ teamId: "team-001", consumer: "scheduler-team-001", mattermost: { channelId: "home", token: "test-bot-token" }, github: { port: 9781, secret: "fixture-webhook-secret" } });
+    expect(fakes.hosts[0].consumers).toBeTypeOf("function"); expect(fakes.hosts[0].activity).toBeTypeOf("function");
     expect(fakes.calls).toEqual([]);
     expect(runWorkflowHost).toHaveBeenCalled();
   });

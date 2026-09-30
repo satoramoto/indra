@@ -3,7 +3,7 @@ import { seatRecordName } from "./developer-maintenance.js";
 import { implementationFactsName, type ImplementationFacts } from "./implementation-facts.js";
 import { CLAUDE_MODEL, DEVELOPER_CLAUDE_EFFORT, PRODUCT_CLAUDE_EFFORT, TEAM_LEAD_CLAUDE_EFFORT } from "./claude-runtime.js";
 import { DEVELOPER_CODEX_MODEL, DEVELOPER_CODEX_REASONING_EFFORT, PRODUCT_CODEX_MODEL, PRODUCT_CODEX_REASONING_EFFORT, TEAM_LEAD_CODEX_MODEL, TEAM_LEAD_CODEX_REASONING_EFFORT } from "./harness-home.js";
-import { parseUsage, sumUsage, type CiState, type SeatStep } from "./hub-format.js";
+import { parseUsage, sumUsage, totalTokens, type CiState, type SeatStep } from "./hub-format.js";
 import type { RuntimeEngine, TokenUsage } from "./runtime-facts.js";
 
 /** Which harness a seat runs, with the model and effort its roles get (see codexConfigForRoles and claudeModelArgs). */
@@ -35,6 +35,8 @@ export interface AssignmentFacts {
   /** When the newest attempt was claimed, and when it ended if it has. */
   claimedAt?: string;
   endedAt?: string;
+  /** Each recorded session's tokens at the time it finished, for the seat's burn sparkline. */
+  burn?: { at: string; tokens: number }[];
 }
 
 export interface RuntimeFileReader { readRuntimeFile<T>(name: string): Promise<T | undefined> }
@@ -63,6 +65,10 @@ export function assignmentFacts(record: SeatTaskRecord | undefined, ledger: Impl
   const latestEvents = latest && Array.isArray(latest.events) ? latest.events : [];
   const ci = [...latestEvents].reverse().find((event) => event.kind === "ci" || (event.kind === "merge" && event.result === "passed"));
   const step = record && STEPS.includes(record.step) ? record.step : undefined;
+  const burn = (sessions.length ? sessions.map((event) => event.session!) : record?.sessions ?? []).flatMap((session) => {
+    const tokens = totalTokens(parseUsage(session.usage));
+    return tokens && typeof session.finishedAt === "string" && Number.isFinite(Date.parse(session.finishedAt)) ? [{ at: session.finishedAt, tokens }] : [];
+  });
   const sessionIds = [...new Set([...sessions.map((event) => event.session?.sessionId), ...(record?.sessions ?? []).map((session) => session.sessionId)]
     .filter((id): id is string => typeof id === "string" && !!id))];
   return {
@@ -75,5 +81,6 @@ export function assignmentFacts(record: SeatTaskRecord | undefined, ledger: Impl
     ...(sessions.at(-1)?.session?.engine ? { engine: sessions.at(-1)!.session!.engine } : {}),
     ...(latest?.claimedAt ? { claimedAt: latest.claimedAt } : {}),
     ...(latest?.terminal?.at ? { endedAt: latest.terminal.at } : {}),
+    ...(burn.length ? { burn } : {}),
   };
 }

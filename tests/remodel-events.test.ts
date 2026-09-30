@@ -9,8 +9,16 @@ import { githubEvents, runWorkflowHost, validateWorkflowEvent, verifyWebhook, we
 import type { PlanningStore } from "../src/planning.js";
 import type { WorkflowEvent } from "../src/goal-contract.js";
 
+const fileNotifications = vi.hoisted(() => ({ suppressed: false }));
+vi.mock("node:fs", async (importOriginal) => {
+  const original = await importOriginal<typeof import("node:fs")>();
+  return { ...original, watch: (path: string, listener: (event: string, name: string | null) => void) => original.watch(path, (event, name) => {
+    if (!fileNotifications.suppressed) listener(event, name);
+  }) };
+});
+
 const roots: string[] = [];
-afterEach(async () => { await Promise.all(roots.splice(0).map((path) => rm(path, { recursive: true, force: true }))); vi.unstubAllGlobals(); });
+afterEach(async () => { await Promise.all(roots.splice(0).map((path) => rm(path, { recursive: true, force: true }))); vi.unstubAllGlobals(); fileNotifications.suppressed = false; });
 const at = "2026-09-01T00:00:00.000Z";
 const sha = "a".repeat(40);
 const url = "https://github.com/test/project/pull/7";
@@ -70,8 +78,47 @@ describe("immutable delivery and restart receipts", () => {
     expect(seen).toEqual(["startup", "queue-changed"]);
     const restarted = vi.fn(async () => {}); await new WorkflowInbox(root).drain("consumer-one", "team-one", restarted); expect(restarted).not.toHaveBeenCalled();
   });
-  it("authenticates the Mattermost socket and turns only home-channel notifications into GET-reconciliation hints", async () => {
+  it("delivers a durable UI-only idle hint after the activity lease releases and then settles receipt-only", async () => {
+    const root = await directory(); const inbox = new WorkflowInbox(root); const controller = new AbortController();
+    const deferred = () => { let resolve!: () => void; const promise = new Promise<void>((done) => { resolve = done; }); return { promise, resolve }; };
+    const slowStarted = deferred(); const release = deferred(); const idleSeen = deferred(); const receiptOnly = deferred(); const uiReady = deferred();
+    let leased = false; let activities = 0; let idleEvent: WorkflowEvent | undefined;
+    const acknowledged = new Set<string>();
+    const acknowledge = WorkflowInbox.prototype.acknowledgeSchedulerIdle;
+    const receiptObservation = vi.spyOn(WorkflowInbox.prototype, "acknowledgeSchedulerIdle").mockImplementation(async function (this: WorkflowInbox, consumer, teamId, event) {
+      await acknowledge.call(this, consumer, teamId, event);
+      acknowledged.add(consumer); if (acknowledged.size === 2) receiptOnly.resolve();
+    });
+    const primary = vi.fn(async () => {}); const slow = vi.fn(async (event: WorkflowEvent): Promise<WorkflowEvent[]> => { if (event.kind === "startup") { slowStarted.resolve(); await release.promise; } return []; });
+    const onIdle = vi.fn(async (identity: string) => {
+      expect(leased).toBe(false);
+      idleEvent = { kind: "queue-changed", id: `scheduler-idle:team-one:${identity}`, teamId: "team-one", at: "1970-01-01T00:00:00.000Z" };
+      await inbox.publish(idleEvent);
+    });
+    const ui = runWorkflowHost({ store: store(root), teamId: "team-one", consumer: "ui-team-one", signal: controller.signal, includeSchedulerIdle: true,
+      onReady: async () => uiReady.resolve(), turn: async (event) => { if (event.kind === "queue-changed" && event.id.startsWith("scheduler-idle:")) { expect(leased).toBe(false); idleSeen.resolve(); } },
+    });
+    await uiReady.promise;
+    const business = runWorkflowHost({ store: store(root), teamId: "team-one", consumer: "scheduler-team-one", signal: controller.signal, turn: primary,
+      consumers: async () => [{ consumer: "release-goal-one", turn: slow }], onIdle,
+      activity: async (run) => { activities++; leased = true; try { await run(); } finally { leased = false; } },
+    });
+    try {
+      await slowStarted.promise; expect(onIdle).not.toHaveBeenCalled(); expect(leased).toBe(true);
+      release.resolve(); await idleSeen.promise; await receiptOnly.promise;
+      expect(onIdle).toHaveBeenCalledTimes(1); expect(primary).toHaveBeenCalledTimes(1); expect(slow).toHaveBeenCalledTimes(1);
+      expect(activities).toBe(1);
+      expect(idleEvent!.kind === "queue-changed" && idleEvent!.id).toMatch(/^scheduler-idle:team-one:[a-f0-9]{64}$/);
+      await inbox.publish(idleEvent!);
+      const rerun = vi.fn(async () => {});
+      await new WorkflowInbox(root).drain("scheduler-team-one", "team-one", rerun);
+      await new WorkflowInbox(root).drain("release-goal-one", "team-one", rerun);
+      expect(rerun).not.toHaveBeenCalled(); expect(onIdle).toHaveBeenCalledTimes(1);
+    } finally { controller.abort(); release.resolve(); await Promise.allSettled([business, ui]); receiptObservation.mockRestore(); }
+  });
+  it.each([false, true])("authenticates the Mattermost socket and durably dispatches only home notifications (missed file notification: %s)", async (missedNotification) => {
     const root = await directory(); const controller = new AbortController(); let socket!: FakeSocket;
+    fileNotifications.suppressed = missedNotification;
     const frames: unknown[] = [];
     class FakeSocket extends EventTarget {
       closed = false;
@@ -84,12 +131,23 @@ describe("immutable delivery and restart receipts", () => {
     let received!: () => void; const delivery = new Promise<void>((resolve) => { received = resolve; }); const events: WorkflowEvent[] = [];
     const host = runWorkflowHost({ store: store(root), teamId: "team-one", consumer: "bridge-one", signal: controller.signal, mattermost: { server: "https://mattermost.example", token: "fixture-token", channelId: "home" },
       onReady: async () => { socket.frame({ event: "reaction_added", broadcast: { channel_id: "elsewhere" } }); socket.frame({ event: "reaction_added", broadcast: { channel_id: "home" }, data: { reaction: "untrusted" } }); },
-      turn: async (event) => { events.push(event); if (event.kind !== "startup") received(); },
+      turn: async (event) => {
+        events.push(event);
+        if (event.kind !== "startup") {
+          const directory = join(root, "workflow-events");
+          const retained = await Promise.all((await readdir(directory)).filter((name) => name.endsWith(".json")).map(async (name) => JSON.parse(await readFile(join(directory, name), "utf8"))));
+          expect(retained).toContainEqual(event); received();
+        }
+      },
     });
-    await delivery; controller.abort(); await host;
+    const deadline = setTimeout(() => controller.abort(), 4_000);
+    try {
+      await Promise.race([delivery, host.then(() => { throw new Error("Mattermost host ended before delivering the authenticated notification."); })]);
+    } finally { clearTimeout(deadline); controller.abort(); await host; }
     expect(frames).toEqual([{ seq: 1, action: "authentication_challenge", data: { token: "fixture-token" } }]);
     expect(events.map((event) => event.kind)).toEqual(["startup", "queue-changed"]);
     expect(JSON.stringify(events)).not.toContain("fixture-token"); expect(JSON.stringify(events)).not.toContain("untrusted"); expect(socket.closed).toBe(true);
+    const duplicate = vi.fn(async () => {}); await new WorkflowInbox(root).drain("bridge-one", "team-one", duplicate); expect(duplicate).not.toHaveBeenCalled();
   });
 });
 

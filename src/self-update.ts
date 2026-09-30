@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process";
 import { childEnv } from "./op-env.js";
 import { randomUUID } from "node:crypto";
-import { access, lstat, mkdir, readdir, readFile, readlink, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { readBuildStamp, readStampIn, type BuildStamp } from "./build-stamp.js";
 import { buildsInUse, confirmApplicationReady } from "./running-build.js";
@@ -15,7 +16,7 @@ export { IN_USE, processStart, recordRunningBuild, type RunningBuildReceipt } fr
  * says what is waiting.
  */
 export type UpdateOutcome = "up-to-date" | "built" | "blocked" | "failed" | "paused";
-export interface UpdateResult { outcome: UpdateOutcome; message: string; at: string; /** `npm ci` failed: node_modules may be broken, so nothing is restarted until an install succeeds. */ installFailed?: boolean }
+export interface UpdateResult { outcome: UpdateOutcome; message: string; at: string; /** `npm ci` failed: node_modules may be broken, so nothing is restarted until an install succeeds. */ installFailed?: boolean; /** The upstream being followed, e.g. `origin/hotfix`. */ following?: string; /** The local branch and the HEAD it built or checked. */ branch?: string; sha?: string }
 
 /** The owner's auto-update setting, kept in `<runtimeDir>/self-update.json` so it survives reloads and restarts. */
 export interface UpdateSettings {
@@ -76,12 +77,14 @@ const reason = (error: unknown) => (error instanceof Error ? error.message : Str
 export class SelfUpdater {
   /** The HEAD whose build failed; not retried until HEAD moves. */
   private failed?: { sha: string; message: string };
+  private lastFetch = -Infinity;
 
-  constructor(readonly appDir: string, private readonly npm = "npm", private readonly timeoutMs = 15 * 60_000, private readonly runtimeDir = defaultRuntimeDir(appDir)) {}
+  /** `fetchIntervalMs`: checks run often to pick up local commits, but fetch the upstream at most this often. */
+  constructor(readonly appDir: string, private readonly npm = "npm", private readonly timeoutMs = 15 * 60_000, private readonly runtimeDir = defaultRuntimeDir(appDir), private readonly fetchIntervalMs = 60_000) {}
 
-  private exec(command: string, args: string[]): Promise<string> {
+  private exec(command: string, args: string[], cwd = this.appDir): Promise<string> {
     return new Promise((resolve, reject) => {
-      execFile(command, args, { cwd: this.appDir, encoding: "utf8", env: { ...childEnv(), GIT_TERMINAL_PROMPT: "0" }, timeout: this.timeoutMs, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
+      execFile(command, args, { cwd, encoding: "utf8", env: { ...childEnv(), GIT_TERMINAL_PROMPT: "0" }, timeout: this.timeoutMs, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
         if (!error) { resolve(stdout.trim()); return; }
         const lines = `${stderr}\n${stdout}`.split("\n").map((line) => line.trim()).filter(Boolean);
         reject(new Error(`${command} ${args[0]} failed: ${lines.find((line) => /error/i.test(line)) ?? lines.at(-1) ?? error.message}`));
@@ -91,7 +94,17 @@ export class SelfUpdater {
 
   private git(...args: string[]): Promise<string> { return this.exec("git", args); }
 
-  async check(): Promise<UpdateResult> {
+  private checking?: Promise<UpdateResult>;
+
+  /**
+   * One check at a time: a call while a check runs (the 5 s timer, a key press) gets that check's result instead of
+   * starting a second fetch, install or build next to it.
+   */
+  check(): Promise<UpdateResult> {
+    return this.checking ??= this.runCheck().finally(() => { this.checking = undefined; });
+  }
+
+  private async runCheck(): Promise<UpdateResult> {
     // Called by the initialized application, including when auto-update is paused.
     confirmApplicationReady(this.runtimeDir);
     await this.saveStatus({ outcome: "checking", at: new Date().toISOString() });
@@ -109,23 +122,32 @@ export class SelfUpdater {
 
   private async checkCheckout(): Promise<UpdateResult> {
     const at = new Date().toISOString();
-    const result = (outcome: UpdateOutcome, message: string): UpdateResult => ({ outcome, message, at });
-    if (await this.paused()) return this.pausedCheck(at);
+    let following: string | undefined;
+    const result = (outcome: UpdateOutcome, message: string): UpdateResult => ({ outcome, message, at, ...(following ? { following } : {}) });
     try {
-      const branch = await this.git("rev-parse", "--abbrev-ref", "HEAD");
-      if (branch !== "main") return result("blocked", `the Indra checkout is on ${branch}, not main`);
-      if (await this.git("--no-optional-locks", "status", "--porcelain", "--untracked-files=no")) return result("blocked", "the Indra checkout has uncommitted changes");
-      try { await this.git("fetch", "--quiet", "origin", "main"); }
-      catch (error) { return result("blocked", `could not fetch origin/main: ${reason(error)}`); }
-      const [ahead, behind] = (await this.git("rev-list", "--left-right", "--count", "HEAD...origin/main")).split(/\s+/).map(Number);
-      if (ahead > 0 && behind > 0) return result("blocked", "main has diverged from origin/main");
-      if (behind > 0) {
-        try { await this.git("pull", "--ff-only", "--quiet", "origin", "main"); }
-        catch (error) { return result("blocked", `could not fast-forward main: ${reason(error)}`); }
+      const target = await this.upstream();
+      if (typeof target === "string") return result(await this.paused() ? "paused" : "blocked", target);
+      const { local, branch } = target;
+      following = `origin/${branch}`;
+      if (await this.paused()) return this.pausedCheck(at, branch);
+      // A dirty tree skips the upstream entirely: local HEAD is built as it is, uncommitted edits left out.
+      const dirty = !!await this.git("--no-optional-locks", "status", "--porcelain", "--untracked-files=no");
+      if (!dirty) {
+        if (Date.now() - this.lastFetch >= this.fetchIntervalMs) {
+          try { await this.git("fetch", "--quiet", "origin", branch); this.lastFetch = Date.now(); }
+          catch (error) { return result("blocked", `could not fetch ${following}: ${reason(error)}`); }
+        }
+        const [ahead, behind] = (await this.git("rev-list", "--left-right", "--count", `HEAD...${following}`)).split(/\s+/).map(Number);
+        if (ahead > 0 && behind > 0) return result("blocked", `${local} has diverged from ${following}`);
+        if (behind > 0) {
+          try { await this.git("merge", "--ff-only", "--quiet", following); }
+          catch (error) { return result("blocked", `could not fast-forward ${local}: ${reason(error)}`); }
+        }
       }
       const head = await this.git("rev-parse", "HEAD");
+      const live = (outcome: UpdateOutcome, message: string): UpdateResult => ({ ...result(outcome, message), branch: local, sha: head });
       const built = await readBuildStamp(this.appDir);
-      if (built?.sha === head) return result("up-to-date", `up to date at ${head.slice(0, 7)}`);
+      if (built?.sha === head) return live("up-to-date", `up to date at ${head.slice(0, 7)}`);
       if (this.failed?.sha === head) return result("failed", this.failed.message);
       const lockChanged = !built?.sha || await this.git("diff", "--name-only", built.sha, head, "--", "package-lock.json").then((names) => names !== "", () => true);
       if (lockChanged) {
@@ -135,31 +157,52 @@ export class SelfUpdater {
       }
       const name = `${head.slice(0, 12)}-${Date.now()}`;
       const out = join(this.appDir, BUILDS, name);
+      const source = await mkdtemp(join(tmpdir(), "indra-build-"));
       try {
-        await this.exec(this.npm, ["run", "build", "--", "--outDir", out, "--emptyOutDir"]);
+        // Build an export of HEAD, not the working tree, so uncommitted edits never go live.
+        const archive = join(source, "..", `${basename(source)}.tar`);
+        try {
+          await this.git("archive", "--format=tar", "-o", archive, head);
+          await this.exec("tar", ["-xf", archive, "-C", source]);
+        } finally { await rm(archive, { force: true }); }
+        await symlink(join(this.appDir, "node_modules"), join(source, "node_modules"));
+        await this.exec(this.npm, ["run", "build", "--", "--outDir", out, "--emptyOutDir"], source);
         await access(join(out, "cli.js"));
-        await access(join(out, "build-stamp.json"));
+        // The stamp plugin cannot run `git rev-parse` outside a checkout, so the SHA is set here.
+        const stamp = JSON.parse(await readFile(join(out, "build-stamp.json"), "utf8")) as BuildStamp;
+        await writeFile(join(out, "build-stamp.json"), JSON.stringify({ ...stamp, sha: head }));
       } catch (error) {
         await rm(out, { recursive: true, force: true }).catch(() => undefined);
         this.failed = { sha: head, message: `build of ${head.slice(0, 7)} failed; still running the previous build: ${reason(error)}` };
-        return result("failed", this.failed.message);
-      }
+        return live("failed", this.failed.message);
+      } finally { await rm(source, { recursive: true, force: true }).catch(() => undefined); }
       // Paused while this build ran: keep the running build; the unused one is pruned later.
-      if (await this.paused()) return result("paused", `paused before switching to ${head.slice(0, 7)}; still running the current build`);
+      if (await this.paused()) return live("paused", `paused before switching to ${head.slice(0, 7)}; still running the current build`);
       await switchDist(this.appDir, name, { runtimeDir: this.runtimeDir });
       this.failed = undefined;
-      return result("built", `built ${head.slice(0, 7)}`);
+      return live("built", `built ${head.slice(0, 7)}`);
     } catch (error) { return result("blocked", `update check failed: ${reason(error)}`); }
   }
 
-  /** While paused, a check only fetches and says how many commits wait on origin/main; it never pulls, builds or switches. */
-  private async pausedCheck(at: string): Promise<UpdateResult> {
-    const done = (message: string): UpdateResult => ({ outcome: "paused", message, at });
+  /** The checkout's branch and its upstream branch on origin, or why there is nothing to follow. */
+  private async upstream(): Promise<{ local: string; branch: string } | string> {
+    const local = await this.git("rev-parse", "--abbrev-ref", "HEAD");
+    if (local === "HEAD") return "not following a branch: the Indra checkout has a detached HEAD";
+    const remote = await this.git("config", "--get", `branch.${local}.remote`).catch(() => "");
+    const merge = await this.git("config", "--get", `branch.${local}.merge`).catch(() => "");
+    if (remote !== "origin" || !merge.startsWith("refs/heads/")) return `not following a branch: ${local} has no upstream on origin`;
+    return { local, branch: merge.slice("refs/heads/".length) };
+  }
+
+  /** While paused, a check only fetches and says how many commits wait upstream; it never pulls, builds or switches. */
+  private async pausedCheck(at: string, branch: string): Promise<UpdateResult> {
+    const following = `origin/${branch}`;
+    const done = (message: string): UpdateResult => ({ outcome: "paused", message, at, following });
     try {
-      await this.git("fetch", "--quiet", "origin", "main");
-      const behind = Number(await this.git("rev-list", "--count", "HEAD..origin/main"));
-      return done(behind ? `${behind} new commit${behind === 1 ? "" : "s"} waiting on origin/main` : "no new commits on origin/main");
-    } catch (error) { return done(`could not check origin/main: ${reason(error)}`); }
+      await this.git("fetch", "--quiet", "origin", branch);
+      const behind = Number(await this.git("rev-list", "--count", `HEAD..${following}`));
+      return done(behind ? `${behind} new commit${behind === 1 ? "" : "s"} waiting on ${following}` : `no new commits on ${following}`);
+    } catch (error) { return done(`could not check ${following}: ${reason(error)}`); }
   }
 
   async paused(): Promise<boolean> { return (await readUpdateSettings(this.runtimeDir)).paused; }

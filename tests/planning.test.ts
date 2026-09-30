@@ -12,7 +12,7 @@ import { CLARIFY_TIMEOUT_MS, DRAFT_TIMEOUT_MS } from "../src/codex-runtime.js";
 
 import { advanceCeremony } from "../src/ceremony.js";
 import { goalRuntimeFilename, productRuntimeFilename, teamRuntimeFilename, validateProductProposal, type GoalReport, type GoalRuntimeRecord, type ProductRuntimeRecord, type SchedulerRuntimeRecord } from "../src/goal-contract.js";
-import { workflowDigest } from "../src/remodel-events.js";
+import { runWorkflowHost, WorkflowInbox, workflowDigest } from "../src/remodel-events.js";
 import { SprintGitHub } from "../src/sprint.js";
 
 afterEach(() => vi.restoreAllMocks());
@@ -56,14 +56,15 @@ class FakeGh implements Shell {
   private next = 100;
   async run(command: string, args: string[], _cwd: string): Promise<ShellResult> {
     const line = `${command} ${args.join(" ")}`;
+    const repositoryLine = line.replace(/repos\/satoramoto\/indra\//i, "repos/satoramoto/indra/");
     this.calls.push(line);
     const ok = (stdout = "") => ({ code: 0, stdout, stderr: "" });
     const flag = (name: string) => args[args.indexOf(name) + 1];
     const byUrl = () => [...this.prs.values()].find((pr) => pr.url === args[2]);
     if (line.startsWith("gh repo clone")) { await mkdir(join(args[3], ".git"), { recursive: true }); return ok(); }
-    if (line === "gh api repos/satoramoto/indra/git/ref/heads/main --jq .object.sha") return this.failBranch ? { code: 1, stdout: "", stderr: "HTTP 502" } : ok(`${MAIN_SHA}\n`);
-    if (line.startsWith("gh api repos/satoramoto/indra/git/ref/heads/")) { const branch = args[1].split("/heads/")[1]; return this.branches.has(branch) ? ok(`${MAIN_SHA}\n`) : { code: 1, stdout: "", stderr: "HTTP 404" }; }
-    if (line.startsWith("gh api -X POST repos/satoramoto/indra/git/refs")) { this.branches.add(flag("-f").replace("ref=refs/heads/", "")); return ok(); }
+    if (repositoryLine === "gh api repos/satoramoto/indra/git/ref/heads/main --jq .object.sha") return this.failBranch ? { code: 1, stdout: "", stderr: "HTTP 502" } : ok(`${MAIN_SHA}\n`);
+    if (repositoryLine.startsWith("gh api repos/satoramoto/indra/git/ref/heads/")) { const branch = args[1].split("/heads/")[1]; return this.branches.has(branch) ? ok(`${MAIN_SHA}\n`) : { code: 1, stdout: "", stderr: "HTTP 404" }; }
+    if (repositoryLine.startsWith("gh api -X POST repos/satoramoto/indra/git/refs")) { this.branches.add(flag("-f").replace("ref=refs/heads/", "")); return ok(); }
     if (args[0] === "api" && args.includes("--method") && !args.includes("--paginate")) {
       const endpoint = args[1]; const owners = "* @satori-miyamoto\n";
       if (/\/pulls\/\d+$/.test(endpoint)) return ok(JSON.stringify({ state: "open", draft: false, auto_merge: null, head: { sha: MAIN_SHA }, base: { ref: "main", sha: MAIN_SHA, repo: { full_name: "satoramoto/indra" } } }));
@@ -804,6 +805,71 @@ describe("whole-goal queue contract", () => {
     expect(gh.calls.slice(calls).some((call) => call.includes("-X POST"))).toBe(false);
     expect((await store.read()).planningGoals!.filter((goal) => goal.goalAssignment)).toHaveLength(2);
   });
+
+  it.each(["review", "developer-lock", "other-team"] as const)("dispatches a later disjoint approval through the production host while A is deferred by %s", async (mode) => {
+    const store = await remodelStore(); const chat = new FakeChat();
+    const deferred = () => { let resolve!: () => void; const promise = new Promise<void>((done) => { resolve = done; }); return { promise, resolve }; };
+    const held = deferred(); const started = deferred(); const dispatched = deferred(); const ready = deferred();
+    const controller = new AbortController(); const inbox = new WorkflowInbox(store.runtimeDir);
+    await propose(store, "goal-a"); await store.approveGoal("goal-a", proof("goal-a"), at); await scheduler(store, chat).dispatch(startup);
+    if (mode === "other-team") await store.update((state) => {
+      state.teams.push({ id: "team-other", slug: "other", displayName: "Other", workflowModel: "goals-v1", project: { github: "Satoramoto/Indra" }, externalIdentities: { mattermost: { teamId: "other-external", homeChannelId: "channel" } }, seats: [
+        { id: "seat-other-lead", displayName: "Lead", roles: ["Team Lead"], externalIdentities: { mattermost: { userId: "other-lead", username: "otherlead" } } },
+        { id: "seat-other-product", displayName: "Product", roles: ["Product"], externalIdentities: { mattermost: { userId: "other-product", username: "otherproduct" } } },
+        { id: "seat-other-dev", displayName: "Developer", roles: ["Developer"], externalIdentities: { mattermost: { userId: "other-dev", username: "otherdev" } } },
+      ] });
+    }, "Add independent fixture team");
+    const other = mode === "other-team"; const teamId = other ? "team-other" : "team-001";
+    let locked: Promise<void> | undefined;
+    if (mode !== "review") {
+      const acquired = deferred(); locked = store.withGoalLock("goal-a", async () => { acquired.resolve(); await held.promise; }); await acquired.promise;
+    }
+    const message = vi.fn(async (): Promise<AgentResult> => { started.resolve(); await held.promise; return { sessionId: "review-a", startedAt: at, finishedAt: at, response: { summary: "Approved", findings: [] } }; });
+    vi.spyOn(SprintGitHub.prototype, "verifyGoalReport").mockResolvedValue(undefined);
+    vi.spyOn(SprintGitHub.prototype, "integrationScope").mockResolvedValue({ headSha: MAIN_SHA, baseSha: MAIN_SHA, conflicting: false });
+    vi.spyOn(SprintGitHub.prototype, "reviewIntegration").mockImplementation(async (_repo, _goal, _url, _sha, review) => { await review("/fixture/reviewer"); gh.reviewed = true; });
+    vi.spyOn(SprintGitHub.prototype, "merge").mockResolvedValue({ merged: false, reason: "CI pending" });
+    const factory = () => scheduler(store, chat, { message });
+    let activity = 0; let maxActivity = 0; let stopped = false;
+    const hostFor = (id: string) => runWorkflowHost({ store, teamId: id, consumer: `test-scheduler-${id}`, signal: controller.signal,
+      activity: async (run) => { activity++; maxActivity = Math.max(maxActivity, activity); try { await run(); } finally { activity--; } },
+      consumers: async () => (await factory().consumers(id)).map((consumer) => ({ ...consumer, turn: async (event) => {
+        if (mode !== "review" && consumer.consumer === "scheduler-release-goal-a") started.resolve();
+        return await consumer.turn(event);
+      } })),
+      onReady: async () => { if (id === "team-001") ready.resolve(); },
+      turn: async (event) => { const result = await factory().dispatch(event); for (const next of result.events) await inbox.publish(next); if (result.record.activeDispatches.some((item) => item.goalId === "goal-b")) dispatched.resolve(); },
+    });
+    const hosts = [hostFor("team-001")];
+    const finished = () => Promise.all(hosts).then(() => { stopped = true; });
+    try {
+      await ready.promise;
+      if (mode === "review") await inbox.publish({ kind: "developer-report", id: "deferred-report-a", goalId: "goal-a", teamId: "team-001", seatId: "seat-003", report: reportFor("goal-a"), at });
+      await started.promise; // B does not exist until the real release consumer is inside the held work.
+      if (other) hosts.push(hostFor("team-other"));
+      await propose(store, "goal-overlap", ["src/future.ts"], other, 1); await store.approveGoal("goal-overlap", proof("goal-overlap"), at);
+      await propose(store, "goal-b", ["tests/**"], other, 2); await store.approveGoal("goal-b", proof("goal-b"), at);
+      const approved = { kind: "approval" as const, id: "late-approval-b", goalId: "goal-b", teamId, at };
+      await Promise.all([inbox.publish(approved), inbox.publish(approved)]);
+      await dispatched.promise;
+      const goals = (await store.read()).planningGoals!;
+      expect(goals.find((goal) => goal.id === "goal-b")!.goalAssignment?.seatId).toBe(other ? "seat-other-dev" : mode === "review" ? "seat-003" : "seat-004");
+      expect(goals.find((goal) => goal.id === "goal-overlap")!.goalAssignment).toBeUndefined();
+      const active = goals.flatMap((goal) => goal.goalAssignment && goal.goalAssignment.status !== "reported" ? [goal.goalAssignment.seatId] : []);
+      expect(new Set(active).size).toBe(active.length);
+      if (mode === "review") expect(message).toHaveBeenCalledTimes(1);
+      else expect(goals.find((goal) => goal.id === "goal-a")!.ceremony!.stage).toBe("implement");
+      const before = await store.readRuntimeFile(goalRuntimeFilename("goal-b"));
+      controller.abort(); const end = finished(); await new Promise<void>((resolve) => setImmediate(resolve));
+      if (mode === "review") expect(stopped).toBe(false); // Abort closes ingress, but joins its active finite runtime.
+      held.resolve(); await locked; await end; expect(activity).toBe(0);
+      if (!other) expect(maxActivity).toBe(1); // One activity lease admits independent consumers concurrently.
+      await new WorkflowInbox(store.runtimeDir).drain(`test-scheduler-${teamId}`, teamId, async (event) => { await factory().dispatch(event); });
+      const restarted = await factory().turn({ kind: "startup", teamId, at });
+      expect(restarted.record.activeDispatches.filter((item) => item.goalId === "goal-b")).toHaveLength(1);
+      expect(await store.readRuntimeFile(goalRuntimeFilename("goal-b"))).toEqual(before);
+    } finally { controller.abort(); held.resolve(); await locked; await Promise.allSettled(hosts); }
+  }, 30_000);
 
   it("GET-verifies human redirects once and never turns bot messages or forged local hints into an owner redirect", async () => {
     const store = await remodelStore(); await propose(store, "goal-redirect"); await store.approveGoal("goal-redirect", proof("goal-redirect"), at);

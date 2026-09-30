@@ -1,5 +1,6 @@
 import { dirname, join } from "node:path";
-import { lstat, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { runChecked, stderrExcerpt, type Shell, type ShellResult } from "./command-shell.js";
 import { ensureProjectCheckout } from "./project-checkout.js";
 import { withFileLock } from "./state-commit.js";
@@ -27,6 +28,11 @@ export interface ReleaseAttempts {
   corrections?: { headSha: string; baseSha: string; startedAt: string; finishedAt?: string; resultSha?: string; status: "running" | "pushed" | "blocked"; decisions: string[] }[];
 }
 export const releaseAttemptsName = (goalId: string) => { retroPath(goalId); return `release-attempts-${goalId}`; };
+interface IntegrationRecovery {
+  version: 1; github: string; goalId: string; branch: string; prUrl: string; headSha: string; baseSha: string; ownedFiles: string[];
+  checkout: string; sharedGitDir: string; phase: "preparing" | "prepared" | "resolved" | "committed" | "pushed" | "cleaned";
+  resultSha: string | null; decisions: string[]; failure: string | null;
+}
 export interface PrRetrospective { url: string; headSha: string; decisions: string | null; followUps: string | null }
 
 export function retroPath(goalId: string): string {
@@ -105,57 +111,117 @@ export class SprintGitHub implements RetroArchive {
     return { headSha: String(pr.headRefOid), baseSha: String(pr.baseRefOid), conflicting: pr.mergeable === "CONFLICTING" };
   }
 
-  /** Merge the observed main commit into a detached integration checkout; publish only verified owned changes. */
+  /** A retained correction is resumed only at its pinned identity; uncertain/dirty work is never discarded. */
   async resolveIntegration(github: string, goalId: string, ownedFiles: string[], prUrl: string, headSha: string, baseSha: string,
     resolve: (cwd: string, sharedGitDir: string) => Promise<{ decisions: string[]; blocked: string[] }>, revert = false): Promise<{ headSha: string; decisions: string[] }> {
     this.retroRepo(github, goalId, prUrl);
     if (!SHA.test(headSha) || !SHA.test(baseSha)) throw new SprintError("Invalid integration correction commits.");
-    const project = await ensureProjectCheckout(this.shell, this.runtimeDir, github);
     const branch = revert ? revertBranch(goalId) : sprintBranch(goalId);
-    await this.must("git", [...GH_CREDENTIAL, "fetch", "origin", branch, baseSha], project);
-    const shared = (await this.must("git", ["rev-parse", "--absolute-git-dir"], project)).stdout.trim();
-    const parent = join(this.runtimeDir, "worktrees"); await mkdir(parent, { recursive: true, mode: 0o700 });
-    const root = await mkdtemp(join(parent, `integration-fix-${goalId}-`)); const cwd = join(root, "checkout");
-    try {
-      await this.must("git", ["worktree", "add", "--detach", cwd, headSha], project);
-      const merged = await this.run("git", ["merge", "--no-commit", "--no-ff", baseSha], cwd);
-      const conflicts = (await this.must("git", ["diff", "--name-only", "--diff-filter=U", "-z"], cwd)).stdout.split("\0").filter(Boolean);
+    const identity = { version: 1 as const, github, goalId, branch, prUrl, headSha, baseSha, ownedFiles };
+    const key = createHash("sha256").update(JSON.stringify({ github, goalId, branch, headSha, baseSha })).digest("hex");
+    const journal = join(this.runtimeDir, `integration-recovery-${goalId}-${key}.json`);
+    return await withFileLock(`${journal}.lock`, async () => {
+      const project = await ensureProjectCheckout(this.shell, this.runtimeDir, github);
+      await this.must("git", [...GH_CREDENTIAL, "fetch", "origin", branch, baseSha], project);
+      const shared = await realpath((await this.must("git", ["rev-parse", "--absolute-git-dir"], project)).stdout.trim());
+      const root = join(this.runtimeDir, "worktrees", `integration-fix-${goalId}-${key}`); const cwd = join(root, "checkout");
+      const saved = await readFile(journal, "utf8").catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; return undefined; });
+      const record: IntegrationRecovery = saved ? JSON.parse(saved) as IntegrationRecovery : { ...identity, checkout: cwd, sharedGitDir: shared, phase: "preparing", resultSha: null, decisions: [], failure: null };
+      if (Object.entries(identity).some(([key, value]) => JSON.stringify(record[key as keyof IntegrationRecovery]) !== JSON.stringify(value)) || record.checkout !== cwd || record.sharedGitDir !== shared || !["preparing", "prepared", "resolved", "committed", "pushed", "cleaned"].includes(record.phase) || (record.resultSha !== null && !SHA.test(record.resultSha)) || !Array.isArray(record.decisions) || record.decisions.some((item) => typeof item !== "string")) throw new SprintError(`Integration recovery identity is uncertain; preserved at ${journal}.`);
+      const save = async () => { const temp = `${journal}.${process.pid}.tmp`; await writeFile(temp, JSON.stringify(record), { mode: 0o600 }); await rename(temp, journal); };
       const within = (files: string[]) => files.every((file) => ownedFiles.some((pattern) => ownedFileMatches(pattern, file)));
-      if ((merged.code !== 0 && !conflicts.length) || !within(conflicts)) throw new SprintError("Integration conflict needs files outside approved ownership or could not be prepared.");
-      let decisions = ["Merged the observed main commit into the sprint without rebasing."];
-      if (conflicts.length) {
-        const result = await resolve(cwd, shared);
-        if (result.blocked.length) throw new SprintError(`Integration correction needs an owner decision: ${redactSecrets(result.blocked.join("; ")).slice(0, 800)}`);
-        decisions = result.decisions;
+      const files = async (args: string[]) => (await this.must("git", args, cwd)).stdout.split("\0").filter(Boolean);
+      const idle = async () => {
+        // The AgentRuntime stops its verified owned tree. Any remaining owner or foreign user prevents reuse/removal.
+        // lsof exit 1 with no output means no open files; unreadable/unsupported inspection fails closed.
+        const users = await this.run("lsof", ["-nP", "-F", "p", "+D", cwd], project);
+        if (users.code !== 1 || users.stdout.trim() || users.stderr.trim()) throw new SprintError("Integration checkout has live processes or its process liveness is uninspectable; no process was signalled.");
+      };
+      if (!saved) {
+        await mkdir(dirname(root), { recursive: true, mode: 0o700 });
+        await mkdir(root, { mode: 0o700 }); // Never claim an existing, unjournaled checkout, even on failure.
+        await save();
       }
-      if ((await this.must("git", ["rev-parse", "HEAD"], cwd)).stdout.trim() !== headSha || (await this.must("git", ["rev-parse", "MERGE_HEAD"], cwd)).stdout.trim() !== baseSha) throw new SprintError("Resolver changed the pinned integration history.");
-      const unstaged = (await this.must("git", ["diff", "--name-only", "--no-renames", "-z"], cwd)).stdout.split("\0").filter(Boolean);
-      const untracked = (await this.must("git", ["ls-files", "--others", "--exclude-standard", "-z"], cwd)).stdout.split("\0").filter(Boolean);
-      if (!within([...unstaged, ...untracked])) throw new SprintError("Resolver edited files outside approved ownership.");
-      await this.must("git", ["add", "--all"], cwd);
-      if ((await this.must("git", ["diff", "--name-only", "--diff-filter=U", "-z"], cwd)).stdout) throw new SprintError("Integration conflicts remain unresolved.");
-      const changed = (await this.must("git", ["diff", "--cached", "--name-only", "--no-renames", "-z", baseSha], cwd)).stdout.split("\0").filter(Boolean);
-      if (!within(changed)) throw new SprintError("Corrected integration exceeds approved ownership relative to main.");
-      const current = await this.integrationScope(github, goalId, ownedFiles, prUrl, revert);
-      if (current.headSha !== headSha || current.baseSha !== baseSha) throw new SprintError("Integration changed during correction; a fresh event must reconcile it.");
-      await this.must("git", ["commit", "-m", `Merge main into ${branch} within approved scope`], cwd);
-      const resultSha = (await this.must("git", ["rev-parse", "HEAD"], cwd)).stdout.trim();
-      await this.must("git", [...GH_CREDENTIAL, "push", "origin", `HEAD:refs/heads/${branch}`], cwd);
-      const remote = (await this.must("gh", ["api", `repos/${github}/git/ref/heads/${branch}`, "--jq", ".object.sha"])).stdout.trim();
-      if (remote !== resultSha) throw new SprintError("Corrected integration push is not verified.");
-      // A bounded Decisions addition is reconciled by its immutable result marker after a lost response.
-      const marker = `<!-- indra-integration-correction:${resultSha} -->`;
-      const body = JSON.parse((await this.must("gh", ["pr", "view", prUrl, "--json", "body"])).stdout).body as unknown;
-      if (typeof body !== "string") throw new SprintError("Integration PR body is unreadable.");
-      if (!body.includes(marker)) {
-        const path = join(root, "body.md"); await writeFile(path, `${body}\n\n## Integration correction\n\n${marker}\nMerged ${baseSha} into ${headSha}, producing ${resultSha}.\n\nDecisions:\n${decisions.map((item) => `- ${redactSecrets(item)}`).join("\n")}\n\nFresh review and CI are required on the new head.\n`, { mode: 0o600 });
-        await this.must("gh", ["pr", "edit", prUrl, "--body-file", path]);
+      try {
+        if (!(await lstat(root)).isDirectory()) throw new SprintError("Integration recovery root ownership is uncertain.");
+        const exists = await lstat(cwd).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; return undefined; });
+        if (exists && !exists.isDirectory()) throw new SprintError("Integration recovery checkout is not an owned directory.");
+        if (!exists && record.phase === "preparing") await this.must("git", ["worktree", "add", "--detach", cwd, headSha], project);
+        else if (!exists && record.phase === "pushed" && record.resultSha) record.phase = "cleaned"; // Lost removal response; remote proof is checked below.
+        else if (!exists && record.phase !== "cleaned") throw new SprintError("Integration recovery checkout is missing; retained work cannot be assumed safe.");
+        if (record.phase !== "cleaned") {
+          const common = (await this.must("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd)).stdout.trim();
+          if (await realpath(common) !== shared || (await this.run("git", ["symbolic-ref", "-q", "HEAD"], cwd)).code !== 1) throw new SprintError("Integration recovery checkout ownership or detached identity changed.");
+          await idle();
+          let head = (await this.must("git", ["rev-parse", "HEAD"], cwd)).stdout.trim();
+          if (head !== headSha && !record.resultSha && record.phase !== "resolved") throw new SprintError("Resolver changed the pinned integration history without a host commit intent.");
+          if (head === headSha && !record.resultSha) {
+            const mergeHead = await this.run("git", ["rev-parse", "--verify", "MERGE_HEAD"], cwd);
+            let prepared = mergeHead.code === 0;
+            if (prepared && mergeHead.stdout.trim() !== baseSha) throw new SprintError("Retained merge has a different base; preserved for inspection.");
+            if (!prepared) {
+              if (record.phase !== "preparing" || (await this.must("git", ["status", "--porcelain", "--untracked-files=all"], cwd)).stdout.trim()) throw new SprintError("Retained correction is not a clean prepared merge; no history was reset.");
+              const merged = await this.run("git", ["merge", "--no-commit", "--no-ff", baseSha], cwd);
+              const conflicts = await files(["diff", "--name-only", "--diff-filter=U", "-z"]);
+              if ((merged.code !== 0 && !conflicts.length) || !within(conflicts)) throw new SprintError("Integration conflict needs files outside approved ownership or could not be prepared.");
+              prepared = true;
+            }
+            const conflicts = await files(["diff", "--name-only", "--diff-filter=U", "-z"]);
+            if (!within(conflicts)) throw new SprintError("Integration conflict needs files outside approved ownership.");
+            const needsResolver = conflicts.length > 0 || record.phase === "prepared";
+            if (record.phase === "preparing") { record.phase = "prepared"; await save(); }
+            if (needsResolver) {
+              const result = await resolve(cwd, shared); record.decisions = result.decisions.map((item) => redactSecrets(item)); await save();
+              if (result.blocked.length) throw new SprintError(`Integration correction needs an owner decision: ${redactSecrets(result.blocked.join("; ")).slice(0, 800)}`);
+            } else if (!record.decisions.length) record.decisions = ["Merged the observed main commit into the sprint without rebasing."];
+            await idle();
+            if ((await this.must("git", ["rev-parse", "HEAD"], cwd)).stdout.trim() !== headSha || (await this.must("git", ["rev-parse", "MERGE_HEAD"], cwd)).stdout.trim() !== baseSha) throw new SprintError("Resolver changed the pinned integration history.");
+            const unstaged = await files(["diff", "--name-only", "--no-renames", "-z"]);
+            const untracked = await files(["ls-files", "--others", "--exclude-standard", "-z"]);
+            if (!within([...unstaged, ...untracked])) throw new SprintError("Resolver edited files outside approved ownership.");
+            await this.must("git", ["add", "--all"], cwd);
+            if ((await files(["diff", "--name-only", "--diff-filter=U", "-z"])).length) throw new SprintError("Integration conflicts remain unresolved.");
+            if (!within(await files(["diff", "--cached", "--name-only", "--no-renames", "-z", baseSha]))) throw new SprintError("Corrected integration exceeds approved ownership relative to main.");
+            const current = await this.integrationScope(github, goalId, ownedFiles, prUrl, revert);
+            if (current.headSha !== headSha || current.baseSha !== baseSha) throw new SprintError("Integration changed during correction; retained work needs reconciliation.");
+            record.phase = "resolved"; await save();
+            await this.must("git", ["commit", "-m", `Merge main into ${branch} within approved scope`], cwd);
+            head = (await this.must("git", ["rev-parse", "HEAD"], cwd)).stdout.trim();
+          }
+          // Also recovers a crash immediately after commit, before its result SHA was journaled.
+          const parents = (await this.must("git", ["rev-list", "--parents", "-n", "1", head], cwd)).stdout.trim().split(" ");
+          if (!SHA.test(head) || JSON.stringify(parents) !== JSON.stringify([head, headSha, baseSha]) || (record.resultSha && record.resultSha !== head) || !within(await files(["diff", "--name-only", "--no-renames", "-z", baseSha, head]))) throw new SprintError("Retained correction commit does not match its pinned history and approved scope.");
+          if ((await this.must("git", ["status", "--porcelain", "--untracked-files=all", "--ignored=matching"], cwd)).stdout.trim()) throw new SprintError("Integration correction has uncommitted or ignored work; retained without cleanup.");
+          record.resultSha = head; record.phase = "committed"; await save();
+          const current = await this.integrationScope(github, goalId, ownedFiles, prUrl, revert);
+          if (![headSha, head].includes(current.headSha) || current.baseSha !== baseSha) throw new SprintError("Integration changed before publication; retained correction needs reconciliation.");
+          if (current.headSha !== head) await this.must("git", [...GH_CREDENTIAL, "push", "origin", `HEAD:refs/heads/${branch}`], cwd);
+        }
+        const resultSha = record.resultSha;
+        const remote = (await this.must("gh", ["api", `repos/${github}/git/ref/heads/${branch}`, "--jq", ".object.sha"])).stdout.trim();
+        if (!resultSha || remote !== resultSha) throw new SprintError("Corrected integration push is not verified.");
+        record.phase = record.phase === "cleaned" ? "cleaned" : "pushed"; await save();
+        const marker = `<!-- indra-integration-correction:${resultSha} -->`;
+        const body = JSON.parse((await this.must("gh", ["pr", "view", prUrl, "--json", "body"])).stdout).body as unknown;
+        if (typeof body !== "string") throw new SprintError("Integration PR body is unreadable.");
+        if (!body.includes(marker)) {
+          const path = join(root, "body.md"); await writeFile(path, `${body}\n\n## Integration correction\n\n${marker}\nMerged ${baseSha} into ${headSha}, producing ${resultSha}.\n\nDecisions:\n${record.decisions.map((item) => `- ${item}`).join("\n")}\n\nFresh review and CI are required on the new head.\n`, { mode: 0o600 });
+          await this.must("gh", ["pr", "edit", prUrl, "--body-file", path]);
+        }
+        if (record.phase !== "cleaned") {
+          await idle();
+          if ((await this.must("git", ["status", "--porcelain", "--untracked-files=all", "--ignored=matching"], cwd)).stdout.trim() || (await this.must("git", ["rev-parse", "HEAD"], cwd)).stdout.trim() !== resultSha) throw new SprintError("Published correction has new or uncertain work; retained without cleanup.");
+          await this.must("git", ["worktree", "remove", cwd], project); // No --force; Git gets the final dirty-work veto.
+          record.phase = "cleaned";
+        }
+        record.failure = null; await save();
+        return { headSha: resultSha, decisions: record.decisions };
+      } catch (error) {
+        record.failure = error instanceof Error ? redactSecrets(error.message).slice(0, 1000) : "Integration correction was not confirmed.";
+        await save();
+        throw new SprintError(`${record.failure} Recovery retained at ${cwd}; identity and retry journal: ${journal}.`);
       }
-      return { headSha: resultSha, decisions };
-    } finally {
-      const removed = await this.run("git", ["worktree", "remove", "--force", cwd], project);
-      if (removed.code === 0) await rm(root, { recursive: true, force: true });
-    }
+    });
   }
 
   /** Archive only sections read from the actual merged PR, bound to the delivered lane head. */

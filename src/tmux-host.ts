@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { access, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { access, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { readBuildStamp } from "./build-stamp.js";
 import { appRootOf } from "./reload.js";
@@ -55,6 +55,44 @@ export async function signalReady(stateCheckout: string, nonce: string, error?: 
   await writeFile(file, JSON.stringify({ nonce, pid: process.pid, readyAt: new Date().toISOString(), ...(error ? { error } : {}), ...(message ? { message } : {}) }), { flag: "wx", mode: 0o600 });
 }
 
+const NONCE_FILE = /^(?:host-ready|headed)-([a-f0-9-]{36})\.json$/;
+const HOST_RECORD = /^(?:tmux-host|tmux-seat-[a-z][a-z0-9-]+)\.json$/;
+
+async function removeHostFiles(runtimeDir: string, nonce: string): Promise<void> {
+  await Promise.all([`host-ready-${nonce}.json`, `headed-${nonce}.json`].map((name) => rm(join(runtimeDir, name), { force: true }).catch(() => undefined)));
+}
+
+/**
+ * Removes readiness signals (`host-ready-<nonce>.json`) and headed-run markers (`headed-<nonce>.json`) that no
+ * current ownership record names: they belonged to hosted processes that were since replaced. Files younger than
+ * `minAgeMs` stay, since a process just started signals readiness before its record is written. Returns how many
+ * were removed.
+ */
+export async function sweepHostFiles(runtimeDir: string, minAgeMs = 60_000, now = Date.now()): Promise<number> {
+  let entries: string[];
+  try { entries = await readdir(runtimeDir); } catch { return 0; }
+  const current = new Set<string>();
+  for (const entry of entries.filter((name) => HOST_RECORD.test(name))) {
+    try { const record = JSON.parse(await readFile(join(runtimeDir, entry), "utf8")) as Partial<HostRecord>; if (typeof record.readyNonce === "string") current.add(record.readyNonce); }
+    catch { return 0; } // An unreadable record may name any nonce: remove nothing.
+  }
+  let removed = 0;
+  for (const entry of entries) {
+    const nonce = NONCE_FILE.exec(entry)?.[1];
+    if (!nonce || current.has(nonce)) continue;
+    const file = join(runtimeDir, entry);
+    const info = await stat(file).catch(() => undefined);
+    if (!info || now - info.mtimeMs < minAgeMs) continue;
+    if (await rm(file, { force: true }).then(() => true, () => false)) removed++;
+  }
+  return removed;
+}
+
+/** The `terminal-features` entry that tells tmux every outer terminal takes 24-bit colour. */
+export const TRUECOLOR_FEATURE = "*:RGB";
+/** `show-options -s terminal-features` lines look like `terminal-features[3] "*:RGB"`. */
+export const hasTruecolorFeature = (options: string) => options.split("\n").some((line) => /^terminal-features\[\d+\]\s+"?\*:RGB"?\s*$/.test(line.trim()));
+
 export class TmuxHost {
   readonly appDir: string;
   readonly cli: string;
@@ -62,6 +100,8 @@ export class TmuxHost {
   readonly session: string;
   readonly recordFile: string;
   readonly runtimeDir: string;
+  /** How long stop() waits for the hosted process to end its process trees before closing the session. */
+  stopGraceMs = 5000;
 
   constructor(readonly stateCheckout: string, private readonly runner: TmuxRunner = new SystemTmux(), appDir = defaultAppDir, private readonly readinessTimeoutMs = 15_000, readonly hosted: HostedProcess = { kind: "bridge" }) {
     this.appDir = resolve(appDir);
@@ -99,7 +139,7 @@ export class TmuxHost {
 
   async start(): Promise<HostRecord> {
     const existing = await this.verifiedRecord();
-    if (existing) { await this.waitReady(existing); return existing; }
+    if (existing) { await this.enableTruecolor(); await this.waitReady(existing); return existing; }
     try { await access(this.cli); }
     catch { throw new Error(`Built CLI is missing at ${this.cli}; run npm run build first.`); }
     const previous = await this.readRecord();
@@ -127,11 +167,14 @@ export class TmuxHost {
       await this.runner.run(["-L", this.socket, "kill-session", "-t", this.target()]).catch(() => undefined);
       throw new Error("Tmux did not return a stable server and session identity.");
     }
+    await this.enableTruecolor();
     const record: HostRecord = { socket: this.socket, session: this.session, paneId, tmuxIdentity, readyNonce, stateCheckout: resolve(this.stateCheckout), appDir: this.appDir, startedAt: new Date().toISOString(), ...(build ? { build } : {}) };
     await mkdir(dirname(this.recordFile), { recursive: true, mode: 0o700 });
     const temp = `${this.recordFile}.${randomUUID()}.tmp`;
     await writeFile(temp, JSON.stringify(record), { flag: "wx", mode: 0o600 });
     await rename(temp, this.recordFile);
+    // The replaced process's readiness signal and headed-run marker were consumed with its record.
+    if (previous && previous.readyNonce !== readyNonce && /^[a-f0-9-]{36}$/.test(previous.readyNonce)) await removeHostFiles(this.runtimeDir, previous.readyNonce);
     if (!await this.verifiedRecord()) {
       await this.throwIfRefused(record);
       throw new Error(`Tmux pane ${paneId} exited before verification; inspect socket ${this.socket} and credentials.`);
@@ -140,12 +183,42 @@ export class TmuxHost {
     return record;
   }
 
+  /**
+   * Lets clients attached to Indra's own tmux server show truecolor: `terminal-features` gains `*:RGB` as a server
+   * option on this socket only, once. The global config, the default socket and other servers are never touched, and
+   * a failure only leaves the watch view in 256 colours.
+   */
+  private async enableTruecolor(): Promise<void> {
+    const current = await this.runner.run(["-L", this.socket, "show-options", "-s", "terminal-features"]).catch(() => undefined);
+    if (current === undefined || hasTruecolorFeature(current)) return;
+    await this.runner.run(["-L", this.socket, "set-option", "-s", "-a", "terminal-features", TRUECOLOR_FEATURE]).catch(() => undefined);
+  }
+
   /** Stops only this host's own verified session. Returns false when there was nothing verified to stop. */
   async stop(): Promise<boolean> {
     const record = await this.verifiedRecord();
     if (!record) return false;
-    await this.runner.run(["-L", this.socket, "kill-session", "-t", this.target()]);
+    await this.stopProcess(record);
+    try { await this.runner.run(["-L", this.socket, "kill-session", "-t", this.target()]); }
+    catch (error) { if (await this.verifiedRecord()) throw error; } // Already gone with its process.
     return true;
+  }
+
+  /**
+   * Asks the hosted process in this verified session's own pane to stop (SIGTERM) and waits up to `stopGraceMs` for
+   * it: it then ends its engine CLIs' whole process trees while they are still intact (process-tree.ts), rather than
+   * losing them when the pane closes. Only the pane named in the verified record is looked at.
+   */
+  private async stopProcess(record: HostRecord): Promise<void> {
+    const panes = await this.runner.run(["-L", this.socket, "list-panes", "-t", this.target(), "-F", "#{pane_id} #{pane_pid}"]).catch(() => "");
+    const pid = Number(panes.split("\n").map((line) => line.trim().split(" ")).find(([pane]) => pane === record.paneId)?.[1]);
+    if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid) return;
+    try { process.kill(pid, "SIGTERM"); } catch { return; }
+    const deadline = Date.now() + this.stopGraceMs;
+    while (Date.now() < deadline) {
+      try { process.kill(pid, 0); } catch { return; }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
   }
 
   /** Exact-name target. The trailing colon makes tmux resolve the session's current window and pane, which tmux 3.6a needs for pane and format lookups. */
