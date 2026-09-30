@@ -10,6 +10,7 @@ import type { LiveUsage, LiveUsagePort } from "./live-usage.js";
 import type { TokenUsage } from "./runtime-facts.js";
 import type { WorkflowEvent } from "./goal-contract.js";
 import { sumUsage } from "./hub-format.js";
+import { MAX_SCROLLBACK } from "./session-mirror.js";
 
 /** Keeps Indra's own code current: pulls and builds new commits, and says when `dist/` holds a newer build. */
 export interface UpdatePort {
@@ -66,7 +67,18 @@ export interface StateSyncPort {
 }
 
 export type UiPage = "teams" | "team" | "seat";
-export type UiAction = "none" | "refresh" | "quit" | "attach" | "drive" | "stop" | "restart" | "retry" | "submit" | "approve" | "propose" | "sprint" | "pause" | "ask-rollback" | "rollback";
+/**
+ * `drive`: the owner focused the session pane, so the runner checks for a headed run and switches the pane's input on.
+ * `release`: the owner left the pane, so its input goes back off. `forward`: this key goes to the driven session.
+ */
+export type UiAction = "none" | "refresh" | "quit" | "drive" | "release" | "forward" | "stop" | "restart" | "retry" | "submit" | "approve" | "propose" | "sprint" | "pause" | "ask-rollback" | "rollback";
+/** The parts of the seat screen the owner moves between with Tab and Shift-Tab, or a click. */
+export type FocusRegion = "seats" | "session" | "details" | "sprints";
+export const SEAT_REGIONS: readonly FocusRegion[] = ["seats", "session", "details", "sprints"];
+/** Esc goes to the driven session; a second Esc within this many milliseconds stops driving. */
+export const DOUBLE_ESCAPE_MS = 300;
+/** Modifier keys of a key event, used only for keys forwarded to a driven session and for Shift-Tab. */
+export interface KeyMods { ctrl?: boolean; shift?: boolean; meta?: boolean }
 /** Longest goal the new-goal input accepts; a Mattermost post (~16k) holds it with room to spare. */
 export const GOAL_INPUT_LIMIT = 8000;
 /** The multi-line text input for a new planning goal. The channel and project come from the team in state. */
@@ -134,6 +146,18 @@ export class TerminalUiModel {
   confirm?: UiApproval | UiRollback | UiRetry;
   /** A full-screen view over the page: the key help (`?`) or the selected seat's session transcript (`t`). */
   overlay?: "help" | "transcript";
+  /** The focused part of the seat screen. Watching is the default; focusing the session pane asks to drive it. */
+  focus: FocusRegion = "details";
+  /**
+   * Set while the session pane is focused to drive `seatId`: `checking` until the runner has verified a headed run
+   * and switched the pane's input on, then `on`. Keys reach the session only while `on`.
+   */
+  driving?: { seatId: string; state: "checking" | "on" };
+  /** Lines the session pane is scrolled back from live; 0 is live. */
+  sessionScroll = 0;
+  /** The clock for the double Esc; tests pass their own. */
+  now: () => number = Date.now;
+  private escapeAt?: number;
   private retrying?: UiRetry;
   private retryPending = false;
   /** The approval the owner confirmed, until `approveConfirmed` runs it. */
@@ -168,11 +192,12 @@ export class TerminalUiModel {
   workflowError?: string;
   workflowSuspended = false;
   private updateQueued = false;
+  private upgradeQueued = false;
   private eventRun?: Promise<void>;
   private pendingEvents = new Map<string, WorkflowEvent>();
   private pendingMerges = new Map<string, Extract<WorkflowEvent, { kind: "merge" }>>();
 
-  private workflowBusy(): boolean { return this.workflowSuspended || !!this.input || !!this.confirm || this.busy > 0 || this.updating || this.syncing; }
+  private workflowBusy(): boolean { return this.workflowSuspended || !!this.driving || !!this.input || !!this.confirm || this.busy > 0 || this.updating || this.syncing; }
 
   /** Event acknowledgements retain pending work even while input, an action or attachment owns the UI. */
   async workflowEvent(event: WorkflowEvent): Promise<void> {
@@ -183,10 +208,11 @@ export class TerminalUiModel {
 
   async flushWorkflowEvents(): Promise<void> {
     if (this.eventRun) return this.eventRun;
-    if (this.workflowBusy() || (!this.pendingEvents.size && !this.updateQueued)) return;
+    if (this.workflowBusy() || (!this.pendingEvents.size && !this.updateQueued && !this.upgradeQueued)) return;
     this.eventRun = (async () => {
       do {
         const events = [...this.pendingEvents.values()]; this.pendingEvents.clear();
+        if (events.length) this.upgradeQueued = true;
         await this.refresh();
         for (const event of events) if (event.kind === "merge" && event.laneId === null) this.pendingMerges.set(event.id, event);
         for (const [id, event] of this.pendingMerges) {
@@ -201,9 +227,14 @@ export class TerminalUiModel {
         // Build/running receipts only observe readiness. Calling check() here would write another receipt forever.
         await this.checkBuild();
         if (this.workflowBusy()) break;
+        const upgrade = this.upgradeQueued; this.upgradeQueued = false;
         if (this.updateQueued) await this.updateCode();
-        else if (events.length && !this.reloadWanted && !this.updateResult?.installFailed && this.processes?.upgrade) {
-          await this.exclusive(async () => { await this.processes!.upgrade!(); await this.refresh(); });
+        else if (upgrade && !this.reloadWanted && !this.updateResult?.installFailed && this.processes?.upgrade) {
+          await this.exclusive(async () => {
+            const { problems } = await this.processes!.upgrade!();
+            if (problems.length) this.notice = "Could not restart after an update: " + problems.join("; ");
+            await this.refresh();
+          });
         }
       } while (this.pendingEvents.size && !this.workflowBusy());
     })();
@@ -364,7 +395,7 @@ export class TerminalUiModel {
 
   /** A reload is due and nothing is in flight: no typing, confirmation, state sync, update or action. */
   readyToReload(): boolean {
-    return this.reloadWanted && !!this.update?.canReload && !this.updateResult?.installFailed && !this.input && !this.confirm && !this.syncing && !this.updating && this.busy === 0;
+    return this.reloadWanted && !!this.update?.canReload && !this.updateResult?.installFailed && !this.driving && !this.input && !this.confirm && !this.syncing && !this.updating && this.busy === 0;
   }
 
   view(): UiView { return { page: this.page, ...(this.teamId ? { teamId: this.teamId } : {}), ...(this.seatId ? { seatId: this.seatId } : {}) }; }
@@ -380,8 +411,9 @@ export class TerminalUiModel {
   /** One line for the screen: the running version and the update state; undefined without an updater. */
   updateLine(): { text: string; ok: boolean } | undefined {
     if (!this.update) return undefined;
-    const version = "Indra " + (this.update.running?.sha.slice(0, 7) || "unknown build");
+    let version = "Indra " + (this.update.running?.sha.slice(0, 7) || "unknown build");
     const last = this.updateResult;
+    if (last?.following) version += " · Following " + last.following;
     const waiting = this.teams.flatMap((team) => team.seats).filter((seat) => this.live[seat.id]?.updatePending).map((seat) => seat.displayName);
     const rolled = this.rolledBack ? " · rolled back to " + shortSha(this.rolledBack.sha) + " from " + shortSha(this.rolledBack.fromSha) : "";
     const restarts = waiting.length ? " · " + waiting.join(", ") + " restart when idle" : "";
@@ -391,7 +423,8 @@ export class TerminalUiModel {
     if (this.updating) return { text: version + rolled + " · updating…", ok: true };
     if (last && (last.outcome === "blocked" || last.outcome === "failed")) return { text: version + " · blocked · " + last.message, ok: false };
     if (waiting.length) return { text: version + rolled + " · update pending" + restarts, ok: true };
-    return { text: version + rolled + " · " + (last ? "up to date" : "checking for updates…"), ok: true };
+    const live = last?.branch && last.sha ? " · Live from local " + last.branch + " @ " + last.sha.slice(0, 7) : "";
+    return { text: version + rolled + " · " + (last ? "up to date" : "checking for updates…") + live, ok: true };
   }
 
   /** Pulls the state checkout's remote changes and pushes Indra's; a changed state.json refreshes the screen. */
@@ -621,6 +654,88 @@ export class TerminalUiModel {
     return attach?.kind === "tmux" ? attach.target : undefined;
   }
 
+  /** True while the owner's keys go to the selected seat's live session. */
+  drivingOn(): boolean {
+    return this.page === "seat" && this.focus === "session" && this.driving?.state === "on" && this.driving.seatId === this.seatId;
+  }
+
+  /**
+   * Focuses a part of the seat screen (a click, Tab or `i`); undefined is a click outside every part, which leaves the
+   * session pane. Leaving the pane while driving returns `release`. Entering it on a seat with a live session returns
+   * `drive`, and the runner answers with `driveResult`; until then nothing is forwarded.
+   */
+  setFocus(region: FocusRegion | undefined): UiAction {
+    if (this.page !== "seat") return "none";
+    const next = region ?? (this.focus === "session" ? "details" : this.focus);
+    this.focus = next;
+    this.escapeAt = undefined;
+    this.revision++;
+    if (next !== "session") {
+      if (!this.driving) return "none";
+      this.driving = undefined;
+      return "release";
+    }
+    if (this.driving) return "none";
+    if (!this.seat || !this.attachTarget()) {
+      this.notice = "No live session to drive for this seat; its process is not running under Indra.";
+      return "none";
+    }
+    this.driving = { seatId: this.seat.id, state: "checking" };
+    this.sessionScroll = 0;
+    return "drive";
+  }
+
+  /** A click on the seat screen: on a part of it (and, in the seat list, on a seat), or outside every part. */
+  focusAt(region: FocusRegion | undefined, seatId?: string): UiAction {
+    if (this.page !== "seat" || this.input || this.confirm || this.overlay) return "none";
+    const action = this.setFocus(region);
+    if (region === "seats" && seatId && seatId !== this.seatId && this.team?.seats.some((seat) => seat.id === seatId)) {
+      this.seatId = seatId;
+      this.sessionScroll = 0;
+    }
+    return action;
+  }
+
+  /** Tab and Shift-Tab: the next or previous part of the seat screen. */
+  cycleFocus(direction: 1 | -1): UiAction {
+    const index = SEAT_REGIONS.indexOf(this.focus);
+    return this.setFocus(SEAT_REGIONS[(index + direction + SEAT_REGIONS.length) % SEAT_REGIONS.length]);
+  }
+
+  /**
+   * The runner's answer to `drive`: the pane's input is on (`ok`), or there is nothing to drive. Returns false when the
+   * owner already left the pane or chose another seat, so the runner switches the input back off.
+   */
+  driveResult(seatId: string, result: { ok: true } | { ok: false; reason: "no-session" | "not-headed" }): boolean {
+    if (this.driving?.seatId !== seatId || this.driving.state !== "checking" || this.page !== "seat" || this.focus !== "session") return false;
+    const name = this.seat?.displayName ?? "This seat";
+    if (result.ok) this.driving = { seatId, state: "on" };
+    else {
+      this.driving = undefined;
+      this.notice = result.reason === "not-headed"
+        ? `${name} is not in a headed run, so there is nothing to drive; watching only.`
+        : "No live session to drive for this seat; its process is not running under Indra.";
+    }
+    this.revision++;
+    return result.ok;
+  }
+
+  /** Scrolls the session pane back (positive) or towards live (negative). */
+  scrollSession(lines: number): void {
+    const next = Math.max(0, Math.min(MAX_SCROLLBACK, this.sessionScroll + Math.trunc(lines)));
+    if (next === this.sessionScroll) return;
+    this.sessionScroll = next;
+    this.revision++;
+  }
+
+  /** Leaves the seat screen's focus and driving state behind when the page or seat changes. */
+  private resetFocus(): void {
+    this.focus = "details";
+    this.driving = undefined;
+    this.escapeAt = undefined;
+    this.sessionScroll = 0;
+  }
+
   async refresh(): Promise<boolean> {
     const previous = JSON.stringify([this.snapshot, this.stateError, this.sessionResult, this.live]);
     const previousState = JSON.stringify(this.snapshot);
@@ -646,6 +761,8 @@ export class TerminalUiModel {
     this.sessionsReadable = sessions.status === "fulfilled";
     if (sessions.status === "fulfilled") this.sessionResult = sessions.value;
     else this.sessionResult = { connection: "error", sessions: [], message: sessions.reason instanceof Error ? sessions.reason.message : "Session reader failed." };
+    // A seat that left the state takes its driving with it; the runner then switches the pane's input back off.
+    if (this.driving && (this.page !== "seat" || this.driving.seatId !== this.seatId)) this.resetFocus();
     let staleConfirmation = false;
     if (this.confirm && this.confirm.action !== "retry" && this.confirm.action !== "rollback" && !this.confirmationCurrent(this.confirm)) {
       this.notice = `Confirmation for ${this.confirm.goalId} expired: its operation changed or is unavailable. Review the refreshed ceremony and confirm again.`;
@@ -683,8 +800,11 @@ export class TerminalUiModel {
     return true;
   }
 
-  /** `text` is the key's raw character, used only while the text input is open. */
-  key(value: string, text?: string): UiAction {
+  /**
+   * `text` is the key's raw character, used while the text input is open and for keys forwarded to a driven session.
+   * `mods` tells Shift-Tab from Tab.
+   */
+  key(value: string, text?: string, mods: KeyMods = {}): UiAction {
     if (this.input) {
       const name = value.toLowerCase();
       if (name === "escape") this.input = undefined;
@@ -719,8 +839,41 @@ export class TerminalUiModel {
       if (name === "escape" || name === "q" || (this.overlay === "help" && text === "?")) { this.overlay = undefined; this.revision++; }
       return "none";
     }
-    this.notice = undefined;
     const input = value.toLowerCase();
+    if (this.page === "seat" && this.focus === "session" && this.driving) {
+      // Driving: every key goes to the session except Tab and Shift-Tab, which move on, and a second quick Esc.
+      if (input === "tab") return this.cycleFocus(mods.shift ? -1 : 1);
+      if (this.driving.state !== "on") return input === "escape" ? this.setFocus("details") : "none";
+      if (input === "escape") {
+        const at = this.now();
+        if (this.escapeAt !== undefined && at - this.escapeAt <= DOUBLE_ESCAPE_MS) return this.setFocus("details");
+        this.escapeAt = at;
+        return "forward";
+      }
+      this.escapeAt = undefined;
+      return "forward";
+    }
+    this.notice = undefined;
+    if (input === "tab") {
+      if (this.page === "seat") return this.cycleFocus(mods.shift ? -1 : 1);
+      this.revision++;
+      return "none";
+    }
+    if (text === "i" || text === "D" || (text === undefined && (value === "i" || value === "D"))) {
+      if (this.page !== "seat") { this.notice = "Open a seat first to drive its live session."; this.revision++; return "none"; }
+      return this.setFocus("session");
+    }
+    if (this.page === "seat" && this.focus === "session") {
+      // The session pane is focused but not driven (no headed run): it scrolls, and Esc or Enter leave or retry.
+      const page = 10;
+      if (input === "up" || input === "k") { this.scrollSession(1); return "none"; }
+      if (input === "down" || input === "j") { this.scrollSession(-1); return "none"; }
+      if (input === "pageup") { this.scrollSession(page); return "none"; }
+      if (input === "pagedown") { this.scrollSession(-page); return "none"; }
+      if (input === "end") { this.scrollSession(-this.sessionScroll); return "none"; }
+      if (input === "escape") return this.setFocus("details");
+      if (input === "return" || input === "enter") return this.setFocus("session");
+    }
     if (text === "?") { this.overlay = "help"; this.revision++; return "none"; }
     if (text === "t" || (text === undefined && value === "t")) {
       if (this.page !== "seat" || !this.seat) this.notice = "Open a seat first to read its session transcript.";
@@ -773,7 +926,7 @@ export class TerminalUiModel {
       else if (!this.processes) this.notice = "Seat processes are not managed from this screen.";
       else { this.revision++; return input === "s" ? "restart" : "stop"; }
     } else if (input === "b" || input === "left" || input === "escape") {
-      if (this.page === "seat") this.page = "team";
+      if (this.page === "seat") { this.page = "team"; this.resetFocus(); }
       else if (this.page === "team") this.page = "teams";
     } else if (["up", "k", "down", "j"].includes(input)) {
       const direction = input === "up" || input === "k" ? -1 : 1;
@@ -781,22 +934,17 @@ export class TerminalUiModel {
         const index = this.teams.findIndex((team) => team.id === this.teamId);
         const next = this.teams[Math.max(0, Math.min(this.teams.length - 1, index + direction))];
         if (next) { this.teamId = next.id; this.seatId = next.seats[0]?.id; }
-      } else if (this.page === "team") {
+      } else if (this.page === "team" || (this.page === "seat" && this.focus === "seats")) {
+        // On the seat screen the seat list switches the seat shown beside it.
         const seats = this.team?.seats ?? [];
         const index = seats.findIndex((seat) => seat.id === this.seatId);
-        this.seatId = seats[Math.max(0, Math.min(seats.length - 1, index + direction))]?.id;
+        const next = seats[Math.max(0, Math.min(seats.length - 1, index + direction))]?.id;
+        if (next !== this.seatId) this.sessionScroll = 0;
+        this.seatId = next;
       }
     } else if (input === "enter" || input === "return" || input === "right") {
       if (this.page === "teams" && this.team) this.page = "team";
-      else if (this.page === "team" && this.seat) this.page = "seat";
-    } else if (text === "D" || (text === undefined && value === "D")) {
-      if (this.page !== "seat") this.notice = "Open a seat first to drive its live session.";
-      else if (!this.attachTarget()) this.notice = "No live session to drive for this seat; its process is not running under Indra.";
-      else return "drive";
-    } else if (input === "a") {
-      if (this.page !== "seat") this.notice = "Open a seat first to watch its live process.";
-      else if (!this.attachTarget()) this.notice = "No live view is available for this seat; its process is not running under Indra.";
-      else return "attach";
+      else if (this.page === "team" && this.seat) { this.page = "seat"; this.resetFocus(); }
     }
     this.revision++;
     return "none";
@@ -821,22 +969,25 @@ export class TerminalUiWorkflow {
         if (!this.controller.signal.aborted) throw new Error("Event host stopped.");
       }).catch(() => {
         if (!this.controller.signal.aborted) {
-          this.controller.abort();
-          this.model.workflowError = "Workflow event host failed; restart Indra to reconcile retained events.";
-          this.model.revision++; this.model.changed?.();
+          this.fail("Workflow event host failed; restart Indra to reconcile retained events.");
         }
       });
       await this.model.start();
-      this.ready = true;
+      this.ready = !this.controller.signal.aborted;
       await this.wake();
     })();
     return this.startRun;
+  }
+  private fail(message: string): void {
+    this.ready = false; this.controller.abort(); this.model.workflowSuspended = true;
+    this.model.workflowError = message; this.model.revision++; this.model.changed?.();
   }
   async setAttached(attached: boolean): Promise<void> { this.attached = attached; await this.wake(); }
   async wake(): Promise<void> {
     this.model.workflowSuspended = !this.active || !this.ready || this.attached;
     if (this.model.workflowSuspended) return;
-    await this.model.flushWorkflowEvents();
+    try { await this.model.flushWorkflowEvents(); }
+    catch { this.fail("Workflow reconciliation failed; restart Indra to reconcile retained events."); return; }
     if (this.active && !this.attached && this.model.readyToReload()) this.idle();
   }
   async stop(): Promise<void> {

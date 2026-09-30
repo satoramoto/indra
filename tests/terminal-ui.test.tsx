@@ -7,7 +7,6 @@ import { GOAL_INPUT_LIMIT, TerminalUiModel, TerminalUiWorkflow, sessionSprint, t
 import type { UpdateResult } from "../src/self-update.js";
 import type { StateSyncResult } from "../src/state-commit.js";
 import { TerminalApp } from "../src/terminal-ui-solid.js";
-import { attachTmux, parseOwnedTmuxTarget } from "../src/tmux-attach.js";
 import type { AssignmentRetry, GoalStarter, SeatLive, SeatProcessPort } from "../src/supervisor.js";
 import { prLabel } from "../src/hub-format.js";
 import { CEREMONY_STAGES, type CeremonySnapshot, type CeremonyStage, type SprintBuild, type SprintLoop } from "../src/session-snapshot.js";
@@ -87,7 +86,7 @@ describe("terminal UI", () => {
     try {
       await setup.renderOnce();
       expect(setup.captureCharFrame()).toContain("Re-queued goal-retry/outcome-1 for seat-002.");
-      expect(setup.captureCharFrame()).toContain("Assignment: Retry failed work · queued");
+      expect(visibleIn(await scrollFrames(setup, "detail-scroll"), "historical Retry failed work · queued")).toBe(true);
     } finally { setup.renderer.destroy(); }
     model.key("t", "T");
     expect(model.confirm).toBeUndefined();
@@ -177,7 +176,9 @@ describe("terminal UI", () => {
     expect(fixture.model.sessionsFor("seat-003")).toEqual([]);
     fixture.model.key("return");
     expect(fixture.model.attachTarget()).toBe("indra-bridge:indra-goal-1");
-    expect(fixture.model.key("a")).toBe("attach");
+    // i focuses the session pane and asks to drive it; Esc leaves before the check answers.
+    expect(fixture.model.key("i", "i")).toBe("drive");
+    expect(fixture.model.key("escape")).toBe("release");
     fixture.model.key("b");
     fixture.model.key("b");
     expect(fixture.model.page).toBe("teams");
@@ -209,7 +210,7 @@ describe("terminal UI", () => {
       await setup.renderOnce();
       const initial = setup.captureCharFrame();
       for (const name of names) expect(initial).toContain(name);
-      expect(initial).toContain("NO ACTIVE SESSION");
+      expect(initial).toContain("no active session");
       fixture.sessions({ connection: "connected", sessions: [{
         id: "goal-1", teamId: "team-001", seatId: "seat-001", status: "running", engine: "codex",
         sessionId: "codex-123", goal: "Plan the next cycle", stage: "clarifying", recentActivity: ["Old note", "Read the brief"],
@@ -219,33 +220,29 @@ describe("terminal UI", () => {
       setRevision(fixture.model.revision);
       await setup.renderOnce();
       const updated = setup.captureCharFrame();
-      expect(updated).toContain("RUNNING SESSION");
-      expect(updated).toContain("Latest: Read the brief");
-      expect(updated).not.toContain("Latest: Old note");
+      expect(updated).toContain("running session");
+      expect(updated).toContain("Read the brief");
+      expect(updated).not.toContain("Old note");
       fixture.model.key("down");
       fixture.model.key("enter");
       setRevision(fixture.model.revision);
       await setup.renderOnce();
-      expect(setup.captureCharFrame()).toContain("Planning detail: clarifying");
+      expect(setup.captureCharFrame()).toMatch(/detail +clarifying/);
       fixture.model.key("b");
       setRevision(fixture.model.revision);
       const narrow = await testRender(() => <TerminalApp model={fixture.model} revision={revision} onKey={() => {}} />, { width: 80, height: 24 });
       try {
         await narrow.renderOnce();
         const frame = narrow.captureCharFrame();
-        for (const name of names) expect(frame).toContain(name);
+        // At 24 rows the open sprint comes first; the seats table is further down the page.
+        const frames = await scrollFrames(narrow, "team-scroll");
+        for (const name of names) expect(visibleIn(frames, name), name + "\n" + frame).toBe(true);
       } finally { narrow.renderer.destroy(); }
     } finally {
       setup.renderer.destroy();
     }
   });
 
-  it("only accepts exact socket:session tmux targets", () => {
-    expect(parseOwnedTmuxTarget("indra-bridge:indra-goal-1")).toEqual({ socket: "indra-bridge", session: "indra-goal-1" });
-    for (const invalid of ["indra-bridge", "one:two:three", "one:$(id)", "one:two;kill", "UPPER:case", "one:/tmp"]) {
-      expect(() => parseOwnedTmuxTarget(invalid)).toThrow("valid Indra tmux target");
-    }
-  });
 
   it("keeps planning context visible with no Codex session and marks disconnected occupancy unknown", async () => {
     const fixture = harness();
@@ -263,11 +260,8 @@ describe("terminal UI", () => {
     try {
       await setup.renderOnce();
       const frame = setup.captureCharFrame();
-      expect(frame).toContain("OCCUPANCY UNKNOWN");
-      expect(frame).toContain("Earlier response");
-      expect(frame).toContain("Planning goal: Plan the next cycle");
-      expect(frame).toContain("Planning detail: clarifying");
-      expect(frame).toContain("Live view: not available");
+      const frames = [frame, ...await scrollFrames(setup, "detail-scroll")];
+      for (const text of ["occupancy unknown", "Earlier response", "goal Plan the next cycle", "detail clarifying", "live not available"]) expect(visibleIn(frames, text), text).toBe(true);
     } finally { setup.renderer.destroy(); }
   });
 
@@ -283,7 +277,7 @@ describe("terminal UI", () => {
     try {
       await setup.renderOnce();
       const frame = setup.captureCharFrame();
-      expect(frame).toContain("RUNTIME RECORD ERROR");
+      expect(frame).toContain("runtime record error");
       expect(frame).toContain("Runtime metadata is unreadable.");
     } finally { setup.renderer.destroy(); }
   });
@@ -300,16 +294,18 @@ describe("terminal UI", () => {
     try {
       await setup.renderOnce();
       const frame = setup.captureCharFrame();
-      expect(frame).toContain("RUNTIME ERROR · SAVED SESSION");
-      expect(frame).toContain("Latest: Runtime metadata is unreadable.");
-      expect(frame).not.toContain("Latest: Old activity");
+      expect(frame).toContain("runtime error · saved session");
+      // The newest goal's activity is the seat's latest, lower on the page; the older goal's is not.
+      const frames = await scrollFrames(setup, "team-scroll");
+      expect(visibleIn(frames, "Chick Corea Runtime metadata is unreadable.")).toBe(true);
+      expect(visibleIn(frames, "Old activity")).toBe(false);
       fixture.model.key("down");
       fixture.model.key("return");
       setRevision(fixture.model.revision);
       await setup.renderOnce();
       const detail = setup.captureCharFrame();
-      expect(detail).toContain("Planning goal: New goal");
-      expect(detail).toContain("Planning detail: drafting");
+      expect(detail).toMatch(/goal +New goal/);
+      expect(detail).toMatch(/detail +drafting/);
     } finally { setup.renderer.destroy(); }
   });
 
@@ -335,12 +331,12 @@ describe("terminal UI", () => {
     try {
       await wide.renderOnce();
       const frame = wide.captureCharFrame();
-      expect(frame).toMatch(/George Duke +Developer +RUNNING/);
-      expect(frame).toContain("Second · in-review 🐙 #2");
-      expect(frame).toContain("Latest: Opened PR 2");
-      expect(frame).toMatch(/Aaron Magner +Developer +NO CREDENTIAL/);
-      expect(frame).toMatch(/Corey Henry +Developer +STOPPED/);
-      expect(frame).toContain("Third · queued");
+      // One row per seat: name, then its task (or why it has none), then its pipeline, model, tokens, time and PR.
+      expect(frame).toMatch(/● George Duke +(dev +)?Second +■◧□□□ .* ⎇ #2/);
+      expect(frame).toContain("Opened PR 2");
+      expect(frame).toMatch(/✗ Aaron Magner +(dev +)?no credential/);
+      expect(frame).toMatch(/◐ Corey Henry +(dev +)?stopped/);
+      expect(frame).toMatch(/◐ Jordan Rudess +(dev +)?Third +□□□□□/);
       expect(frame).toContain("No thread activity yet.");
     } finally { wide.renderer.destroy(); }
     const narrow = await testRender(() => <TerminalApp model={model} revision={revision} onKey={() => {}} />, { width: 80, height: 24 });
@@ -348,8 +344,8 @@ describe("terminal UI", () => {
       await narrow.renderOnce();
       const frame = narrow.captureCharFrame();
       for (const name of names) expect(frame).toContain(name);
-      expect(frame).toContain("NO CREDENTIAL");
-      expect(frame).toContain("Second · in-review");
+      expect(frame).toContain("no credential");
+      expect(frame).toMatch(/George Duke +Second/);
     } finally { narrow.renderer.destroy(); }
 
     for (const _ of [1, 2, 3]) model.key("down");
@@ -367,8 +363,8 @@ describe("terminal UI", () => {
     try {
       await detail.renderOnce();
       const frame = detail.captureCharFrame();
-      expect(frame).toContain("Process: running (seat runner)");
-      expect(frame).toContain("Assignment: Second · in-review");
+      const frames = [frame, ...await scrollFrames(detail, "detail-scroll")];
+      for (const text of ["process running (seat runner)", "historical Second · in-review"]) expect(visibleIn(frames, text), text).toBe(true);
     } finally { detail.renderer.destroy(); }
   });
 
@@ -383,7 +379,7 @@ describe("terminal UI", () => {
       try {
         await view.renderOnce();
         const frame = view.captureCharFrame();
-        expect(frame).toContain("NO CHANNEL");
+        expect(frame).toContain("no channel");
         expect(frame).toContain("@chickcorea can't join the home channel home");
       } finally { view.renderer.destroy(); }
     }
@@ -440,6 +436,9 @@ describe("terminal UI", () => {
     live = { "seat-002": { process: "running" } };
     await model.refresh();
     expect(model.updateLine()?.text).toBe("Indra abc1234 · up to date");
+    result = { outcome: "up-to-date", message: "up to date at abc1234", at: "now", branch: "hotfix", sha: "abc1234def" };
+    await model.updateCode();
+    expect(model.updateLine()?.text).toBe("Indra abc1234 · up to date · Live from local hotfix @ abc1234");
 
     result = { outcome: "blocked", message: "the Indra checkout has uncommitted changes", at: "now" };
     await model.updateCode();
@@ -487,8 +486,10 @@ describe("terminal UI", () => {
     expect(model.reloadWanted).toBe(false);
     expect(model.updateLine()).toEqual({ ok: false, text: "Indra abc1234 · blocked: dependency install failed: npm ci failed: ENOSPC · retrying on the next check" });
 
-    // The next check installs and builds: the new build is live, then held actions run again.
+    // Typing is preserved while blocked. At the next idle boundary the retry may install and build.
+    const draft = model.input; model.input = undefined;
     const retry = model.updateCode();
+    model.input = draft;
     const again = model.control("restart");
     await new Promise((done) => setTimeout(done, 20));
     expect(calls).toEqual(["check", "check"]);
@@ -578,7 +579,7 @@ describe("terminal UI", () => {
       expect(after.updateLine()?.text).toBe("Indra abc1234 · rolled back to abc1234 from fed4321 · updates paused · 2 new commits waiting on origin/main");
       setRevision(model.revision);
       await setup.renderOnce();
-      expect(setup.captureCharFrame()).toContain("Auto-update paused  ·  U resumes");
+      expect(setup.captureCharFrame()).toContain("Auto-update paused · U resumes");
     } finally { setup.renderer.destroy(); }
   });
 
@@ -739,7 +740,9 @@ describe("terminal UI", () => {
     try {
       await setup.renderOnce();
       expect(setup.captureCharFrame()).toContain("Open the integration PR into main");
-      expect(setup.captureCharFrame()).toContain("I integrate");
+      // While the y/n is open the shortcut bar shows its keys; the ceremony key is offered on the seat screen.
+      expect(setup.captureCharFrame()).toContain("y confirm · any other key cancel");
+      expect(model.ceremonyKeys()).toContain("I integrate");
     } finally { setup.renderer.destroy(); }
     expect(model.key("n", "n")).toBe("none");
     expect(model.notice).toContain("cancelled");
@@ -793,8 +796,8 @@ describe("terminal UI", () => {
       const frame = setup.captureCharFrame();
       expect(frame).toContain("Request Chick's proposal for goal-2");
       expect(frame).toContain("y request");
-      expect(frame).toContain("P propose");
-      expect(frame).not.toContain("A approve");
+      expect(model.ceremonyKeys()).toContain("P propose");
+      expect(model.ceremonyKeys()).not.toContain("A approve");
       expect(frame).toContain("P requests Chick's proposal here");
       // Anything but y cancels, and nothing runs.
       expect(model.key("n", "n")).toBe("none");
@@ -835,14 +838,6 @@ describe("terminal UI", () => {
     expect(model.notice).toBe("Could not request a proposal for goal-1: Goal goal-1 is at the drafting stage; a proposal can be requested only while it is clarifying.");
   });
 
-  it("attaches to the verified tmux session in read-only mode", async () => {
-    const calls: { args: string[]; stdio: string }[] = [];
-    await attachTmux("indra-bridge:chick-123", async (args, stdio) => { calls.push({ args, stdio }); return 0; });
-    expect(calls).toEqual([
-      { args: ["-L", "indra-bridge", "has-session", "-t", "=chick-123"], stdio: "ignore" },
-      { args: ["-L", "indra-bridge", "attach-session", "-r", "-t", "=chick-123"], stdio: "inherit" },
-    ]);
-  });
 });
 
 const projectedSession = (id: string, loop: SprintLoop): TerminalSession => ({
@@ -924,9 +919,9 @@ describe("persisted ceremony and allowed actions", () => {
         const frames = await scrollFrames(setup, view.page === "team" ? "team-scroll" : "detail-scroll");
         const cycle = CEREMONY_STAGES.map((name) => name === stage ? `[${name}]` : name).join(" → ");
         expect(visibleIn(frames, cycle), view.page + " " + view.seatId).toBe(true);
-        expect(visibleIn(frames, "Current stage: " + stage)).toBe(true);
-        expect(visibleIn(frames, "Closure: open")).toBe(true);
-        expect(visibleIn(frames, "Current stage: Updated")).toBe(false);
+        expect(visibleIn(frames, `[${stage}]`)).toBe(true);
+        expect(visibleIn(frames, (stage === "retro" ? "[retro]" : "retro") + " open")).toBe(true);
+        expect(visibleIn(frames, "[Updated]")).toBe(false);
       }
       for (const action of Object.values(fixture.goals)) expect(action).not.toHaveBeenCalled();
     } finally { setup.renderer.destroy(); }
@@ -987,7 +982,7 @@ describe("persisted ceremony and allowed actions", () => {
       await setup.renderOnce();
       expect(setup.captureCharFrame()).toContain("P propose");
       const frames = await scrollFrames(setup, "detail-scroll");
-      expect(visibleIn(frames, "Current stage: proposal")).toBe(true);
+      expect(visibleIn(frames, "[proposal]")).toBe(true);
       expect(visibleIn(frames, "P requests Chick's proposal here")).toBe(true);
     } finally { setup.renderer.destroy(); }
     model.key("p", "P");
@@ -1148,7 +1143,7 @@ describe("persisted ceremony and allowed actions", () => {
     try {
       await setup.renderOnce();
       const frames = await scrollFrames(setup, "team-scroll");
-      expect(visibleIn(frames, "Current stage: proposal")).toBe(true);
+      expect(visibleIn(frames, "[proposal]")).toBe(true);
       expect(visibleIn(frames, detail === "drafting" ? "Chick is drafting the proposal." : "Draft ready; waiting for the owner's plan approval.")).toBe(true);
     } finally { setup.renderer.destroy(); }
   });
@@ -1162,8 +1157,8 @@ describe("persisted ceremony and allowed actions", () => {
       await setup.renderOnce();
       const frames = await scrollFrames(setup, "team-scroll");
       expect(visibleIn(frames, "Release waiting: " + reason)).toBe(true);
-      expect(visibleIn(frames, "Current stage: release")).toBe(true);
-      expect(visibleIn(frames, "Integration PR: 🐙 " + prLabel(session.loop!.integration!.prUrl, true))).toBe(true);
+      expect(visibleIn(frames, "[release]")).toBe(true);
+      expect(visibleIn(frames, "integration ⎇ " + prLabel(session.loop!.integration!.prUrl, true))).toBe(true);
       expect(fixture.model.ceremonyKeys()).not.toContain("M merge release");
     } finally { setup.renderer.destroy(); }
   });
@@ -1192,7 +1187,7 @@ describe("persisted ceremony and allowed actions", () => {
       // Closed means finished (#59): the sprint card leaves the list.
       expect(fixture.model.sprintsForTeam().map((sprint) => sprint.id)).not.toContain("goal-ceremony");
       const frames = await scrollFrames(setup, "detail-scroll");
-      expect(visibleIn(frames, "Current stage: retro")).toBe(false);
+      expect(visibleIn(frames, "[retro]")).toBe(false);
       // The seat's record still carries the published retro and the recorded release.
       const [record] = fixture.model.sessionsFor("seat-001");
       const loop = sessionSprint(record!).loop;
@@ -1215,15 +1210,17 @@ describe("visible sprint loop", () => {
     const setup = await testRender(() => <TerminalApp model={model} revision={() => model.revision} onKey={() => {}} />, { width: 140, height: 35 });
     try {
       await setup.renderOnce();
-      expect(setup.captureCharFrame()).toContain("Current stage: implement");
+      expect(setup.captureCharFrame()).toContain("[implement]");
       const spans = setup.captureSpans().lines.flatMap((line) => line.spans);
       const current = spans.find((span) => span.text.includes("[implement]"));
-      expect(current?.fg.toInts().slice(0, 3)).toEqual([103, 232, 249]);
+      // The one accent colour.
+      expect(current?.fg.toInts().slice(0, 3)).toEqual([165, 180, 252]);
       expect(spans.find((span) => span.text.includes("planning →"))?.fg.toInts()).not.toEqual(current?.fg.toInts());
       const frames = await scrollFrames(setup, "team-scroll");
       for (const ticket of ticketLoop.tickets) {
-        expect(visibleIn(frames, `${ticket.title} · ${ticket.status}`)).toBe(true);
-        expect(visibleIn(frames, "🐙 " + prLabel(ticket.prUrl))).toBe(true);
+        // A table row: the title, then its status in its own column.
+        expect(visibleIn(frames, `${ticket.title} ${ticket.status}`)).toBe(true);
+        expect(visibleIn(frames, "⎇ " + prLabel(ticket.prUrl))).toBe(true);
       }
       for (const action of [processes.ensureAll, processes.stop, processes.restart, processes.retry, goals.start, goals.propose, goals.approve, goals.sprint]) expect(action).not.toHaveBeenCalled();
       expect(model.confirm).toBeUndefined();
@@ -1244,13 +1241,13 @@ describe("visible sprint loop", () => {
     try {
       await setup.renderOnce();
       const frames = await scrollFrames(setup, "team-scroll");
-      for (const text of ["SPRINT · goal-one", "SPRINT · goal-two", "Current stage: implement", "Current stage: release", "Integration PR: 🐙 " + prLabel(second.loop!.integration!.prUrl, true), "Failed ticket retained · failed", "👤 George Duke", "👤 Aaron Magner", "🐙 " + prLabel(second.loop!.tickets[0].prUrl)]) {
+      for (const text of ["SPRINT goal-one", "SPRINT goal-two", "[implement]", "[release]", "integration ⎇ " + prLabel(second.loop!.integration!.prUrl, true), "Failed ticket retained · failed", "George Duke ·", "Aaron Magner ·", "⎇ " + prLabel(second.loop!.tickets[0].prUrl)]) {
         expect(visibleIn(frames, text), text).toBe(true);
       }
       expect(visibleIn(frames, "planning → proposal → [implement] → release → retro")).toBe(true);
       for (const ticket of ticketLoop.tickets) {
         expect(visibleIn(frames, `${ticket.title} · ${ticket.status}`), `${ticket.title} · ${ticket.status}`).toBe(true);
-        expect(visibleIn(frames, "🐙 " + prLabel(ticket.prUrl)), ticket.prUrl).toBe(true);
+        expect(visibleIn(frames, "⎇ " + prLabel(ticket.prUrl)), ticket.prUrl).toBe(true);
       }
     } finally { setup.renderer.destroy(); }
   });
@@ -1293,7 +1290,7 @@ describe("visible sprint loop", () => {
       await setup.renderOnce();
       const frames = await scrollFrames(setup, "team-scroll");
       expect(visibleIn(frames, message), frames[0]).toBe(true);
-      expect(visibleIn(frames, "Current stage: release")).toBe(true);
+      expect(visibleIn(frames, "[release]")).toBe(true);
     } finally { setup.renderer.destroy(); }
   });
 
@@ -1305,9 +1302,157 @@ describe("visible sprint loop", () => {
     try {
       await setup.renderOnce();
       const frame = setup.captureCharFrame();
-      expect(frame).toContain(`IDLE SESSION · ${label}`);
+      expect(frame).toContain(`idle session · ${label}`);
       expect(frame).toContain(`${label} session: ${sessionId}`);
       if (engine !== "codex") expect(frame).not.toContain("Codex");
     } finally { setup.renderer.destroy(); }
+  });
+});
+
+describe("event-driven UI lifetime", () => {
+  const at = "2026-09-29T12:00:00Z";
+  const queue = (source: string, suffix: string): import("../src/goal-contract.js").WorkflowEvent => ({ kind: "queue-changed", teamId: "team-001", id: `${source}:team-001:${suffix}`, at });
+  function deferred<T = void>() { let resolve!: (value: T) => void; let reject!: (reason: unknown) => void; const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
+  async function setup(options: { legacy?: boolean; close?: Promise<void> } = {}) {
+    type Event = import("../src/goal-contract.js").WorkflowEvent;
+    let send!: (event: Event) => Promise<void>;
+    let signal!: AbortSignal;
+    const calls: string[] = [];
+    const sourceExit = deferred();
+    let sessions: TerminalSession[] = [];
+    let pending = true;
+    let current = { id: "current", sha: "a".repeat(40), builtAt: at };
+    const check = vi.fn(async (): Promise<UpdateResult> => { calls.push("check"); return { outcome: "up-to-date", message: "Current build", at }; });
+    const upgrade = vi.fn(async () => { calls.push("upgrade"); return { pending: pending ? ["seat-003"] : [], problems: [] }; });
+    const read = vi.fn(async (): Promise<SessionReadResult> => ({ connection: "connected", sessions }));
+    const processes: SeatProcessPort = { ensureAll: async () => { calls.push("ensure"); return []; }, read: async () => ({ "seat-003": { process: "running", ...(pending ? { updatePending: true } : {}) } }), stop: async () => {}, restart: async () => {}, upgrade };
+    const state = structuredClone(homed);
+    if (!options.legacy) { state.teams[0].workflowModel = "goals-v1"; state.teams[0].seats[1].roles = ["Product"]; }
+    const model = new TerminalUiModel(new StateInventory({ read: async () => state }), { readSessions: read }, processes, undefined, undefined,
+      { running: current, canReload: true, check, current: async () => current });
+    const reload = vi.fn();
+    const host = new TerminalUiWorkflow(model, options.legacy ? undefined : async (onEvent, abort) => {
+      calls.push("subscribe"); send = onEvent; signal = abort;
+      await onEvent({ kind: "startup", teamId: "team-001", at });
+      await Promise.race([sourceExit.promise, new Promise<void>((done) => { if (abort.aborted) done(); else abort.addEventListener("abort", () => done(), { once: true }); })]);
+      if (options.close) await options.close;
+      calls.push("host-closed");
+    }, reload);
+    await host.start();
+    return { model, host, check, upgrade, read, reload, calls, processes, send: (event: Event) => send(event), signal: () => signal,
+      sessions: (value: TerminalSession[]) => { sessions = value; }, current: () => { current = { ...current, id: "new", sha: "b".repeat(40) }; }, idle: () => { pending = false; }, fail: () => sourceExit.reject(new Error("Host connection lost")) };
+  }
+
+  it("subscribes before startup hosting, reconciles once, and observes build receipts without writing update receipts", async () => {
+    const f = await setup();
+    try {
+      expect(f.calls.slice(0, 4)).toEqual(["subscribe", "ensure", "check", "upgrade"]);
+      expect(f.check).toHaveBeenCalledTimes(1);
+      for (const event of [queue("build", "first"), queue("running", "first"), queue("state", "first")]) await f.send(event);
+      expect(f.check).toHaveBeenCalledTimes(1);
+      expect(f.upgrade).toHaveBeenCalledTimes(4);
+      expect(f.model.workflowError).toBeUndefined();
+      // The UI already runs this build, but an older busy seat was deferred at startup.
+      f.idle();
+      await f.send(queue("scheduler-idle", "completed-turn"));
+      expect(f.upgrade).toHaveBeenCalledTimes(5);
+      expect(f.model.live["seat-003"].updatePending).toBeUndefined();
+      expect(f.check).toHaveBeenCalledTimes(1);
+    } finally { await f.host.stop(); }
+  });
+
+  it("retains legacy startup/update behavior when no new-model event capability is supplied", async () => {
+    const f = await setup({ legacy: true });
+    try {
+      expect(f.calls).toEqual(["ensure", "check", "upgrade"]);
+      expect(f.model.workflowError).toBeUndefined();
+      await f.model.updateCode(); expect(f.check).toHaveBeenCalledTimes(2);
+    } finally { await f.host.stop(); }
+  });
+
+  it.each(["input", "confirm", "drive"] as const)("coalesces receipts while %s owns the UI, then safely reloads the retained build", async (busy) => {
+    const f = await setup();
+    try {
+      if (busy === "input") f.model.input = { value: "preserve my text" };
+      else if (busy === "confirm") f.model.confirm = { action: "rollback", from: "a", to: "b" };
+      else f.model.driving = { seatId: "seat-003", state: "on" };
+      const reads = f.read.mock.calls.length;
+      f.current();
+      for (const event of [queue("build", "one"), queue("build", "two"), queue("running", "one")]) await f.send(event);
+      expect(f.read).toHaveBeenCalledTimes(reads); expect(f.reload).not.toHaveBeenCalled();
+      f.model.input = undefined; f.model.confirm = undefined; f.model.driving = undefined;
+      await f.host.wake();
+      expect(f.read).toHaveBeenCalledTimes(reads + 1);
+      expect(f.model.reloadWanted).toBe(true); expect(f.reload).toHaveBeenCalledTimes(1);
+      expect(f.check).toHaveBeenCalledTimes(1);
+    } finally { await f.host.stop(); }
+  });
+
+  it("retains event work while an owned process action is in flight", async () => {
+    const f = await setup();
+    try {
+      const entered = deferred(); const finish = deferred();
+      f.processes.restart = async () => { entered.resolve(); await finish.promise; };
+      f.model.restore({ page: "seat", teamId: "team-001", seatId: "seat-003" });
+      const action = f.model.control("restart"); await entered.promise;
+      const reads = f.read.mock.calls.length;
+      await f.send(queue("state", "during-action")); await f.send(queue("state", "latest"));
+      expect(f.read).toHaveBeenCalledTimes(reads); expect(f.upgrade).toHaveBeenCalledTimes(1);
+      finish.resolve(); await action; await f.host.wake();
+      expect(f.upgrade).toHaveBeenCalledTimes(2); expect(f.check).toHaveBeenCalledTimes(1);
+    } finally { await f.host.stop(); }
+  });
+
+  it("preserves an upgrade event when typing starts during its asynchronous refresh", async () => {
+    const f = await setup();
+    try {
+      const reached = deferred(); const finish = deferred();
+      f.read.mockImplementationOnce(async () => { reached.resolve(); await finish.promise; return { connection: "connected", sessions: [] }; });
+      const turn = f.send({ kind: "seat-idle", teamId: "team-001", seatId: "seat-003", id: "late-idle", at });
+      await reached.promise; f.model.input = { value: "in flight" }; finish.resolve(); await turn;
+      expect(f.upgrade).toHaveBeenCalledTimes(1);
+      f.model.input = undefined; f.idle(); await f.host.wake();
+      expect(f.upgrade).toHaveBeenCalledTimes(2); expect(f.model.live["seat-003"].updatePending).toBeUndefined();
+    } finally { await f.host.stop(); }
+  });
+
+  it("updates only matching integration/revert merges and retains an integration event until state catches up", async () => {
+    const f = await setup();
+    try {
+      const session = ceremonySession("release"); session.workflowModel = "goals-v1";
+      const event: Extract<import("../src/goal-contract.js").WorkflowEvent, { kind: "merge" }> = { kind: "merge", id: "integration", teamId: session.teamId, goalId: session.id, laneId: null, prUrl: session.loop!.integration!.prUrl!, headSha: "c".repeat(40), mergedSha: "d".repeat(40), at };
+      f.sessions([session]);
+      await f.send({ ...event, id: "lane", laneId: "implementation" });
+      await f.send({ ...event, id: "retro", prUrl: "https://github.com/example/indra/pull/900" });
+      await f.send(event); expect(f.check).toHaveBeenCalledTimes(1);
+      session.loop!.integration!.status = "merged"; session.loop!.integration!.mergedSha = event.mergedSha;
+      await f.send(queue("state", "caught-up")); expect(f.check).toHaveBeenCalledTimes(2);
+      session.loop!.integration!.status = "reverted"; session.loop!.integration!.revertPrUrl = "https://github.com/example/indra/pull/901";
+      await f.send({ ...event, id: "revert", prUrl: session.loop!.integration!.revertPrUrl });
+      expect(f.check).toHaveBeenCalledTimes(3);
+      expect(f.model.readyToReload()).toBe(false);
+    } finally { await f.host.stop(); }
+  });
+
+  it("surfaces a deferred reconciliation failure instead of rejecting a detached key-handler wake", async () => {
+    const f = await setup();
+    try {
+      f.model.input = { value: "editing" }; await f.send(queue("scheduler-idle", "pending"));
+      f.processes.upgrade = async () => { throw new Error("State unavailable"); };
+      f.model.input = undefined; await f.host.wake();
+      expect(f.model.workflowError).toContain("reconciliation failed"); expect(f.signal().aborted).toBe(true);
+    } finally { await f.host.stop(); }
+  });
+
+  it("awaits host shutdown on exit and surfaces an unexpected host failure", async () => {
+    const closed = deferred(); const f = await setup({ close: closed.promise });
+    const stopped = vi.fn(); const stopping = f.host.stop().then(stopped);
+    await Promise.resolve(); expect(f.signal().aborted).toBe(true); expect(stopped).not.toHaveBeenCalled();
+    closed.resolve(); await stopping; expect(stopped).toHaveBeenCalledTimes(1); expect(f.calls.at(-1)).toBe("host-closed");
+    const failed = await setup();
+    try {
+      failed.fail(); await new Promise<void>((done) => setImmediate(done));
+      expect(failed.signal().aborted).toBe(true); expect(failed.model.workflowError).toContain("event host failed");
+    } finally { await failed.host.stop(); }
   });
 });

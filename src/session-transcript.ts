@@ -12,10 +12,12 @@
  */
 import { lstat, open, readdir, readFile, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { engineHome, seatHarnessDir } from "./harness-home.js";
 import { sanitizePaneText } from "./pane-tail.js";
 import { PlanningStore } from "./planning.js";
+import { headedMarkerFile, readHeadedMarker } from "./headed-session.js";
+import { TmuxHost } from "./tmux-host.js";
 
 export type TranscriptEngine = "claude" | "codex";
 export type TranscriptKind = "user" | "assistant" | "thinking" | "tool" | "result" | "error";
@@ -261,7 +263,7 @@ export class TranscriptLocator {
   readonly runtimeDir: string;
   private readonly store: PlanningStore;
   private readonly found = new Map<string, string>();
-  constructor(checkout: string, private readonly env: NodeJS.ProcessEnv = process.env, private readonly home = homedir()) {
+  constructor(private readonly checkout: string, private readonly env: NodeJS.ProcessEnv = process.env, private readonly home = homedir()) {
     this.runtimeDir = `${resolve(checkout)}.runtime`;
     this.store = new PlanningStore(checkout);
   }
@@ -331,6 +333,18 @@ export class TranscriptLocator {
     return found;
   }
 
+  /** The current finite run's exact log, bound to this seat's verified host and live headed process. */
+  private async headed(seatId: string): Promise<TranscriptLocation | undefined> {
+    const host = new TmuxHost(this.checkout, undefined, undefined, undefined, { kind: "seat", seatId });
+    const record = await host.verifiedRecord().catch(() => undefined);
+    if (!record) return undefined;
+    const marker = await readHeadedMarker(headedMarkerFile(this.checkout, record.readyNonce));
+    if (!marker?.log || !await isFile(marker.log)) return undefined;
+    const name = basename(marker.log);
+    const id = marker.engine === "claude" ? name.slice(0, -6) : /-([0-9a-f-]{36})\.jsonl$/i.exec(name)?.[1];
+    return id && UUID.test(id) ? { engine: marker.engine, sessionId: id, path: marker.log } : undefined;
+  }
+
   /**
    * The seat's current session log: the newest of the recorded session's log and, for a Developer seat, the newest
    * log of its active work. `recordedHandle` is Chick's recorded planning session for a Team Lead seat.
@@ -343,7 +357,11 @@ export class TranscriptLocator {
     const state = await this.store.read().catch(() => undefined);
     const goal = state?.planningGoals?.some((goal) => goal.workflowModel === "goals-v1" && !goal.ceremony?.closure && goal.goalAssignment?.seatId === seat.id && goal.goalAssignment.status !== "reported");
     const task = !lead && !product && !goal ? await seatTask(this.runtimeDir, seat.id) : undefined;
-    const recorded = await this.recorded(seat.id, lead ? recordedHandle : task?.sessionId ?? recordedHandle);
+    if (product || goal) {
+      const headed = await this.headed(seat.id);
+      if (headed) return headed;
+    }
+    const recorded = await this.recorded(seat.id, product || goal ? undefined : lead ? recordedHandle : task?.sessionId ?? recordedHandle);
     if (recorded) candidates.push(recorded);
     candidates.push(...await this.live(seat.id, task?.worktree, product || goal));
     let best: { location: TranscriptLocation; at: number } | undefined;

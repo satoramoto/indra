@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SystemTmux, TmuxHost, type TmuxRunner } from "../src/tmux-host.js";
+import { hasTruecolorFeature, SystemTmux, TmuxHost, type TmuxRunner } from "../src/tmux-host.js";
 import { LocalSessionReader } from "../src/session-snapshot.js";
 import { PlanningStore } from "../src/planning.js";
 import { git } from "./state-checkout.js";
@@ -15,6 +15,7 @@ class FakeTmux implements TmuxRunner {
   identity = "123:456";
   dead = false;
   globalEnv = "";
+  features = ["xterm*:clipboard:ccolour:cstyle:focus:title", "screen*:title"];
   onStart?: (nonce: string) => Promise<void>;
   async run(args: string[]): Promise<string> {
     this.calls.push(args);
@@ -24,6 +25,8 @@ class FakeTmux implements TmuxRunner {
     if (args.includes("list-sessions")) return this.pane ? `${this.session} ${this.identity.split(":")[1]}` : "";
     if (args.includes("has-session")) throw new Error("absent");
     if (args.includes("show-environment")) return this.globalEnv;
+    if (args.includes("show-options")) return this.features.map((feature, index) => `terminal-features[${index}] ${feature}`).join("\n");
+    if (args.includes("set-option")) { this.features.push(args.at(-1)!); return ""; }
     if (args.includes("new-session")) { this.pane = "%1"; this.session = args[args.indexOf("-s") + 1]; if (this.onStart) await this.onStart(args[args.indexOf("--ready-nonce") + 1]); return `${args[args.indexOf("-s") + 1]}:%1`; }
     throw new Error("unexpected tmux call");
   }
@@ -52,6 +55,21 @@ describe("tmux host", () => {
     expect(host.attachTarget(record)).toMatch(/^indra-[a-f0-9]{12}:chick-[a-f0-9]{12}$/);
     await host.start();
     expect(fake.calls.filter((args) => args.includes("new-session"))).toHaveLength(1);
+  });
+
+  it("turns on truecolor for its own tmux socket once, as a server option, and never globally", async () => {
+    const dir = await fixture(); const fake = new FakeTmux(); const host = new TmuxHost(dir, fake, dir);
+    fake.onStart = async (nonce) => { await writeFile(host.readyFile(nonce), JSON.stringify({ nonce })); };
+    await host.start();
+    await host.start();
+    const sets = fake.calls.filter((args) => args.includes("set-option"));
+    expect(sets).toEqual([["-L", host.socket, "set-option", "-s", "-a", "terminal-features", "*:RGB"]]);
+    expect(fake.features.filter((feature) => feature === "*:RGB")).toHaveLength(1);
+    // Every call names Indra's own socket; none touches the global options or environment it does not own.
+    for (const args of fake.calls) expect(args.slice(0, 2)).toEqual(["-L", host.socket]);
+    expect(fake.calls.some((args) => args.includes("-g") && !args.includes("show-environment"))).toBe(false);
+    expect(hasTruecolorFeature("terminal-features[0] xterm*:RGB")).toBe(false);
+    expect(hasTruecolorFeature("terminal-features[0] xterm*:title\nterminal-features[3] \"*:RGB\"")).toBe(true);
   });
 
   it("unsets OP_SERVICE_ACCOUNT_TOKEN and any OP_* variable in the tmux server's environment for the hosted pane", async () => {

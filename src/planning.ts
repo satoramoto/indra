@@ -179,6 +179,9 @@ export function validatePlanningDocument(state: PlanningDocument): void {
     if (outcome) throw new Error(closedLegacy ? `Historical outcome ${outcome.id} seat ${outcome.seatId} is outside the team.` : `Outcome ${outcome.id} seat ${outcome.seatId} is not a Developer seat on the team.`);
     const assignment = goal.assignments?.find((item) => !seats.has(item.seatId));
     if (assignment) throw new Error(`Assignment seat ${assignment.seatId} is outside the team.`);
+    // In a ceremony goal, an assignment leaves its proposed seat only when an idle Developer seat on the team takes it over.
+    const moved = !closedLegacy && goal.ceremony && goal.assignments?.find((item) => item.seatId !== goal.proposal?.outcomes.find((outcome) => outcome.id === item.outcomeId)?.seatId && !developers.has(item.seatId));
+    if (moved) throw new Error(`Assignment ${moved.outcomeId} is off its proposed seat, and ${moved.seatId} is not a Developer seat on the team.`);
     const ineligible = !closedLegacy && goal.assignments?.find((item) => !developers.has(item.seatId));
     if (ineligible) throw new Error(`Assignment seat ${ineligible.seatId} is not a Developer seat on the team.`);
     if (goal.ceremony) {

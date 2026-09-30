@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { copyFile, mkdir, mkdtemp, writeFile, readFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readdir, rm, utimes, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
+import { goalRuntimeFilename, productRuntimeFilename, teamRuntimeFilename, type GoalRuntimeRecord, type ProductProposal, type ProductRuntimeRecord, type SchedulerRuntimeRecord } from "../src/goal-contract.js";
 import { PlanningStore, type PlanningGoal } from "../src/planning.js";
-import { signalReady, TmuxHost, turnLockFile, type TmuxRunner } from "../src/tmux-host.js";
+import { signalReady, sweepHostFiles, TmuxHost, turnLockFile, type TmuxRunner } from "../src/tmux-host.js";
 import { withFileLock } from "../src/state-commit.js";
 import { activityRecordName, CliGoalStarter, Supervisor } from "../src/supervisor.js";
 import { ImplementationRecorder } from "../src/implementation-facts.js";
@@ -57,8 +58,8 @@ class FakeTmux implements TmuxRunner {
 const seat = (id: string, name: string, roles: string[]) => ({ id, displayName: name, roles, externalIdentities: { mattermost: { userId: id, username: name.toLowerCase() } } });
 
 const READY = { version: 1 as const, consumers: { planning: 1 as const, developer: 1 as const, release: 1 as const, retro: 1 as const, tui: 1 as const } };
-async function fixture(goals: PlanningGoal[] = []) {
-  const state = { $schema: "./schema/v1/state.schema.json", schemaVersion: 1, sprints: [], planningGoals: goals, teams: [{ id: "team-001", slug: "yahaha", displayName: "Yahaha", project: { github: "o/r" }, externalIdentities: { mattermost: { teamId: "team", homeChannelId: "channel" } }, seats: [seat("seat-001", "Chick", ["Team Lead"]), seat("seat-002", "George", ["Developer"]), seat("seat-003", "Herbie", ["Developer"])] }] };
+async function fixture(goals: PlanningGoal[] = [], newModel = false) {
+  const state = { $schema: "./schema/v1/state.schema.json", schemaVersion: 1, sprints: [], planningGoals: goals, teams: [{ id: "team-001", slug: "yahaha", displayName: "Yahaha", ...(newModel ? { workflowModel: "goals-v1" } : {}), project: { github: "o/r" }, externalIdentities: { mattermost: { teamId: "team", homeChannelId: "channel" } }, seats: [seat("seat-001", "Chick", ["Team Lead"]), seat("seat-002", "George", [newModel ? "Product" : "Developer"]), seat("seat-003", "Herbie", ["Developer"])] }] };
   const dir = await stateCheckout("indra-supervisor-", state);
   await mkdir(join(dir, "dist"));
   await writeFile(join(dir, "dist", "cli.js"), "");
@@ -66,7 +67,7 @@ async function fixture(goals: PlanningGoal[] = []) {
   await copyFile("schema/v1/state.schema.json", join(dir, "schema/v1/state.schema.json"));
   const tmux = new FakeTmux();
   tmux.onStart = async (_session, nonce) => { await signalReady(dir, nonce); };
-  return { dir, tmux, supervisor: new Supervisor(dir, tmux, dir, 1000, new PlanningStore(dir, undefined, READY)) };
+  return { dir, tmux, supervisor: new Supervisor(dir, tmux, dir, 1000, new PlanningStore(dir, undefined, READY), undefined, { restartDebounceMs: 0 }) };
 }
 
 describe("seat process supervisor", () => {
@@ -222,6 +223,83 @@ describe("seat process supervisor", () => {
     expect(tmux.kills()).toHaveLength(3);
     expect(tmux.launches()).toHaveLength(6);
     expect(Object.values(await supervisor.read()).map((item) => [item.process, item.updatePending])).toEqual([["running", undefined], ["running", undefined], ["running", undefined]]);
+  });
+
+  it("debounces update restarts: a burst of builds restarts each process once, and never one with a headed run going", async () => {
+    const { dir, tmux } = await fixture();
+    const reaped: string[] = [];
+    const supervisor = new Supervisor(dir, tmux, dir, 1000, new PlanningStore(dir, undefined, READY), undefined, { restartDebounceMs: 60_000, reap: async (runtime) => { reaped.push(runtime); return 0; } });
+    const stamp = (id: string) => writeFile(join(dir, "dist", "build-stamp.json"), JSON.stringify({ id, sha: "abc1234", builtAt: "now" }));
+    const runtime = `${dir}.runtime`;
+    const records = async () => (await readdir(runtime)).filter((name) => /^tmux-(host|seat-.*)\.json$/.test(name));
+    const age = async () => {
+      for (const name of await records()) {
+        const record = JSON.parse(await readFile(join(runtime, name), "utf8"));
+        await writeFile(join(runtime, name), JSON.stringify({ ...record, startedAt: new Date(Date.now() - 120_000).toISOString() }));
+      }
+    };
+    await stamp("build-1");
+    await supervisor.ensureAll();
+    expect(reaped).toEqual([runtime]);
+    // Builds land every few seconds: processes that just started wait instead of restarting once per build.
+    for (const id of ["build-2", "build-3", "build-4"]) {
+      await stamp(id);
+      expect(await supervisor.upgrade()).toEqual({ pending: ["bridge", "seat-002", "seat-003"], problems: [] });
+    }
+    expect(tmux.kills()).toHaveLength(0);
+    // Once they have been up long enough, each restarts once, onto the newest build; George has a headed run going.
+    await age();
+    const george = JSON.parse(await readFile(join(runtime, "tmux-seat-seat-002.json"), "utf8"));
+    await writeFile(join(runtime, `headed-${george.readyNonce}.json`), JSON.stringify({ pid: process.pid, engine: "claude", startedAt: "now" }));
+    expect(await supervisor.upgrade()).toEqual({ pending: ["seat-002"], problems: [] });
+    expect(tmux.kills().map((args) => args[args.indexOf("-t") + 1])).toEqual([expect.stringMatching(/^=chick-/), expect.stringMatching(/^=dev-seat-003-/)]);
+    await stamp("build-5");
+    expect(await supervisor.upgrade()).toEqual({ pending: ["bridge", "seat-002", "seat-003"], problems: [] });
+    expect(tmux.kills()).toHaveLength(2);
+    // The headed run ended: George restarts too.
+    await rm(join(runtime, `headed-${george.readyNonce}.json`));
+    expect(await supervisor.upgrade()).toEqual({ pending: ["bridge", "seat-003"], problems: [] });
+    expect(tmux.kills()).toHaveLength(3);
+    expect(reaped.length).toBeGreaterThan(1);
+  });
+
+  it("runs one stop or restart at a time per process", async () => {
+    const { tmux, supervisor } = await fixture();
+    await supervisor.ensureAll();
+    const [first, second] = await Promise.allSettled([supervisor.restart("seat-002"), supervisor.restart("seat-002")]);
+    expect(first.status).toBe("fulfilled");
+    expect(second).toMatchObject({ status: "rejected", reason: expect.objectContaining({ message: expect.stringContaining("already being stopped or restarted") }) });
+    expect(tmux.kills()).toHaveLength(1);
+    expect(tmux.launches()).toHaveLength(4);
+  });
+
+  it("removes a replaced process's readiness signal and headed marker, so host-ready records do not accumulate", async () => {
+    const { dir, supervisor } = await fixture();
+    const runtime = `${dir}.runtime`;
+    const readyFiles = async () => (await readdir(runtime)).filter((name) => name.startsWith("host-ready-")).sort();
+    await supervisor.ensureAll();
+    expect(await readyFiles()).toHaveLength(3);
+    const before = JSON.parse(await readFile(join(runtime, "tmux-seat-seat-002.json"), "utf8"));
+    await writeFile(join(runtime, `headed-${before.readyNonce}.json`), "{}");
+    for (let restart = 0; restart < 5; restart++) await supervisor.restart("seat-002");
+    const after = JSON.parse(await readFile(join(runtime, "tmux-seat-seat-002.json"), "utf8"));
+    expect(await readyFiles()).toHaveLength(3);
+    expect(await readyFiles()).toContain(`host-ready-${after.readyNonce}.json`);
+    expect(await readyFiles()).not.toContain(`host-ready-${before.readyNonce}.json`);
+    expect((await readdir(runtime)).filter((name) => name.startsWith("headed-"))).toEqual([]);
+
+    // Left by an older build: swept at start-up once no record names it; a brand-new one is kept.
+    const stale = join(runtime, "host-ready-00000000-0000-4000-8000-000000000000.json");
+    const fresh = join(runtime, "host-ready-11111111-1111-4111-8111-111111111111.json");
+    await writeFile(stale, "{}"); await writeFile(fresh, "{}");
+    const old = new Date(Date.now() - 10 * 60_000);
+    await utimes(stale, old, old);
+    expect(await sweepHostFiles(runtime)).toBe(1);
+    expect(await readyFiles()).toHaveLength(4);
+    expect(await readyFiles()).toContain(basename(fresh));
+    await utimes(fresh, old, old);
+    await supervisor.ensureAll();
+    expect(await readyFiles()).toHaveLength(3);
   });
 
   it("reads the held assignment and newest thread activity", async () => {
@@ -461,5 +539,59 @@ describe("CLI goal starter", () => {
       ["planning", "merge", "--state", "/state", "--goal", "goal-1"],
       ["planning", "rollback", "--state", "/state", "--goal", "goal-1"],
     ]);
+  });
+});
+
+
+describe("whole-goal supervised seats", () => {
+  const at = "2026-09-29T12:00:00Z";
+  const proposal: ProductProposal = { version: 1, goalId: "goal-owned", proposalId: "proposal-owned", productSeatId: "seat-002", rank: 1,
+    mission: "docs/mission.md", summary: "One complete goal", outcomes: [{ number: 1, title: "Ship scope", description: "Complete this goal", reason: "Mission", currentCode: ["src/work.ts"] }],
+    ownedFiles: ["src/work.ts"], risks: [], rationale: "Deliver the mission", basedOnRetros: [] };
+  async function assigned(dir: string) {
+    const store = new PlanningStore(dir, undefined, READY);
+    await store.publishProductProposal("team-001", proposal, { id: "proposal-post", userId: "seat-002", channelId: "channel", rootId: "", createdAt: at },
+      { proposalId: proposal.proposalId, leadSeatId: "seat-001", ownedFiles: proposal.ownedFiles, notes: [], at });
+    await store.approveGoal(proposal.goalId, { kind: "approval", proposalId: proposal.proposalId, proposalPostId: "proposal-post", approval: { source: "owner-command", command: "planning approve", at } });
+    await store.assignGoal(proposal.goalId, "seat-003", { branch: `sprint/${proposal.goalId}`, baseSha: "a".repeat(40), status: "collecting" });
+    return store;
+  }
+  it("projects the three shared records onto their own roles and rejects foreign runtime ownership", async () => {
+    const { dir, tmux, supervisor } = await fixture([], true); const store = await assigned(dir);
+    const goal = (await store.read()).planningGoals![0];
+    const runtime: GoalRuntimeRecord = { version: 1, goalId: goal.id, teamId: goal.teamId, assignment: goal.goalAssignment!, brief: null, plan: null, report: null, events: [], handledEventIds: [], redirects: [], failure: null, updatedAt: at,
+      lanes: [{ id: "lane-work", branch: "codex/work", ownedFiles: ["src/work.ts"], dependsOn: [], status: "reviewing", prUrl: "https://github.com/o/r/pull/11", headSha: "b".repeat(40), mergedSha: null, reviewer: "satori-miyamoto", review: "pending", ci: "passed", findings: [], fixRounds: 0, conflictRounds: 0, decisions: ["Keep scope"], followUps: ["Measure later"], updatedAt: at }] };
+    const scheduler: SchedulerRuntimeRecord = { version: 1, teamId: goal.teamId, events: [], handledEventIds: [], redirects: [], activeDispatches: [], approvedQueue: [{ goalId: "goal-waiting", rank: 2, ownedFiles: ["src/work.ts"], blockedByGoalIds: [goal.id] }], failure: null, updatedAt: at };
+    const product: ProductRuntimeRecord = { version: 1, teamId: goal.teamId, seatId: "seat-002", queue: [{ proposal: { ...proposal, goalId: "goal-next", proposalId: "proposal-next" }, status: "proposed", vetting: null, rootPostId: null, proposalPostId: null }], events: [], handledEventIds: [], pending: null, failure: null, updatedAt: at };
+    await store.saveRuntime(goalRuntimeFilename(goal.id), runtime); await store.saveRuntime(teamRuntimeFilename(goal.teamId), scheduler); await store.saveRuntime(productRuntimeFilename(goal.teamId), product);
+    await supervisor.ensureAll(); const live = await supervisor.read();
+    expect(tmux.launches().filter((args) => args.includes("serve"))).toHaveLength(1);
+    expect(live["seat-002"].attach?.target).toContain("dev-seat-002");
+    expect(live["seat-001"].scheduler?.approvedQueue[0].blockedByGoalIds).toEqual([goal.id]);
+    expect(live["seat-002"].product?.queue[0].proposal.summary).toBe("One complete goal");
+    expect(live["seat-003"].goal).toMatchObject({ goalId: goal.id, status: "assigned", ownedFiles: ["src/work.ts"], progress: { lanes: [{ id: "lane-work", prUrl: "https://github.com/o/r/pull/11", ci: "passed" }], decisions: ["Keep scope"] } });
+    expect(live["seat-003"].assignment).toBeUndefined(); expect(live["seat-002"].goal).toBeUndefined();
+    live["seat-003"].goal!.progress!.decisions.push("UI only");
+    expect((await supervisor.read())["seat-003"].goal!.progress!.decisions).toEqual(["Keep scope"]);
+    await store.saveRuntime(goalRuntimeFilename(goal.id), { ...runtime, assignment: { ...runtime.assignment, seatId: "seat-other" } });
+    expect((await supervisor.read())["seat-003"].goal).toMatchObject({ goalId: goal.id, ownedFiles: ["src/work.ts"] });
+    expect((await supervisor.read())["seat-003"].goal?.progress).toBeUndefined();
+  });
+  it("defers both automatic and manual restarts for an active whole goal, then upgrades after its reported boundary", async () => {
+    const { dir, tmux } = await fixture([], true); const store = await assigned(dir);
+    // The real default cooldown is a minute; no timer is available after the final completion event.
+    const supervisor = new Supervisor(dir, tmux, dir, 1000, store);
+    const stamp = (id: string) => writeFile(join(dir, "dist/build-stamp.json"), JSON.stringify({ id, sha: "a".repeat(40), builtAt: at }));
+    await stamp("old"); await supervisor.ensureAll(); await stamp("new");
+    expect((await supervisor.upgrade()).pending).toEqual(["seat-003"]);
+    const kills = tmux.kills().length; expect(kills).toBe(2);
+    await expect(supervisor.restart("seat-003")).rejects.toThrow("holds active work");
+    expect(tmux.kills()).toHaveLength(kills); expect((await supervisor.read())["seat-003"].updatePending).toBe(true);
+    await store.update((state) => { state.planningGoals![0].goalAssignment!.status = "reported"; }, "Fixture Developer completed its goal");
+    expect(await supervisor.upgrade()).toEqual({ pending: [], problems: [] });
+    expect(tmux.kills()).toHaveLength(kills + 1); expect((await supervisor.read())["seat-003"].goal).toBeUndefined();
+    expect((await supervisor.read())["seat-003"].updatePending).toBeUndefined();
+    expect(await supervisor.upgrade()).toEqual({ pending: [], problems: [] });
+    expect(tmux.kills()).toHaveLength(kills + 1);
   });
 });

@@ -1,7 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { appendFile, mkdir, mkdtemp, readFile, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { TmuxHost, type HostRecord } from "../src/tmux-host.js";
+import { headedMarkerFile } from "../src/headed-session.js";
 import { claudeProjectDir, ENTRY_LIMIT, LocalTranscriptSource, parseSessionHandle, parseTranscript, safeText, TranscriptLocator, TranscriptTail } from "../src/session-transcript.js";
 
 const fixture = (name: string) => readFile(join(import.meta.dirname, "fixtures", "transcripts", name), "utf8");
@@ -131,4 +133,30 @@ describe("session transcript files", () => {
     expect(await feed.poll()).toMatchObject({ status: "ok", reset: false, entries: [] });
     expect((await stat(chickLog)).isFile()).toBe(true);
   });
+});
+
+
+it("routes Product to its own verified finite-run log and never to an old outcome or Chick's handle", async () => {
+  const root = await mkdtemp(join(tmpdir(), "indra-product-transcript-"));
+  const checkout = join(root, "fixture-state"); const runtime = checkout + ".runtime"; const home = join(root, "home");
+  const chickLog = join(home, ".claude/projects/chick", `${CLAUDE_ID}.jsonl`);
+  await mkdir(join(chickLog, ".."), { recursive: true }); await writeFile(chickLog, await fixture("claude-session.jsonl"));
+  await mkdir(runtime); await writeFile(join(runtime, "seat-seat-002-goal-old-outcome-1.json"), JSON.stringify({ sessions: [{ sessionId: "claude:" + CLAUDE_ID }] }));
+  const locator = new TranscriptLocator(checkout, {}, home); const product = { id: "seat-002", roles: ["Product"] };
+  const ownership = vi.spyOn(TmuxHost.prototype, "verifiedRecord").mockResolvedValue(undefined);
+  try {
+    expect(await locator.locate(product, "claude:" + CLAUDE_ID)).toBeUndefined();
+    const nonce = "00000000-0000-4000-8000-000000000001";
+    const id = "99999999-8888-4777-8666-555555555555";
+    const ownLog = join(home, ".claude/projects/product", `${id}.jsonl`);
+    await mkdir(join(ownLog, ".."), { recursive: true }); await writeFile(ownLog, await fixture("claude-session.jsonl"));
+    await writeFile(headedMarkerFile(checkout, nonce), JSON.stringify({ pid: process.pid, engine: "claude", startedAt: new Date().toISOString(), log: ownLog }));
+    ownership.mockImplementation(async function (this: TmuxHost) {
+      expect(this.hosted).toEqual({ kind: "seat", seatId: "seat-002" });
+      return { readyNonce: nonce } as HostRecord;
+    });
+    expect(await locator.locate(product, "claude:" + CLAUDE_ID)).toEqual({ engine: "claude", sessionId: id, path: ownLog });
+    ownership.mockRejectedValue(new Error("Foreign host"));
+    expect(await locator.locate(product, "claude:" + CLAUDE_ID)).toBeUndefined();
+  } finally { ownership.mockRestore(); }
 });

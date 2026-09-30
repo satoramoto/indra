@@ -1,3 +1,4 @@
+import { goalRuntimeFilename, type GoalRuntimeRecord } from "../src/goal-contract.js";
 import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -179,4 +180,24 @@ describe("read-only session snapshots", () => {
     const session = (await new LocalSessionReader("unused", { read: async () => ({ $schema: "", schemaVersion: 1, teams: [], sprints: [], planningGoals: [saved] }), runtime: async () => ({} as RuntimeRecord) }, host(), { read: async () => { throw new Error("unavailable"); } }).readSessions()).sessions[0];
     expect(session).toMatchObject({ status: "error", loop: { stage: "Merge", build: { status: "unavailable" }, tickets: [{ status: "merged" }] } });
   });
+});
+
+
+it("reads whole-goal progress through the public runtime projection without opening Chick's legacy session", async () => {
+  const saved: PlanningGoal = { ...goal(), workflowModel: "goals-v1", ownedFiles: ["src/work.ts"], proposal: undefined, assignments: undefined,
+    goalAssignment: { seatId: "seat-003", status: "running", updatedAt: time } };
+  const runtime: GoalRuntimeRecord = { version: 1, goalId: saved.id, teamId: saved.teamId, assignment: saved.goalAssignment!, brief: null, plan: null, lanes: [], report: null, events: [], handledEventIds: [], redirects: [], failure: { at: time, message: "Lane CI failed", retryable: true }, updatedAt: time };
+  let record: unknown = runtime;
+  const legacy = vi.fn(async () => { throw new Error("Legacy session must not be used"); });
+  const readRuntimeFile = async <T,>(name: string): Promise<T | undefined> => name === goalRuntimeFilename(saved.id) ? structuredClone(record) as T : undefined;
+  const reader = new LocalSessionReader("unused", { read: async () => ({ planningGoals: [saved] }), runtime: legacy, readRuntimeFile },
+    { verifiedRecord: async () => undefined, isReady: async () => false, attachTarget: () => "chick-not-the-goal-owner" });
+  const snapshot = (await reader.readSessions()).sessions[0];
+  expect(snapshot).toMatchObject({ goalOwnerSeatId: "seat-003", workflowModel: "goals-v1", engine: "unknown", status: "error", recentActivity: ["Lane CI failed"], mattermost: { proposalPostId: "root" }, loop: { tickets: [], goal: { goalId: saved.id, status: "running", ownedFiles: ["src/work.ts"], progress: { failure: runtime.failure } } } });
+  expect(snapshot.sessionId).toBeUndefined(); expect(snapshot.attach).toBeUndefined(); expect(legacy).not.toHaveBeenCalled();
+  for (const bad of [undefined, { ...runtime, teamId: "team-foreign" }, { ...runtime, lanes: null }]) {
+    record = bad; const next = (await reader.readSessions()).sessions[0];
+    expect(next.loop?.goal).toMatchObject({ goalId: saved.id, status: "running", ownedFiles: ["src/work.ts"] });
+    expect(next.loop?.goal?.progress).toBeUndefined(); expect(next.engine).toBe("unknown");
+  }
 });

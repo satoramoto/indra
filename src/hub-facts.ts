@@ -3,10 +3,10 @@ import { seatRecordName } from "./developer-maintenance.js";
 import { implementationFactsName, type ImplementationFacts } from "./implementation-facts.js";
 import { CLAUDE_MODEL, DEVELOPER_CLAUDE_EFFORT, PRODUCT_CLAUDE_EFFORT, TEAM_LEAD_CLAUDE_EFFORT } from "./claude-runtime.js";
 import { DEVELOPER_CODEX_MODEL, DEVELOPER_CODEX_REASONING_EFFORT, PRODUCT_CODEX_MODEL, PRODUCT_CODEX_REASONING_EFFORT, TEAM_LEAD_CODEX_MODEL, TEAM_LEAD_CODEX_REASONING_EFFORT } from "./harness-home.js";
-import { parseUsage, sumUsage, type CiState, type SeatStep } from "./hub-format.js";
+import { parseUsage, sumUsage, totalTokens, type CiState, type SeatStep } from "./hub-format.js";
 import type { RuntimeEngine, TokenUsage } from "./runtime-facts.js";
 import type { PlanningGoal } from "./planning.js";
-import { goalRuntimeFilename, productRuntimeFilename, projectGoalRuntime, teamRuntimeFilename, type GoalRuntimeProjection, type GoalRuntimeRecord, type ProductRuntimeRecord, type SchedulerRuntimeRecord } from "./goal-contract.js";
+import { goalRuntimeFilename, productRuntimeFilename, projectGoalRuntime, teamRuntimeFilename, validateProductProposal, type GoalRuntimeProjection, type GoalRuntimeRecord, type ProductRuntimeRecord, type SchedulerRuntimeRecord } from "./goal-contract.js";
 
 export interface GoalSeatFacts { goalId: string; title: string; status: string; ownedFiles: string[]; progress?: GoalRuntimeProjection }
 
@@ -16,7 +16,15 @@ export async function readGoalFacts(store: RuntimeFileReader, goal: PlanningGoal
   try {
     const record = await store.readRuntimeFile<GoalRuntimeRecord>(goalRuntimeFilename(goal.id));
     if (record?.version === 1 && record.goalId === goal.id && record.teamId === goal.teamId && record.assignment?.seatId === goal.goalAssignment?.seatId) {
-      facts.progress = projectGoalRuntime(record);
+      const progress = projectGoalRuntime(record);
+      const strings = (value: unknown): value is string[] => Array.isArray(value) && value.every((item) => typeof item === "string");
+      if (!strings(progress.decisions) || !strings(progress.followUps) || !strings(progress.neededButUnowned)
+        || progress.failure && typeof progress.failure.message !== "string"
+        || progress.lanes.some((lane) => typeof lane.id !== "string" || typeof lane.branch !== "string" || !strings(lane.ownedFiles)
+          || !["queued", "running", "pr-open", "reviewing", "changes-requested", "merging", "merged", "failed"].includes(lane.status)
+          || !["pending", "passed", "failed"].includes(lane.ci) || !["pending", "approved", "changes-requested", "dismissed"].includes(lane.review)
+          || lane.prUrl !== null && typeof lane.prUrl !== "string")) return facts;
+      facts.progress = progress;
     }
   } catch { /* Missing or malformed runtime facts are unknown, never invented progress. */ }
   return facts;
@@ -26,7 +34,9 @@ export async function readSchedulerFacts(store: RuntimeFileReader, teamId: strin
   try {
     const record = await store.readRuntimeFile<SchedulerRuntimeRecord>(teamRuntimeFilename(teamId));
     if (record?.version !== 1 || record.teamId !== teamId || !Array.isArray(record.approvedQueue) || !Array.isArray(record.activeDispatches)) return;
-    if (record.approvedQueue.some((item) => typeof item.goalId !== "string" || !Array.isArray(item.blockedByGoalIds) || !Array.isArray(item.ownedFiles))) return;
+    if (record.approvedQueue.some((item) => typeof item?.goalId !== "string" || !Number.isSafeInteger(item.rank) || item.rank < 1 || !Array.isArray(item.blockedByGoalIds) || item.blockedByGoalIds.some((id) => typeof id !== "string") || !Array.isArray(item.ownedFiles))) return;
+    if (record.activeDispatches.some((item) => typeof item?.goalId !== "string" || typeof item.seatId !== "string" || typeof item.status !== "string")) return;
+    if (record.failure && typeof record.failure.message !== "string") return;
     return structuredClone(record);
   } catch { return; }
 }
@@ -35,7 +45,11 @@ export async function readProductFacts(store: RuntimeFileReader, teamId: string,
   try {
     const record = await store.readRuntimeFile<ProductRuntimeRecord>(productRuntimeFilename(teamId));
     if (record?.version !== 1 || record.teamId !== teamId || record.seatId !== seatId || !Array.isArray(record.queue)) return;
-    if (record.queue.some((item) => typeof item.proposal?.summary !== "string" || typeof item.proposal.rank !== "number")) return;
+    for (const item of record.queue) {
+      validateProductProposal(item.proposal);
+      if (item.proposal.productSeatId !== seatId || !["proposed", "posted", "approved"].includes(item.status)) return;
+    }
+    if (record.failure && typeof record.failure.message !== "string") return;
     return structuredClone(record);
   } catch { return; }
 }
@@ -69,6 +83,8 @@ export interface AssignmentFacts {
   /** When the newest attempt was claimed, and when it ended if it has. */
   claimedAt?: string;
   endedAt?: string;
+  /** Each recorded session's tokens at the time it finished, for the seat's burn sparkline. */
+  burn?: { at: string; tokens: number }[];
 }
 
 export interface RuntimeFileReader { readRuntimeFile<T>(name: string): Promise<T | undefined> }
@@ -97,6 +113,10 @@ export function assignmentFacts(record: SeatTaskRecord | undefined, ledger: Impl
   const latestEvents = latest && Array.isArray(latest.events) ? latest.events : [];
   const ci = [...latestEvents].reverse().find((event) => event.kind === "ci" || (event.kind === "merge" && event.result === "passed"));
   const step = record && STEPS.includes(record.step) ? record.step : undefined;
+  const burn = (sessions.length ? sessions.map((event) => event.session!) : record?.sessions ?? []).flatMap((session) => {
+    const tokens = totalTokens(parseUsage(session.usage));
+    return tokens && typeof session.finishedAt === "string" && Number.isFinite(Date.parse(session.finishedAt)) ? [{ at: session.finishedAt, tokens }] : [];
+  });
   const sessionIds = [...new Set([...sessions.map((event) => event.session?.sessionId), ...(record?.sessions ?? []).map((session) => session.sessionId)]
     .filter((id): id is string => typeof id === "string" && !!id))];
   return {
@@ -109,5 +129,6 @@ export function assignmentFacts(record: SeatTaskRecord | undefined, ledger: Impl
     ...(sessions.at(-1)?.session?.engine ? { engine: sessions.at(-1)!.session!.engine } : {}),
     ...(latest?.claimedAt ? { claimedAt: latest.claimedAt } : {}),
     ...(latest?.terminal?.at ? { endedAt: latest.terminal.at } : {}),
+    ...(burn.length ? { burn } : {}),
   };
 }
