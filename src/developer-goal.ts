@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { AgentRuntime, WriteAccess } from "./codex-runtime.js";
 import type { Shell } from "./command-shell.js";
-import { GitDeveloperLanes, LaneError, laneBrief, type DeveloperLaneServices, type LaneJournal } from "./developer-lanes.js";
+import { GitDeveloperLanes, LaneError, LaneValidationError, laneBrief, type DeveloperLaneServices, type LaneJournal } from "./developer-lanes.js";
 import { goalRuntimeFilename, validateGoalBrief, validateGoalReport, validateLanePlan, type GoalBrief, type GoalLane, type GoalLaneProgress, type GoalReport, type GoalRuntimeRecord, type WorkflowEvent } from "./goal-contract.js";
 import { teamProject, type PlanningGoal, type PlanningStore } from "./planning.js";
 import type { GoalAgentSession } from "./seat-runtime.js";
@@ -121,9 +121,21 @@ export class DeveloperGoal {
               const key = id([failedCheck.headSha, failedCheck.command, failedCheck.diagnostic]);
               await this.services.fix(lane, scoped, saved, `${failedCheck.command} exited ${failedCheck.exitCode}:\n${failedCheck.diagnostic}`, key, null, persist, true);
             }
-            laneProgress.prUrl = saved.prUrl ?? await this.services.publish(lane, scoped, saved, persist); laneProgress.status = "pr-open"; laneProgress.headSha = saved.headSha;
+            try {
+              laneProgress.prUrl = saved.prUrl ?? await this.services.publish(lane, scoped, saved, persist);
+            } catch (error) {
+              // Before the first PR, any durable fix reservation consumes this lane's one automatic validation repair.
+              // A restart may replay a cached failure, but must not launch a second fix for its changed head.
+              if (!(error instanceof LaneValidationError) || saved.fixes.length) throw error;
+              const check = error.check; const key = id([check.headSha, check.command, check.diagnostic]);
+              laneProgress.fixRounds++; await persist();
+              await this.services.fix(lane, scoped, saved, `${check.command} exited ${check.exitCode}:\n${check.diagnostic}`, key, null, persist);
+              laneProgress.prUrl = saved.prUrl;
+            }
+            laneProgress.status = "pr-open"; laneProgress.headSha = saved.headSha;
             emit({ kind: "agent-completed", id: `lead:${goal.id}:${lane.id}:${saved.headSha}`, goalId: goal.id, teamId: goal.teamId, laneId: lane.id, agentId: `lead:${lane.id}:${saved.attempt}`, status: "succeeded", headSha: saved.headSha, report: null, at: now() }); await persist();
           }
+          laneProgress.prUrl = saved.prUrl; // Recover a crash after publication persisted its URL.
           let observation = await this.services.observe(lane, scoped, saved);
           if (observation.state === "CLOSED") throw new LaneError(`Lane ${lane.id} PR closed without merging; its checkout is retained.`);
           if (observation.state === "OPEN" && (saved.review?.headSha !== observation.headSha || !saved.review.posted)) {
